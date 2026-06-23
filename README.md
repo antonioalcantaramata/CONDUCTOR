@@ -26,31 +26,49 @@ tools from a chat interface.
 
 ## Requirements
 
-- [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install)
+- [git](https://git-scm.com/downloads)
+- Conda — either [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install)
+  (lightweight, recommended) or full Anaconda. The only heavy prerequisite;
+  `start.sh` builds the environment for you.
 - A Google Gemini API key (free tier works) — https://aistudio.google.com/apikey
+- macOS or Linux. On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/)
+  or Git Bash (the launcher is a bash script).
 
 ## Quick start
 
 ```bash
-# 1. Backend environment (conda)
-conda env create -f environment.yml      # creates the `pyopt` env
+# 1. Download the code
+git clone https://github.com/antonioalcantaramata/CONDUCTOR.git
+cd CONDUCTOR
 
-# 2. Agent API key
+# 2. Add your API key
 cp llm_agent/.env.example llm_agent/.env
-#   then edit llm_agent/.env and paste your GEMINI_API_KEY
+#    then open llm_agent/.env and paste your key after GEMINI_API_KEY=
 
-# 3. Launch backend + chat app
+# 3. Launch (first run is slow: it builds the conda env + installs deps)
 ./start.sh
 ```
 
-`start.sh` creates the conda env if needed, installs the agent's pip
-requirements (`llm_agent/requirements.txt`), and starts both services. The chat
-app opens at http://localhost:8501.
+On the **first run**, `start.sh` creates the `pyopt` conda environment from
+`environment.yml`, installs the agent's pip requirements
+(`llm_agent/requirements.txt`), then starts the backend and the chat app.
+Subsequent runs reuse the environment and start in seconds.
+
+When it's ready, the chat app opens at **http://localhost:8501**.
+Press **Ctrl+C** in the terminal once to stop both services.
+
+To update later, pull the latest code and relaunch:
+
+```bash
+git pull
+./start.sh
+```
 
 ## Configuration
 
-All secrets live in `llm_agent/.env` (git-ignored). Never commit your API key.
-See `llm_agent/.env.example` for the expected variables.
+All secrets live in `llm_agent/.env` (git-ignored — never commit your API key).
+See `llm_agent/.env.example` for the expected variables. You can also pick a
+different model there via `GEMINI_MODEL`.
 
 ## License
 
