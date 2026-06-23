@@ -1,0 +1,32 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────
+.env
+*.env
+!*.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ── OS / editor / tooling ─────────────────────────────────────────────────
+.DS_Store
+*.bak
+.claude/
+
+# ── Internal docs (not for public release) ────────────────────────────────
+capabilities.md
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+backend.log
+streamlit.log
+llm_agent/session_logs/*.jsonl
+
+# ── Runtime state & user uploads (keep only the bundled default network) ───
+systems/*
+!systems/.gitkeep
+!systems/pglib_opf_case14_ieee.m
+
+data_files/*
+!data_files/.gitkeep
+!data_files/example_timeseries_template.csv

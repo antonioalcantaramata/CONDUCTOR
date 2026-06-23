@@ -1,0 +1,17 @@
+name: "IEEE 14-Bus Test Case"
+source: ieee
+case: "case14"
+measurement_source: synthetic
+synthetic_n_days: 7
+synthetic_resolution_min: 15
+synthetic_load_profile: "residential"
+synthetic_generation_profile: "wind"
+precomputed_ybus_path: null   # compute on-the-fly at startup
+slack_max_mw: 999.0
+vm_lower: 0.94
+vm_upper: 1.06
+max_loading_pct: 100.0
+voltage_level_kv: 0
+grid_type: "transmission"
+slack_name: "External Grid"
+description: "Synthetic 7-day profile, 15-min resolution. 5 generators, 11 loads."

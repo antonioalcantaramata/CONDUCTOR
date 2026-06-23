@@ -1,0 +1,17 @@
+name: "PGLib IEEE 14-Bus System"
+source: matpower
+matpower_path: "systems/pglib_opf_case14_ieee.m"
+measurement_source: synthetic
+synthetic_n_days: 7
+synthetic_resolution_min: 15
+synthetic_load_profile: "residential"
+synthetic_generation_profile: "wind"
+precomputed_ybus_path: null
+slack_max_mw: 999.0
+vm_lower: 0.94
+vm_upper: 1.06
+max_loading_pct: 100.0
+voltage_level_kv: 0
+grid_type: "transmission"
+slack_name: "External Grid"
+description: "Synthetic 7-day profile generated from the bundled PGLib IEEE 14-bus MATPOWER case."

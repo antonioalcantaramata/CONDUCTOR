@@ -1,0 +1,23 @@
+name: pyopt
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  # Power systems core
+  - pandapower>=3.4.0        # load flow, network modelling
+  - pyomo>=6.10.0            # optimisation framework
+  - ipopt>=3.14              # IPOPT solver (used by flex_engine)
+  # Scientific stack (required by pandapower)
+  - numpy>=2.0
+  - pandas>=2.3
+  - scipy>=1.13
+  - networkx>=3.4
+  # FastAPI backend
+  - fastapi>=0.116
+  - uvicorn>=0.35
+  - pydantic>=2.11
+  - requests>=2.33
+  - python-dotenv>=1.0
+  - pyyaml>=6.0             # network-profile YAML loading
