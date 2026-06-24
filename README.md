@@ -31,12 +31,13 @@ tools from a chat interface.
   (lightweight, recommended) or full Anaconda. The only heavy prerequisite;
   `start.sh` builds the environment for you.
 - A Google Gemini API key (free tier works) — https://aistudio.google.com/apikey
-- macOS or Linux. On Windows, use [WSL](https://learn.microsoft.com/windows/wsl/)
-  or Git Bash (the launcher is a bash script).
+- macOS or Linux. The launcher is a bash script, so any terminal that runs bash
+  works — including the VSCode integrated terminal. On Windows, open the
+  integrated terminal with WSL or Git Bash as the shell (not PowerShell/cmd).
 
 ## Quick start
 
-```bash
+```Shell
 # 1. Download the code
 git clone https://github.com/antonioalcantaramata/CONDUCTOR.git
 cd CONDUCTOR
