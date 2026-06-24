@@ -4,8 +4,8 @@
 # Usage:
 #   chmod +x start.sh   (once)
 #   ./start.sh                            # bundled PGLib IEEE 14-bus profile (default)
-#   GRID_PROFILE=pglib_case14 ./start.sh # explicit bundled MATPOWER profile
-#   GRID_PROFILE=ieee14 ./start.sh       # pandapower IEEE 14-bus synthetic profile
+#   GRID_PROFILE=pglib_case14 ./start.sh  # explicit bundled MATPOWER profile
+#   GRID_PROFILE=ieee14 ./start.sh        # pandapower IEEE 14-bus synthetic profile
 #
 # Press Ctrl+C once to stop both services cleanly.
 
@@ -41,7 +41,7 @@ if ! command -v conda >/dev/null 2>&1; then
     echo "  Install it from: https://www.anaconda.com/docs/getting-started/miniconda/install" >&2
     echo "" >&2
     echo "  Quick install on macOS/Linux:" >&2
-    echo "    curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-$(uname -s)-$(uname -m).sh -o /tmp/miniconda.sh" >&2
+    echo "    curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-\$(uname -s)-\$(uname -m).sh -o /tmp/miniconda.sh" >&2
     echo "    bash /tmp/miniconda.sh -b -p \$HOME/miniconda3" >&2
     echo "    source \$HOME/miniconda3/etc/profile.d/conda.sh" >&2
     echo "" >&2
@@ -49,76 +49,34 @@ if ! command -v conda >/dev/null 2>&1; then
     exit 1
 fi
 
-# Auto-create pyopt env from environment.yml if it doesn't exist yet
-if ! conda env list | grep -q "^pyopt "; then
+# Create the conductor_env from environment.yml if it doesn't exist yet.
+# On first run this takes a few minutes; subsequent runs skip this entirely.
+if ! conda env list | grep -q "^conductor_env "; then
     if [[ -f "$SCRIPT_DIR/environment.yml" ]]; then
-        warn "Conda env 'pyopt' not found — creating it from environment.yml…"
+        warn "Conda env 'conductor_env' not found — creating it from environment.yml…"
         warn "This takes a few minutes on first run."
         conda env create -f "$SCRIPT_DIR/environment.yml" \
             || die "Failed to create conda env. Check the output above."
-        log "Conda env 'pyopt' created ✓"
+        log "Conda env 'conductor_env' created ✓"
     else
-        die "Conda env 'pyopt' not found and environment.yml is missing.\nRun: conda env create -f environment.yml"
+        die "Conda env 'conductor_env' not found and environment.yml is missing."
     fi
-fi
-
-# Always use conda base's Python for the agent — avoids picking up the
-# macOS system Python 3.9 when conda is not explicitly activated.
-BASE_PYTHON="$(conda run -n base which python)"
-[[ -x "$BASE_PYTHON" ]] || die "Could not locate Python in conda base env"
-log "Using Python: $BASE_PYTHON"
-
-# --- Check backend (pyopt env) requirements ---
-log "Checking pyopt environment packages…"
-BACKEND_PACKAGES=(
-    fastapi
-    uvicorn
-    pandapower
-    pydantic
-    pyomo
-    pandas
-    requests
-    dotenv      # python-dotenv
-)
-MISSING_BACKEND=()
-for pkg in "${BACKEND_PACKAGES[@]}"; do
-    # Map package names that differ between pip name and import name
-    import_name="$pkg"
-    [[ "$pkg" == "dotenv" ]] && import_name="dotenv"
-    if ! conda run -n pyopt python -c "import $import_name" >/dev/null 2>&1; then
-        MISSING_BACKEND+=("$pkg")
-    fi
-done
-if [[ ${#MISSING_BACKEND[@]} -gt 0 ]]; then
-    warn "The following packages are missing from the 'pyopt' environment:"
-    for p in "${MISSING_BACKEND[@]}"; do echo "    - $p"; done
-    die "Install them with: conda run -n pyopt pip install ${MISSING_BACKEND[*]}"
-fi
-log "pyopt environment OK ✓"
-
-# --- Check Streamlit / agent (conda base env) requirements ---
-# Use pip show against the explicit conda base Python — never the system Python.
-log "Checking Streamlit agent packages…"
-AGENT_PACKAGES=(streamlit plotly httpx google-genai python-dotenv)
-MISSING_AGENT=()
-for pip_name in "${AGENT_PACKAGES[@]}"; do
-    if ! "$BASE_PYTHON" -m pip show "$pip_name" >/dev/null 2>&1; then
-        MISSING_AGENT+=("$pip_name")
-    fi
-done
-if [[ ${#MISSING_AGENT[@]} -gt 0 ]]; then
-    warn "The following packages are missing from the conda base environment:"
-    for p in "${MISSING_AGENT[@]}"; do echo "    - $p"; done
-    warn "Installing from llm_agent/requirements.txt…"
-    "$BASE_PYTHON" -m pip install -r "$AGENT_DIR/requirements.txt" \
-        || die "pip install failed — check your internet connection or Python environment."
-    log "Agent packages installed ✓"
 else
-    log "Agent environment OK ✓"
+    # Env exists — update if environment.yml changed since the last run.
+    ENV_YML="$SCRIPT_DIR/environment.yml"
+    HASH_FILE="$SCRIPT_DIR/.conductor_env_hash"
+    CURRENT_HASH="$(shasum -a 256 "$ENV_YML" | awk '{print $1}')"
+    STORED_HASH="$(cat "$HASH_FILE" 2>/dev/null || echo '')"
+    if [[ "$CURRENT_HASH" != "$STORED_HASH" ]]; then
+        warn "environment.yml changed — updating 'conductor_env'…"
+        conda env update -n conductor_env -f "$ENV_YML" --prune \
+            || die "conda env update failed. Check the output above."
+        echo "$CURRENT_HASH" > "$HASH_FILE"
+        log "Env updated ✓"
+    fi
 fi
 
-# API key check — a soft warning only; the Streamlit app shows a setup screen
-# on first run so users can enter their key without editing files manually.
+# API key check — soft warning only; the app shows a setup screen on first run.
 if [[ ! -f "$AGENT_DIR/.env" ]] || ! grep -q "GEMINI_API_KEY=." "$AGENT_DIR/.env" 2>/dev/null; then
     warn "No GEMINI_API_KEY found in $AGENT_DIR/.env"
     warn "The app will guide you through setup on first open."
@@ -142,10 +100,10 @@ trap cleanup INT TERM
 # ---------------------------------------------------------------------------
 # Start FastAPI backend
 # ---------------------------------------------------------------------------
-log "Starting FastAPI backend on http://localhost:$BACKEND_PORT (conda env: pyopt)…"
+log "Starting FastAPI backend on http://localhost:$BACKEND_PORT …"
 log "Grid profile: $GRID_PROFILE"
 cd "$BACKEND_DIR"
-conda run -n pyopt --no-capture-output \
+conda run -n conductor_env --no-capture-output \
     uvicorn main_backend:app \
     --host 0.0.0.0 \
     --port "$BACKEND_PORT" \
@@ -153,10 +111,9 @@ conda run -n pyopt --no-capture-output \
 BACKEND_PID=$!
 log "Backend PID: $BACKEND_PID  (logs → backend.log)"
 
-# Wait until the backend is accepting connections (up to 30 s)
+# Wait until the backend is accepting connections (up to 120 s)
 log "Waiting for backend to be ready (this can take 60–120 s for pandapower load)…"
 for i in $(seq 1 120); do
-    # Abort early if the backend process already died
     if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
         warn "Backend process exited unexpectedly. Check backend.log:"
         tail -20 "$SCRIPT_DIR/backend.log" >&2
@@ -181,7 +138,8 @@ echo ""
 # ---------------------------------------------------------------------------
 log "Starting Streamlit chat app on http://localhost:$STREAMLIT_PORT …"
 cd "$AGENT_DIR"
-"$BASE_PYTHON" -m streamlit run app.py \
+conda run -n conductor_env --no-capture-output \
+    streamlit run app.py \
     --server.port "$STREAMLIT_PORT" \
     --server.headless true \
     > "$SCRIPT_DIR/streamlit.log" 2>&1 &

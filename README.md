@@ -50,10 +50,10 @@ cp llm_agent/.env.example llm_agent/.env
 ./start.sh
 ```
 
-On the **first run**, `start.sh` creates the `pyopt` conda environment from
-`environment.yml`, installs the agent's pip requirements
-(`llm_agent/requirements.txt`), then starts the backend and the chat app.
-Subsequent runs reuse the environment and start in seconds.
+On the **first run**, `start.sh` creates the `conductor_env` conda environment
+from `environment.yml` (this includes everything — the backend, the chat app,
+and the LLM agent). It takes a few minutes. Subsequent runs reuse the
+environment and start in seconds.
 
 When it's ready, the chat app opens at **http://localhost:8501**.
 Press **Ctrl+C** in the terminal once to stop both services.

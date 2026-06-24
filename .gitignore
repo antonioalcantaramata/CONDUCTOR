@@ -13,6 +13,7 @@ __pycache__/
 .DS_Store
 *.bak
 .claude/
+.conductor_env_hash
 
 # ── Internal docs (not for public release) ────────────────────────────────
 capabilities.md

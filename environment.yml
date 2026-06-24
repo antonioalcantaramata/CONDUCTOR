@@ -1,23 +1,33 @@
-name: pyopt
+name: conductor_env
 channels:
   - conda-forge
   - defaults
 
 dependencies:
   - python=3.12
-  # Power systems core
-  - pandapower>=3.4.0        # load flow, network modelling
-  - pyomo>=6.10.0            # optimisation framework
-  - ipopt>=3.14              # IPOPT solver (used by flex_engine)
-  # Scientific stack (required by pandapower)
-  - numpy>=2.0
-  - pandas>=2.3
-  - scipy>=1.13
-  - networkx>=3.4
-  # FastAPI backend
-  - fastapi>=0.116
-  - uvicorn>=0.35
-  - pydantic>=2.11
-  - requests>=2.33
-  - python-dotenv>=1.0
-  - pyyaml>=6.0             # network-profile YAML loading
+  - pip                  # explicit pip avoids conda nagging
+  - ipopt>=3.14          # native binary — must come from conda-forge
+  - pip:
+    # Power systems core
+    - pandapower>=3.0.0
+    - pyomo>=6.10.0
+    - numba>=0.60.0      # speeds up pandapower power flow significantly
+    - matpowercaseframes # parse MATPOWER .m network files
+    # Scientific stack
+    - numpy>=2.0
+    - pandas>=2.3
+    - scipy>=1.13
+    - networkx>=3.4
+    # FastAPI backend
+    - fastapi>=0.116
+    - uvicorn>=0.35
+    - pydantic>=2.11
+    - requests>=2.33
+    - python-dotenv>=1.0
+    - pyyaml>=6.0
+    # LLM agent / chat UI
+    - streamlit>=1.35.0
+    - plotly>=5.20.0
+    - httpx>=0.27.0
+    - google-genai>=1.0.0
+    - google-api-core>=2.0.0
