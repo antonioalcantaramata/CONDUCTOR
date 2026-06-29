@@ -8,20 +8,25 @@ Run with:
 from __future__ import annotations
 
 import base64
+import json
 import os
 import pathlib
+import re
 from datetime import datetime
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-from agent.config import BASE_URL, GEMINI_MODEL
+from agent.config import BASE_URL, GEMINI_MODEL, HTTP_TIMEOUT
 from agent.loop import run_agent_turn
 from agent.renderers import RENDERER_MAP
 from agent import tools as _tools_module
 from agent.tools import get_current_timestamp
 
 _APP_DIR = pathlib.Path(__file__).parent
+_REPO_ROOT = _APP_DIR.parent
+_DATA_FILES_DIR = _REPO_ROOT / "data_files"
+_SYSTEMS_DIR = _REPO_ROOT / "systems"
 _LOGO_PATH = _APP_DIR / "assets" / "conductor_logo.png"
 _BRAND_NAME = "CONDUCTOR"
 _BRAND_TAGLINE = "An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations"
@@ -328,6 +333,105 @@ def _render_main_hero() -> None:
                 .cb-ds-tab-active { background: #fff; color: #2a72e8; box-shadow: 0 1px 2px rgba(46,49,64,0.15); }
                 .cb-ds-section { margin-bottom: 0.6rem; }
                 .cb-ds-sub { display: block; font-size: 0.69rem; color: #7a7f8c; margin-bottom: 0.35rem; }
+                .cb-adv-card { border-top: 1px solid rgba(46,49,64,0.08); margin-top: 0.2rem; padding-top: 0.55rem; }
+                .cb-adv-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.35rem 0 0.2rem; }
+                .cb-chip-btn {
+                    border: 1px solid rgba(46,49,64,0.2);
+                    background: #fff;
+                    color: #2e3140;
+                    border-radius: 16px;
+                    padding: 0.2rem 0.55rem;
+                    font-size: 0.72rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                }
+                .cb-chip-btn:hover { background: rgba(46,49,64,0.06); }
+                .cb-adv-upload-wrap { display: none; margin-top: 0.35rem; }
+
+                .cb-drawer-overlay {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(16, 22, 36, 0.35);
+                    z-index: 9999997;
+                    display: none;
+                }
+                .cb-drawer-overlay.is-open { display: block; }
+                .cb-drawer {
+                    position: fixed;
+                    top: 0;
+                    right: 0;
+                    height: 100vh;
+                    width: var(--cb-drawer-w, min(460px, 92vw));
+                    min-width: 340px;
+                    max-width: 95vw;
+                    background: #fff;
+                    border-left: 1px solid rgba(46,49,64,0.14);
+                    box-shadow: -12px 0 30px rgba(0,0,0,0.15);
+                    z-index: 9999998;
+                    transform: translateX(100%);
+                    transition: transform 0.18s ease;
+                    display: flex;
+                    flex-direction: column;
+                }
+                .cb-drawer.is-open { transform: translateX(0); }
+                .cb-drawer-head {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    padding: 0.8rem 0.95rem;
+                    border-bottom: 1px solid rgba(46,49,64,0.12);
+                }
+                .cb-drawer-controls {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.4rem;
+                    font-size: 0.72rem;
+                    color: #5c6272;
+                    margin-right: auto;
+                    margin-left: 0.8rem;
+                }
+                .cb-drawer-controls input[type=range] { width: 120px; }
+                .cb-drawer-wval {
+                    min-width: 2.2rem;
+                    text-align: right;
+                    font-variant-numeric: tabular-nums;
+                    color: #2e3140;
+                    font-weight: 600;
+                }
+                .cb-drawer-title { font-size: 0.86rem; font-weight: 700; color: #2e3140; }
+                .cb-drawer-close {
+                    border: none;
+                    background: transparent;
+                    font-size: 1rem;
+                    line-height: 1;
+                    color: #5c6272;
+                    cursor: pointer;
+                }
+                .cb-drawer-body {
+                    overflow-y: auto;
+                    overflow-x: hidden;
+                    padding: 0.8rem 0.95rem 1rem;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.65rem;
+                    box-sizing: border-box;
+                }
+                .cb-drawer-body .cb-fmt-guide,
+                .cb-drawer-body .cb-fmt-row,
+                .cb-drawer-body .cb-fmt-desc,
+                .cb-drawer-body .cb-csv-example { width: 100%; box-sizing: border-box; }
+                .cb-drawer-body .cb-fmt-row { align-items: flex-start; }
+                .cb-drawer-body .cb-fmt-desc { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+                .cb-drawer-body .cb-fmt-desc code {
+                    white-space: normal;
+                    overflow-wrap: anywhere;
+                    word-break: break-word;
+                }
+                .cb-drawer-body .cb-csv-example {
+                    white-space: pre-wrap;
+                    overflow-wrap: anywhere;
+                    word-break: break-word;
+                }
                 @media (max-width: 900px) {
                     #${brandId} { left: 2.75rem; max-width: calc(100vw - 8.5rem); }
                     #${brandId} img { width: 24px; }
@@ -441,7 +545,7 @@ def _render_main_hero() -> None:
 
         const ensureUploadControls = () => {
             // Remove stale panels and old document-level click handler from prior runs
-            ['cb-net-panel', 'cb-data-panel', 'cb-info-panel'].forEach(id => {
+            ['cb-net-panel', 'cb-data-panel', 'cb-info-panel', 'cb-adm-overlay', 'cb-adm-drawer'].forEach(id => {
                 const el = parentDoc.getElementById(id);
                 if (el) el.remove();
             });
@@ -459,6 +563,13 @@ def _render_main_hero() -> None:
                     <input type="checkbox" id="cb-net-convert" checked />
                     Convert generators to controllable sgen (enables OPF &amp; flexibility tools)
                 </label>
+                <label class="cb-check" style="display:block; margin-top:0.35rem;">
+                    Transformer tap policy
+                    <select id="cb-net-tap-policy" style="display:block; width:100%; margin-top:0.25rem;">
+                        <option value="current" selected>Keep current taps from uploaded file</option>
+                        <option value="neutral">Force neutral taps (tap_pos = tap_neutral)</option>
+                    </select>
+                </label>
                 <button id="cb-net-submit" class="cb-submit">Upload &amp; Load</button>
                 <div id="cb-net-status" class="cb-status"></div>
                 <div class="cb-fmt-guide">
@@ -468,8 +579,100 @@ def _render_main_hero() -> None:
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.xlsx</span><span class="cb-fmt-desc">pandapower Excel — export with <code>pp.to_excel(net, "file.xlsx")</code></span></div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.uct</span><span class="cb-fmt-desc">UCTE/CGMES exchange — ENTSO-E standard for European TSO networks</span></div>
                 </div>
+                <div class="cb-adv-card">
+                    <div class="cb-fmt-title">Advanced OPF admittance (expert)</div>
+                    <div class="cb-fmt-desc">Hidden by default. Use only when replacing backend-generated OPF admittance with externally prepared CSV databases.</div>
+                    <div class="cb-adv-actions">
+                        <button type="button" class="cb-chip-btn" id="cb-adm-guide-open">Open guide</button>
+                        <button type="button" class="cb-chip-btn" id="cb-adm-dl-core">Core template</button>
+                        <button type="button" class="cb-chip-btn" id="cb-adm-dl-meta">Meta template</button>
+                        <button type="button" class="cb-chip-btn" id="cb-adm-toggle">Show advanced upload</button>
+                    </div>
+                    <div class="cb-adv-upload-wrap" id="cb-adm-upload-wrap">
+                        <input type="file" id="cb-adm-core-file" accept=".csv" />
+                        <input type="file" id="cb-adm-meta-file" accept=".csv" style="margin-top:0.25rem;" />
+                        <button id="cb-adm-submit" class="cb-submit" style="margin-top:0.35rem;">Upload advanced admittance</button>
+                        <div id="cb-adm-status" class="cb-status"></div>
+                    </div>
+                </div>
             `;
             parentDoc.body.appendChild(netPanel);
+
+            const admOverlay = parentDoc.createElement('div');
+            admOverlay.id = 'cb-adm-overlay';
+            admOverlay.className = 'cb-drawer-overlay';
+            parentDoc.body.appendChild(admOverlay);
+
+            const admDrawer = parentDoc.createElement('div');
+            admDrawer.id = 'cb-adm-drawer';
+            admDrawer.className = 'cb-drawer';
+            admDrawer.innerHTML = `
+                <div class="cb-drawer-head">
+                    <div class="cb-drawer-title">Advanced OPF admittance guide</div>
+                    <div class="cb-drawer-controls">
+                        <span>Width</span>
+                        <input type="range" id="cb-adm-width" min="360" max="920" step="10" value="460" />
+                        <span class="cb-drawer-wval" id="cb-adm-width-val">460</span>
+                    </div>
+                    <button type="button" class="cb-drawer-close" id="cb-adm-guide-close" aria-label="Close">✕</button>
+                </div>
+                <div class="cb-drawer-body">
+                    <div class="cb-fmt-desc"><strong>When to use</strong><br>
+                        Use this only for expert workflows where OPF results must match an external/legacy admittance pipeline.
+                        Typical cases: reproducibility against prior studies, custom tap/admittance conventions, or validated precomputed N-1 databases.
+                        For normal operation, upload only the network and let backend admittance generation run automatically.
+                    </div>
+
+                    <div class="cb-fmt-guide" style="margin-top:0.1rem;">
+                        <div class="cb-fmt-title">What this upload replaces</div>
+                        <div class="cb-fmt-desc">Uploading core+meta CSVs replaces in-memory OPF admittance databases:</div>
+                        <div class="cb-fmt-desc">• Full case admittance (<code>db_full</code>)</div>
+                        <div class="cb-fmt-desc">• N-1 line admittance (<code>db_n1_line</code>)</div>
+                        <div class="cb-fmt-desc">• N-1 transformer admittance (<code>db_n1_trafo</code>)</div>
+                        <div class="cb-fmt-desc">It does <strong>not</strong> upload timeseries and does <strong>not</strong> change the simulation clock.</div>
+                    </div>
+
+                    <div class="cb-fmt-guide" style="margin-top:0.2rem;">
+                        <div class="cb-fmt-title">Which tools use these values</div>
+                        <div class="cb-fmt-desc">Used by OPF-based tools:</div>
+                        <div class="cb-fmt-desc">• Flexibility optimize (N-0 OPF)</div>
+                        <div class="cb-fmt-desc">• Robust OPF (heuristic + scenario paths)</div>
+                        <div class="cb-fmt-desc">• Contingency optimize (N-1 OPF)</div>
+                        <div class="cb-fmt-desc" style="margin-top:0.25rem;">Not used by runpp-only tools:</div>
+                        <div class="cb-fmt-desc">• Real-time RSA snapshot</div>
+                        <div class="cb-fmt-desc">• Worst-case timestamp scan</div>
+                        <div class="cb-fmt-desc">• Contingency simulate-all screening</div>
+                    </div>
+
+                    <div class="cb-fmt-guide" style="margin-top:0; padding-top:0; border-top:none;">
+                        <div class="cb-fmt-title">Required files (2 CSVs)</div>
+                        <div class="cb-fmt-row"><span class="cb-fmt-tag">core CSV</span><span class="cb-fmt-desc">Columns: <code>outage_scope,outage_index,section,from_bus,to_bus,tap,value</code></span></div>
+                        <div class="cb-fmt-row"><span class="cb-fmt-tag">sections</span><span class="cb-fmt-desc"><code>Yff_r,Yff_i,Yft_r,Yft_i</code></span></div>
+                        <pre class="cb-csv-example">outage_scope,outage_index,section,from_bus,to_bus,tap,value
+full,,Yff_r,3,33,0,6.693097
+full,,Yft_i,3,33,0,-17.483221
+line,0,Yff_r,2,34,0,8.747084</pre>
+                    </div>
+
+                    <div class="cb-fmt-guide" style="margin-top:0.2rem;">
+                        <div class="cb-fmt-row"><span class="cb-fmt-tag">meta CSV</span><span class="cb-fmt-desc">Columns: <code>outage_scope,outage_index,meta_type,from_bus,to_bus,trafo_index,tap,value</code></span></div>
+                        <div class="cb-fmt-row"><span class="cb-fmt-tag">meta_type</span><span class="cb-fmt-desc"><code>TAPS,trafo_defaults,trafo_ranges,branch_to_trafo</code></span></div>
+                        <div class="cb-fmt-row"><span class="cb-fmt-tag">scope</span><span class="cb-fmt-desc"><code>outage_scope</code> must be <code>full</code>, <code>line</code>, or <code>trafo</code>. At least one <code>full</code> entry is required.</span></div>
+                        <pre class="cb-csv-example">outage_scope,outage_index,meta_type,from_bus,to_bus,trafo_index,tap,value
+full,,TAPS,,,,0,
+full,,trafo_defaults,,,0,,3
+full,,branch_to_trafo,3,33,0,,</pre>
+                    </div>
+
+                    <div class="cb-fmt-guide" style="margin-top:0.2rem;">
+                        <div class="cb-fmt-title">Construction checklist</div>
+                        <div class="cb-fmt-desc">1) Build from a known-good baseline.</div>
+                        <div class="cb-fmt-desc">2) Keep bus and outage indices aligned with the currently loaded network.</div>
+                        <div class="cb-fmt-desc">3) Validate one OPF run before batch studies.</div>
+                    </div>
+                </div>
+            `;
+            parentDoc.body.appendChild(admDrawer);
 
             const dataPanel = parentDoc.createElement('div');
             dataPanel.id = 'cb-data-panel';
@@ -554,6 +757,14 @@ def _render_main_hero() -> None:
             const netBtn = parentDoc.getElementById('cb-net-btn');
             const dataBtn = parentDoc.getElementById('cb-data-btn');
             const infoBtn = parentDoc.getElementById('cb-info-btn');
+            const openAdmGuide = () => {
+                admOverlay.classList.add('is-open');
+                admDrawer.classList.add('is-open');
+            };
+            const closeAdmGuide = () => {
+                admOverlay.classList.remove('is-open');
+                admDrawer.classList.remove('is-open');
+            };
 
             netBtn && netBtn.addEventListener('click', e => {
                 e.stopPropagation();
@@ -578,10 +789,71 @@ def _render_main_hero() -> None:
             netPanel.addEventListener('click', e => e.stopPropagation());
             dataPanel.addEventListener('click', e => e.stopPropagation());
             infoPanel.addEventListener('click', e => e.stopPropagation());
+            admDrawer.addEventListener('click', e => e.stopPropagation());
+            admOverlay.addEventListener('click', closeAdmGuide);
+
+            const _dlText = (filename, text) => {
+                const blob = new Blob([text], { type: 'text/csv' });
+                const url = (parentWindow.URL || parentWindow.webkitURL).createObjectURL(blob);
+                const a = parentDoc.createElement('a');
+                a.href = url;
+                a.download = filename;
+                parentDoc.body.appendChild(a);
+                a.click();
+                parentDoc.body.removeChild(a);
+                (parentWindow.URL || parentWindow.webkitURL).revokeObjectURL(url);
+            };
+
+            const coreTemplate = [
+                'outage_scope,outage_index,section,from_bus,to_bus,tap,value',
+                'full,,Yff_r,3,33,0,0.0',
+                'full,,Yff_i,3,33,0,0.0',
+                'full,,Yft_r,3,33,0,0.0',
+                'full,,Yft_i,3,33,0,0.0',
+            ].join(String.fromCharCode(10));
+            const metaTemplate = [
+                'outage_scope,outage_index,meta_type,from_bus,to_bus,trafo_index,tap,value',
+                'full,,TAPS,,,,0,',
+                'full,,trafo_defaults,,,0,,0',
+                'full,,trafo_ranges,,,0,0,',
+                'full,,branch_to_trafo,3,33,0,,',
+            ].join(String.fromCharCode(10));
+
+            parentDoc.getElementById('cb-adm-guide-open').addEventListener('click', openAdmGuide);
+            parentDoc.getElementById('cb-adm-guide-close').addEventListener('click', closeAdmGuide);
+
+            const widthKey = 'conductor_adm_drawer_w';
+            const widthInput = parentDoc.getElementById('cb-adm-width');
+            const widthVal = parentDoc.getElementById('cb-adm-width-val');
+            const _applyDrawerWidth = (raw) => {
+                const n = Math.max(360, Math.min(920, parseInt(raw, 10) || 460));
+                admDrawer.style.width = n + 'px';
+                widthInput.value = String(n);
+                widthVal.textContent = String(n);
+                try { parentWindow.localStorage.setItem(widthKey, String(n)); } catch (_) {}
+            };
+            try {
+                const saved = parentWindow.localStorage.getItem(widthKey);
+                _applyDrawerWidth(saved || 460);
+            } catch (_) {
+                _applyDrawerWidth(460);
+            }
+            widthInput.addEventListener('input', (e) => _applyDrawerWidth(e.target.value));
+
+            parentDoc.getElementById('cb-adm-dl-core').addEventListener('click', () => _dlText('admittance_core_template.csv', coreTemplate));
+            parentDoc.getElementById('cb-adm-dl-meta').addEventListener('click', () => _dlText('admittance_meta_template.csv', metaTemplate));
+            parentDoc.getElementById('cb-adm-toggle').addEventListener('click', () => {
+                const wrap = parentDoc.getElementById('cb-adm-upload-wrap');
+                const btn = parentDoc.getElementById('cb-adm-toggle');
+                const open = wrap.style.display === 'block';
+                wrap.style.display = open ? 'none' : 'block';
+                btn.textContent = open ? 'Show advanced upload' : 'Hide advanced upload';
+            });
 
             parentDoc.getElementById('cb-net-submit').addEventListener('click', async () => {
                 const file = parentDoc.getElementById('cb-net-file').files[0];
                 const convert = parentDoc.getElementById('cb-net-convert').checked;
+                const tapPolicy = parentDoc.getElementById('cb-net-tap-policy').value;
                 const status = parentDoc.getElementById('cb-net-status');
                 const btn = parentDoc.getElementById('cb-net-submit');
                 if (!file) { status.textContent = 'Select a file first (.m, .json, .xlsx, .uct).'; status.className = 'cb-status err'; return; }
@@ -589,6 +861,7 @@ def _render_main_hero() -> None:
                 const fd = new FormData();
                 fd.append('file', file, file.name);
                 fd.append('convert_gen_to_sgen', convert ? 'true' : 'false');
+                fd.append('tap_policy', tapPolicy);
                 try {
                     const resp = await fetch(baseUrl + '/api/network/upload', { method: 'POST', body: fd });
                     const data = await resp.json();
@@ -678,6 +951,56 @@ def _render_main_hero() -> None:
                 } catch (err) {
                     status.textContent = '❌ ' + err.message;
                     status.className = 'cb-status err';
+                    btn.disabled = false;
+                }
+            });
+
+            parentDoc.getElementById('cb-adm-submit').addEventListener('click', async () => {
+                const coreFile = parentDoc.getElementById('cb-adm-core-file').files[0];
+                const metaFile = parentDoc.getElementById('cb-adm-meta-file').files[0];
+                const status = parentDoc.getElementById('cb-adm-status');
+                const btn = parentDoc.getElementById('cb-adm-submit');
+                if (!coreFile || !metaFile) {
+                    status.textContent = 'Select both CSV files (core + meta).';
+                    status.className = 'cb-status err';
+                    return;
+                }
+
+                const send = async (overwrite) => {
+                    const fd = new FormData();
+                    fd.append('core_file', coreFile, coreFile.name);
+                    fd.append('meta_file', metaFile, metaFile.name);
+                    if (overwrite) fd.append('overwrite', 'true');
+                    const resp = await fetch(baseUrl + '/api/network/upload_advanced_admittance', { method: 'POST', body: fd });
+                    const data = await resp.json();
+                    if (!resp.ok) throw new Error(data.detail || resp.statusText);
+                    return data;
+                };
+
+                status.textContent = 'Uploading advanced admittance…';
+                status.className = 'cb-status';
+                btn.disabled = true;
+                try {
+                    let data = await send(false);
+                    if (data && data.status === 'confirm_required') {
+                        if (!parentWindow.confirm(data.message + '  Replace it?')) {
+                            status.textContent = 'Upload cancelled — existing admittance kept.';
+                            status.className = 'cb-status';
+                            btn.disabled = false;
+                            return;
+                        }
+                        data = await send(true);
+                    }
+                    const s = data.summary || {};
+                    status.innerHTML = '✅ Advanced admittance uploaded. '
+                        + 'full scalars=' + (s.n_full_scalars ?? '?')
+                        + ', line outages=' + (s.n_line_outages ?? '?')
+                        + ', trafo outages=' + (s.n_trafo_outages ?? '?') + '.';
+                    status.className = 'cb-status ok';
+                } catch (err) {
+                    status.textContent = '❌ ' + err.message;
+                    status.className = 'cb-status err';
+                } finally {
                     btn.disabled = false;
                 }
             });
@@ -925,6 +1248,151 @@ def _jump_to_timestamp(ts: str) -> str:
         return st.session_state.current_ts
 
 
+def _reset_conversation_state() -> None:
+    """Clear chat memory so the next prompt starts a fresh LLM conversation."""
+    st.session_state.history = []
+    st.session_state.messages = []
+    st.session_state.pop("chat_box", None)
+    st.session_state.pop("_box_pending", None)
+    st.session_state.pop("viewing_forecast_ts", None)
+    _tools_module._last_tool_results.clear()
+
+
+def _path_within(path: pathlib.Path, base: pathlib.Path) -> bool:
+    """Return True when path is inside base (or equal)."""
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _read_json_file(path: pathlib.Path) -> dict | None:
+    try:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _collect_uploaded_cleanup_groups() -> dict[str, list[pathlib.Path]]:
+    """Collect grouped uploaded artifacts that can be safely deleted by user choice."""
+    groups: dict[str, list[pathlib.Path]] = {}
+    seen: set[pathlib.Path] = set()
+
+    def _add(group_name: str, candidate: pathlib.Path | None) -> None:
+        if candidate is None:
+            return
+        p = candidate.resolve()
+        if not p.is_file():
+            return
+        if not (_path_within(p, _DATA_FILES_DIR) or _path_within(p, _SYSTEMS_DIR)):
+            return
+        if p in seen:
+            return
+        groups.setdefault(group_name, []).append(p)
+        seen.add(p)
+
+    upload_sentinel = _SYSTEMS_DIR / "last_uploaded.json"
+    upload_meta = _read_json_file(upload_sentinel)
+    if upload_sentinel.is_file():
+        _add("Uploaded network restore metadata", upload_sentinel)
+    if isinstance(upload_meta, dict):
+        net_path = pathlib.Path(str(upload_meta.get("network_path", "")))
+        if net_path:
+            _add("Current uploaded network file", net_path)
+
+    ts_sentinel = _DATA_FILES_DIR / "last_uploaded_timeseries.json"
+    ts_meta = _read_json_file(ts_sentinel)
+    if ts_sentinel.is_file() and isinstance(ts_meta, dict) and ts_meta.get("source") == "uploaded":
+        _add("Uploaded measurements CSV + restore metadata", ts_sentinel)
+        _add(
+            "Uploaded measurements CSV + restore metadata",
+            pathlib.Path(str(ts_meta.get("csv_path", ""))),
+        )
+
+    fc_sentinel = _DATA_FILES_DIR / "last_uploaded_forecast.json"
+    fc_meta = _read_json_file(fc_sentinel)
+    if fc_sentinel.is_file() and isinstance(fc_meta, dict) and fc_meta.get("source") == "uploaded":
+        _add("Uploaded forecast CSV + restore metadata", fc_sentinel)
+        _add(
+            "Uploaded forecast CSV + restore metadata",
+            pathlib.Path(str(fc_meta.get("csv_path", ""))),
+        )
+
+    for p in sorted(_DATA_FILES_DIR.glob("uploaded_admittance*.csv")):
+        _add("Advanced admittance uploads", p)
+    for p in sorted(_DATA_FILES_DIR.glob("*admittance*upload*.csv")):
+        _add("Advanced admittance uploads", p)
+
+    for p in sorted(_DATA_FILES_DIR.glob("uploaded_*.csv")):
+        _add("Other uploaded-looking CSV files", p)
+    for p in sorted(_SYSTEMS_DIR.glob("uploaded_*")):
+        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
+            _add("Other uploaded-looking network files", p)
+
+    # Show non-default network files as optional removable artifacts.
+    protected_system_files = {
+        ".gitkeep",
+        "pglib_opf_case14_ieee.m",
+        "pglib_opf_case30_ieee.m",
+        "pandapower_network_flex.xlsx",
+    }
+    for p in sorted(_SYSTEMS_DIR.iterdir()):
+        if not p.is_file() or p.name in protected_system_files:
+            continue
+        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
+            _add("Other network files in systems (non-default)", p)
+
+    return groups
+
+
+def _delete_uploaded_artifacts(paths: list[pathlib.Path]) -> tuple[int, list[str]]:
+    """Delete selected files inside data_files/systems and return (count, errors)."""
+    deleted = 0
+    errors: list[str] = []
+    deduped = []
+    seen: set[pathlib.Path] = set()
+    for p in paths:
+        rp = p.resolve()
+        if rp not in seen:
+            deduped.append(rp)
+            seen.add(rp)
+
+    for p in deduped:
+        if not (_path_within(p, _DATA_FILES_DIR) or _path_within(p, _SYSTEMS_DIR)):
+            errors.append(f"Skipped outside managed folders: {p}")
+            continue
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            p.unlink()
+            deleted += 1
+        except Exception as exc:
+            errors.append(f"Could not remove {p.name}: {exc}")
+    return deleted, errors
+
+
+def _reset_active_backend_profile(profile_name: str = "pglib_case14") -> tuple[bool, str]:
+    """Request backend to reload active in-memory state from a YAML profile."""
+    import httpx
+
+    try:
+        r = httpx.post(
+            f"{BASE_URL}/api/network/reset_active",
+            json={"profile_name": profile_name},
+            timeout=HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        payload = r.json() if r.content else {}
+        if str(payload.get("status", "")).lower() == "success":
+            return True, f"Active backend reset to profile '{profile_name}'."
+        return False, f"Reset endpoint returned unexpected payload: {payload}"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def render_charts(tool_results: list) -> None:
     """
     Render Plotly charts for a list of (tool_name, result) tuples.
@@ -970,9 +1438,58 @@ with st.sidebar:
     st.markdown(f"### {_BRAND_NAME}")
     st.caption(_BRAND_TAGLINE)
     st.markdown(f'<div class="conductor-sidebar-copy">{_SIDEBAR_BRIEF}</div>', unsafe_allow_html=True)
+    st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
 
-    with st.expander("About CONDUCTOR", expanded=False):
-        st.caption(_BRAND_CAPTION)
+    if st.button("Start New Conversation", use_container_width=True, type="secondary"):
+        _reset_conversation_state()
+        st.rerun()
+
+    if "show_manage_uploads" not in st.session_state:
+        st.session_state.show_manage_uploads = False
+    if st.button("Manage uploaded data", use_container_width=True):
+        st.session_state.show_manage_uploads = not st.session_state.show_manage_uploads
+
+    if st.session_state.show_manage_uploads:
+        st.caption("Choose exactly what to remove from data_files and systems.")
+        cleanup_groups = _collect_uploaded_cleanup_groups()
+        if not cleanup_groups:
+            st.info("No removable uploaded artifacts found.")
+        else:
+            selected_paths: list[pathlib.Path] = []
+            for label, paths in cleanup_groups.items():
+                key_slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+                checked = st.checkbox(f"{label} ({len(paths)})", key=f"cleanup_group_{key_slug}")
+                if checked:
+                    selected_paths.extend(paths)
+
+            if selected_paths:
+                reset_active_now = st.checkbox(
+                    "Also reset active backend to default profile now",
+                    key="cleanup_reset_active_now",
+                )
+                st.caption("Files to remove:")
+                for p in sorted(set(selected_paths)):
+                    rel = p.relative_to(_REPO_ROOT) if _path_within(p, _REPO_ROOT) else p
+                    st.markdown(f"- {rel}")
+
+                if st.button("Delete selected", type="secondary", use_container_width=True):
+                    deleted, errs = _delete_uploaded_artifacts(selected_paths)
+                    if deleted:
+                        st.success(f"Removed {deleted} file(s).")
+                    if errs:
+                        for err in errs:
+                            st.warning(err)
+                    if reset_active_now:
+                        ok, msg = _reset_active_backend_profile("pglib_case14")
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.warning(f"Could not reset active backend: {msg}")
+                    if not deleted and not errs:
+                        st.info("Nothing was removed.")
+                    st.rerun()
+            else:
+                st.caption("Select at least one group to enable deletion.")
 
     st.divider()
     st.markdown("<div class='conductor-sidebar-label'>Workspace</div>", unsafe_allow_html=True)
@@ -1115,9 +1632,6 @@ with st.sidebar:
                 # Copy into the input box (applied before the widget renders below);
                 # do NOT auto-run — the user sends it themselves.
                 st.session_state._box_pending = query
-
-
-
 
 # ---------------------------------------------------------------------------
 # Main chat area

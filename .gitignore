@@ -13,6 +13,7 @@ __pycache__/
 .DS_Store
 *.bak
 .claude/
+.vscode/
 .conductor_env_hash
 
 # ── Internal docs (not for public release) ────────────────────────────────
@@ -31,3 +32,12 @@ systems/*
 data_files/*
 !data_files/.gitkeep
 !data_files/example_timeseries_template.csv
+
+
+# ── Others ───
+.old_bornholm/*
+bornholm_legacy/*
+backend/compare_legacy_admittance.py
+backend/convert*
+backend/build*
+.venv/

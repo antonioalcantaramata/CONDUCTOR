@@ -84,8 +84,12 @@ def active_power_balance_rule(m, bus_idx):
         for (i, j) in m.Branches if i == bus_idx
     )
 
-    # Convert per-unit flows to MW
-    return P_inj == P_flow * 100
+    # Convert per-unit flows to MW. For buses with no connected model terms,
+    # Pyomo can simplify to a plain bool (e.g. 0 == 0), which is invalid.
+    expr = P_inj == P_flow * 100
+    if isinstance(expr, (bool, np.bool_)):
+        return Constraint.Feasible if expr else Constraint.Infeasible
+    return expr
 
 
 def reactive_power_balance_rule(m, bus_idx):
@@ -112,8 +116,11 @@ def reactive_power_balance_rule(m, bus_idx):
         for (i, j) in m.Branches if i == bus_idx
     )
 
-    # Convert per-unit flows to MVAr
-    return Q_inj == Q_flow * 100
+    # Convert per-unit flows to MVAr. Guard against trivial bool expressions.
+    expr = Q_inj == Q_flow * 100
+    if isinstance(expr, (bool, np.bool_)):
+        return Constraint.Feasible if expr else Constraint.Infeasible
+    return expr
 
 
 # Current from i->j
@@ -176,8 +183,18 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # -------------------------
     # Step 2: Define bus set
     # -------------------------
-    # Get all bus indices from pandapower network
-    bus_indices = list(net.bus.index)
+    # Model only electrically active buses. Uploaded/custom networks can carry
+    # auxiliary offline buses (in_service=False) that have no branch equations
+    # and would otherwise yield uninitialized variables.
+    if "in_service" in net.bus.columns:
+        bus_indices = [int(i) for i in net.bus.index if bool(net.bus.at[i, "in_service"])]
+    else:
+        bus_indices = [int(i) for i in net.bus.index]
+    # Always keep slack bus in the model set.
+    for _sb in net.ext_grid["bus"].tolist() if "bus" in net.ext_grid.columns else []:
+        _sb_i = int(_sb)
+        if _sb_i not in bus_indices:
+            bus_indices.append(_sb_i)
     # Create a Pyomo set of buses
     model.B = Set(initialize=bus_indices)
     
@@ -891,17 +908,41 @@ def extract_post_opf_voltages(model, net) -> dict:
     dict
         Keys:
         - ``bus_voltages_post_opf``: list of ``{bus, bus_name, vm_pu}`` records.
+        - ``excluded_buses_post_opf``: list of ``{bus, bus_name, reason}`` records.
+        - ``excluded_bus_count_post_opf``: integer count of excluded bus records.
         - ``opf_vm_lower_used``: lower voltage bound applied inside the OPF (p.u.).
         - ``opf_vm_upper_used``: upper voltage bound applied inside the OPF (p.u.).
     """
+    def _bus_name(bus_idx: int) -> str:
+        _raw = str(net.bus.at[bus_idx, 'name']).strip() if 'name' in net.bus.columns else ""
+        return _raw if _raw else f"Bus_{bus_idx}"
+
     bus_voltages = []
-    for b in sorted(model.B):
-        v = value(model.V[b])
-        if v is None:
+    excluded_buses = []
+    model_buses = {int(b) for b in model.B}
+
+    # Buses omitted from model.B are still reported so callers/LLMs can explain why.
+    for idx in net.bus.index:
+        b = int(idx)
+        if b in model_buses:
             continue
-        _raw = str(net.bus.at[b, 'name']).strip() if 'name' in net.bus.columns else ""
-        bus_name = _raw if _raw else f"Bus_{b}"
-        bus_voltages.append({"bus": int(b), "bus_name": bus_name, "vm_pu": round(float(v), 6)})
+        if "in_service" in net.bus.columns and not bool(net.bus.at[idx, "in_service"]):
+            reason = "out_of_service"
+        else:
+            reason = "not_in_model_bus_set"
+        excluded_buses.append({"bus": b, "bus_name": _bus_name(b), "reason": reason})
+
+    for b in sorted(model.B):
+        # Some buses can remain structurally disconnected in uploaded/custom
+        # admittance cases, leaving V[b] uninitialized after solve.
+        v = value(model.V[b], exception=False)
+        if v is None:
+            excluded_buses.append({"bus": int(b), "bus_name": _bus_name(int(b)), "reason": "uninitialized_voltage"})
+            continue
+        if not np.isfinite(v):
+            excluded_buses.append({"bus": int(b), "bus_name": _bus_name(int(b)), "reason": "non_finite_voltage"})
+            continue
+        bus_voltages.append({"bus": int(b), "bus_name": _bus_name(int(b)), "vm_pu": round(float(v), 6)})
 
     first_b = next(iter(model.B))
     vm_lower = model.V[first_b].lb
@@ -909,6 +950,8 @@ def extract_post_opf_voltages(model, net) -> dict:
 
     return {
         "bus_voltages_post_opf": bus_voltages,
+        "excluded_buses_post_opf": excluded_buses,
+        "excluded_bus_count_post_opf": len(excluded_buses),
         "opf_vm_lower_used": float(vm_lower) if vm_lower is not None else 0.95,
         "opf_vm_upper_used": float(vm_upper) if vm_upper is not None else 1.05,
     }
@@ -930,14 +973,33 @@ def extract_post_opf_voltages_scenario(
     the caller expose the enforced security limits in the UI instead of the relaxed
     internal box.
     """
+    def _bus_name(bus_idx: int) -> str:
+        _raw = str(net.bus.at[bus_idx, 'name']).strip() if 'name' in net.bus.columns else ""
+        return _raw if _raw else f"Bus_{bus_idx}"
+
     bus_voltages = []
-    for b in sorted(model.B):
-        v = value(model.V[b, scenario_idx])
-        if v is None:
+    excluded_buses = []
+    model_buses = {int(b) for b in model.B}
+
+    for idx in net.bus.index:
+        b = int(idx)
+        if b in model_buses:
             continue
-        _raw = str(net.bus.at[b, 'name']).strip() if 'name' in net.bus.columns else ""
-        bus_name = _raw if _raw else f"Bus_{b}"
-        bus_voltages.append({"bus": int(b), "bus_name": bus_name, "vm_pu": round(float(v), 6)})
+        if "in_service" in net.bus.columns and not bool(net.bus.at[idx, "in_service"]):
+            reason = "out_of_service"
+        else:
+            reason = "not_in_model_bus_set"
+        excluded_buses.append({"bus": b, "bus_name": _bus_name(b), "reason": reason})
+
+    for b in sorted(model.B):
+        v = value(model.V[b, scenario_idx], exception=False)
+        if v is None:
+            excluded_buses.append({"bus": int(b), "bus_name": _bus_name(int(b)), "reason": "uninitialized_voltage"})
+            continue
+        if not np.isfinite(v):
+            excluded_buses.append({"bus": int(b), "bus_name": _bus_name(int(b)), "reason": "non_finite_voltage"})
+            continue
+        bus_voltages.append({"bus": int(b), "bus_name": _bus_name(int(b)), "vm_pu": round(float(v), 6)})
 
     first_b = next(iter(model.B))
     vm_lower = display_vm_lower if display_vm_lower is not None else model.V[first_b, scenario_idx].lb
@@ -945,6 +1007,8 @@ def extract_post_opf_voltages_scenario(
 
     return {
         "bus_voltages_post_opf": bus_voltages,
+        "excluded_buses_post_opf": excluded_buses,
+        "excluded_bus_count_post_opf": len(excluded_buses),
         "opf_vm_lower_used": float(vm_lower) if vm_lower is not None else 0.95,
         "opf_vm_upper_used": float(vm_upper) if vm_upper is not None else 1.05,
     }
@@ -989,7 +1053,14 @@ def scenario_optimization_model_base(
     model = ConcreteModel()
 
     # Core index sets.
-    bus_indices = [int(i) for i in net.bus.index]
+    if "in_service" in net.bus.columns:
+        bus_indices = [int(i) for i in net.bus.index if bool(net.bus.at[i, "in_service"])]
+    else:
+        bus_indices = [int(i) for i in net.bus.index]
+    for _sb in net.ext_grid["bus"].tolist() if "bus" in net.ext_grid.columns else []:
+        _sb_i = int(_sb)
+        if _sb_i not in bus_indices:
+            bus_indices.append(_sb_i)
     model.B = Set(initialize=bus_indices)
     K = max(1, len(load_multipliers))
     model.K = Set(initialize=list(range(K)))
@@ -1252,7 +1323,10 @@ def scenario_optimization_model_base(
             )
             for (i, j) in m.Branches if i == b
         )
-        return p_inj == p_flow * 100
+        expr = p_inj == p_flow * 100
+        if isinstance(expr, (bool, np.bool_)):
+            return Constraint.Feasible if expr else Constraint.Infeasible
+        return expr
 
     def reactive_balance_rule(m, b, k):
         q_gen = sum(m.Qg_new[g] for g in m.G if m.gen_bus[g] == b)
@@ -1268,7 +1342,10 @@ def scenario_optimization_model_base(
             )
             for (i, j) in m.Branches if i == b
         )
-        return q_inj == q_flow * 100
+        expr = q_inj == q_flow * 100
+        if isinstance(expr, (bool, np.bool_)):
+            return Constraint.Feasible if expr else Constraint.Infeasible
+        return expr
 
     model.active_balance = Constraint(model.B, model.K, rule=active_balance_rule)
     model.reactive_balance = Constraint(model.B, model.K, rule=reactive_balance_rule)

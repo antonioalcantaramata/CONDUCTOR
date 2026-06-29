@@ -664,6 +664,7 @@ app_data = {
     "db_full": None,
     "db_n1_line": None,
     "db_n1_trafo": None,
+    "admittance_source": "generated",  # generated | uploaded_csv
     "grid_profile": {},   # metadata exposed via GET /api/grid_constants
     "last_dispatch_result": [],
     "last_dispatch_timestamp": None,
@@ -1273,6 +1274,11 @@ class PushDataRequest(BaseModel):
     pass
 
 
+class ResetActiveNetworkRequest(BaseModel):
+    """Request body for ``POST /api/network/reset_active``."""
+    profile_name: str = DEFAULT_GRID_PROFILE
+
+
 def _build_and_store_ybus(net) -> None:
     """Build Ybus databases on-the-fly from *net* and populate app_data."""
     print("[lifespan] Building Ybus databases on-the-fly...")
@@ -1282,6 +1288,7 @@ def _build_and_store_ybus(net) -> None:
         app_data["db_full"] = db_full
         app_data["db_n1_line"] = db_n1_line
         app_data["db_n1_trafo"] = db_n1_trafo
+        app_data["admittance_source"] = "generated"
         print(
             f"[lifespan] Ybus ready in {round(time.time() - t0, 2)}s: "
             f"{len(db_n1_line)} line contingencies, {len(db_n1_trafo)} trafo contingencies."
@@ -1305,12 +1312,59 @@ def _extract_vm_limits(net) -> tuple[float, float]:
     return vm_lower, vm_upper
 
 
-def _write_upload_sentinel(network_path: str, grid_profile: dict, convert_gen_to_sgen: bool) -> None:
+def _normalize_tap_policy(raw_policy: str | None) -> str:
+    """Normalize user-provided transformer tap policy.
+
+    Supported values:
+      - ``current``: preserve current tap positions from the uploaded file
+        and redefine ``tap_neutral`` to match them.
+      - ``neutral``: force ``tap_pos = tap_neutral``.
+    """
+    val = str(raw_policy or "current").strip().lower()
+    aliases_current = {"current", "preserve", "as_is", "as-is", "uploaded"}
+    aliases_neutral = {"neutral", "tap_neutral", "tap-neutral"}
+    if val in aliases_current:
+        return "current"
+    if val in aliases_neutral:
+        return "neutral"
+    raise ValueError(f"Unknown tap_policy {raw_policy!r}. Use 'current' or 'neutral'.")
+
+
+def _apply_tap_policy(net, tap_policy: str, context: str = "upload") -> None:
+    """Apply transformer tap policy in-place for any supported network format."""
+    if net.trafo.empty:
+        return
+    if "tap_pos" not in net.trafo.columns or "tap_neutral" not in net.trafo.columns:
+        return
+
+    policy = _normalize_tap_policy(tap_policy)
+    diff_mask = (net.trafo["tap_pos"] != net.trafo["tap_neutral"]).fillna(False)
+    changed = int(diff_mask.sum())
+
+    if policy == "neutral":
+        net.trafo["tap_pos"] = net.trafo["tap_neutral"]
+        if changed:
+            print(f"[{context}] Tap policy=neutral applied to {changed} trafo(s): tap_pos <- tap_neutral")
+        return
+
+    # policy == "current": keep current imported positions as the neutral reference.
+    net.trafo["tap_neutral"] = net.trafo["tap_pos"]
+    if changed:
+        print(f"[{context}] Tap policy=current applied to {changed} trafo(s): tap_neutral <- tap_pos")
+
+
+def _write_upload_sentinel(
+    network_path: str,
+    grid_profile: dict,
+    convert_gen_to_sgen: bool,
+    tap_policy: str,
+) -> None:
     """Write a JSON sentinel so the backend can restore the uploaded network on restart."""
     record = {
         "network_path": network_path,
         "grid_profile": grid_profile,
         "convert_gen_to_sgen": convert_gen_to_sgen,
+        "tap_policy": tap_policy,
         "uploaded_at": time.time(),
     }
     try:
@@ -1355,6 +1409,175 @@ def _parse_timeseries_csv(content: bytes) -> tuple[dict, list]:
     if not timestamps:
         raise ValueError("CSV contained no valid rows after parsing.")
     return measurements, timestamps
+
+
+def _empty_admittance_entry() -> dict:
+    return {
+        "Yff_r": {},
+        "Yff_i": {},
+        "Yft_r": {},
+        "Yft_i": {},
+        "TAPS": [],
+        "trafo_ranges": {},
+        "trafo_defaults": {},
+        "branch_to_trafo": {},
+    }
+
+
+def _parse_upload_admittance_csvs(core_content: bytes, meta_content: bytes, net) -> tuple[dict, dict, dict, dict]:
+    """Parse two generic CSV files into (db_full, db_n1_line, db_n1_trafo).
+
+    core CSV columns:
+      outage_scope, outage_index, section, from_bus, to_bus, tap, value
+      where outage_scope in {full,line,trafo} and section in {Yff_r,Yff_i,Yft_r,Yft_i}
+
+    meta CSV columns:
+      outage_scope, outage_index, meta_type, from_bus, to_bus, trafo_index, tap, value
+      where meta_type in {TAPS,trafo_defaults,trafo_ranges,branch_to_trafo}
+    """
+    def _as_int(v, allow_empty: bool = False):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None if allow_empty else (_ for _ in ()).throw(ValueError("missing integer value"))
+        s = str(v).strip()
+        if not s:
+            return None if allow_empty else (_ for _ in ()).throw(ValueError("empty integer value"))
+        return int(float(s))
+
+    def _scope_and_idx(raw_scope, raw_idx):
+        scope = str(raw_scope or "").strip().lower()
+        if scope not in {"full", "line", "trafo"}:
+            raise ValueError(f"Unsupported outage_scope {raw_scope!r}. Use full|line|trafo.")
+        idx = _as_int(raw_idx, allow_empty=True)
+        if scope == "full":
+            idx = None
+        elif idx is None:
+            raise ValueError(f"outage_index is required for outage_scope={scope!r}")
+        return scope, idx
+
+    def _entry_key(scope, idx):
+        return (scope, idx)
+
+    text_core = core_content.decode("utf-8-sig")
+    text_meta = meta_content.decode("utf-8-sig")
+    df_core = pd.read_csv(io.StringIO(text_core))
+    df_meta = pd.read_csv(io.StringIO(text_meta))
+
+    core_required = {"outage_scope", "outage_index", "section", "from_bus", "to_bus", "tap", "value"}
+    meta_required = {"outage_scope", "outage_index", "meta_type", "from_bus", "to_bus", "trafo_index", "tap", "value"}
+    miss_core = core_required - set(df_core.columns)
+    miss_meta = meta_required - set(df_meta.columns)
+    if miss_core:
+        raise ValueError(f"Core CSV missing columns: {sorted(miss_core)}")
+    if miss_meta:
+        raise ValueError(f"Meta CSV missing columns: {sorted(miss_meta)}")
+
+    bus_set = set(int(i) for i in net.bus.index)
+    line_set = set(int(i) for i in net.line.index)
+    trafo_set = set(int(i) for i in net.trafo.index)
+
+    entries: dict[tuple[str, int | None], dict] = {}
+
+    def _get_entry(scope, idx):
+        k = _entry_key(scope, idx)
+        if k not in entries:
+            entries[k] = _empty_admittance_entry()
+        return entries[k]
+
+    allowed_sections = {"Yff_r", "Yff_i", "Yft_r", "Yft_i"}
+    for _, row in df_core.iterrows():
+        scope, idx = _scope_and_idx(row.get("outage_scope"), row.get("outage_index"))
+        if scope == "line" and idx not in line_set:
+            raise ValueError(f"Core CSV references unknown line outage_index={idx}")
+        if scope == "trafo" and idx not in trafo_set:
+            raise ValueError(f"Core CSV references unknown trafo outage_index={idx}")
+
+        section = str(row.get("section") or "").strip()
+        if section not in allowed_sections:
+            raise ValueError(f"Unsupported section {section!r}. Use {sorted(allowed_sections)}")
+
+        fb = _as_int(row.get("from_bus"))
+        tb = _as_int(row.get("to_bus"))
+        tap = _as_int(row.get("tap"))
+        val = float(row.get("value"))
+        if fb not in bus_set or tb not in bus_set:
+            raise ValueError(f"Core CSV branch ({fb},{tb}) is not valid for current network buses.")
+
+        e = _get_entry(scope, idx)
+        e[section][((fb, tb), tap)] = val
+
+    for _, row in df_meta.iterrows():
+        scope, idx = _scope_and_idx(row.get("outage_scope"), row.get("outage_index"))
+        if scope == "line" and idx not in line_set:
+            raise ValueError(f"Meta CSV references unknown line outage_index={idx}")
+        if scope == "trafo" and idx not in trafo_set:
+            raise ValueError(f"Meta CSV references unknown trafo outage_index={idx}")
+
+        mtype = str(row.get("meta_type") or "").strip()
+        e = _get_entry(scope, idx)
+
+        if mtype == "TAPS":
+            t = _as_int(row.get("tap"), allow_empty=True)
+            if t is None:
+                t = _as_int(row.get("value"))
+            e["TAPS"].append(int(t))
+            continue
+
+        if mtype == "trafo_defaults":
+            tidx = _as_int(row.get("trafo_index"))
+            if tidx not in trafo_set:
+                raise ValueError(f"Meta CSV trafo_defaults references unknown trafo_index={tidx}")
+            t = _as_int(row.get("tap"), allow_empty=True)
+            if t is None:
+                t = _as_int(row.get("value"))
+            e["trafo_defaults"][tidx] = int(t)
+            continue
+
+        if mtype == "trafo_ranges":
+            tidx = _as_int(row.get("trafo_index"))
+            if tidx not in trafo_set:
+                raise ValueError(f"Meta CSV trafo_ranges references unknown trafo_index={tidx}")
+            t = _as_int(row.get("tap"), allow_empty=True)
+            if t is None:
+                t = _as_int(row.get("value"))
+            e["trafo_ranges"].setdefault(tidx, []).append(int(t))
+            continue
+
+        if mtype == "branch_to_trafo":
+            fb = _as_int(row.get("from_bus"))
+            tb = _as_int(row.get("to_bus"))
+            tidx = _as_int(row.get("trafo_index"), allow_empty=True)
+            if tidx is None:
+                tidx = _as_int(row.get("value"))
+            if fb not in bus_set or tb not in bus_set:
+                raise ValueError(f"Meta CSV branch_to_trafo references invalid branch ({fb},{tb})")
+            if tidx not in trafo_set:
+                raise ValueError(f"Meta CSV branch_to_trafo references unknown trafo_index={tidx}")
+            e["branch_to_trafo"][(fb, tb)] = tidx
+            continue
+
+        raise ValueError(
+            f"Unsupported meta_type {mtype!r}. Use TAPS|trafo_defaults|trafo_ranges|branch_to_trafo"
+        )
+
+    # Finalize dedupe/sort for list-like fields and provide defaults where absent.
+    for e in entries.values():
+        e["TAPS"] = sorted(set(int(t) for t in e.get("TAPS", []))) or [1]
+        for tidx, taps in list(e.get("trafo_ranges", {}).items()):
+            e["trafo_ranges"][tidx] = sorted(set(int(t) for t in taps))
+
+    db_full = entries.get(("full", None))
+    if not db_full:
+        raise ValueError("Advanced admittance upload requires at least one full-scope entry (outage_scope=full).")
+
+    db_n1_line = {idx: e for (scope, idx), e in entries.items() if scope == "line"}
+    db_n1_trafo = {idx: e for (scope, idx), e in entries.items() if scope == "trafo"}
+
+    summary = {
+        "n_full_scalars": sum(len(db_full[k]) for k in ("Yff_r", "Yff_i", "Yft_r", "Yft_i")),
+        "n_line_outages": len(db_n1_line),
+        "n_trafo_outages": len(db_n1_trafo),
+    }
+    return db_full, db_n1_line, db_n1_trafo, summary
 
 
 def _measurements_to_csv_bytes(measurements: dict, timestamps: list) -> bytes:
@@ -1480,6 +1703,17 @@ def _restore_forecast_from_sentinel() -> bool:
 
     csv_path = sentinel.get("csv_path", "")
     source = sentinel.get("source", "uploaded")
+
+    # If measurements come from a user upload, do not auto-attach a synthetic
+    # forecast from an older network upload. This keeps the timeline truthful:
+    # forecast appears only when explicitly uploaded by the user.
+    if source == "synthetic" and app_data.get("measurements_source") == "uploaded":
+        app_data["forecasts"] = {}
+        app_data["forecast_timestamps"] = []
+        app_data["forecasts_source"] = "none"
+        print("[lifespan] Skipping synthetic forecast restore because uploaded measurements are active.")
+        return False
+
     if not os.path.isfile(csv_path):
         print(f"[lifespan] Forecast sentinel points to missing file {csv_path!r} — using synthetic forecast.")
         return False
@@ -1501,6 +1735,18 @@ def _restore_forecast_from_sentinel() -> bool:
     return True
 
 
+def _prepare_runtime_reload() -> None:
+    """Reset mutable runtime containers before loading a profile/network again."""
+    substations.clear()
+    PG_MAX_DATA.clear()
+    app_data["forecasts"] = {}
+    app_data["forecast_timestamps"] = []
+    app_data["forecasts_source"] = "none"
+    app_data["measurements_source"] = "synthetic"
+    app_data["last_dispatch_result"] = []
+    app_data["last_dispatch_timestamp"] = None
+
+
 def _lifespan_from_uploaded(sentinel: dict) -> bool:
     """Startup path that restores a previously uploaded network.
 
@@ -1512,6 +1758,8 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     default YAML profile.
     """
     import synthetic_timeseries as st
+
+    _prepare_runtime_reload()
 
     network_path = sentinel.get("network_path", "")
     if not os.path.isfile(network_path):
@@ -1538,9 +1786,14 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
         print(f"[lifespan] Could not parse uploaded network: {exc} — falling back.")
         return False
 
-    # Fix MATPOWER off-nominal tap positions (not needed for native pandapower formats).
-    if ext == ".m" and not net.trafo.empty and (net.trafo["tap_pos"] != net.trafo["tap_neutral"]).any():
-        net.trafo["tap_neutral"] = net.trafo["tap_pos"]
+    # Restore the same tap policy selected at upload time.
+    tap_policy = sentinel.get("tap_policy", "current")
+    try:
+        tap_policy = _normalize_tap_policy(tap_policy)
+    except ValueError:
+        print(f"[lifespan] Invalid tap_policy in sentinel ({tap_policy!r}) — using 'current'.")
+        tap_policy = "current"
+    _apply_tap_policy(net, tap_policy, context="lifespan")
 
     # gen→sgen conversion.
     if sentinel.get("convert_gen_to_sgen", True) and len(net.gen) > 0:
@@ -1565,6 +1818,7 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     net, _ = lg.assign_generators_values_from_measurements(net, initial_meas, subs)
 
     grid_profile = sentinel.get("grid_profile", {})
+    grid_profile["tap_policy"] = tap_policy
     # Re-extract vm limits from the live net in case the sentinel was written
     # before the vm-limit extraction fix was in place.
     _vm_lower, _vm_upper = _extract_vm_limits(net)
@@ -1601,6 +1855,7 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
     """
     import synthetic_timeseries as st
 
+    _prepare_runtime_reload()
     print(f"[lifespan] Loading profile '{profile_name}'...")
     try:
         profile = nl.load_profile(profile_name, backend_dir=backend_dir)
@@ -1955,6 +2210,22 @@ async def upload_timeseries(
     app_data["current_index"] = 0
     app_data["measurements_source"] = "uploaded"
 
+    # Measurements upload should not imply forecast availability. If the current
+    # forecast is only synthetic placeholder data, clear it.
+    if app_data.get("forecasts_source") == "synthetic":
+        app_data["forecasts"] = {}
+        app_data["forecast_timestamps"] = []
+        app_data["forecasts_source"] = "none"
+        try:
+            if os.path.isfile(_LAST_FORECAST_SENTINEL):
+                with open(_LAST_FORECAST_SENTINEL, encoding="utf-8") as fh:
+                    _fc = json.load(fh)
+                if _fc.get("source") == "synthetic":
+                    os.remove(_LAST_FORECAST_SENTINEL)
+                    print(f"[upload] Cleared synthetic forecast sentinel: {_LAST_FORECAST_SENTINEL}")
+        except Exception as exc:
+            print(f"[upload] WARNING: Could not clear synthetic forecast sentinel: {exc}")
+
     # Apply first timestamp to the live network so RSA calls reflect new data.
     try:
         initial_meas = prepare_measurement_df(app_data["measurements"][new_timestamps[0]])
@@ -1991,6 +2262,7 @@ async def upload_timeseries(
 async def upload_network(
     file: UploadFile = File(...),
     convert_gen_to_sgen: bool = Form(True),
+    tap_policy: str = Form("current"),
 ):
     """Replace the in-memory pandapower network with a user-supplied MATPOWER .m file.
 
@@ -2045,15 +2317,12 @@ async def upload_network(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse {ext} file: {exc}")
 
-    # Fix off-nominal transformer tap positions from MATPOWER import.
-    # from_mpc encodes ratios like 0.978 as tap_pos=-1, tap_neutral=0.
-    # If OPF endpoints reset tap_pos to tap_neutral they would silently
-    # remove these ratios.  Redefine the MATPOWER tap positions as the
-    # neutral reference so the reset is a no-op.
-    if ext == ".m" and not net.trafo.empty and (net.trafo['tap_pos'] != net.trafo['tap_neutral']).any():
-        net.trafo['tap_neutral'] = net.trafo['tap_pos']
-        print(f"[upload] Tap neutral redefined to match MATPOWER tap positions: "
-              f"{net.trafo[['hv_bus','lv_bus','tap_pos','tap_neutral']].to_dict('records')}")
+    try:
+        tap_policy_norm = _normalize_tap_policy(tap_policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    _apply_tap_policy(net, tap_policy_norm, context="upload")
 
     # Optionally convert net.gen (PV-bus) → net.sgen for OPF/flexibility tools.
     gen_conversion_note = ""
@@ -2120,6 +2389,7 @@ async def upload_network(
     app_data["db_full"] = None
     app_data["db_n1_line"] = None
     app_data["db_n1_trafo"] = None
+    app_data["admittance_source"] = "generated"
     # Derive the ext_grid active power cap from the .m file (Pmax of the slack-bus
     # generator).  Fall back to 999 (effectively uncapped) if the column is absent.
     _ext_pmax = None
@@ -2139,6 +2409,7 @@ async def upload_network(
         "name": net_name,
         "profile_name": "uploaded_system",
         "source": ext.lstrip("."),
+        "tap_policy": tap_policy_norm,
         "measurement_source": "synthetic",
         "vm_lower": _vm_lower,
         "vm_upper": _vm_upper,
@@ -2171,11 +2442,13 @@ async def upload_network(
         app_data["db_full"]    = db_full
         app_data["db_n1_line"] = db_n1_line
         app_data["db_n1_trafo"] = db_n1_trafo
+        app_data["admittance_source"] = "generated"
         print(f"[upload] Admittance databases built in {time.perf_counter() - t0:.1f}s.")
     except Exception as _ybus_exc:
         print(f"[upload] WARNING: Ybus build failed: {_ybus_exc} — OPF/N-1 disabled.")
         app_data["db_n1_line"]  = {}   # empty dict, not None — 503 guard uses is None
         app_data["db_n1_trafo"] = {}
+        app_data["admittance_source"] = "generated"
         ybus_note = f" Admittance build failed ({_ybus_exc}); OPF/N-1 unavailable."
 
     bus_names = [bus_name_map[i] for i in sorted(bus_name_map.keys())]
@@ -2201,7 +2474,7 @@ async def upload_network(
         print(f"[upload] WARNING: Could not persist generated series: {exc}")
 
     # Persist sentinel so this network is restored automatically on next restart.
-    _write_upload_sentinel(stored_path, app_data["grid_profile"], convert_gen_to_sgen)
+    _write_upload_sentinel(stored_path, app_data["grid_profile"], convert_gen_to_sgen, tap_policy_norm)
 
     return {
         "status": "ok",
@@ -2224,6 +2497,108 @@ async def upload_network(
         "n_sgens": len(net.sgen),
         "n_gens_remaining": len(net.gen),
         "gen_conversion_applied": convert_gen_to_sgen and bool(gen_conversion_note),
+        "tap_policy_applied": tap_policy_norm,
+    }
+
+
+@app.post("/api/network/upload_advanced_admittance")
+async def upload_advanced_admittance(
+    core_file: UploadFile = File(...),
+    meta_file: UploadFile = File(...),
+    overwrite: bool = Form(False),
+):
+    """Upload advanced OPF admittance data (2 CSV files).
+
+    This endpoint is network-scoped and **does not upload timeseries**.
+    It only replaces the optimizer admittance databases consumed by OPF-related
+    endpoints (flexibility, contingency optimize, KPI evaluate/forecast).
+
+    Required files:
+      1) core_file: outage_scope/outage_index/section/from_bus/to_bus/tap/value
+      2) meta_file: outage_scope/outage_index/meta_type/from_bus/to_bus/trafo_index/tap/value
+    """
+    if app_data.get("net") is None:
+        raise HTTPException(status_code=503, detail="Network not loaded yet — upload a network first.")
+
+    if not overwrite and app_data.get("admittance_source") == "uploaded_csv":
+        return {
+            "status": "confirm_required",
+            "message": "Advanced admittance data is already uploaded. Uploading again will replace it.",
+        }
+
+    core_content = await core_file.read()
+    meta_content = await meta_file.read()
+    if not core_content or not meta_content:
+        raise HTTPException(status_code=400, detail="Both core_file and meta_file must be non-empty CSV files.")
+
+    try:
+        db_full, db_n1_line, db_n1_trafo, summary = _parse_upload_admittance_csvs(
+            core_content,
+            meta_content,
+            app_data["net"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse advanced admittance CSVs: {exc}")
+
+    # Persist uploaded CSVs for traceability/reuse.
+    core_path = _persist_uploaded_bytes(DATA_FILES_DIR, core_file.filename, core_content, "uploaded_admittance_core", ".csv")
+    meta_path = _persist_uploaded_bytes(DATA_FILES_DIR, meta_file.filename, meta_content, "uploaded_admittance_meta", ".csv")
+
+    app_data["db_full"] = db_full
+    app_data["db_n1_line"] = db_n1_line
+    app_data["db_n1_trafo"] = db_n1_trafo
+    app_data["admittance_source"] = "uploaded_csv"
+
+    return {
+        "status": "success",
+        "admittance_source": "uploaded_csv",
+        "summary": summary,
+        "stored_paths": {
+            "core_file": core_path,
+            "meta_file": meta_path,
+        },
+        "note": (
+            "Advanced admittance uploaded. This only affects OPF-related endpoints; "
+            "RSA and contingency simulation continue to use power-flow calculations from the loaded network."
+        ),
+    }
+
+
+@app.post("/api/network/reset_active")
+async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveNetworkRequest()):
+    """Reload active in-memory state from a YAML profile without restarting the backend."""
+    profile_name = (request.profile_name or DEFAULT_GRID_PROFILE).strip().lower()
+    if not profile_name:
+        profile_name = DEFAULT_GRID_PROFILE
+
+    try:
+        _lifespan_generic(profile_name, BACKEND_DIR)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to reset active network: {exc}")
+
+    net = app_data.get("net")
+    if net is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Reset endpoint ran but no active network is loaded.",
+        )
+
+    ts = app_data.get("timestamps") or []
+    fc = app_data.get("forecast_timestamps") or []
+    return {
+        "status": "success",
+        "profile_name": profile_name,
+        "n_buses": len(net.bus),
+        "n_lines": len(net.line),
+        "n_trafos": len(net.trafo),
+        "n_timestamps": len(ts),
+        "first_timestamp": ts[0] if ts else None,
+        "n_forecast_timestamps": len(fc),
+        "forecast_first_timestamp": fc[0] if fc else None,
+        "forecast_last_timestamp": fc[-1] if fc else None,
+        "admittance_source": app_data.get("admittance_source", "generated"),
     }
 
 
@@ -2400,10 +2775,19 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
          else f"Bus_{i}")
         for i in df_bus["index"]
     ]
-    all_voltages = [
-        {"bus_name": row["bus_name"], "vm_pu": _safe_float(row["vm_pu"])}
-        for _, row in df_bus.iterrows()
-    ]
+
+    # Exclude buses not in service and rows with non-finite vm_pu from the
+    # chart payload. This keeps RSA visuals aligned with the active network.
+    bus_in_service_map = net_calculated.bus.get("in_service", pd.Series(True, index=net_calculated.bus.index)).to_dict()
+    all_voltages = []
+    for _, row in df_bus.iterrows():
+        bus_idx = int(row["index"])
+        if not bool(bus_in_service_map.get(bus_idx, True)):
+            continue
+        vm = _safe_float(row["vm_pu"])
+        if vm is None:
+            continue
+        all_voltages.append({"bus_name": row["bus_name"], "vm_pu": vm})
 
     df_line = net_calculated.res_line.reset_index()
     df_line["line_name"] = [_line_display_name(net_calculated, int(i)) for i in df_line["index"]]
@@ -3026,6 +3410,10 @@ async def worst_case_scan(request: WorstCaseRequest):
         "min_voltage": [], "max_voltage": [], "max_line_loading": [],
     }
 
+    def _finite_array(values) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        return arr[np.isfinite(arr)]
+
     for idx in indices:
         ts = timestamps[idx]
         try:
@@ -3037,29 +3425,38 @@ async def worst_case_scan(request: WorstCaseRequest):
         except Exception:
             continue
 
-        vm = net_copy.res_bus["vm_pu"].values
-        line_load = net_copy.res_line["loading_percent"].values
-        trafo_load = net_copy.res_trafo["loading_percent"].values
-        slack_mw = float(net_copy.res_ext_grid.iloc[0]["p_mw"])
+        vm_series = net_copy.res_bus["vm_pu"]
+        bus_in_service = net_copy.bus.get("in_service", pd.Series(True, index=net_copy.bus.index))
+        active_mask = bus_in_service.reindex(vm_series.index).fillna(True).astype(bool)
+        vm = _finite_array(vm_series.loc[active_mask].values)
+        line_load = _finite_array(net_copy.res_line.get("loading_percent", pd.Series(dtype=float)).values)
+        trafo_load = _finite_array(net_copy.res_trafo.get("loading_percent", pd.Series(dtype=float)).values)
+        slack_mw = _safe_float(net_copy.res_ext_grid.iloc[0].get("p_mw"))
+
+        # Skip timestamps that produce unusable metrics (typically islanding/non-converged residue).
+        if vm.size == 0:
+            continue
 
         v_viol = int(((vm < vlo) | (vm > vhi)).sum())
-        l_viol = int((line_load > mll).sum())
-        t_viol = int((trafo_load > mtl).sum())
+        l_viol = int((line_load > mll).sum()) if line_load.size else 0
+        t_viol = int((trafo_load > mtl).sum()) if trafo_load.size else 0
 
         series["timestamps"].append(ts)
         series["violation_counts"].append(v_viol + l_viol + t_viol)
-        series["slack_import_mw"].append(round(slack_mw, 4))
-        series["min_voltage"].append(round(float(vm.min()), 4))
-        series["max_voltage"].append(round(float(vm.max()), 4))
-        series["max_line_loading"].append(round(float(line_load.max()) if len(line_load) > 0 else 0.0, 2))
+        series["slack_import_mw"].append(slack_mw if slack_mw is not None else 0.0)
+        series["min_voltage"].append(_safe_float(vm.min()) if vm.size else None)
+        series["max_voltage"].append(_safe_float(vm.max()) if vm.size else None)
+        series["max_line_loading"].append(_safe_float(line_load.max(), ndigits=2) if line_load.size else 0.0)
 
     if not series["timestamps"]:
         raise HTTPException(status_code=500, detail="No timestamps could be scanned.")
 
     def _worst(key: str, maximize: bool = True) -> dict:
-        vals = series[key]
+        vals = [v for v in series[key] if v is not None]
+        if not vals:
+            return {"timestamp": None, "value": None}
         best_val = max(vals) if maximize else min(vals)
-        best_idx = vals.index(best_val)
+        best_idx = series[key].index(best_val)
         return {"timestamp": series["timestamps"][best_idx], "value": best_val}
 
     worst_per_metric = {
@@ -4743,10 +5140,15 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         )
 
         # Shared response structure with heuristic path.
+        sc_msg = "Scenario robust OPF solved successfully."
+        _excluded_sc = int(voltage_data.get("excluded_bus_count_post_opf") or 0)
+        if _excluded_sc > 0:
+            sc_msg += f" Excluded {_excluded_sc} bus(es) from post-OPF voltage output; see excluded_buses_post_opf for details."
+
         result = {
             "timestamp": current_ts,
             "status": "optimal",
-            "message": "Scenario robust OPF solved successfully.",
+            "message": sc_msg,
             "feasible": True,
             "guarantee_met": guarantee_met,
             "activated_resources": activated_resources,
@@ -6402,20 +6804,30 @@ async def optimise_flexibility(request: FlexibilityRequest):
         if _col in df_reg_flex_rsa.columns:
             df_reg_flex_rsa[_col] = df_reg_flex_rsa[_col].round(DECIMALS)
 
+    # Ensure NaN/inf from solver artifacts cannot leak into JSON payloads.
+    df_reg_flex_rsa = df_reg_flex_rsa.replace([np.inf, -np.inf], np.nan)
+    df_reg_flex_rsa = df_reg_flex_rsa.where(pd.notna(df_reg_flex_rsa), None)
     regulation_data = df_reg_flex_rsa.to_dict(orient="records")
     msg = f"Grid restored at slack cap ±{slack_cap:.0f} MW.{note}"
+    excluded_count = int(voltage_data.get("excluded_bus_count_post_opf") or 0)
+    if excluded_count > 0:
+        msg += f" Excluded {excluded_count} bus(es) from post-OPF voltage output; see excluded_buses_post_opf for details."
 
     # Base bus voltages (pre-OPF power flow on the scaled network)
     # so the frontend can render ΔV = V_post_opf − V_base per bus.
     try:
-        bus_voltages_base = [
-            {
-                "bus": int(i),
-                "bus_name": (str(net.bus.at[i, "name"]).strip() or f"Bus_{int(i)}") if "name" in net.bus.columns else f"Bus_{int(i)}",
-                "vm_pu": round(float(net.res_bus.at[i, "vm_pu"]), 6),
-            }
-            for i in net.bus.index
-        ]
+        bus_voltages_base = []
+        for i in net.bus.index:
+            vm = _safe_float(net.res_bus.at[i, "vm_pu"], ndigits=6)
+            if vm is None:
+                continue
+            bus_voltages_base.append(
+                {
+                    "bus": int(i),
+                    "bus_name": (str(net.bus.at[i, "name"]).strip() or f"Bus_{int(i)}") if "name" in net.bus.columns else f"Bus_{int(i)}",
+                    "vm_pu": vm,
+                }
+            )
     except Exception:
         bus_voltages_base = []
 

@@ -25,6 +25,7 @@ dependencies:
     - requests>=2.33
     - python-dotenv>=1.0
     - pyyaml>=6.0
+    - openpyxl>=3.1.0      # required by pandapower.from_excel() for .xlsx network upload
     # LLM agent / chat UI
     - streamlit>=1.35.0
     - plotly>=5.20.0

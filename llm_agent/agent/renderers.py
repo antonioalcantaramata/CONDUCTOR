@@ -35,6 +35,31 @@ _VM_UPPER = DEFAULT_GRID_CONSTANTS["vm_upper"]
 _MAX_LOADING = DEFAULT_GRID_CONSTANTS["max_loading_pct"]
 
 
+def _coerce_float(value, fallback: float) -> float:
+    """Return value as float when possible, else fallback.
+
+    Some backend payload fields may be None (e.g., non-finite vm_pu sanitized
+    to null). Renderers must remain resilient to those values.
+    """
+    try:
+        if value is None:
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _float_or_none(value) -> float | None:
+    """Return a finite float or None when the value is missing/invalid."""
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        return out if out == out and out not in (float("inf"), float("-inf")) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _empty_figure(title: str, color: str = "#333") -> go.Figure:
     """Return a blank figure with a descriptive centred title."""
     fig = go.Figure()
@@ -121,9 +146,9 @@ def render_rsa(result: dict) -> list[go.Figure]:
 
     # Read actual thresholds used by the backend (fall back to constants if absent)
     thresholds = result.get("thresholds_used", {})
-    vm_lower = thresholds.get("vm_lower_pu", _VM_LOWER)
-    vm_upper = thresholds.get("vm_upper_pu", _VM_UPPER)
-    max_loading = thresholds.get("max_line_loading_pct", _MAX_LOADING)
+    vm_lower = _coerce_float(thresholds.get("vm_lower_pu", _VM_LOWER), _VM_LOWER)
+    vm_upper = _coerce_float(thresholds.get("vm_upper_pu", _VM_UPPER), _VM_UPPER)
+    max_loading = _coerce_float(thresholds.get("max_line_loading_pct", _MAX_LOADING), _MAX_LOADING)
 
     # ------------------------------------------------------------------
     # Figure 1: Bus voltages
@@ -132,42 +157,51 @@ def render_rsa(result: dict) -> list[go.Figure]:
     if not all_voltages:
         fig_v = _empty_figure(f"No data — run the analysis first{title_suffix}")
     else:
-        bus_names = _safe_labels([v.get("bus_name", "") for v in all_voltages], "Bus")
-        vm_values = [v.get("vm_pu", 1.0) for v in all_voltages]
-        colors = [
-            "red" if (v < vm_lower or v > vm_upper) else "steelblue"
-            for v in vm_values
-        ]
+        valid_points = []
+        for row in all_voltages:
+            vm = _float_or_none(row.get("vm_pu"))
+            if vm is None:
+                continue
+            valid_points.append((row.get("bus_name", ""), vm))
 
-        fig_v = go.Figure()
-        fig_v.add_trace(
-            go.Scatter(
-                x=bus_names,
-                y=vm_values,
-                mode="markers",
-                marker={"color": colors, "size": 9},
-                name="Voltage (p.u.)",
+        if not valid_points:
+            fig_v = _empty_figure(f"No in-service bus voltages available{title_suffix}")
+        else:
+            bus_names = _safe_labels([name for name, _ in valid_points], "Bus")
+            vm_values = [vm for _, vm in valid_points]
+            colors = [
+                "red" if (v < vm_lower or v > vm_upper) else "steelblue"
+                for v in vm_values
+            ]
+            fig_v = go.Figure()
+            fig_v.add_trace(
+                go.Scatter(
+                    x=bus_names,
+                    y=vm_values,
+                    mode="markers",
+                    marker={"color": colors, "size": 9},
+                    name="Voltage (p.u.)",
+                )
             )
-        )
-        # Reference lines
-        for limit, label in [(vm_upper, f"V_max {vm_upper:.2f}"), (vm_lower, f"V_min {vm_lower:.2f}")]:
-            fig_v.add_hline(
-                y=limit,
-                line_dash="dash",
-                line_color="red",
-                annotation_text=label,
-                annotation_position="right",
+            # Reference lines
+            for limit, label in [(vm_upper, f"V_max {vm_upper:.2f}"), (vm_lower, f"V_min {vm_lower:.2f}")]:
+                fig_v.add_hline(
+                    y=limit,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text=label,
+                    annotation_position="right",
+                )
+            _v_min = min(vm_values)
+            _v_max = max(vm_values)
+            _y_lo = min(_v_min - 0.02, vm_lower - 0.02)
+            _y_hi = max(_v_max + 0.02, vm_upper + 0.02)
+            fig_v.update_layout(
+                title=f"Bus Voltage Profile (p.u.){title_suffix}",
+                xaxis={"tickangle": 45, "title": "Bus"},
+                yaxis={"title": "Voltage (p.u.)", "range": [round(_y_lo, 3), round(_y_hi, 3)]},
+                **CHART_THEME,
             )
-        _v_min = min(vm_values)
-        _v_max = max(vm_values)
-        _y_lo = min(_v_min - 0.02, vm_lower - 0.02)
-        _y_hi = max(_v_max + 0.02, vm_upper + 0.02)
-        fig_v.update_layout(
-            title=f"Bus Voltage Profile (p.u.){title_suffix}",
-            xaxis={"tickangle": 45, "title": "Bus"},
-            yaxis={"title": "Voltage (p.u.)", "range": [round(_y_lo, 3), round(_y_hi, 3)]},
-            **CHART_THEME,
-        )
 
     # ------------------------------------------------------------------
     # Figure 2: Line loading
