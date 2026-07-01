@@ -38,6 +38,6 @@ data_files/*
 .old_bornholm/*
 bornholm_legacy/*
 backend/compare_legacy_admittance.py
-backend/convert*
+backend/convert_*
 backend/build*
 .venv/
