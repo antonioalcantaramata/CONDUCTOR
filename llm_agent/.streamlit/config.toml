@@ -8,3 +8,6 @@ font = "sans serif"
 
 [server]
 headless = true
+
+[browser]
+gatherUsageStats = false

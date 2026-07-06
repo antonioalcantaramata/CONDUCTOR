@@ -1,0 +1,100 @@
+# Tier 2 — real first-run test on Windows.
+#
+# Simulates a brand-new Windows user: bare miniconda, then `python start.py`
+# builds conductor_env from environment.yml (including the IPOPT binary from
+# conda-forge), boots both services, and must pass a real OPF solve.
+#
+# Slow (~15–30 min, dominated by the conda solve), so it is manually
+# triggered rather than run on every push. Trigger from the Actions tab or:
+#   gh workflow run windows-first-run.yml
+
+name: Windows first-run (Tier 2)
+
+on:
+  workflow_dispatch:
+  # Uncomment for a weekly canary:
+  # schedule:
+  #   - cron: "0 6 * * 1"
+
+jobs:
+  windows-first-run:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: "latest"
+          auto-activate-base: true
+          activate-environment: ""
+
+      - name: Launch via start.py (builds conductor_env on first run)
+        run: |
+          python start.py > launcher.log 2>&1 &
+          echo $! > launcher.pid
+          # Poll /health for up to 40 min — the conda env solve dominates.
+          for i in $(seq 1 480); do
+            if curl -sf -m 2 http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              echo "Backend healthy after ~$((i*5))s"
+              exit 0
+            fi
+            if ! kill -0 "$(cat launcher.pid)" 2>/dev/null; then
+              echo "::error::Launcher exited before the backend became healthy."
+              tail -100 launcher.log 2>/dev/null || true
+              tail -50 backend.log 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::Backend did not become healthy within 40 minutes."
+          tail -100 launcher.log 2>/dev/null || true
+          tail -50 backend.log 2>/dev/null || true
+          exit 1
+
+      - name: Verify /health payload (network + IPOPT)
+        run: |
+          curl -s http://127.0.0.1:8000/health | python -c "import json, sys; d = json.load(sys.stdin); print(d); assert d['status'] == 'ok', d; assert d['network_loaded'] is True, 'network failed to load'; assert d['ipopt_available'] is True, 'IPOPT solver unavailable on Windows!'"
+
+      - name: Verify Streamlit responds
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 http://127.0.0.1:8501 || true)
+            if [ "$code" = "200" ]; then echo "Streamlit up (HTTP 200)"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::Streamlit did not respond with HTTP 200."
+          tail -50 streamlit.log 2>/dev/null || true
+          exit 1
+
+      - name: Run a real OPF solve through the API (exercises IPOPT)
+        run: |
+          code=$(curl -s -o opf.json -w "%{http_code}" -m 300 \
+            -X POST -H "Content-Type: application/json" -d '{}' \
+            http://127.0.0.1:8000/api/flexibility/optimize)
+          echo "HTTP $code"
+          head -c 2000 opf.json; echo
+          [ "$code" = "200" ] || { echo "::error::OPF endpoint returned HTTP $code"; exit 1; }
+
+      - name: Shut down (best effort)
+        if: always()
+        run: |
+          kill "$(cat launcher.pid)" 2>/dev/null || true
+          sleep 5
+          taskkill //IM python.exe //T //F 2>/dev/null || true
+
+      - name: Upload service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-first-run-logs
+          path: |
+            launcher.log
+            backend.log
+            streamlit.log
+          if-no-files-found: ignore

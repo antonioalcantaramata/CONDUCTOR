@@ -664,6 +664,7 @@ app_data = {
     "db_n1_line": None,
     "db_n1_trafo": None,
     "admittance_source": "generated",  # generated | uploaded_csv
+    "ipopt_available": None,  # probed once at startup; None = not yet checked
     "grid_profile": {},   # metadata exposed via GET /api/grid_constants
     "last_dispatch_result": [],
     "last_dispatch_timestamp": None,
@@ -1579,6 +1580,59 @@ def _parse_upload_admittance_csvs(core_content: bytes, meta_content: bytes, net)
     return db_full, db_n1_line, db_n1_trafo, summary
 
 
+def _validate_uploaded_admittance(db_full: dict, net) -> None:
+    """Reject admittance data whose topology does not match the active network.
+
+    Two independent checks, both fatal (HTTP 400):
+    - the CSV must not reference bus indices absent from ``net.bus`` (data was
+      built for a different/larger network);
+    - every in-service branch of the active network (lines + trafos) must have
+      an admittance entry, otherwise the OPF crashes later with an opaque
+      ``KeyError`` on the first request that touches the uncovered branch.
+    """
+    yff_keys = db_full.get("Yff_r", {}).keys()
+    covered_pairs = {pair for (pair, _tap) in yff_keys}
+
+    net_bus_ids = {int(b) for b in net.bus.index}
+    csv_bus_ids = {int(b) for pair in covered_pairs for b in pair}
+    unknown_buses = sorted(csv_bus_ids - net_bus_ids)
+
+    required_pairs = set()
+    for _, row in net.line[net.line["in_service"] == True].iterrows():  # noqa: E712
+        required_pairs.add((int(row["from_bus"]), int(row["to_bus"])))
+    for _, row in net.trafo[net.trafo["in_service"] == True].iterrows():  # noqa: E712
+        required_pairs.add((int(row["hv_bus"]), int(row["lv_bus"])))
+    missing_pairs = sorted(
+        p for p in required_pairs
+        if p not in covered_pairs and (p[1], p[0]) not in covered_pairs
+    )
+
+    problems = []
+    if unknown_buses:
+        shown = ", ".join(map(str, unknown_buses[:10]))
+        problems.append(
+            f"CSV references bus indices that do not exist in the active network: {shown}"
+            + (" …" if len(unknown_buses) > 10 else "")
+        )
+    if missing_pairs:
+        shown = ", ".join(f"{i}-{j}" for i, j in missing_pairs[:10])
+        problems.append(
+            f"CSV has no admittance entry for {len(missing_pairs)} in-service branch(es) "
+            f"of the active network (from_bus-to_bus): {shown}"
+            + (" …" if len(missing_pairs) > 10 else "")
+        )
+    if problems:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Advanced admittance data does not match the currently loaded network — "
+                "it was likely generated from a different network version. "
+                + " | ".join(problems)
+                + " Re-export the CSVs from the active network, or re-upload the network first."
+            ),
+        )
+
+
 def _measurements_to_csv_bytes(measurements: dict, timestamps: list) -> bytes:
     """Serialize a {timestamp: DataFrame[substation_name, production, consumption]}
     series to the canonical long-format CSV (the same shape uploads use), so a
@@ -1950,6 +2004,22 @@ async def lifespan(app: FastAPI):
     _ensure_storage_dirs()
     print(f"1) Upload storage ready: data_files={DATA_FILES_DIR}, systems={SYSTEMS_DIR}")
 
+    # Probe the IPOPT solver once so a missing/broken binary is an obvious
+    # startup message instead of a mysterious 500 on the first OPF request.
+    try:
+        from pyomo.environ import SolverFactory
+        app_data["ipopt_available"] = bool(SolverFactory("ipopt").available(exception_flag=False))
+    except Exception:
+        app_data["ipopt_available"] = False
+    if app_data["ipopt_available"]:
+        print("[lifespan] IPOPT solver available ✓")
+    else:
+        print(
+            "[lifespan] WARNING: IPOPT solver NOT available — optimization endpoints "
+            "(flexibility, contingency optimize, KPIs) will fail. "
+            "Install it with: conda install -c conda-forge ipopt"
+        )
+
     # Prefer a previously uploaded network over the default YAML profile.
     if os.path.isfile(_LAST_UPLOAD_SENTINEL):
         print(f"[lifespan] Found upload sentinel: {_LAST_UPLOAD_SENTINEL}")
@@ -1987,6 +2057,16 @@ app.add_middleware(
 async def root():
     """Tests if API is running. Returns a static hello so the frontend can confirm the backend is up."""
     return {"message": "Power-system digital twin backend is online"}
+
+
+@app.get("/health")
+async def health():
+    """Lightweight liveness/readiness probe for launchers and Docker healthchecks."""
+    return {
+        "status": "ok",
+        "network_loaded": app_data.get("net") is not None,
+        "ipopt_available": app_data.get("ipopt_available"),
+    }
 
 
 @app.get("/api/grid_constants")
@@ -2540,6 +2620,10 @@ async def upload_advanced_admittance(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse advanced admittance CSVs: {exc}")
+
+    # Reject data built for a different network version *before* installing it —
+    # a mismatched upload would otherwise silently corrupt every OPF endpoint.
+    _validate_uploaded_admittance(db_full, app_data["net"])
 
     # Persist uploaded CSVs for traceability/reuse.
     core_path = _persist_uploaded_bytes(DATA_FILES_DIR, core_file.filename, core_content, "uploaded_admittance_core", ".csv")

@@ -18,7 +18,15 @@ jobs:
       - run: ruff check .
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Backend code prints unicode symbols; force UTF-8 on the Windows runner
+      # so pytest output capture never trips over the legacy console codepage.
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

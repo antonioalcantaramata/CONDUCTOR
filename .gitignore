@@ -42,4 +42,5 @@ bornholm_legacy*
 backend/compare_legacy_admittance.py
 backend/convert_*
 backend/build*
+suggest*
 .venv/

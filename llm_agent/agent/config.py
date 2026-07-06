@@ -23,7 +23,8 @@ BASE_URL: str = os.environ.get("DT_BACKEND_URL", "http://localhost:8000")
 # ---------------------------------------------------------------------------
 # Gemini
 # ---------------------------------------------------------------------------
-GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+# Default matches llm_agent/.env.example — keep the two in sync.
+GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemma-4-31b-it")
 
 _api_key = os.environ.get("GEMINI_API_KEY", "")
 # Not raising here — the Streamlit app handles the missing-key setup flow.

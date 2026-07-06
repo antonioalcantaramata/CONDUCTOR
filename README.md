@@ -29,11 +29,15 @@ tools from a chat interface.
 - [git](https://git-scm.com/downloads)
 - Conda — either [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install)
   (lightweight, recommended) or full Anaconda. The only heavy prerequisite;
-  `start.sh` builds the environment for you.
+  the launcher builds the environment for you.
 - A Google Gemini API key (free tier works) — https://aistudio.google.com/apikey
-- macOS or Linux. The launcher is a bash script, so any terminal that runs bash
-  works — including the VSCode integrated terminal. On Windows, open the
-  integrated terminal with WSL or Git Bash as the shell (not PowerShell/cmd).
+
+| Platform | Launcher | Notes |
+| --- | --- | --- |
+| macOS | `./start.sh` or `python start.py` | |
+| Linux | `./start.sh` or `python start.py` | |
+| Windows (native) | `python start.py` | Run from **Anaconda Prompt** (or any shell where `conda` is on PATH) |
+| Windows (WSL) | `./start.sh` | Follows the Linux path |
 
 ## Quick start
 
@@ -42,20 +46,15 @@ tools from a chat interface.
 git clone https://github.com/antonioalcantaramata/CONDUCTOR.git
 cd CONDUCTOR
 
-# 2. Add your API key
-cp llm_agent/.env.example llm_agent/.env
-#    then open llm_agent/.env and paste your key after GEMINI_API_KEY=
-
-# 3. Launch (first run is slow: it builds the conda env + installs deps)
-./start.sh
+# 2. Launch (first run builds the conda env: ~3–5 min, ~2 GB download)
+./start.sh          # macOS / Linux
+python start.py     # any OS, including Windows
 ```
 
-On the **first run**, `start.sh` creates the `conductor_env` conda environment
-from `environment.yml` (this includes everything — the backend, the chat app,
-and the LLM agent). It takes a few minutes. Subsequent runs reuse the
-environment and start in seconds.
+When it's ready, the chat app opens at **http://localhost:8501** and asks for
+your Gemini API key on first open — paste it there and you're done. (You can
+also pre-create `llm_agent/.env` from `llm_agent/.env.example` if you prefer.)
 
-When it's ready, the chat app opens at **http://localhost:8501**.
 Press **Ctrl+C** in the terminal once to stop both services.
 
 To update later, pull the latest code and relaunch:
@@ -65,11 +64,21 @@ git pull
 ./start.sh
 ```
 
+**Tips**
+
+- Ports taken? Override them: `BACKEND_PORT=8010 STREAMLIT_PORT=8502 python start.py`.
+- The services bind to `127.0.0.1` by default. Set `BACKEND_HOST=0.0.0.0` only
+  if you need LAN access (expect an OS firewall prompt).
+- Slow env solve on an older conda? Enable the fast solver once:
+  `conda config --set solver libmamba`.
+- If the first env build was interrupted, remove the broken env before
+  retrying: `conda env remove -n conductor_env`.
+
 ## Configuration
 
 All secrets live in `llm_agent/.env` (git-ignored — never commit your API key).
 See `llm_agent/.env.example` for the expected variables. You can also pick a
-different model there via `GEMINI_MODEL`.
+different model there via `GEMINI_MODEL` (default: `gemma-4-31b-it`).
 
 ## Development
 
@@ -84,7 +93,14 @@ ruff check .
 ```
 
 Both run automatically on every push/PR via GitHub Actions
-(`.github/workflows/ci.yml`).
+(`.github/workflows/ci.yml`), on Linux and Windows.
+
+A separate, manually-triggered workflow
+(`.github/workflows/windows-first-run.yml`) simulates a brand-new Windows
+user end-to-end: bare miniconda → `python start.py` builds the conda env
+(including IPOPT) → both services boot → a real OPF solve succeeds. Run it
+from the Actions tab (or `gh workflow run windows-first-run.yml`) before
+cutting a release.
 
 ## License
 

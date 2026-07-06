@@ -1,0 +1,16 @@
+# Normalize line endings so clones on Windows (core.autocrlf=true) don't
+# break bash scripts or YAML parsing with CRLF endings.
+* text=auto
+
+*.sh    text eol=lf
+*.py    text
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.toml  text
+*.md    text
+*.csv   text
+
+# Binary formats — never touch line endings.
+*.xlsx  binary
+*.pkl   binary
+*.png   binary
