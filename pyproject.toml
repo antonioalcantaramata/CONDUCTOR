@@ -1,0 +1,27 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["bornholm_legacy", ".old_bornholm", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+# Pre-existing, tracked issues in legacy/notebook-derived code — not tightened
+# further here since this pass is scoped to adding tests + CI, not a lint
+# remediation of the whole codebase:
+#   F821 (undefined-name): a handful of dead/debug code paths in
+#     backend/rsa_engine.py (missing `import matplotlib.pyplot as plt`) and
+#     backend/main_backend.py (one `_clean_name` typo) — not on any tested path.
+#   F841 (unused-variable): a few harmless leftover assignments.
+#   E741/E701/E712: idiomatic in this numerical/optimization code (e.g. `l`
+#     for line index in Pyomo expressions) and pre-existing one-line
+#     `if x: raise` statements.
+#   E501 (line-too-long): widespread across the large route/UI files; not
+#     enforced pending a dedicated formatting pass.
+ignore = ["F821", "F841", "E741", "E701", "E712", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# sys.path.append(...) must run before the local-module imports that follow it.
+"backend/main_backend.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -17,7 +17,6 @@ from typing import Callable
 import re
 
 import plotly.graph_objects as go
-import plotly.express as px
 
 from .config import DEFAULT_GRID_CONSTANTS
 

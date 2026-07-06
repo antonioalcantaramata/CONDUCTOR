@@ -71,6 +71,21 @@ All secrets live in `llm_agent/.env` (git-ignored — never commit your API key)
 See `llm_agent/.env.example` for the expected variables. You can also pick a
 different model there via `GEMINI_MODEL`.
 
+## Development
+
+Unit tests cover pure-logic code in `backend/` and `llm_agent/agent/` (network
+loading/editing helpers, error classification, request validation, etc.) and
+don't require IPOPT or a conda environment:
+
+```Shell
+pip install -r requirements-dev.txt
+pytest tests/
+ruff check .
+```
+
+Both run automatically on every push/PR via GitHub Actions
+(`.github/workflows/ci.yml`).
+
 ## License
 
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).

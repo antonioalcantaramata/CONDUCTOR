@@ -4,14 +4,10 @@
 # In[1]:
 
 
-import re
 import pandas as pd
-import numpy as np
 import pandapower.networks
 import pandapower as pp
 import os
-import copy
-import unicodedata
 
 
 # In[2]:
@@ -103,7 +99,7 @@ def real_time_security_assessment(
 
 
     print("\n==================== Real-Time Security Assessment Engine (RSAE) ====================")
-    print(f"=====================================================================================\n")
+    print("=====================================================================================\n")
 
     results = []  # List to store structured violations
 

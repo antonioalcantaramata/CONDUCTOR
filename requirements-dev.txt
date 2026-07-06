@@ -1,0 +1,33 @@
+# Dependencies needed to lint and run the unit test suite (tests/) in CI.
+#
+# This is a pip-only subset of environment.yml's dependencies — enough to
+# import backend/ and llm_agent/agent/ modules and exercise their pure-logic
+# code paths. It deliberately excludes IPOPT (native conda-forge binary,
+# only needed to actually *solve* an OPF — not to import pandapower/Pyomo)
+# and UI-only packages (streamlit, plotly) that the unit tests don't touch.
+#
+# For full local development (running the app itself), use environment.yml
+# via `./start.sh` instead.
+
+pytest>=8.0
+ruff>=0.6
+
+pandapower>=3.0.0
+pyomo>=6.10.0
+numpy>=2.0
+pandas>=2.3
+scipy>=1.13
+networkx>=3.4
+matpowercaseframes
+
+fastapi>=0.116
+python-multipart>=0.0.9
+pydantic>=2.11
+requests>=2.33
+python-dotenv>=1.0
+pyyaml>=6.0
+openpyxl>=3.1.0
+
+httpx>=0.27.0
+google-genai>=1.0.0
+google-api-core>=2.0.0

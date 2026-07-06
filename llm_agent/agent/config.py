@@ -5,7 +5,6 @@ All values are overridable via environment variables.
 GEMINI_API_KEY is required and raises EnvironmentError at import time if missing.
 """
 
-import json
 import logging
 import os
 

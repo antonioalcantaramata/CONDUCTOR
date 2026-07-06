@@ -3,10 +3,8 @@ import csv
 from io import StringIO
 from typing import List
 from datetime import datetime
-import sys
 import os
 #from pipeline_functions import *
-from typing import List
 import pandas as pd
 
 metadata = {

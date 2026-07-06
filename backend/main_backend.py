@@ -35,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import io
-import pickle
 import os
 import pandapower as pp
 from contextlib import asynccontextmanager

@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
 
 # ── OS / editor / tooling ─────────────────────────────────────────────────
 .DS_Store
@@ -35,8 +37,8 @@ data_files/*
 
 
 # ── Others ───
-.old_bornholm/*
-bornholm_legacy/*
+.old_bornholm*
+bornholm_legacy*
 backend/compare_legacy_admittance.py
 backend/convert_*
 backend/build*

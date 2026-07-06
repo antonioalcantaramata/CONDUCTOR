@@ -8,14 +8,7 @@
 # Import Required Libraries
 # ===========================
 #import re
-import pandas as pd
-import numpy as np
 #import pandapower.networks
-import pandapower as pp
-import os
-import copy
-import unicodedata
-from pandapower.powerflow import LoadflowNotConverged
 
 
 # In[2]:
@@ -139,7 +132,8 @@ def remove_trafo_and_connected_elements(net_copy, trafo_index):
     net_copy = update_bus_mapping(net_copy, lv_bus_value)
 
     # --- 9 Remove corresponding controller entry if present ---
-    net_copy.controller = net_copy.controller.drop(index=trafo_index).reset_index(drop=True)
+    if trafo_index in net_copy.controller.index:
+        net_copy.controller = net_copy.controller.drop(index=trafo_index).reset_index(drop=True)
 
     print(f"✅ Transformer {trafo_index} and connected elements removed successfully.")
     return net_copy, hv_bus_value, lv_bus_value

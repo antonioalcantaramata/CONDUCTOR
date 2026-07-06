@@ -1,13 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import re
 import pandas as pd
-import numpy as np
 import pandapower.networks
 import pandapower as pp
-import os
-import copy
 from pandapower.powerflow import LoadflowNotConverged
 
 
@@ -52,7 +48,7 @@ def contingency_assessment_single(
     """
 
     print("\n================ Contingency Assessment (Single Outage) =============================")
-    print(f"=====================================================================================\n")
+    print("=====================================================================================\n")
     print(f"→ Outage Element: {element.upper()} | Index: {element_index}\n")
 
     # ---------------------------------------------------------
