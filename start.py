@@ -187,15 +187,29 @@ def check_port_free(port: int, what: str, override_var: str) -> None:
             )
 
 
-def check_api_key() -> None:
+def check_llm_config() -> None:
+    """
+    Warn only if the *selected* backend is unconfigured.
+
+    An Ollama user has no Gemini key and needs none, so checking for one
+    unconditionally would warn at every launch about a non-problem.
+    """
     env_file = AGENT_DIR / ".env"
-    has_key = False
+    values: dict[str, str] = {}
     if env_file.is_file():
         for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("GEMINI_API_KEY=") and line.split("=", 1)[1].strip():
-                has_key = True
-                break
-    if not has_key:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+
+    provider = values.get("LLM_PROVIDER", "").lower() or "google"
+
+    if provider == "ollama":
+        if not values.get("OLLAMA_MODEL"):
+            warn(f"No OLLAMA_MODEL set in {env_file}")
+            warn("The app will let you pick one from your installed models.")
+    elif not values.get("GEMINI_API_KEY"):
         warn(f"No GEMINI_API_KEY found in {env_file}")
         warn("The app will guide you through setup on first open.")
 
@@ -288,7 +302,7 @@ def main() -> None:
 
     conda = find_conda()
     ensure_env(conda)
-    check_api_key()
+    check_llm_config()
     check_port_free(BACKEND_PORT, "FastAPI backend", "BACKEND_PORT")
     check_port_free(STREAMLIT_PORT, "Streamlit app", "STREAMLIT_PORT")
 

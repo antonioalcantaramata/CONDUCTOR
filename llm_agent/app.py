@@ -17,8 +17,22 @@ from datetime import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 
-from agent.config import BASE_URL, GEMINI_MODEL, HTTP_TIMEOUT
+from agent.config import (
+    BASE_URL,
+    GEMINI_MODEL,
+    HTTP_TIMEOUT,
+    OLLAMA_HOST,
+    OLLAMA_KEEP_ALIVE,
+    OLLAMA_NUM_CTX,
+    OLLAMA_OUTPUT_RESERVE,
+    OLLAMA_TIMEOUT_S,
+)
+from agent.hardware import advice as hw_advice
+from agent.hardware import detect as detect_hardware
+from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent.loop import run_agent_turn
+from agent.providers import active_provider_name, get_provider, reset_providers
+from agent.providers.ollama import probe as ollama_probe
 from agent.renderers import RENDERER_MAP
 from agent import tools as _tools_module
 from agent.tools import get_current_timestamp
@@ -28,6 +42,18 @@ _REPO_ROOT = _APP_DIR.parent
 _DATA_FILES_DIR = _REPO_ROOT / "data_files"
 _SYSTEMS_DIR = _REPO_ROOT / "systems"
 _LOGO_PATH = _APP_DIR / "assets" / "conductor_logo.png"
+
+_PROVIDER_LABELS = {"google": "Google Gemini API", "ollama": "Ollama (local)"}
+
+
+def _active_model_label() -> str:
+    """Model id of the selected backend, for the info panel."""
+    try:
+        return get_provider().model
+    except Exception:  # noqa: BLE001 — never let the badge break the page
+        return "unknown"
+
+
 _BRAND_NAME = "CONDUCTOR"
 _BRAND_TAGLINE = "An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations"
 _BRAND_CAPTION = (
@@ -719,7 +745,11 @@ full,,branch_to_trafo,3,33,0,,</pre>
             infoPanel.innerHTML = `
                 <div class="cb-info-row">
                     <span class="cb-info-label">LLM Model</span>
-                    <span class="cb-info-value">GEMINI_MODEL_PLACEHOLDER</span>
+                    <span class="cb-info-value">LLM_MODEL_PLACEHOLDER</span>
+                </div>
+                <div class="cb-info-row">
+                    <span class="cb-info-label">Provider</span>
+                    <span class="cb-info-value">LLM_PROVIDER_PLACEHOLDER</span>
                 </div>
                 <div class="cb-info-row">
                     <span class="cb-info-label">Backend</span>
@@ -1124,32 +1154,55 @@ full,,branch_to_trafo,3,33,0,,</pre>
             if (_rafId) parentWindow.cancelAnimationFrame(_rafId);
         };
         </script>
-        """.replace("DATA_URI_PLACEHOLDER", logo_uri).replace("BRAND_NAME_PLACEHOLDER", _BRAND_NAME).replace("BASE_URL_PLACEHOLDER", BASE_URL).replace("GEMINI_MODEL_PLACEHOLDER", GEMINI_MODEL),
+        """.replace("DATA_URI_PLACEHOLDER", logo_uri).replace("BRAND_NAME_PLACEHOLDER", _BRAND_NAME).replace("BASE_URL_PLACEHOLDER", BASE_URL).replace("LLM_MODEL_PLACEHOLDER", _active_model_label()).replace("LLM_PROVIDER_PLACEHOLDER", _PROVIDER_LABELS.get(active_provider_name(), active_provider_name())),
         height=0,
     )
+
+
+def _write_env(updates: dict[str, str]) -> None:
+    """Merge key=value pairs into .env, preserving unrelated lines and comments."""
+    lines = _ENV_PATH.read_text(encoding="utf-8").splitlines() if _ENV_PATH.exists() else []
+    remaining = dict(updates)
+
+    merged = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key in remaining:
+            merged.append(f"{key}={remaining.pop(key)}")
+        else:
+            merged.append(line)
+    merged.extend(f"{k}={v}" for k, v in remaining.items())
+
+    _ENV_PATH.write_text("\n".join(merged) + "\n", encoding="utf-8")
+    # Inject into the running process so the change takes effect on the next rerun.
+    os.environ.update(updates)
+    reset_providers()
 
 
 def _has_api_key() -> bool:
     return bool(os.environ.get("GEMINI_API_KEY", "").strip())
 
 
-if not _has_api_key():
-    _render_brand_block(f"{_BRAND_NAME} Setup", _BRAND_TAGLINE, image_width=120)
-    st.caption(_BRAND_CAPTION)
+def _provider_configured(provider: str) -> bool:
+    """Whether `provider` already has what it needs, so starting is one click."""
+    if provider == "ollama":
+        return bool(os.environ.get("OLLAMA_MODEL", "").strip())
+    return _has_api_key()
+
+
+def _render_google_setup() -> None:
     st.markdown(
         """
-        ### A Gemini API key is required to run the assistant.
+        #### Google Gemini API
 
         The **free tier** at Google AI Studio is sufficient — no payment needed.
 
-        **How to get a key (takes ~2 minutes):**
         1. Go to [https://aistudio.google.com/](https://aistudio.google.com/)
         2. Sign in with any Google account
         3. Click **Get API key** → **Create API key**
         4. Copy the key and paste it below
         """
     )
-
     with st.form("api_key_setup"):
         key_input = st.text_input(
             "Gemini API Key",
@@ -1164,34 +1217,374 @@ if not _has_api_key():
         if not key:
             st.error("Please paste a valid API key before continuing.")
         else:
-            # Write / update the .env file
-            if _ENV_PATH.exists():
-                lines = _ENV_PATH.read_text(encoding="utf-8").splitlines()
-                new_lines, updated = [], False
-                for line in lines:
-                    if line.startswith("GEMINI_API_KEY="):
-                        new_lines.append(f"GEMINI_API_KEY={key}")
-                        updated = True
-                    else:
-                        new_lines.append(line)
-                if not updated:
-                    new_lines.append(f"GEMINI_API_KEY={key}")
-                _ENV_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-            else:
-                _ENV_PATH.write_text(f"GEMINI_API_KEY={key}\n", encoding="utf-8")
-
-            # Inject into the current process so the lazy client picks it up immediately
-            os.environ["GEMINI_API_KEY"] = key
+            _write_env({"LLM_PROVIDER": "google", "GEMINI_API_KEY": key})
+            st.session_state._launched = True
             st.success("API key saved! Starting the assistant…")
             st.rerun()
 
-    st.stop()  # Do not render the rest of the app until setup is complete
+
+def _prompt_token_estimate() -> int:
+    """Roughly how many tokens the system prompt and tool schemas occupy."""
+    try:
+        from agent.providers.schema import to_json_schema_tools
+        from agent.system_prompt import get_system_prompt
+        from agent.tool_schemas import TOOLS
+
+        blob = json.dumps(to_json_schema_tools(TOOLS)) + get_system_prompt()
+        return len(blob) // 4
+    except Exception:  # noqa: BLE001
+        return 25_000
+
+
+def _render_ollama_settings(*, key_prefix: str) -> bool:
+    """
+    Every Ollama option, editable at any time. Returns True if saved.
+
+    Sizing guidance is derived from the detected machine rather than hard-coded,
+    since what is generous on a workstation is impossible on a small laptop.
+    """
+    hw = detect_hardware()
+    required = _prompt_token_estimate()
+    current_ctx = int(os.environ.get("OLLAMA_NUM_CTX") or OLLAMA_NUM_CTX)
+
+    for note in hw_advice(hw):
+        st.caption(note)
+
+    info = ollama_probe()
+    installed = [m["name"] for m in info["models"] if m["tools"] is not False]
+    if not installed:
+        installed = [os.environ.get("OLLAMA_MODEL") or ""]
+    current_model = os.environ.get("OLLAMA_MODEL") or installed[0]
+
+    with st.form(f"{key_prefix}_ollama_settings"):
+        model = st.selectbox(
+            "Model",
+            options=installed,
+            index=installed.index(current_model) if current_model in installed else 0,
+        )
+
+        suggested = recommended_num_ctx(hw, required)
+        num_ctx = st.number_input(
+            f"Context window — prompt needs ~{required:,} tokens, suggested {suggested:,}",
+            min_value=4096, max_value=1_048_576, value=current_ctx, step=4096,
+            help=(
+                "Ollama defaults to ~4096 and silently discards anything beyond the "
+                "window, dropping the system prompt first. CONDUCTOR refuses "
+                "over-long prompts instead. Larger windows use more memory but, "
+                "measured, do not slow processing down."
+            ),
+        )
+        warning = num_ctx_warning(int(num_ctx), required, hw)
+        if warning:
+            st.warning(warning)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            keep_alive = st.text_input(
+                "Keep model loaded for",
+                value=os.environ.get("OLLAMA_KEEP_ALIVE") or OLLAMA_KEEP_ALIVE,
+                help=(
+                    "How long Ollama keeps the model and its prompt cache in memory. "
+                    "The cache is what makes questions after the first one fast, so "
+                    "short values make every question pay the full startup cost."
+                ),
+            )
+            think_default = (os.environ.get("OLLAMA_THINK", "true").lower() == "true")
+            think = st.checkbox(
+                "Allow the model to reason before answering",
+                value=think_default,
+                help=(
+                    "On by default, matching the hosted path — Gemini also reasons, "
+                    "it just doesn't show the trace. Turning this off trades answer "
+                    "quality for speed."
+                ),
+            )
+        with col_b:
+            timeout_s = st.number_input(
+                "Request timeout (s)",
+                min_value=30, max_value=3600,
+                value=int(float(os.environ.get("OLLAMA_TIMEOUT_S") or OLLAMA_TIMEOUT_S)),
+                step=30,
+                help="Local generation is slow, especially while the model loads.",
+            )
+            output_reserve = st.number_input(
+                "Tokens reserved for the reply",
+                min_value=512, max_value=32768,
+                value=int(os.environ.get("OLLAMA_OUTPUT_RESERVE") or OLLAMA_OUTPUT_RESERVE),
+                step=512,
+                help="Held back from the context window so the answer has room.",
+            )
+
+        host = st.text_input(
+            "Ollama host",
+            value=os.environ.get("OLLAMA_HOST") or OLLAMA_HOST,
+        )
+
+        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+            _write_env({
+                "LLM_PROVIDER": "ollama",
+                "OLLAMA_MODEL": model,
+                "OLLAMA_NUM_CTX": str(int(num_ctx)),
+                "OLLAMA_KEEP_ALIVE": keep_alive.strip(),
+                "OLLAMA_THINK": "true" if think else "false",
+                "OLLAMA_TIMEOUT_S": str(int(timeout_s)),
+                "OLLAMA_OUTPUT_RESERVE": str(int(output_reserve)),
+                "OLLAMA_HOST": host.strip(),
+            })
+            return True
+    return False
+
+
+def _render_google_settings(*, key_prefix: str) -> bool:
+    """Gemini options, editable at any time. Returns True if saved."""
+    with st.form(f"{key_prefix}_google_settings"):
+        model = st.text_input(
+            "Model",
+            value=os.environ.get("GEMINI_MODEL") or GEMINI_MODEL,
+            help="Free-tier Gemma models cap input well below this agent's "
+                 "per-call overhead; a Flash model is the safe choice.",
+        )
+        key = st.text_input(
+            "API key (leave blank to keep the current one)",
+            type="password", placeholder="AIzaSy…",
+        )
+        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+            updates = {"LLM_PROVIDER": "google", "GEMINI_MODEL": model.strip()}
+            if key.strip():
+                updates["GEMINI_API_KEY"] = key.strip()
+            _write_env(updates)
+            return True
+    return False
+
+
+def _warm_up_if_needed() -> None:
+    """
+    Pay the cold-start cost here, with an explanation, rather than inside the
+    user's first question.
+
+    The outcome is stashed in session_state rather than rendered directly: this
+    runs immediately before `st.rerun()`, which discards anything written here.
+    """
+    if active_provider_name() != "ollama":
+        return
+    provider = get_provider()
+    if not hasattr(provider, "warm_up"):
+        return
+
+    from agent.system_prompt import get_system_prompt
+    from agent.tool_schemas import TOOLS
+
+    # Always warm up rather than asking whether it's needed. `/api/ps` reports
+    # Ollama's keep_alive bookkeeping, not real residency — it still claims a
+    # model is loaded after the weights have been evicted — so skipping on its
+    # word produced a confident "already loaded" that was simply false. Warming
+    # an already-warm model costs ~0.5s (measured), which is not worth a lie.
+    with st.spinner(
+        f"Preparing `{provider.model}`. If the model needs loading this can take "
+        "several minutes; if it is already in memory it will be quick. Questions "
+        "after this are much faster."
+    ):
+        elapsed, error = provider.warm_up(TOOLS, get_system_prompt())
+
+    if error:
+        st.session_state._warm_up_note = (
+            "warning",
+            f"Warm-up did not complete ({error}). Your first question will be "
+            "slow, but it will still work.",
+        )
+    elif elapsed < 5:
+        # Fast means the prefix was genuinely cached — the elapsed time is the
+        # evidence, unlike anything the server claims about residency.
+        st.session_state._warm_up_note = (
+            "info", f"`{provider.model}` was already warm ({elapsed:.1f}s)."
+        )
+    else:
+        st.session_state._warm_up_note = (
+            "success", f"Model loaded and ready in {elapsed:.0f}s."
+        )
+
+
+def _show_warm_up_note() -> None:
+    """Render the warm-up outcome once, after the rerun that followed it."""
+    note = st.session_state.pop("_warm_up_note", None)
+    if not note:
+        return
+    level, message = note
+    {"success": st.success, "warning": st.warning, "info": st.caption}[level](message)
+
+
+def _render_ollama_setup() -> None:
+    st.markdown(
+        """
+        #### Local model via Ollama
+
+        Runs entirely on this machine — no API key, and no grid data leaves it.
+        """
+    )
+
+    info = ollama_probe()
+
+    if not info["reachable"]:
+        st.error(
+            f"Cannot reach Ollama at `{os.environ.get('OLLAMA_HOST', 'http://localhost:11434')}`."
+        )
+        st.markdown(
+            "Install it from [ollama.com](https://ollama.com/download), then start it:\n\n"
+            "```\nollama serve\n```"
+        )
+        if st.button("Check again", use_container_width=True):
+            st.rerun()
+        return
+
+    st.success(f"Ollama {info['version']} is running.")
+
+    tool_models = [m for m in info["models"] if m["tools"] is not False]
+    if not tool_models:
+        if info["models"]:
+            st.warning(
+                "None of the installed models support tool calling. CONDUCTOR drives "
+                "the grid entirely through tools, so it needs one that does."
+            )
+        else:
+            st.warning("No models are installed yet.")
+        st.markdown(
+            "Pull a tool-capable model, for example:\n\n"
+            "```\nollama pull gemma4:12b-mlx\n```\n\n"
+            "On Apple Silicon the `-mlx` tags run noticeably faster."
+        )
+        if st.button("Check again", use_container_width=True):
+            st.rerun()
+        return
+
+    def _label(model: dict) -> str:
+        caveat = "" if model["tools"] else "  ⚠︎ tool support unconfirmed"
+        return f"{model['name']}  ({model['size_gb']} GB){caveat}"
+
+    with st.form("ollama_setup"):
+        choice = st.selectbox(
+            "Model",
+            options=[m["name"] for m in tool_models],
+            format_func=lambda n: _label(next(m for m in tool_models if m["name"] == n)),
+        )
+        num_ctx = st.number_input(
+            "Context window (num_ctx)",
+            min_value=8192,
+            max_value=1_048_576,
+            value=int(os.environ.get("OLLAMA_NUM_CTX", OLLAMA_NUM_CTX)),
+            step=8192,
+            help=(
+                "This agent's system prompt and tool schemas are ~25k tokens before "
+                "any conversation. Ollama defaults to ~4096 and silently discards "
+                "anything beyond the window, so this must be set generously. Larger "
+                "windows use more memory."
+            ),
+        )
+        submitted = st.form_submit_button("Save & Start", type="primary", use_container_width=True)
+
+    if submitted:
+        _write_env({
+            "LLM_PROVIDER": "ollama",
+            "OLLAMA_MODEL": choice,
+            "OLLAMA_NUM_CTX": str(int(num_ctx)),
+        })
+        st.session_state._launched = True
+        st.success(f"Using {choice}. Starting the assistant…")
+        st.rerun()
+
+
+def _render_ready_to_start(provider: str) -> None:
+    """
+    The already-configured case: confirm what will be used and get out of the way.
+
+    Starting is a single click — no re-entering settings that are already saved.
+    """
+    if provider == "google":
+        key = os.environ.get("GEMINI_API_KEY", "")
+        st.success(
+            f"Ready — model `{os.environ.get('GEMINI_MODEL') or GEMINI_MODEL}`, "
+            f"key `…{key[-4:]}` loaded from `.env`."
+        )
+    else:
+        model = os.environ.get("OLLAMA_MODEL", "")
+        info = ollama_probe()
+        if not info["reachable"]:
+            st.error("Ollama is not running. Start it with `ollama serve`, then re-check.")
+            if st.button("Check again", use_container_width=True):
+                st.rerun()
+            return
+        if model not in {m["name"] for m in info["models"]}:
+            st.error(f"Model `{model}` is no longer installed. Pull it or pick another below.")
+            _render_ollama_setup()
+            return
+        st.success(
+            f"Ready — `{model}` on Ollama {info['version']}, "
+            f"context {int(os.environ.get('OLLAMA_NUM_CTX') or OLLAMA_NUM_CTX):,} tokens."
+        )
+
+    if st.button("Start CONDUCTOR", type="primary", use_container_width=True):
+        _write_env({"LLM_PROVIDER": provider})
+        _warm_up_if_needed()
+        st.session_state._launched = True
+        st.rerun()
+
+    with st.expander("Change settings"):
+        saved = (
+            _render_google_settings(key_prefix="launch")
+            if provider == "google"
+            else _render_ollama_settings(key_prefix="launch")
+        )
+        if saved:
+            st.success("Saved.")
+            st.rerun()
+
+
+# The launch screen shows on every start of the app — picking a backend is an
+# explicit, per-session decision rather than a one-time setup step. The flag is
+# session-scoped, so it survives Streamlit reruns but not an app restart.
+if not st.session_state.get("_launched"):
+    _render_brand_block(_BRAND_NAME, _BRAND_TAGLINE, image_width=120)
+    st.caption(_BRAND_CAPTION)
+    st.markdown("### Choose how to run the assistant")
+
+    _CHOICES = {
+        "Google Gemini API": "google",
+        "Local model (Ollama)": "ollama",
+    }
+    _labels = list(_CHOICES)
+    _current = active_provider_name()
+    _index = next((i for i, l in enumerate(_labels) if _CHOICES[l] == _current), 0)
+
+    _picked = _CHOICES[
+        st.radio(
+            "Backend",
+            _labels,
+            index=_index,
+            horizontal=True,
+            captions=[
+                "Hosted, needs a free API key, fastest to set up.",
+                "Fully local and private, needs a tool-capable model.",
+            ],
+            label_visibility="collapsed",
+        )
+    ]
+
+    st.divider()
+    if _provider_configured(_picked):
+        _render_ready_to_start(_picked)
+    else:
+        _render_google_setup() if _picked == "google" else _render_ollama_setup()
+
+    st.stop()  # Do not render the rest of the app until a backend is chosen
 
 # ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
 if "history" not in st.session_state:
     st.session_state.history = []
+
+# Report how the model warm-up went. Written just before the rerun that brought
+# us here, so it could not have been rendered on the launch screen itself.
+_show_warm_up_note()
 
 if "current_ts" not in st.session_state:
     ts_result = get_current_timestamp()
@@ -1200,7 +1593,7 @@ if "current_ts" not in st.session_state:
     )
 
 # Display messages: [{"role": "user"|"assistant", "text": str, "charts": list|None}]
-# Separate from `history` (which is the Gemini proto history).
+# Separate from `history` (the provider-neutral message list — see agent/providers/base.py).
 # Charts are stored here so they survive re-runs.
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -1443,6 +1836,28 @@ with st.sidebar:
     if st.button("Start New Conversation", use_container_width=True, type="secondary"):
         _reset_conversation_state()
         st.rerun()
+
+    # Model settings stay reachable mid-session — switching backend or adjusting
+    # a local model's context should not require a restart or a .env edit.
+    _active = active_provider_name()
+    with st.expander(f"Model settings — {_PROVIDER_LABELS.get(_active, _active)}"):
+        _switch_to = st.radio(
+            "Backend",
+            ["google", "ollama"],
+            index=0 if _active == "google" else 1,
+            format_func=lambda p: _PROVIDER_LABELS.get(p, p),
+            horizontal=True,
+            key="sidebar_provider",
+        )
+        st.divider()
+        _saved = (
+            _render_google_settings(key_prefix="sidebar")
+            if _switch_to == "google"
+            else _render_ollama_settings(key_prefix="sidebar")
+        )
+        if _saved:
+            st.success("Saved — applies to your next message.")
+            st.rerun()
 
     if "show_manage_uploads" not in st.session_state:
         st.session_state.show_manage_uploads = False
@@ -1741,6 +2156,12 @@ def _chat_input_fragment():
                     elif event == "tool_error":
                         label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
                         st.write(f"❌ **{label}** failed: {data.get('error', '')}")
+                    elif event == "model_loading":
+                        st.write(
+                            f"⏳ Loading **{data.get('model', 'the model')}** into memory "
+                            "and reprocessing the prompt — this can take a few minutes "
+                            "when the model has been idle. Later questions are fast."
+                        )
                     elif event == "retry":
                         reason = data.get("reason", "Transient error")
                         wait = data.get("wait_s", "?")

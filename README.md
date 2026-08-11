@@ -6,13 +6,9 @@ contingencies, probabilistic risk, robust corrective dispatch, flexibility and
 hosting-capacity studies, KPIs) with a natural-language agent that drives those
 tools from a chat interface.
 
-> ## ⚠️ Work in progress — please don't use this yet
->
-> This repository is being prepared for open release. We are still reviewing the
-> code, results, and documentation for correctness. **It is not ready for use or
-> citation**, interfaces may change without notice, and outputs should not be
-> relied upon. A tagged, documented release will follow once the review is
-> complete. Until then, treat everything here as a preview.
+The agent runs on either a **hosted Google Gemini model** or a **local model via
+Ollama** — you pick which each time you start it, and no grid data leaves your
+machine in local mode.
 
 ## Overview
 
@@ -30,7 +26,10 @@ tools from a chat interface.
 - Conda — either [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install)
   (lightweight, recommended) or full Anaconda. The only heavy prerequisite;
   the launcher builds the environment for you.
-- A Google Gemini API key (free tier works) — https://aistudio.google.com/apikey
+- **One LLM backend**, either:
+  - a Google Gemini API key (free tier works) — https://aistudio.google.com/apikey, or
+  - [Ollama](https://ollama.com/download) with a tool-capable model pulled
+    (see [Running a local model](#running-a-local-model)).
 
 | Platform | Launcher | Notes |
 | --- | --- | --- |
@@ -51,9 +50,16 @@ cd CONDUCTOR
 python start.py     # any OS, including Windows
 ```
 
-When it's ready, the chat app opens at **http://localhost:8501** and asks for
-your Gemini API key on first open — paste it there and you're done. (You can
-also pre-create `llm_agent/.env` from `llm_agent/.env.example` if you prefer.)
+When it's ready, the chat app opens at **http://localhost:8501** and shows a
+launch screen where you choose the backend:
+
+- **Google Gemini API** — paste a key once; it's saved to `llm_agent/.env`.
+- **Local model (Ollama)** — pick from the tool-capable models you have pulled.
+
+The screen appears on every start, so switching backends is a restart and one
+click. Settings are also editable mid-session under **Model settings** in the
+sidebar. (You can pre-create `llm_agent/.env` from `llm_agent/.env.example` if
+you prefer to skip the screen.)
 
 Press **Ctrl+C** in the terminal once to stop both services.
 
@@ -74,11 +80,75 @@ git pull
 - If the first env build was interrupted, remove the broken env before
   retrying: `conda env remove -n conductor_env`.
 
+## Running a local model
+
+CONDUCTOR can drive a model running entirely on your own machine through
+[Ollama](https://ollama.com/download) — no API key, no quota, and no grid data
+sent anywhere.
+
+```bash
+ollama pull gemma4:12b-mlx     # on Apple Silicon, -mlx tags are faster
+```
+
+**The model must support tool calling.** CONDUCTOR drives every study through
+tools, so a model without that capability can only chat. Check with
+`ollama show <model>` and look for `tools` in Capabilities; the launch screen
+also filters to models that report it.
+
+### What to expect
+
+The agent sends a large prompt — the system instructions plus 20 tool schemas
+come to roughly **25,000 tokens before any conversation**. Hosted models absorb
+that easily; local models process it at a few hundred tokens per second, so the
+first request after a model loads is slow. Measured on an Apple M3 Pro (18 GB)
+with a 12B model:
+
+| | time |
+| --- | --- |
+| First request after the model loads | ~3 min (processing the 25k-token prompt) |
+| Every request after that | ~15 s |
+
+Ollama caches the processed prompt, which is why only the first one is
+expensive. CONDUCTOR pays that cost up front — after you click Start it loads
+the model and primes the cache behind a progress message, so your first question
+isn't the thing that waits. Keeping the model resident (`OLLAMA_KEEP_ALIVE`,
+default 60 min) is what keeps subsequent questions fast.
+
+A smaller model processes the prompt proportionally faster, at some cost to how
+reliably it picks the right tool among twenty.
+
+### Context window
+
+Ollama defaults `num_ctx` to about 4096 **regardless of what the model
+supports**, and silently discards anything beyond the window — starting from the
+front, which is where the system prompt lives. That produces a model that looks
+functional but has lost its instructions.
+
+CONDUCTOR sets the window explicitly and refuses over-long prompts rather than
+letting them be truncated. The launch screen suggests a size based on your
+machine's detected memory and warns if the value you choose is too small for the
+prompt or larger than your RAM comfortably allows.
+
 ## Configuration
 
 All secrets live in `llm_agent/.env` (git-ignored — never commit your API key).
-See `llm_agent/.env.example` for the expected variables. You can also pick a
-different model there via `GEMINI_MODEL` (default: `gemma-4-31b-it`).
+See `llm_agent/.env.example` for every variable and what it does; the app writes
+this file for you when you use the launch screen or the sidebar settings panel.
+
+Key choices:
+
+| Variable | Purpose |
+| --- | --- |
+| `LLM_PROVIDER` | `google` or `ollama` |
+| `GEMINI_MODEL` | default `gemini-3.5-flash-lite` |
+| `OLLAMA_MODEL` | any tool-capable model you have pulled |
+| `OLLAMA_NUM_CTX` | context window — must exceed the ~25k-token prompt |
+| `OLLAMA_KEEP_ALIVE` | how long the model and its prompt cache stay resident |
+
+Avoid free-tier **Gemma models on the Gemini API**: their 16K
+input-tokens-per-minute cap is below this agent's per-call overhead, so requests
+fail immediately. This does not apply to Gemma run locally through Ollama, where
+no such quota exists.
 
 ## Development
 

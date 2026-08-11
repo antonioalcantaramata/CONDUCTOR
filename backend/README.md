@@ -5,7 +5,7 @@ The [LLM agent](../llm_agent/) is the primary client: it calls these endpoints,
 and the chat app renders the results. The backend holds the network and its
 time-series in memory and runs pandapower / Pyomo+IPOPT under the hood.
 
-> See the [root README](../README.md) for the work-in-progress notice and setup.
+> See the [root README](../README.md) for setup.
 > `./start.sh` (project root) launches this service on `http://localhost:8000`
 > (interactive API docs at `/docs`).
 

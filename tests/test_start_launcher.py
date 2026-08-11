@@ -72,22 +72,52 @@ class TestTail:
         assert start.tail(tmp_path / "nope.log") == "(no log output)"
 
 
-class TestCheckApiKey:
+class TestCheckLlmConfig:
     def test_warns_when_env_file_missing(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
-        start.check_api_key()
+        start.check_llm_config()
         assert "No GEMINI_API_KEY" in capsys.readouterr().out
 
     def test_warns_when_key_empty(self, tmp_path, monkeypatch, capsys):
         (tmp_path / ".env").write_text("GEMINI_API_KEY=\n")
         monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
-        start.check_api_key()
+        start.check_llm_config()
         assert "No GEMINI_API_KEY" in capsys.readouterr().out
 
     def test_silent_when_key_present(self, tmp_path, monkeypatch, capsys):
         (tmp_path / ".env").write_text("GEMINI_API_KEY=abc123\n")
         monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
-        start.check_api_key()
+        start.check_llm_config()
+        assert "No GEMINI_API_KEY" not in capsys.readouterr().out
+
+    def test_ollama_user_is_not_nagged_about_a_gemini_key(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # A local-model user has no API key and needs none.
+        (tmp_path / ".env").write_text(
+            "LLM_PROVIDER=ollama\nOLLAMA_MODEL=some-model\n"
+        )
+        monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
+        start.check_llm_config()
+        assert capsys.readouterr().out.strip() == ""
+
+    def test_warns_when_ollama_selected_without_a_model(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / ".env").write_text("LLM_PROVIDER=ollama\n")
+        monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
+        start.check_llm_config()
+        assert "No OLLAMA_MODEL" in capsys.readouterr().out
+
+    def test_comments_and_blank_lines_are_ignored(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / ".env").write_text(
+            "# GEMINI_API_KEY=commented-out\n\nLLM_PROVIDER=google\n"
+            "GEMINI_API_KEY=real\n"
+        )
+        monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
+        start.check_llm_config()
         assert "No GEMINI_API_KEY" not in capsys.readouterr().out
 
 

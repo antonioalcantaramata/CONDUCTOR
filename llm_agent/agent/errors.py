@@ -9,6 +9,7 @@ Provides utilities to:
 
 from __future__ import annotations
 
+import math
 import re
 from typing import NamedTuple
 
@@ -53,13 +54,20 @@ def extract_retry_delay(error_message: str) -> int | None:
     """Extract retry_delay in seconds from Google API error message.
     
     Looks for patterns like:
-      retry_delay { seconds: 60 }
-    
-    Returns seconds to wait, or None if not found.
+      retry_delay { seconds: 60 }        (gRPC / google-api-core protobuf text)
+      'retryDelay': '5.253735734s'       (google-genai REST JSON)
+
+    Returns seconds to wait (rounded up), or None if not found.
     """
     match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", error_message)
     if match:
         return int(match.group(1))
+
+    # google-genai surfaces the RetryInfo detail as JSON: "retryDelay": "5.25s"
+    match = re.search(r"['\"]retryDelay['\"]\s*:\s*['\"]([\d.]+)s['\"]", error_message)
+    if match:
+        return math.ceil(float(match.group(1)))
+
     return None
 
 
@@ -90,8 +98,8 @@ def classify_error(error_message: str, error_type: str | None = None) -> ErrorCl
                 "- Wait until midnight Pacific time for the quota to reset.\n"
                 "- Add a payment method at [Google AI Studio](https://aistudio.google.com) "
                 "to get higher limits (pay-as-you-go is very cheap for this use case).\n"
-                "- Switch to `gemini-2.5-flash-lite` by setting "
-                "`GEMINI_MODEL=gemini-2.5-flash-lite` in your `.env` file."
+                "- Switch to `gemini-3.5-flash-lite` by setting "
+                "`GEMINI_MODEL=gemini-3.5-flash-lite` in your `.env` file."
             ),
         )
     
@@ -122,7 +130,7 @@ def classify_error(error_message: str, error_type: str | None = None) -> ErrorCl
                 "⚠️ **Gemini model temporarily overloaded (503).**\n\n"
                 "The free tier shares capacity with many users — spikes are common. "
                 "Please wait a moment and try again. "
-                "Alternatively, set `GEMINI_MODEL=gemini-2.5-flash-lite` in `.env` "
+                "Alternatively, set `GEMINI_MODEL=gemini-3.5-flash-lite` in `.env` "
                 "for a lower-traffic model."
             ),
         )
