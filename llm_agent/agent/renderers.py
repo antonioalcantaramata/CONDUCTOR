@@ -16,9 +16,11 @@ from __future__ import annotations
 from typing import Callable
 import re
 
+from typing import NamedTuple
+
 import plotly.graph_objects as go
 
-from .config import DEFAULT_GRID_CONSTANTS
+from .config import DEFAULT_GRID_CONSTANTS, last_grid_constants_status
 
 # ---------------------------------------------------------------------------
 # Shared theme
@@ -29,9 +31,34 @@ CHART_THEME: dict = {
     "margin": {"l": 40, "r": 20, "t": 50, "b": 60},
 }
 
-_VM_LOWER = DEFAULT_GRID_CONSTANTS["vm_lower"]
-_VM_UPPER = DEFAULT_GRID_CONSTANTS["vm_upper"]
-_MAX_LOADING = DEFAULT_GRID_CONSTANTS["max_loading_pct"]
+class _Limits(NamedTuple):
+    vm_lower: float
+    vm_upper: float
+    max_loading: float
+
+
+def _limits() -> _Limits:
+    """
+    Voltage and loading limits for the network currently loaded.
+
+    Read at call time, not bound at import. These are the fallbacks used when a
+    tool result carries no thresholds of its own, and binding them at import
+    pinned every chart to the bundled example network's limits (0.94/1.06)
+    regardless of which grid the user actually loaded — drawing violation
+    boundaries in the wrong place with no indication anything was wrong.
+
+    Uses the most recent backend fetch, which the agent loop refreshes on every
+    turn, so this costs no HTTP request per chart.
+    """
+    status = last_grid_constants_status()
+    gc = status.values if status is not None else DEFAULT_GRID_CONSTANTS
+    return _Limits(
+        vm_lower=gc.get("vm_lower", DEFAULT_GRID_CONSTANTS["vm_lower"]),
+        vm_upper=gc.get("vm_upper", DEFAULT_GRID_CONSTANTS["vm_upper"]),
+        max_loading=gc.get(
+            "max_loading_pct", DEFAULT_GRID_CONSTANTS["max_loading_pct"]
+        ),
+    )
 
 
 def _coerce_float(value, fallback: float) -> float:
@@ -145,9 +172,9 @@ def render_rsa(result: dict) -> list[go.Figure]:
 
     # Read actual thresholds used by the backend (fall back to constants if absent)
     thresholds = result.get("thresholds_used", {})
-    vm_lower = _coerce_float(thresholds.get("vm_lower_pu", _VM_LOWER), _VM_LOWER)
-    vm_upper = _coerce_float(thresholds.get("vm_upper_pu", _VM_UPPER), _VM_UPPER)
-    max_loading = _coerce_float(thresholds.get("max_line_loading_pct", _MAX_LOADING), _MAX_LOADING)
+    vm_lower = _coerce_float(thresholds.get("vm_lower_pu", _limits().vm_lower), _limits().vm_lower)
+    vm_upper = _coerce_float(thresholds.get("vm_upper_pu", _limits().vm_upper), _limits().vm_upper)
+    max_loading = _coerce_float(thresholds.get("max_line_loading_pct", _limits().max_loading), _limits().max_loading)
 
     # ------------------------------------------------------------------
     # Figure 1: Bus voltages
@@ -364,8 +391,8 @@ def _render_post_opf_voltages(result: dict) -> go.Figure | None:
 
     bus_names = _safe_labels([bv.get("bus_name") or str(bv.get("bus", "")) for bv in bus_voltages], "Bus")
     vm_pu = [bv["vm_pu"] for bv in bus_voltages]
-    vm_lower = result.get("opf_vm_lower_used", _VM_LOWER)
-    vm_upper = result.get("opf_vm_upper_used", _VM_UPPER)
+    vm_lower = result.get("opf_vm_lower_used", _limits().vm_lower)
+    vm_upper = result.get("opf_vm_upper_used", _limits().vm_upper)
 
     # Dots are red when outside the OPF bounds (should not happen, but surface if so)
     colors = [
@@ -924,10 +951,10 @@ def render_time_series(result: dict) -> list[go.Figure]:
     max_trafo_loading = result.get("max_trafo_loading", [])
 
     thresholds = result.get("thresholds_used", {})
-    vm_lower = thresholds.get("vm_lower_pu", _VM_LOWER)
-    vm_upper = thresholds.get("vm_upper_pu", _VM_UPPER)
-    max_loading = thresholds.get("max_line_loading_pct", _MAX_LOADING)
-    max_trafo_loading_pct = thresholds.get("max_trafo_loading_pct", _MAX_LOADING)
+    vm_lower = thresholds.get("vm_lower_pu", _limits().vm_lower)
+    vm_upper = thresholds.get("vm_upper_pu", _limits().vm_upper)
+    max_loading = thresholds.get("max_line_loading_pct", _limits().max_loading)
+    max_trafo_loading_pct = thresholds.get("max_trafo_loading_pct", _limits().max_loading)
 
     voltage_fig = go.Figure()
 
@@ -1282,8 +1309,8 @@ def render_worst_case(result: dict) -> list:
     slack = series.get("slack_import_mw", [])
 
     thresholds = result.get("thresholds_used", {})
-    vm_lower = thresholds.get("vm_lower_pu", _VM_LOWER)
-    vm_upper = thresholds.get("vm_upper_pu", _VM_UPPER)
+    vm_lower = thresholds.get("vm_lower_pu", _limits().vm_lower)
+    vm_upper = thresholds.get("vm_upper_pu", _limits().vm_upper)
 
     max_violations = max(violations) if violations else 1
 
@@ -1595,8 +1622,8 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
 
     if etype == "bus":
         vm = series.get("vm_pu", [])
-        vm_upper = thresholds.get("vm_upper_pu", _VM_UPPER)
-        vm_lower = thresholds.get("vm_lower_pu", _VM_LOWER)
+        vm_upper = thresholds.get("vm_upper_pu", _limits().vm_upper)
+        vm_lower = thresholds.get("vm_lower_pu", _limits().vm_lower)
         violation_mask = [v > vm_upper or v < vm_lower for v in vm]
 
         fig = go.Figure()
@@ -1655,9 +1682,9 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
     else:  # line or trafo
         loading = series.get("loading_percent", [])
         threshold_pct = (
-            thresholds.get("max_line_loading_pct", _MAX_LOADING)
+            thresholds.get("max_line_loading_pct", _limits().max_loading)
             if etype == "line"
-            else thresholds.get("max_trafo_loading_pct", _MAX_LOADING)
+            else thresholds.get("max_trafo_loading_pct", _limits().max_loading)
         )
         violation_mask = [v > threshold_pct for v in loading]
         n_viol = sum(violation_mask)
@@ -1735,8 +1762,8 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
     exp_viol = result.get("expected_violations", 0.0)
     sgen_sigma = result.get("samples_summary", {}).get("sgen_sigma", 0.15)
     thresholds = result.get("thresholds", {})
-    vm_upper = thresholds.get("vm_upper_pu", _VM_UPPER)
-    vm_lower = thresholds.get("vm_lower_pu", _VM_LOWER)
+    vm_upper = thresholds.get("vm_upper_pu", _limits().vm_upper)
+    vm_lower = thresholds.get("vm_lower_pu", _limits().vm_lower)
 
     subtitle = (
         f"{n_converged}/{n_samples} samples | "

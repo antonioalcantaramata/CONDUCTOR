@@ -5,7 +5,7 @@ The system prompt is built dynamically from live grid constants so it
 automatically reflects any network uploaded at runtime.
 """
 
-from .config import DEFAULT_GRID_CONSTANTS, get_grid_constants
+from .config import DEFAULT_GRID_CONSTANTS, fetch_grid_constants
 
 
 def build_system_prompt(gc: dict) -> str:
@@ -482,15 +482,42 @@ If the tool returns the no-time-series structured error, report it plainly and s
 """
 
 
+STALE_CONSTANTS_WARNING = """
+# ⚠️ CRITICAL — GRID IDENTITY UNVERIFIED
+
+The backend could not be reached, so the network description above is a
+**placeholder for a different grid** (the bundled example case). It is almost
+certainly NOT the network currently loaded.
+
+You must therefore:
+- **Never state the grid's name, size, topology, bus names, or voltage limits.**
+  Everything above describing the network is unreliable.
+- Tell the user the backend is unreachable and that you cannot identify the
+  loaded network, before anything else.
+- Do not invent or infer the grid's identity from the placeholder values.
+
+Tool calls read live data from the backend and will fail while it is down. If a
+tool does succeed, trust its result over anything in this description.
+""".strip()
+
+
 def get_system_prompt() -> str:
     """Return the system prompt built from live grid constants.
 
     Fetches /api/grid_constants from the backend on every call so the prompt
     automatically reflects any network uploaded at runtime.
-    Falls back to DEFAULT_GRID_CONSTANTS if the backend is unreachable.
+
+    If that fetch fails the prompt is built from placeholder constants for a
+    *different* network, so an explicit warning is appended instructing the
+    model not to describe the grid. Without it the agent states the placeholder
+    grid's name, bus names, and voltage limits with full confidence — which is
+    how a transient backend blip turns into confidently wrong operational advice.
     """
-    gc = get_grid_constants()
-    return build_system_prompt(gc)
+    status = fetch_grid_constants()
+    prompt = build_system_prompt(status.values)
+    if not status.live:
+        prompt = f"{prompt}\n\n{STALE_CONSTANTS_WARNING}"
+    return prompt
 
 
 # Backward-compatible module-level constant (uses fallback default constants

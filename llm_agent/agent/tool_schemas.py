@@ -13,13 +13,22 @@ from typing import Callable
 from google import genai
 
 from . import tools
-from .config import DEFAULT_GRID_CONSTANTS
 
-_SUBSTATION_NAMES_STR = ", ".join(
-    f"'{n}'" for n in DEFAULT_GRID_CONSTANTS["substation_names"]
+# Tool schemas are built once at import, so anything grid-specific baked in here
+# is frozen to whatever network happened to be the default — it does NOT follow
+# the network the user actually loads. Substation names and the slack-bus name
+# therefore live only in the system prompt, which is rebuilt from live backend
+# constants on every turn (see system_prompt.build_system_prompt). Descriptions
+# below point at it rather than repeating values that would go stale and
+# contradict it.
+_NAMES_FROM_PROMPT = (
+    "Use the exact substation names listed under 'Substation names' in the "
+    "system prompt; they describe the network currently loaded."
 )
 
-_SLACK_NAME = DEFAULT_GRID_CONSTANTS["slack_name"]
+_SLACK_FROM_PROMPT = (
+    "the external-grid slack, named under 'Grid connection' in the system prompt"
+)
 
 _LOAD_SCALING_DESC = (
     "Multiplier applied uniformly to all active and reactive loads. "
@@ -49,7 +58,7 @@ _ELEMENT_TYPE_DESC = (
 
 _DISABLED_GEN_DESC = (
     "List of substation names whose generators are forced offline. "
-    f"Valid names: [{_SUBSTATION_NAMES_STR}]. "
+    f"{_NAMES_FROM_PROMPT} "
     "Use when user asks about generator loss or islanding of a substation."
 )
 
@@ -80,9 +89,10 @@ _OPF_LAMBDA_Q_DESC = (
 _FIXED_SETPOINTS_DESC = (
     "Optional dict that pins specific generators or the external-grid slack to an exact MW value, "
     "preventing the OPF from changing their output. "
-    f'Example: {{"{_SLACK_NAME}": 5.0}} keeps external-grid import fixed at 5 MW. '
-    f'Example: {{"Bus_2": 3.0, "{_SLACK_NAME}": 0.0}} pins Bus_2 at 3 MW and fully isolates the external interface. '
-    f"Keys are substation names (generators) or \"{_SLACK_NAME}\" (ext. grid). "
+    f"Keys are substation names (generators) or {_SLACK_FROM_PROMPT}. "
+    f"{_NAMES_FROM_PROMPT} "
+    'Setting the slack entry to 5.0 keeps external-grid import fixed at 5 MW; '
+    'setting it to 0.0 fully isolates the external interface. '
     "Unspecified elements are free to redispatch normally."
 )
 
@@ -636,9 +646,9 @@ _get_element_timeseries = genai.types.FunctionDeclaration(
                 type=genai.types.Type.STRING,
                 description=(
                     "Name (or partial name) of the element to focus on. "
-                    f"For buses use substation name fragments: {_SUBSTATION_NAMES_STR}. "
-                    "Partial match is supported — 'Åkirkeby' matches both "
-                    "'Åkirkeby 10.5 kV' and 'Åkirkeby 60 kV'. "
+                    f"For buses use substation name fragments. {_NAMES_FROM_PROMPT} "
+                    "Partial match is supported — a fragment such as 'Åkirkeby' "
+                    "matches both 'Åkirkeby 10.5 kV' and 'Åkirkeby 60 kV'. "
                     "For lines and trafos use the element name from the network "
                     "(e.g. the name shown in the contingency results)."
                 ),

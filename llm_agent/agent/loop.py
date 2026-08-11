@@ -218,7 +218,10 @@ def run_agent_turn(
         "turn": len(session_log) + 1,
         "attempt_number": attempt_number,
         "conversation_id": conversation_id,
-        "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        # utcnow() is deprecated and naive; this keeps the identical wire format.
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
         "duration_s": duration_s,
         "status": turn_status,
         "error_classification": error_classification,

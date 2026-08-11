@@ -21,11 +21,17 @@ from agent.config import (
     BASE_URL,
     GEMINI_MODEL,
     HTTP_TIMEOUT,
+    last_grid_constants_status,
     OLLAMA_HOST,
     OLLAMA_KEEP_ALIVE,
     OLLAMA_NUM_CTX,
     OLLAMA_OUTPUT_RESERVE,
     OLLAMA_TIMEOUT_S,
+)
+from agent.config import (
+    fetch_grid_constants,
+    is_network_change,
+    network_fingerprint,
 )
 from agent.hardware import advice as hw_advice
 from agent.hardware import detect as detect_hardware
@@ -1586,6 +1592,27 @@ if "history" not in st.session_state:
 # us here, so it could not have been rendered on the launch screen itself.
 _show_warm_up_note()
 
+
+def _warn_if_grid_identity_unverified() -> None:
+    """
+    Say so when the agent doesn't actually know which network is loaded.
+
+    The system prompt falls back to constants for a *different* grid when the
+    backend is unreachable. The model is instructed not to describe the grid in
+    that state, but the user deserves to see it directly rather than inferring
+    it from hedged answers.
+    """
+    status = last_grid_constants_status()
+    if status is None or status.live:
+        return
+    st.error(
+        f"**Backend unreachable — the loaded network cannot be identified.**\n\n"
+        f"Analyses and grid details shown may be wrong. The assistant has been "
+        f"told not to describe the network until the backend responds again "
+        f"(`{BASE_URL}`).\n\n"
+        f"Reason: {status.error}"
+    )
+
 if "current_ts" not in st.session_state:
     ts_result = get_current_timestamp()
     st.session_state.current_ts = ts_result.get(
@@ -1639,6 +1666,33 @@ def _jump_to_timestamp(ts: str) -> str:
         return r.json().get("new_timestamp", ts)
     except Exception:
         return st.session_state.current_ts
+
+
+def _reset_if_network_changed() -> str | None:
+    """
+    Start a fresh conversation when the backend is serving a different network.
+
+    Prior history holds the *old* grid's tool results and the assistant's own
+    statements about them. Carrying that into a new network lets the model blend
+    two grids — the system prompt would describe the new one while its memory
+    describes the other. Correct constants do not help if the memory is wrong.
+
+    Returns the new network's name when a reset happened, else None.
+    """
+    status = fetch_grid_constants()
+    previous = st.session_state.get("_network_fingerprint")
+    changed = is_network_change(previous, status)
+
+    # Only record a fingerprint from a real fetch; the fallback constants
+    # describe a different grid and would look like a swap on recovery.
+    if status.live:
+        st.session_state._network_fingerprint = network_fingerprint(status.values)
+
+    if not changed:
+        return None
+
+    _reset_conversation_state()
+    return status.values.get("name") or "the loaded network"
 
 
 def _reset_conversation_state() -> None:
@@ -2118,6 +2172,13 @@ def _chat_input_fragment():
         return
 
     effective_input = typed.strip()
+
+    # Networks are uploaded by client-side JS straight to the backend, so no
+    # Python code runs when one is swapped and nothing clears the conversation.
+    # Detect it here — the last moment before stale history is sent to the model
+    # — rather than trusting any particular upload path to announce itself.
+    _swapped = _reset_if_network_changed()
+
     # If the timeline scrubber is parked on a forecast tick, the simulation clock
     # can't be there (forecasts are query-only), so steer the LLM to analyse that
     # forecast timestamp explicitly.
@@ -2135,6 +2196,14 @@ def _chat_input_fragment():
     st.session_state.messages.append({"role": "user", "text": effective_input, "charts": None})
 
     with work:
+        if _swapped:
+            st.info(
+                f"**Network changed — started a new conversation.**\n\n"
+                f"Now analysing **{_swapped}**. Earlier messages referred to a "
+                f"different network, so they were cleared rather than mixed into "
+                f"this one."
+            )
+
         with st.chat_message("user"):
             st.markdown(effective_input)
 
@@ -2176,6 +2245,9 @@ def _chat_input_fragment():
                     on_event=_on_event,
                 )
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
+                # The turn just refetched grid constants; if that failed, the
+                # answer above was produced without knowing the real network.
+                _warn_if_grid_identity_unverified()
             except RuntimeError as exc:
                 status_box.update(label="Error", state="error", expanded=True)
                 with status_box:

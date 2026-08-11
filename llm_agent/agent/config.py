@@ -7,6 +7,7 @@ GEMINI_API_KEY is required and raises EnvironmentError at import time if missing
 
 import logging
 import os
+from typing import NamedTuple
 
 import httpx
 from dotenv import load_dotenv
@@ -86,6 +87,14 @@ OLLAMA_TIMEOUT_S: float = float(os.environ.get("OLLAMA_TIMEOUT_S", "600"))
 # ---------------------------------------------------------------------------
 HTTP_TIMEOUT: float = float(os.environ.get("DT_HTTP_TIMEOUT", "120.0"))
 MAX_AGENT_TURNS: int = int(os.environ.get("DT_MAX_AGENT_TURNS", "8"))
+
+# Timeout for the per-turn grid-constants fetch. Previously 3s — far tighter
+# than everything else here — which meant a briefly busy backend silently
+# swapped the agent onto the wrong network. Missing this fetch is a correctness
+# problem, not a latency one, so it gets a realistic budget.
+GRID_CONSTANTS_TIMEOUT: float = float(
+    os.environ.get("DT_GRID_CONSTANTS_TIMEOUT", "15.0")
+)
 MODEL_REQUEST_TIMEOUT_MS: int = int(
     os.environ.get("DT_MODEL_REQUEST_TIMEOUT_MS", "180000")
 )
@@ -119,21 +128,99 @@ DEFAULT_GRID_CONSTANTS: dict = {
 }
 
 
-def get_grid_constants() -> dict:
-    """Fetch live grid constants from the backend /api/grid_constants endpoint.
+class GridConstants(NamedTuple):
+    """Grid constants plus whether they actually came from the backend."""
 
-    Called on every agent turn so the system prompt automatically reflects
-    any network uploaded at runtime.  Falls back to DEFAULT_GRID_CONSTANTS if
-    the backend is unreachable (e.g. during unit tests or early startup).
+    values: dict
+    live: bool
+    error: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.values.get("name", "Unknown Grid")
+
+
+# Status of the most recent fetch, so the UI can warn without re-querying.
+_last_fetch: GridConstants | None = None
+
+
+def fetch_grid_constants() -> GridConstants:
     """
+    Fetch live grid constants from the backend `/api/grid_constants`.
+
+    Returns the values *and* whether they are real. This distinction matters:
+    the fallback describes a completely different network (the bundled IEEE
+    14-bus case), so silently substituting it makes the agent describe a grid
+    that is not loaded — wrong bus names, wrong voltage limits, wrong topology —
+    with no indication anything went wrong. Callers must decide what to do about
+    a degraded fetch rather than being handed plausible-looking wrong data.
+    """
+    global _last_fetch
+
     try:
-        resp = httpx.get(f"{BASE_URL}/api/grid_constants", timeout=3.0)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.warning(
-            "GET /api/grid_constants returned %d — using fallback constants.",
-            resp.status_code,
+        resp = httpx.get(
+            f"{BASE_URL}/api/grid_constants", timeout=GRID_CONSTANTS_TIMEOUT
         )
-    except Exception as exc:
+        if resp.status_code == 200:
+            _last_fetch = GridConstants(values=resp.json(), live=True)
+            return _last_fetch
+        error = f"backend returned HTTP {resp.status_code}"
+        logger.warning(
+            "GET /api/grid_constants returned %d — falling back to %s.",
+            resp.status_code, DEFAULT_GRID_CONSTANTS["name"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
         logger.warning("Could not reach backend for grid constants: %s", exc)
-    return DEFAULT_GRID_CONSTANTS
+
+    _last_fetch = GridConstants(
+        values=DEFAULT_GRID_CONSTANTS, live=False, error=error
+    )
+    return _last_fetch
+
+
+def get_grid_constants() -> dict:
+    """Live grid constants, falling back to defaults. Prefer
+    `fetch_grid_constants()` when you need to know which you got."""
+    return fetch_grid_constants().values
+
+
+def network_fingerprint(values: dict) -> str:
+    """
+    A stable identity for the loaded network.
+
+    Built from the properties that cannot differ between two networks anyone
+    would consider the same: name, size, and bus names. Deliberately excludes
+    operating limits, which an operator may legitimately retune on the same
+    grid without it becoming a different one.
+    """
+    parts = [
+        str(values.get("name", "")),
+        str(values.get("n_substations", "")),
+        str(values.get("n_lines", "")),
+        str(values.get("n_trafos", "")),
+        ",".join(values.get("substation_names", []) or []),
+    ]
+    return "|".join(parts)
+
+
+def is_network_change(previous: str | None, status: GridConstants) -> bool:
+    """
+    Whether the backend is now serving a different network than `previous`.
+
+    Returns False for a degraded fetch even though the fallback constants
+    describe a different grid: a momentary backend outage must never be
+    mistaken for a network swap, because the caller's response is to discard
+    the user's conversation.
+
+    Also False when there is no previous fingerprint — the first observation
+    establishes the baseline rather than signalling a change.
+    """
+    if not status.live or previous is None:
+        return False
+    return previous != network_fingerprint(status.values)
+
+
+def last_grid_constants_status() -> GridConstants | None:
+    """The most recent fetch result, or None if none has happened yet."""
+    return _last_fetch
