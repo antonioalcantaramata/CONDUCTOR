@@ -185,6 +185,38 @@ def get_grid_constants() -> dict:
     return fetch_grid_constants().values
 
 
+class GridLimits(NamedTuple):
+    vm_lower: float
+    vm_upper: float
+    max_loading: float
+
+
+def grid_limits() -> GridLimits:
+    """
+    Voltage and loading limits for the network currently loaded.
+
+    Read at call time, not bound at import: these are the fallbacks charts use
+    when a tool result carries no thresholds of its own, and freezing them at
+    import pinned every chart to the bundled example network's limits regardless
+    of which grid was loaded.
+
+    Uses the most recent backend fetch — which the agent loop refreshes every
+    turn — so callers pay no HTTP request.
+
+    Lives here rather than in `renderers` so it can be used (and tested) without
+    pulling in plotly, which is a UI-only dependency absent from CI.
+    """
+    status = last_grid_constants_status()
+    values = status.values if status is not None else DEFAULT_GRID_CONSTANTS
+    return GridLimits(
+        vm_lower=values.get("vm_lower", DEFAULT_GRID_CONSTANTS["vm_lower"]),
+        vm_upper=values.get("vm_upper", DEFAULT_GRID_CONSTANTS["vm_upper"]),
+        max_loading=values.get(
+            "max_loading_pct", DEFAULT_GRID_CONSTANTS["max_loading_pct"]
+        ),
+    )
+
+
 def network_fingerprint(values: dict) -> str:
     """
     A stable identity for the loaded network.

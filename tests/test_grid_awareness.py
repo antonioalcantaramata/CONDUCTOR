@@ -14,11 +14,15 @@ these tests exist to keep them honest.
 
 import json
 
-from llm_agent.agent import config, renderers
+import pytest
+
+from llm_agent.agent import config
 from llm_agent.agent.providers.schema import to_json_schema_tools
 from llm_agent.agent.tool_schemas import TOOLS
 
-import pytest
+# Note: `grid_limits` is imported from config, not renderers. renderers pulls in
+# plotly, a UI-only dependency deliberately excluded from requirements-dev.txt,
+# so importing it here would break CI while passing locally.
 
 
 @pytest.fixture(autouse=True)
@@ -35,25 +39,25 @@ def _loaded(**values):
 
 class TestChartLimitsFollowTheLoadedNetwork:
     def test_defaults_apply_before_any_fetch(self):
-        limits = renderers._limits()
+        limits = config.grid_limits()
         assert limits.vm_lower == config.DEFAULT_GRID_CONSTANTS["vm_lower"]
         assert limits.vm_upper == config.DEFAULT_GRID_CONSTANTS["vm_upper"]
 
     def test_limits_track_the_loaded_network(self):
         _loaded(vm_lower=0.90, vm_upper=1.10, max_loading_pct=80.0)
-        assert renderers._limits() == (0.90, 1.10, 80.0)
+        assert config.grid_limits() == (0.90, 1.10, 80.0)
 
     def test_limits_are_not_frozen_at_import(self):
         """A network swap mid-session must move the threshold lines."""
         _loaded(vm_lower=0.90, vm_upper=1.10, max_loading_pct=80.0)
-        first = renderers._limits()
+        first = config.grid_limits()
         _loaded(vm_lower=0.95, vm_upper=1.05, max_loading_pct=120.0)
-        assert renderers._limits() != first
+        assert config.grid_limits() != first
 
     def test_missing_keys_fall_back_individually(self):
         # A sparse payload must not wipe out the other limits.
         _loaded(vm_lower=0.85)
-        limits = renderers._limits()
+        limits = config.grid_limits()
         assert limits.vm_lower == 0.85
         assert limits.vm_upper == config.DEFAULT_GRID_CONSTANTS["vm_upper"]
 
@@ -61,7 +65,7 @@ class TestChartLimitsFollowTheLoadedNetwork:
         config._last_fetch = config.GridConstants(
             values=config.DEFAULT_GRID_CONSTANTS, live=False, error="down"
         )
-        limits = renderers._limits()
+        limits = config.grid_limits()
         assert limits.vm_lower < limits.vm_upper
 
 
