@@ -90,6 +90,10 @@ def _get(endpoint: str) -> dict:
         return {"error": str(exc), "endpoint": url, "status_code": None}
 
 
+# Enough to describe a substation without ever returning a network.
+_MAX_NEIGHBOURS = 12
+
+
 def _record(name: str, result: dict) -> dict:
     """Append result to _last_tool_results and return it."""
     _last_tool_results.append((name, result))
@@ -624,6 +628,102 @@ def get_element_timeseries(
 # 2.x — Current network conditions snapshot
 # ---------------------------------------------------------------------------
 
+def locate_network_element(element: str, **kwargs) -> dict:
+    """
+    GET /api/network/topology, resolved locally to one element.
+
+    Answers "what is X, and what is it joined to" — and returns the index each
+    neighbouring branch has, which is what the contingency and optimisation
+    tools need to act on it.
+
+    Exists because the model had no way to turn a name into an index. Asked
+    which substations would lose supply if the line between Olsker and
+    Østerlars were out, it guessed `element_index=11` — the Nexø–Bodilsker
+    line — ran a perfectly good contingency on it, and reported the result as
+    the answer. Every figure was real and the element was wrong.
+
+    The full topology never reaches the model: it is thousands of tokens on a
+    small network and hundreds of thousands on a large one. Only the matched
+    element and its immediate neighbours are returned.
+    """
+    topology = _get("/api/network/topology")
+    if "error" in topology:
+        return topology
+
+    wanted = str(element or "").strip()
+    if not wanted:
+        return {"error": "locate_network_element needs the name of a bus, line or transformer."}
+
+    buses = {int(b["index"]): b for b in topology.get("buses") or []}
+    branches = topology.get("branches") or []
+    folded = wanted.casefold()
+
+    matches = [b for b in buses.values() if str(b.get("name", "")).casefold() == folded]
+    if len(matches) > 1:
+        # Bus names repeat on real networks; guessing which one is meant is
+        # exactly the error this tool exists to prevent.
+        return {
+            "error": f"{wanted!r} matches {len(matches)} buses; say which by index.",
+            "candidates": [{"index": b["index"], "name": b["name"], "vn_kv": b["vn_kv"]}
+                           for b in matches],
+        }
+
+    if matches:
+        bus = matches[0]
+        index = int(bus["index"])
+        neighbours = []
+        for branch in branches:
+            ends = (int(branch["from_bus"]), int(branch["to_bus"]))
+            if index not in ends:
+                continue
+            other = ends[1] if ends[0] == index else ends[0]
+            neighbours.append({
+                "name": buses.get(other, {}).get("name", f"Bus_{other}"),
+                "bus_index": other,
+                "via": branch["name"],
+                "branch_kind": branch["kind"],
+                # The name the contingency and optimisation tools expect.
+                "element_type": branch["kind"],
+                "element_index": int(branch["index"]),
+                "in_service": branch.get("in_service", True),
+            })
+        return _record("locate_network_element", {
+            "element": bus["name"],
+            "kind": "bus",
+            "bus_index": index,
+            "vn_kv": bus.get("vn_kv"),
+            "in_service": bus.get("in_service", True),
+            "connected_to": neighbours[:_MAX_NEIGHBOURS],
+            "n_connections": len(neighbours),
+            "truncated": len(neighbours) > _MAX_NEIGHBOURS,
+        })
+
+    branch_matches = [b for b in branches
+                      if folded in str(b.get("name", "")).casefold()]
+    if len(branch_matches) == 1:
+        branch = branch_matches[0]
+        return _record("locate_network_element", {
+            "element": branch["name"],
+            "kind": branch["kind"],
+            "element_type": branch["kind"],
+            "element_index": int(branch["index"]),
+            "between": [buses.get(int(branch["from_bus"]), {}).get("name"),
+                        buses.get(int(branch["to_bus"]), {}).get("name")],
+            "in_service": branch.get("in_service", True),
+        })
+    if len(branch_matches) > 1:
+        return {
+            "error": f"{wanted!r} matches {len(branch_matches)} branches; name one exactly.",
+            "candidates": [{"element_index": b["index"], "name": b["name"],
+                            "element_type": b["kind"]} for b in branch_matches[:10]],
+        }
+
+    return {
+        "error": f"No bus, line or transformer is named {wanted!r}.",
+        "known_buses": sorted({str(b.get("name")) for b in buses.values()})[:20],
+    }
+
+
 def get_current_conditions(**kwargs) -> dict:
     """
     POST /api/network/snapshot
@@ -1092,6 +1192,11 @@ def optimize_robust_flexibility(
         body["alpha"] = alpha
     if target_p_any is not None:
         body["target_p_any"] = target_p_any
+    # Everything else the caller passed, `timestamp` and `data_source` above
+    # all. Without this the endpoint — which accepts both, via
+    # `_TimeseriesRequest` — silently runs at the simulation clock while the
+    # rest of the answer describes the requested operating point.
+    body.update(kwargs)
     result = _post("/api/flexibility/robust", body)
     return _record("optimize_robust_flexibility", result)
 
@@ -1316,3 +1421,44 @@ def compute_historical_risk(
                 }
 
     return _record("compute_historical_risk", result)
+
+
+def compute_violation_attribution(
+    timestamp: str | None = None,
+    data_source: str = "measurements",
+    load_scaling_factor: float = 1.0,
+    vm_lower_pu: float | None = None,
+    vm_upper_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
+    top_n_sources: int = 20,
+    top_n_drivers: int = 5,
+    **kwargs,
+) -> dict:
+    """Rank the injections driving each violated element at one operating point."""
+    unsupported = _unsupported_kwargs_result(
+        "compute_violation_attribution", kwargs,
+        {"sgen_scaling_factor", "delta_mw", "delta_mvar"},
+    )
+    if unsupported is not None:
+        return unsupported
+
+    body = {
+        "data_source": data_source,
+        "load_scaling_factor": load_scaling_factor,
+        "top_n_sources": top_n_sources,
+        "top_n_drivers": top_n_drivers,
+        **kwargs,
+    }
+    if timestamp is not None:
+        body["timestamp"] = _expand_day_prefix(timestamp)
+    for key, value in (
+        ("vm_lower_pu", vm_lower_pu),
+        ("vm_upper_pu", vm_upper_pu),
+        ("max_line_loading_pct", max_line_loading_pct),
+        ("max_trafo_loading_pct", max_trafo_loading_pct),
+    ):
+        if value is not None:
+            body[key] = value
+
+    return _record("compute_violation_attribution", _post("/api/rsa/attribution", body))

@@ -2069,6 +2069,82 @@ async def health():
     }
 
 
+@app.get("/api/network/topology")
+async def network_topology():
+    """Buses and branches of the network currently loaded.
+
+    The shape of the system, so a caller can draw it or reason about how it is
+    connected. `/api/grid_constants` reports counts and names; this reports
+    what is joined to what.
+
+    Read from the live network rather than from the file it came from: after
+    an upload the two differ, and a picture drawn from the file would show a
+    system nobody is analysing.
+    """
+    net = app_data["net"]
+
+    buses = [
+        {
+            "index": int(idx),
+            "name": _bus_display_name(net, int(idx)),
+            "vn_kv": _safe_float(net.bus.at[idx, "vn_kv"]) or 0.0,
+            "in_service": bool(net.bus.at[idx, "in_service"])
+            if "in_service" in net.bus.columns else True,
+        }
+        for idx in net.bus.index
+    ]
+
+    branches = []
+    for idx in net.line.index:
+        branches.append({
+            "index": int(idx),
+            "name": _line_display_name(net, int(idx)),
+            "from_bus": int(net.line.at[idx, "from_bus"]),
+            "to_bus": int(net.line.at[idx, "to_bus"]),
+            "kind": "line",
+            "in_service": bool(net.line.at[idx, "in_service"])
+            if "in_service" in net.line.columns else True,
+        })
+    for idx in net.trafo.index:
+        raw = _clean_label(net.trafo.at[idx, "name"]) if "name" in net.trafo.columns else ""
+        hv, lv = int(net.trafo.at[idx, "hv_bus"]), int(net.trafo.at[idx, "lv_bus"])
+        branches.append({
+            "index": int(idx),
+            "name": raw or f"Trafo_{hv}-{lv}_{int(idx)}",
+            "from_bus": hv,
+            "to_bus": lv,
+            "kind": "trafo",
+            "in_service": bool(net.trafo.at[idx, "in_service"])
+            if "in_service" in net.trafo.columns else True,
+        })
+
+    external_grids = [
+        {
+            "name": _clean_label(net.ext_grid.at[idx, "name"]) or f"External grid {position + 1}",
+            "bus": int(net.ext_grid.at[idx, "bus"]),
+            "in_service": bool(net.ext_grid.at[idx, "in_service"])
+            if "in_service" in net.ext_grid.columns else True,
+        }
+        for position, idx in enumerate(net.ext_grid.index)
+    ]
+
+    profile = app_data.get("grid_profile", {}) or {}
+    return {
+        "name": str(profile.get("name") or getattr(net, "name", "") or "network"),
+        "buses": buses,
+        "branches": branches,
+        "external_grids": external_grids,
+        "counts": {
+            "buses": len(buses),
+            "lines": int(len(net.line)),
+            "trafos": int(len(net.trafo)),
+            "loads": int(len(net.load)),
+            "generators": int(len(net.sgen)) + int(len(net.gen)),
+        },
+        "voltage_levels": sorted({b["vn_kv"] for b in buses}, reverse=True),
+    }
+
+
 @app.get("/api/grid_constants")
 async def get_grid_constants_endpoint():
     """Return grid metadata for the currently loaded network.
@@ -2707,13 +2783,23 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
         slack_name = "Slack"
 
     # --- Generators: read from assigned p_mw / q_mvar columns directly ---
+    #
+    # Each entry carries the bus it sits on as well as its own name. A unit is
+    # named after its substation while a bus is named with its voltage level
+    # ("Viadukten" against "Viadukten A"), so a caller given only the name has
+    # to guess which bus is meant — and on this network three units have no
+    # bus of the same name at all. The bus is known here; reporting it removes
+    # the guess.
     generators = []
     if not net_copy.sgen.empty:
         key_col = "substation_name" if "substation_name" in net_copy.sgen.columns else "name"
         for _, row in net_copy.sgen.iterrows():
-            name = str(row.get(key_col) or "").strip() or f"Bus_{row['bus']}"
+            bus_id = int(row["bus"])
+            name = str(row.get(key_col) or "").strip() or f"Bus_{bus_id}"
             generators.append({
                 "name": name,
+                "bus": _bus_display_name(net_copy, bus_id),
+                "bus_index": bus_id,
                 "Pg_mw": _safe_float(row["p_mw"]) or 0.0,
                 "Qg_mvar": _safe_float(row.get("q_mvar") or 0.0) or 0.0,
                 "Pg_max_mw": _safe_float(PG_MAX_DATA[name]) if name in PG_MAX_DATA else None,
@@ -2726,6 +2812,8 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
             name = str(raw_name).strip() if (raw_name and str(raw_name).strip()) else f"Gen_bus{bus_id}"
             generators.append({
                 "name": name,
+                "bus": _bus_display_name(net_copy, bus_id),
+                "bus_index": bus_id,
                 "Pg_mw": _safe_float(row["p_mw"]) or 0.0,
                 "Qg_mvar": 0.0,
                 "Pg_max_mw": _safe_float(row.get("max_p_mw") or 0.0) or 0.0,
@@ -2740,6 +2828,9 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
         label = str(bus_name).strip() if (bus_name and str(bus_name).strip()) else f"Bus_{bus_id}"
         loads.append({
             "bus": label,
+            # Bus names are not unique on every network — this one has four
+            # buses sharing a name — so the index is reported alongside it.
+            "bus_index": bus_id,
             "P_mw": _safe_float(row["p_mw"]) or 0.0,
             "Q_mvar": _safe_float(row.get("q_mvar") or 0.0) or 0.0,
         })
@@ -3812,12 +3903,22 @@ def _run_probabilistic_sample(
     viol_lines: list[str] = []
     viol_trafos: list[str] = []
     bus_vm: dict[str, float] = {}
+    excluded_buses: list[str] = []
 
     for bus_idx, row in net_copy.res_bus.iterrows():
         raw_name = net_copy.bus.at[bus_idx, "name"] if has_bus_names else None
         name = _clean_label(raw_name) or f"Bus_{int(bus_idx)}"
-        bus_vm[name] = round(float(row["vm_pu"]), 5)
-        if row["vm_pu"] > vm_upper_pu or row["vm_pu"] < vm_lower_pu:
+        vm = float(row["vm_pu"])
+        # Out-of-service buses come back with vm_pu = NaN. Carried through,
+        # they made the whole response unserialisable — json.dumps rejects NaN
+        # and the endpoint returned 500 with the analysis already done — and
+        # they corrupt the percentile sort, since NaN has no ordering. Skipped
+        # and reported, the way the OPF endpoints already handle them.
+        if not math.isfinite(vm):
+            excluded_buses.append(name)
+            continue
+        bus_vm[name] = round(vm, 5)
+        if vm > vm_upper_pu or vm < vm_lower_pu:
             viol_buses.append(name)
 
     for line_idx, row in net_copy.res_line.iterrows():
@@ -3843,6 +3944,7 @@ def _run_probabilistic_sample(
         "viol_lines": viol_lines,
         "viol_trafos": viol_trafos,
         "bus_vm": bus_vm,
+        "excluded_buses": excluded_buses,
         "total_violations": len(viol_buses) + len(viol_lines) + len(viol_trafos),
     }
 
@@ -3935,6 +4037,14 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     has_bus_names = "name" in net_base.bus.columns
     has_line_names = "name" in net_base.line.columns
     has_trafo_names = "name" in net_base.trafo.columns
+
+    out_of_service_names = {
+        _clean_label(net_base.bus.at[idx, "name"] if has_bus_names else None)
+        or f"Bus_{int(idx)}"
+        for idx in net_base.bus.index
+        if "in_service" in net_base.bus.columns
+        and not bool(net_base.bus.at[idx, "in_service"])
+    }
 
     # Generation uncertainty inputs (Step 2), with all sgens treated as
     # uncertain generators for now (Step 1 intentionally skipped).
@@ -4033,10 +4143,25 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     max_viol = max(total_viol_dist) if total_viol_dist else 0
     viol_histogram = {k: total_viol_dist.count(k) for k in range(max_viol + 1)}
 
+    # Buses with no finite voltage in any sample. Reported rather than
+    # dropped silently, so a caller can tell "this bus is secure" apart from
+    # "this bus was never assessed" — the same distinction the OPF endpoints
+    # make with excluded_buses_post_opf.
+    excluded_bus_names = sorted({
+        name for r in converged for name in r.get("excluded_buses") or ()
+    })
+    excluded_buses = [
+        {"bus_name": name,
+         "reason": "out_of_service" if name in out_of_service_names else "non_finite_voltage"}
+        for name in excluded_bus_names
+    ]
+
     return {
         "timestamp": ts,
         "n_samples": n,
         "n_converged": n_converged,
+        "excluded_buses": excluded_buses,
+        "excluded_bus_count": len(excluded_buses),
         "p_any_violation": round(any_violation_count / n_converged, 4),
         "expected_violations": round(sum(total_viol_dist) / n_converged, 3),
         "bus_violation_probability": _to_prob(bus_viol_counts),
@@ -4217,6 +4342,46 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
     }
 
 
+def _supply_lost(net, element_type: str, element_index: int) -> dict:
+    """Which buses the outage leaves without a path to a source.
+
+    Answers the question an operator actually asks of a contingency — "what
+    goes dark" — which the violation table cannot. Zero violations does not
+    mean nothing was islanded: an unsupplied bus has no voltage to violate.
+
+    Without this the agent had no way to answer it and tried to walk the
+    network one lookup at a time, exhausting its turn budget before saying
+    anything. Computing it here costs one graph traversal.
+    """
+    try:
+        import pandapower.topology as top
+
+        unsupplied = sorted(int(b) for b in top.unsupplied_buses(net))
+    except Exception:  # noqa: BLE001
+        return {"supply_analysis": "unavailable for this network"}
+
+    named = [_bus_display_name(net, b) for b in unsupplied]
+    # Loads are what an operator means by "loses supply"; a de-energised bus
+    # with nothing on it is not an outage anyone notices.
+    affected_load_mw = 0.0
+    if not net.load.empty and "bus" in net.load.columns:
+        affected_load_mw = float(
+            net.load.loc[net.load["bus"].astype(int).isin(unsupplied), "p_mw"].sum()
+        )
+
+    return {
+        "unsupplied_buses": named,
+        "unsupplied_bus_count": len(named),
+        "unsupplied_load_mw": round(affected_load_mw, 4),
+        "supply_analysis": (
+            "Every bus keeps a path to a source; nothing is islanded."
+            if not named else
+            f"{len(named)} bus(es) lose their path to a source with "
+            f"{element_type} {element_index} out."
+        ),
+    }
+
+
 @app.post("/api/contingency/simulate")
 async def simulate_contingency(request: ContingencyRequest):
     """Single-element N-1 outage simulation *without* corrective action.
@@ -4262,8 +4427,10 @@ async def simulate_contingency(request: ContingencyRequest):
 
     if isinstance(df_results_ca, list): df_results_ca = pd.DataFrame(df_results_ca)
 
-    if df_results_ca.empty: return {"timestamp": current_ts, "system_secure": True, "total_violations": 0,
-                                    "violations": []}
+    if df_results_ca.empty:
+        return {"timestamp": current_ts, "system_secure": True, "total_violations": 0,
+                "violations": [],
+                **_supply_lost(net_copy, request.element_type, request.element_index)}
 
     element_names = []
     for _, row in df_results_ca.iterrows():
@@ -4287,7 +4454,8 @@ async def simulate_contingency(request: ContingencyRequest):
     # Placeholder: publish_ca_results(df_results_ca, current_ts, topic="topic6913"...)
 
     return {"timestamp": current_ts, "system_secure": False, "total_violations": len(df_results_ca),
-            "violations": df_results_ca.to_dict(orient="records")}
+            "violations": df_results_ca.to_dict(orient="records"),
+            **_supply_lost(net_copy, request.element_type, request.element_index)}
 
 
 @app.post("/api/contingency/simulate_all")
@@ -5412,6 +5580,12 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         p_any_prev = float(eval_cal["p_any"])
 
         flex_req = FlexibilityRequest(
+            # The operating point must follow the request into the sub-call.
+            # Without it the OPF resolved its own tick from the simulation
+            # clock and solved a different day than the back-off calibration
+            # above, then stamped the whole robust result with that day.
+            timestamp=request.timestamp,
+            data_source=request.data_source,
             load_scaling_factor=request.load_scaling_factor,
             slack_max_mw=request.slack_max_mw,
             opf_vm_upper=request.vm_upper_pu,
@@ -6568,13 +6742,34 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
         raise HTTPException(status_code=400, detail="p_max_search_mw must be > 0.")
 
     def _base_q_for_bus(local_bus_idx: int) -> float:
-        if "bus" in net_base.sgen.columns and not net_base.sgen.empty:
-            sgen_rows = net_base.sgen[net_base.sgen["bus"].astype(int) == int(local_bus_idx)]
-            if not sgen_rows.empty and "q_mvar" in net_base.res_sgen.columns:
-                return -0.5 * float(net_base.res_sgen.loc[sgen_rows.index, "q_mvar"].sum())
-            if not sgen_rows.empty and "q_mvar" in net_base.sgen.columns:
-                return -0.5 * float(sgen_rows["q_mvar"].sum())
-        return 0.0
+        """Reactive baseline of the units already at this bus.
+
+        `res_sgen` holds only the units the power flow actually solved, so an
+        out-of-service sgen is present in `sgen` and absent from `res_sgen`.
+        Indexing the results by the setpoint table's index then raises
+        KeyError and the endpoint 500s — which it did, on a bus with such a
+        unit. The solved rows are used where they exist and the setpoint
+        elsewhere, rather than choosing one table for all of them.
+        """
+        if "bus" not in net_base.sgen.columns or net_base.sgen.empty:
+            return 0.0
+        sgen_rows = net_base.sgen[net_base.sgen["bus"].astype(int) == int(local_bus_idx)]
+        if sgen_rows.empty:
+            return 0.0
+
+        res = getattr(net_base, "res_sgen", None)
+        solved = sgen_rows.index[:0]
+        total = 0.0
+        if res is not None and "q_mvar" in getattr(res, "columns", []):
+            solved = sgen_rows.index.intersection(res.index)
+            if len(solved):
+                total += float(res.loc[solved, "q_mvar"].sum())
+
+        unsolved = sgen_rows.index.difference(solved)
+        if len(unsolved) and "q_mvar" in sgen_rows.columns:
+            total += float(sgen_rows.loc[unsolved, "q_mvar"].sum())
+
+        return -0.5 * total
 
     bus_targets = (
         [{"bus_index": int(idx), "bus": _bus_display_name(net_base, int(idx))} for idx in net_base.bus.index]
@@ -7468,3 +7663,75 @@ async def push_eddk_data():
     end-to-end happy path can be demoed without a live upload.
     """
     return {"status": "success", "message": "Simulation results successfully pushed to EDDK Data Space."}
+
+
+class AttributionRequest(GridRequest):
+    """Request body for ``POST /api/rsa/attribution``.
+
+    Attributes
+    top_n_sources : int
+        Cap on how many injections are perturbed, largest first. Each source
+        costs two power flows, so this bounds runtime on large networks.
+    top_n_drivers : int
+        How many ranked drivers to return per violated element.
+    delta_mw / delta_mvar : float
+        Finite-difference step sizes. Small enough that the linearisation
+        holds, large enough to stay clear of the power flow's tolerance.
+    """
+    top_n_sources: int = 20
+    top_n_drivers: int = 5
+    delta_mw: float = 0.1
+    delta_mvar: float = 0.1
+
+
+@app.post("/api/rsa/attribution")
+async def violation_attribution(request: AttributionRequest):
+    """Rank the injections driving each violated element at one operating point.
+
+    The security engines report *which* elements violate. This reports *what is
+    driving them*, by measuring the sensitivity of each violated quantity to each
+    injection on the same validated power flow — perturb, re-solve, measure.
+
+    Returns per-violation driver rankings with the movement each source would
+    need to clear the violation. Percentage contribution shares are deliberately
+    not reported: they require choosing a baseline, and different baselines give
+    different answers.
+
+    ``app_data["current_index"]`` is **never mutated** by this endpoint.
+    """
+    import attribution_engine as attr
+
+    (request.vm_lower_pu, request.vm_upper_pu,
+     request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
+    ts = _resolve_tick(request.data_source, request.timestamp)
+
+    meas = prepare_measurement_df(_lookup_measurement_df(ts))
+    net_copy = copy.deepcopy(app_data["net"])
+    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
+    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
+    net_copy.load["p_mw"] *= request.load_scaling_factor
+    net_copy.load["q_mvar"] *= request.load_scaling_factor
+    if request.sgen_scaling_factor != 1.0:
+        net_copy.sgen["p_mw"] *= request.sgen_scaling_factor
+        net_copy.sgen["q_mvar"] *= request.sgen_scaling_factor
+
+    result = attr.attribute_violations(
+        net_copy,
+        timestamp=str(ts),
+        vm_lower=request.vm_lower_pu,
+        vm_upper=request.vm_upper_pu,
+        max_line_loading_pct=request.max_line_loading_pct,
+        max_trafo_loading_pct=request.max_trafo_loading_pct,
+        delta_mw=request.delta_mw,
+        delta_mvar=request.delta_mvar,
+        top_n_sources=request.top_n_sources,
+        top_n_drivers=request.top_n_drivers,
+    )
+    result["data_source"] = request.data_source
+    result["thresholds_used"] = {
+        "vm_lower_pu": request.vm_lower_pu,
+        "vm_upper_pu": request.vm_upper_pu,
+        "max_line_loading_pct": request.max_line_loading_pct,
+        "max_trafo_loading_pct": request.max_trafo_loading_pct,
+    }
+    return result

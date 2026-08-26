@@ -231,3 +231,155 @@ class TestSystemPromptIsFreshPerTurn:
         provider._responses = [ModelResponse(text="b")]
         loop_module.run_agent_turn("two", [])
         assert provider.calls[-1]["system"] == "CHANGED"
+
+
+class TestParameterIntegrity:
+    """The guard must sit before dispatch, not after."""
+
+    def test_impossible_parameters_never_reach_the_tool(self, stub):
+        calls = []
+
+        def spy(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        stub([
+            # An inverted voltage band: no parameterisation satisfies it.
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {"vm_lower_pu": 1.05,
+                                                          "vm_upper_pu": 0.95})]),
+            ModelResponse(text="corrected"),
+        ], tools={"run_rsa": spy})
+
+        text, history = loop_module.run_agent_turn("check security", [])
+        assert calls == [], "the solver ran on parameters that cannot be satisfied"
+        assert "invalid_parameters" in history[2]["content"]
+        assert text == "corrected"
+
+    def test_the_model_is_told_what_to_fix(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {"load_sigma": 5.0})]),
+            ModelResponse(text="done"),
+        ], tools={"run_rsa": lambda **k: {"ok": True}})
+
+        _, history = loop_module.run_agent_turn("go", [])
+        assert "load_sigma" in history[2]["content"]["invalid_parameters"]
+
+    def test_rejection_emits_an_event(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {"n_samples": -1})]),
+            ModelResponse(text="done"),
+        ], tools={"run_rsa": lambda **k: {"ok": True}})
+
+        events = []
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append(e))
+        assert "tool_rejected" in events
+        assert "tool_start" not in events
+
+    def test_valid_parameters_still_execute(self, stub):
+        calls = []
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {"vm_lower_pu": 0.95,
+                                                           "vm_upper_pu": 1.05})]),
+            ModelResponse(text="secure"),
+        ], tools={"run_rsa": lambda **k: calls.append(k) or {"ok": True}})
+
+        text, _ = loop_module.run_agent_turn("go", [])
+        assert len(calls) == 1
+        assert text == "secure"
+
+    def test_self_contradictory_results_are_annotated_not_dropped(self, stub):
+        payload = {
+            "total_violations": 0,
+            "violations": [],
+            "all_voltages": [{"bus_name": "S3", "vm_pu": 1.09}],
+            "thresholds_used": {"vm_lower_pu": 0.95, "vm_upper_pu": 1.05},
+            "gen_dispatch": {"S3": 3.5},
+        }
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {})]),
+            ModelResponse(text="reported"),
+        ], tools={"run_rsa": lambda **k: payload})
+
+        _, history = loop_module.run_agent_turn("go", [])
+        tool_msg = history[2]["content"]
+        assert tool_msg["_integrity_warnings"], "contradiction was not surfaced"
+        # The model still needs the underlying data.
+        assert tool_msg["gen_dispatch"] == {"S3": 3.5}
+
+    def test_consistent_results_are_not_annotated(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {})]),
+            ModelResponse(text="ok"),
+        ], tools={"run_rsa": lambda **k: {"total_violations": 0, "violations": []}})
+
+        _, history = loop_module.run_agent_turn("go", [])
+        assert "_integrity_warnings" not in history[2]["content"]
+
+
+class TestCrossToolConsistency:
+    """Reproduces a live failure: a chain that silently mixed two operating points."""
+
+    def test_a_chain_on_two_different_timestamps_is_flagged(self, stub):
+        # The model passed an explicit timestamp to the assessment and dropped it
+        # from the follow-up, which fell back to the simulation clock.
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {"timestamp": "2022-01-02 21:45"})]),
+            ModelResponse(tool_calls=[ToolCall("attribution", {})]),
+            ModelResponse(text="combined answer"),
+        ], tools={
+            "run_rsa": lambda **k: {"timestamp": "2022-01-02 21:45:00", "total_violations": 11},
+            "attribution": lambda **k: {"timestamp": "2022-01-01 00:00:00", "violations": []},
+        })
+
+        _, history = loop_module.run_agent_turn("assess then explain", [])
+        second_result = history[4]["content"]
+        assert second_result["_integrity_warnings"], "the mismatch went unreported"
+        assert "different operating points" in second_result["_integrity_warnings"][0]["message"]
+
+    def test_a_consistent_chain_is_not_flagged(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("run_rsa", {})]),
+            ModelResponse(tool_calls=[ToolCall("attribution", {})]),
+            ModelResponse(text="done"),
+        ], tools={
+            "run_rsa": lambda **k: {"timestamp": "2022-01-02 21:45:00"},
+            "attribution": lambda **k: {"timestamp": "2022-01-02 21:45:00"},
+        })
+        _, history = loop_module.run_agent_turn("go", [])
+        assert "_integrity_warnings" not in history[4]["content"]
+
+    def test_mixing_measurements_and_forecasts_is_flagged(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("a", {})]),
+            ModelResponse(tool_calls=[ToolCall("b", {})]),
+            ModelResponse(text="done"),
+        ], tools={
+            "a": lambda **k: {"data_source": "measurements"},
+            "b": lambda **k: {"data_source": "forecasts"},
+        })
+        _, history = loop_module.run_agent_turn("go", [])
+        assert history[4]["content"]["_integrity_warnings"]
+
+    def test_the_mismatch_reaches_the_user_interface(self, stub):
+        stub([
+            ModelResponse(tool_calls=[ToolCall("a", {})]),
+            ModelResponse(tool_calls=[ToolCall("b", {})]),
+            ModelResponse(text="done"),
+        ], tools={
+            "a": lambda **k: {"timestamp": "2022-01-02 21:45:00"},
+            "b": lambda **k: {"timestamp": "2022-01-01 00:00:00"},
+        })
+        events = []
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append(e))
+        assert "integrity_warning" in events
+
+    def test_tracking_is_per_turn_not_per_session(self, stub):
+        """A new question at a new timestamp is not a mismatch."""
+        stub([ModelResponse(tool_calls=[ToolCall("a", {})]), ModelResponse(text="one")],
+             tools={"a": lambda **k: {"timestamp": "2022-01-02 21:45:00"}})
+        _, history = loop_module.run_agent_turn("first", [])
+
+        stub([ModelResponse(tool_calls=[ToolCall("a", {})]), ModelResponse(text="two")],
+             tools={"a": lambda **k: {"timestamp": "2022-03-01 08:00:00"}})
+        _, history2 = loop_module.run_agent_turn("second", history)
+        assert "_integrity_warnings" not in history2[-2]["content"]

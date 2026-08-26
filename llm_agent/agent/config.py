@@ -7,6 +7,7 @@ GEMINI_API_KEY is required and raises EnvironmentError at import time if missing
 
 import logging
 import os
+import pathlib
 from typing import NamedTuple
 
 import httpx
@@ -102,6 +103,27 @@ MODEL_RETRY_ATTEMPTS: int = int(os.environ.get("DT_MODEL_RETRY_ATTEMPTS", "10"))
 MODEL_OVERLOADED_RETRY_DELAY_S: int = int(
     os.environ.get("DT_MODEL_OVERLOADED_RETRY_DELAY_S", "90")
 )
+
+# ---------------------------------------------------------------------------
+# Session logging
+# ---------------------------------------------------------------------------
+# Every turn is written as one JSON line holding the prompt, the resolved tool
+# calls, the full tool results and the answer. That record is the only durable
+# evidence of what the agent actually did, and the offline graders in
+# `evaluation/` read nothing else.
+#
+# It used to be a single file truncated at process start, so each run destroyed
+# the one before it and nothing could be graded after the fact. Runs now get
+# their own file and `last_session.jsonl` is kept as a pointer to the newest,
+# so existing habits still work.
+SESSION_LOG_DIR: str = os.environ.get(
+    "CONDUCTOR_SESSION_LOG_DIR",
+    str(pathlib.Path(__file__).parent.parent / "session_logs"),
+)
+
+# An explicit file overrides the per-run name, so a batch sweep can collect
+# every turn it runs in one place.
+SESSION_LOG_PATH: str = os.environ.get("CONDUCTOR_SESSION_LOG", "")
 
 # ---------------------------------------------------------------------------
 # Default grid constants — fallback only.

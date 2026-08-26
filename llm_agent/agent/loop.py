@@ -14,13 +14,27 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import pathlib
 import time
 from typing import Callable
 
 from . import tools as _tools_module
-from .config import MAX_AGENT_TURNS
+from .config import (
+    MAX_AGENT_TURNS,
+    SESSION_LOG_DIR,
+    SESSION_LOG_PATH,
+    last_grid_constants_status,
+)
 from .errors import classify_error
+from .validators import (
+    TurnConsistency,
+    TurnOperatingPoint,
+    annotate,
+    requested_timestamps,
+    validate_call,
+    validate_result,
+)
 from .providers import (
     assistant_message,
     get_provider,
@@ -32,31 +46,113 @@ from .tool_schemas import TOOL_DISPATCH, TOOLS
 
 logger = logging.getLogger(__name__)
 
+
+def _tool_argument_names() -> dict[str, set[str]]:
+    """Arguments each tool accepts, so nothing is injected into a tool that
+    would reject it."""
+    from .providers.schema import to_json_schema_tools
+
+    names: dict[str, set[str]] = {}
+    for tool in to_json_schema_tools(TOOLS):
+        fn = tool["function"]
+        names[fn["name"]] = set((fn.get("parameters") or {}).get("properties") or {})
+    return names
+
+
+_TOOL_ARGS = _tool_argument_names()
+
 # Attempt tracking — per-conversation attempt counter
 _attempt_counter: dict[str, int] = {}
 
 # ---------------------------------------------------------------------------
-# Session logging — single file, overwritten each new process start
+# Session logging — one append-only file per run
+#
+# The turn record is the only durable evidence of what the agent did: the
+# prompt, the arguments each tool actually ran with, the full results, and the
+# answer built from them. The offline graders in `evaluation/` read nothing
+# else, and post-hoc diagnosis of a bad answer depends on it entirely.
+#
+# It was previously one fixed file truncated at process start, which meant
+# every run destroyed the evidence of the one before it. Runs now write their
+# own file; `last_session.jsonl` becomes a symlink to the newest so the
+# familiar path still resolves.
 # ---------------------------------------------------------------------------
 session_log: list[dict] = []
-_LOG_PATH = pathlib.Path(__file__).parent.parent / "session_logs" / "last_session.jsonl"
+_LOG_DIR = pathlib.Path(SESSION_LOG_DIR)
+_LATEST = _LOG_DIR / "last_session.jsonl"
+_log_path: pathlib.Path | None = None
 _log_initialized: bool = False
 
 
-def _append_to_log(record: dict) -> None:
-    """Write one turn record to the fixed session log file.
+def _session_log_path() -> pathlib.Path:
+    """The file this process writes to, chosen once and then reused.
 
-    The file is truncated (mode='w') on the very first write of the process
-    so each new session starts clean. Subsequent turns are appended.
+    The pid is part of the name because two runs started in the same second
+    would otherwise interleave into one file.
     """
+    global _log_path
+    if _log_path is None:
+        if SESSION_LOG_PATH:
+            _log_path = pathlib.Path(SESSION_LOG_PATH)
+        else:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            _log_path = _LOG_DIR / f"session-{stamp}-{os.getpid()}.jsonl"
+    return _log_path
+
+
+def _point_latest_at(target: pathlib.Path) -> None:
+    """Keep `last_session.jsonl` resolving to the current run.
+
+    The new link is built under a temporary name first. Windows refuses
+    symlinks without elevation, and doing it in this order means the refusal
+    happens before anything on disk has been touched — the pointer is a
+    convenience, and losing it must not cost a log. Where it does work, the
+    replace is atomic.
+
+    A real file at that path predates this scheme and holds somebody's
+    session, so it is archived rather than overwritten.
+    """
+    if target == _LATEST:
+        return
+
+    staging = _LATEST.with_name(_LATEST.name + ".new")
+    try:
+        staging.unlink(missing_ok=True)
+        staging.symlink_to(target.name)
+    except OSError:
+        logger.debug("Symlinks unavailable; `last_session.jsonl` not updated.", exc_info=True)
+        return
+
+    try:
+        if _LATEST.exists() and not _LATEST.is_symlink():
+            stamp = datetime.datetime.fromtimestamp(
+                _LATEST.stat().st_mtime
+            ).strftime("%Y%m%d-%H%M%S")
+            _LATEST.rename(_LOG_DIR / f"session-{stamp}-archived.jsonl")
+        os.replace(staging, _LATEST)
+    except OSError:
+        staging.unlink(missing_ok=True)
+        logger.debug("Could not update last_session.jsonl.", exc_info=True)
+
+
+def _grid_facts() -> dict:
+    """Constants the prompt stated this turn, or empty if none were known."""
+    status = last_grid_constants_status()
+    return dict(status.values) if status is not None else {}
+
+
+def _append_to_log(record: dict) -> None:
+    """Append one turn record to this run's session log."""
     global _log_initialized
     session_log.append(record)
     try:
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        mode = "w" if not _log_initialized else "a"
-        with _LOG_PATH.open(mode, encoding="utf-8") as fh:
+        path = _session_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        _log_initialized = True
+        if not _log_initialized:
+            _point_latest_at(path)
+            _log_initialized = True
     except Exception:  # noqa: BLE001
         logger.warning("Session log write failed — logging silently disabled.", exc_info=True)
 
@@ -106,6 +202,15 @@ def run_agent_turn(
     turn_tool_calls: list[dict] = []
     turn_tool_results: list[dict] = []
     tool_error_count = 0
+    # Tracks which operating point each tool actually ran at, so a chain
+    # that silently mixes two of them is caught rather than presented as one.
+    # Seeded with the moments the question names: comparing two of them is a
+    # normal request, and warning about it told the model its own correct
+    # behaviour was inconsistent.
+    turn_consistency = TurnConsistency(expected=requested_timestamps(user_message))
+    # Carries an explicitly stated operating point across the turn's calls,
+    # so a later tool cannot silently fall back to the simulation clock.
+    turn_operating_point = TurnOperatingPoint()
 
     # 3. Resolve the backend. The system prompt is read per turn so edits to it
     #    take effect without restarting the app.
@@ -143,17 +248,50 @@ def run_agent_turn(
             # 4d. Execute each tool call and append its result.
             for call in response.tool_calls:
                 tool_name = call.name
-                kwargs = call.args
+                kwargs, inherited = turn_operating_point.resolve(
+                    call.name, call.args, _TOOL_ARGS.get(call.name)
+                )
+                if inherited:
+                    logger.info("Inherited %s for %s from earlier in the turn.",
+                                sorted(inherited), tool_name)
 
                 tool_fn = TOOL_DISPATCH.get(tool_name)
+                verdict = validate_call(tool_name, kwargs)
                 if tool_fn is None:
                     result = {"error": f"Unknown tool: {tool_name}"}
                     tool_error_count += 1
+                elif verdict.rejected:
+                    # A validated solver given invalid parameters returns a
+                    # confidently wrong answer, so impossible parameterisations
+                    # are refused before execution. The model reads the
+                    # structured error and corrects itself.
+                    result = verdict.as_tool_error(tool_name)
+                    tool_error_count += 1
+                    logger.warning("Rejected %s call: %s", tool_name,
+                                   [i.render() for i in verdict.rejections])
+                    if on_event:
+                        on_event("tool_rejected", {
+                            "name": tool_name,
+                            "problems": [i.message for i in verdict.rejections],
+                        })
                 else:
                     try:
                         if on_event:
                             on_event("tool_start", {"name": tool_name, "args": kwargs})
                         result = tool_fn(**kwargs)
+                        # Check the result against itself before the model sees
+                        # it; findings are attached, never substituted.
+                        integrity = validate_result(tool_name, result)
+                        integrity += turn_consistency.observe(tool_name, result)
+                        if integrity:
+                            result = annotate(result, integrity)
+                            logger.warning("Integrity warnings from %s: %s", tool_name,
+                                           [i.render() for i in integrity])
+                            if on_event:
+                                on_event("integrity_warning", {
+                                    "name": tool_name,
+                                    "problems": [i.message for i in integrity],
+                                })
                         if on_event:
                             on_event("tool_done", {"name": tool_name, "result": result})
                     except Exception as exc:  # noqa: BLE001
@@ -165,7 +303,14 @@ def run_agent_turn(
 
                 logger.debug("Tool %s result keys: %s", tool_name, list(result.keys()) if isinstance(result, dict) else type(result))
 
-                turn_tool_calls.append({"name": tool_name, "args": kwargs})
+                if verdict.warnings:
+                    logger.info("Parameter warnings for %s: %s", tool_name,
+                                [i.render() for i in verdict.warnings])
+
+                call_record = {"name": tool_name, "args": kwargs}
+                if inherited:
+                    call_record["inherited"] = inherited
+                turn_tool_calls.append(call_record)
                 turn_tool_results.append({"name": tool_name, "result": result})
                 model_result = _prepare_tool_result_for_model(tool_name, result)
 
@@ -227,6 +372,12 @@ def run_agent_turn(
         "error_classification": error_classification,
         "runner_error": runner_error,
         "user": user_message,
+        # The grid facts the system prompt carried this turn. Recorded because
+        # they are a legitimate source for a figure in the answer: asked to
+        # describe the network, the model correctly quoted its bus and line
+        # counts from here, and a grounding check that only looked at tool
+        # results called them fabricated.
+        "grid": _grid_facts(),
         "tool_calls": turn_tool_calls,
         "tool_call_count": len(turn_tool_calls),
         "tool_results": turn_tool_results,

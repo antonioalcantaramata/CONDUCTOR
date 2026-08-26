@@ -14,11 +14,13 @@ Exports:
 from __future__ import annotations
 
 from typing import Callable
+import math
 import re
 
 import plotly.graph_objects as go
 
 from .config import grid_limits
+from .network_map import MARKER_PX, NetworkMap
 
 # ---------------------------------------------------------------------------
 # Shared theme
@@ -2845,6 +2847,54 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
 # Exports
 # ---------------------------------------------------------------------------
 
+
+def render_violation_attribution(result: dict) -> list[go.Figure]:
+    """One ranked-driver chart per violated element.
+
+    Sensitivities are signed: a negative bar means increasing that source pushes
+    the quantity *down*, which relieves an overvoltage and worsens an
+    undervoltage. Controllable sources are distinguished from loads because only
+    the former are an action the operator can take.
+    """
+    figures: list[go.Figure] = []
+    for violation in (result.get("violations") or [])[:4]:
+        drivers = violation.get("drivers") or []
+        if not drivers:
+            continue
+
+        is_voltage = violation.get("quantity") == "vm_pu"
+        unit = "p.u. / MVAr" if is_voltage else "% / MVAr"
+        key = "d_per_mvar" if is_voltage else "d_per_mw"
+        axis = "MVAr" if is_voltage else "MW"
+
+        names, values, colors = [], [], []
+        for d in reversed(drivers):
+            sensitivity = d.get(key)
+            if sensitivity is None:
+                continue
+            names.append(str(d.get("source", "?")))
+            values.append(sensitivity)
+            colors.append("#1f77b4" if d.get("controllable") else "#aaaaaa")
+
+        if not names:
+            continue
+
+        fig = go.Figure(go.Bar(
+            x=values, y=names, orientation="h", marker_color=colors,
+            hovertemplate="%{y}: %{x:+.5f} " + unit + "<extra></extra>",
+        ))
+        fig.update_layout(
+            **CHART_THEME,
+            title=(f"What drives {violation.get('element', '?')} "
+                   f"({violation.get('value')} vs limit {violation.get('limit')})"),
+            xaxis_title=f"Sensitivity per {axis}  •  blue = controllable, grey = load",
+            yaxis_title="",
+            height=max(220, 40 * len(names) + 120),
+        )
+        figures.append(fig)
+    return figures
+
+
 RENDERER_MAP: dict[str, Callable] = {
     "run_rsa": render_rsa,                              # returns list of 3 figs
     "simulate_contingency": render_contingency_violations,
@@ -2856,6 +2906,7 @@ RENDERER_MAP: dict[str, Callable] = {
     "scan_rsa_over_time": render_time_series,
     "get_current_conditions": render_conditions,
     "compare_results": render_diff,
+    "compute_violation_attribution": render_violation_attribution,
     "find_worst_case_timestamp": render_worst_case,
     "scan_scenarios": render_scenarios,
     "get_element_timeseries": render_element_timeseries,
@@ -2865,3 +2916,351 @@ RENDERER_MAP: dict[str, Callable] = {
     "compute_hosting_capacity": render_hosting_capacity,
     "compute_historical_risk": render_historical_risk,
 }
+
+
+# ---------------------------------------------------------------------------
+# Network map
+#
+# The system as a picture. Positions come from `network_map`, which has to
+# know how large things are drawn — so marker sizes live there and are only
+# read here.
+#
+# Design positions, all deliberate:
+#   * Voltage is the bus fill; loading is the branch width and colour. The two
+#     quantities read first, and they do not compete for one channel.
+#   * A bus with no measured voltage is hollow, never a shade. A near-nominal
+#     voltage sits at the pale middle of a diverging scale, so colouring the
+#     unmeasured ones made "healthy" and "no data" identical.
+#   * Violations get a ring rather than a colour, so how far out a bus is
+#     stays readable.
+#   * Generation and demand are separate marks, sized by the square root of
+#     magnitude so one large unit does not erase the small ones.
+# ---------------------------------------------------------------------------
+
+_VOLTAGE_SCALE = [
+    [0.00, "#2166ac"], [0.35, "#92c5de"], [0.50, "#eef0f2"],
+    [0.65, "#f4a582"], [1.00, "#b2182b"],
+]
+_LOADING_BANDS = ((60.0, "#4d9221", "≤ 60 % loaded"),
+                  (90.0, "#e08214", "60–90 %"),
+                  (float("inf"), "#b2182b", "> 90 %"))
+_UNMEASURED_EDGE = "#b8b8b8"
+_OUT_OF_SERVICE = "#d4d4d4"
+_EXTERNAL = "#3f3f46"
+_GENERATION = "#1b7837"
+_DEMAND = "#762a83"
+
+_MAX_LABELS = 28
+_FONT_PX = 10
+_PLOT_PX = 660
+
+# Where a label sits relative to its marker, in units of
+# (half-marker, half-width, half-height).
+_PLACEMENTS = {
+    "middle right": (1.0, 1.0, 0.0, 0.0), "middle left": (-1.0, -1.0, 0.0, 0.0),
+    "top center": (0.0, 0.0, 1.0, 1.0), "bottom center": (0.0, 0.0, -1.0, -1.0),
+    "top right": (0.7, 1.0, 0.7, 1.0), "top left": (-0.7, -1.0, 0.7, 1.0),
+    "bottom right": (0.7, 1.0, -0.7, -1.0), "bottom left": (-0.7, -1.0, -0.7, -1.0),
+}
+_BY_ANGLE = ("middle right", "top right", "top center", "top left",
+             "middle left", "bottom left", "bottom center", "bottom right")
+
+
+def _band_label(edge) -> str:
+    """Which legend group a branch belongs to."""
+    kind = "transformer" if edge.kind == "trafo" else "line"
+    if not edge.in_service:
+        return f"{kind}, out of service"
+    if edge.loading_pct is None:
+        return f"{kind}, not measured"
+    for threshold, _, label in _LOADING_BANDS:
+        if edge.loading_pct < threshold:
+            return f"{kind} {label}"
+    return f"{kind} {_LOADING_BANDS[-1][2]}"
+
+
+def _loading_colour(loading):
+    if loading is None:
+        return _UNMEASURED_EDGE
+    for threshold, colour, _ in _LOADING_BANDS:
+        if loading < threshold:
+            return colour
+    return _LOADING_BANDS[-1][1]
+
+
+def _blend(a: str, b: str, t: float) -> str:
+    ar, ag, ab = (int(a[i:i + 2], 16) for i in (1, 3, 5))
+    br, bg, bb = (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (round(ar + (br - ar) * t), round(ag + (bg - ag) * t),
+                              round(ab + (bb - ab) * t))
+
+
+def _voltage_colour(vm_pu: float, lower: float, upper: float) -> str:
+    span = max(upper - 1.0, 1.0 - lower, 1e-6)
+    fraction = min(1.0, max(0.0, 0.5 + (vm_pu - 1.0) / (2 * span)))
+    for (p0, c0), (p1, c1) in zip(_VOLTAGE_SCALE, _VOLTAGE_SCALE[1:]):
+        if fraction <= p1:
+            return _blend(c0, c1, 0.0 if p1 == p0 else (fraction - p0) / (p1 - p0))
+    return _VOLTAGE_SCALE[-1][1]
+
+
+def _label_box(x, y, placement, half, width, height):
+    fx, wx, fy, hy = _PLACEMENTS[placement]
+    cx = x + fx * half + wx * width / 2
+    cy = y + fy * half + hy * height / 2
+    return (cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2)
+
+
+def _hits(box, others) -> bool:
+    return any(box[0] < o[2] and o[0] < box[2] and box[1] < o[3] and o[1] < box[3]
+               for o in others)
+
+
+def _place_labels(xs, ys, names, sizes, ranked, obstacles, per_px):
+    """Keep the names that fit, trying every position around each marker.
+
+    A budget alone was not enough: a distribution bus sits close to the
+    substation it hangs off, so both names landed in the same few pixels.
+    Markers count as obstacles too — otherwise a label covers the very bus it
+    is naming, or the triangle showing what that bus injects.
+    """
+    if not xs:
+        return names, "top center", 0
+    cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+    taken, kept = list(obstacles), {}
+
+    for _, _, slot in sorted(ranked)[:_MAX_LABELS]:
+        text = names[slot]
+        if not text:
+            continue
+        width = len(text) * 0.55 * _FONT_PX * per_px
+        height = 1.25 * _FONT_PX * per_px
+        half = (sizes[slot] / 2 + 3) * per_px
+        angle = math.degrees(math.atan2(ys[slot] - cy, xs[slot] - cx))
+        start = int(round(angle / 45.0)) % 8
+        for step in (0, 1, -1, 2, -2, 3, -3, 4):
+            placement = _BY_ANGLE[(start + step) % 8]
+            box = _label_box(xs[slot], ys[slot], placement, half, width, height)
+            if not _hits(box, taken):
+                taken.append(box)
+                kept[slot] = placement
+                break
+
+    return ([name if slot in kept else "" for slot, name in enumerate(names)],
+            [kept.get(slot, "top center") for slot in range(len(names))],
+            sum(1 for _, _, slot in ranked if names[slot] and slot not in kept))
+
+
+def render_network_map(network: NetworkMap, positions: dict, *,
+                       vm_lower: float = 0.95, vm_upper: float = 1.05,
+                       highlight: set | None = None,
+                       subtitle: str = "") -> go.Figure:
+    """The loaded network, coloured by whatever state has been joined onto it."""
+    highlight = highlight or set()
+    measured = any(n.vm_pu is not None for n in network.nodes.values())
+    drawn = [n for n in network.nodes.values() if n.index in positions]
+    if not drawn:
+        return _empty_figure("No network to draw")
+
+    xs = [positions[n.index][0] for n in drawn]
+    ys = [positions[n.index][1] for n in drawn]
+    span = max(max(ys) - min(ys), max(xs) - min(xs)) or 1.0
+    per_px = span / _PLOT_PX
+    power_offset = 0.022 * span
+
+    traces: list[go.Scatter] = []
+    hover_x, hover_y, hover_text = [], [], []
+    shown_groups: set[str] = set()
+
+    for edge in network.edges:
+        if edge.from_bus not in positions or edge.to_bus not in positions:
+            continue
+        x0, y0 = positions[edge.from_bus]
+        x1, y1 = positions[edge.to_bus]
+        if edge.kind == "ext_grid":
+            colour, width, detail = _EXTERNAL, 3.0, "external connection"
+        else:
+            colour = _OUT_OF_SERVICE if not edge.in_service else _loading_colour(edge.loading_pct)
+            width = 1.6 if edge.loading_pct is None else 1.6 + 3.4 * min(edge.loading_pct, 120.0) / 120.0
+            detail = ("not measured" if edge.loading_pct is None
+                      else f"{edge.loading_pct:.1f}% loaded")
+
+        # Every legend entry is a real trace in a group, so clicking one hides
+        # the branches it describes. They used to be empty placeholder traces:
+        # the key looked interactive, and clicking it did nothing at all.
+        group = "external" if edge.kind == "ext_grid" else _band_label(edge)
+        first = group not in shown_groups
+        shown_groups.add(group)
+
+        traces.append(go.Scatter(
+            x=[x0, x1], y=[y0, y1], mode="lines", hoverinfo="skip",
+            legendgroup=group, showlegend=first, name=group,
+            line=dict(color=colour, width=width,
+                      dash="dot" if edge.kind == "trafo" else "solid"),
+        ))
+        # A two-point line answers the cursor only at its endpoints, so
+        # hovering the middle of a branch did nothing at all.
+        label = (f"<b>{edge.name}</b><br>{edge.kind} · {detail}"
+                 + ("" if edge.in_service else "<br>out of service"))
+        for fraction in (0.2, 0.35, 0.5, 0.65, 0.8):
+            hover_x.append(x0 + (x1 - x0) * fraction)
+            hover_y.append(y0 + (y1 - y0) * fraction)
+            hover_text.append(label)
+
+    if hover_x:
+        traces.append(go.Scatter(
+            x=hover_x, y=hover_y, mode="markers", showlegend=False,
+            marker=dict(size=14, color="rgba(0,0,0,0)"),
+            hoverinfo="text", hovertext=hover_text,
+        ))
+
+    fills, outlines, widths, sizes, hovers, names, symbols, ranked, obstacles = (
+        [], [], [], [], [], [], [], [], [])
+    states: list[str] = []
+    for slot, node in enumerate(drawn):
+        flagged = node.name in highlight
+        if node.kind == "external":
+            symbols.append("square")
+            fills.append(_EXTERNAL)
+            states.append("external grid (slack)")
+        elif not node.in_service:
+            symbols.append("circle")
+            fills.append(_OUT_OF_SERVICE)
+            states.append("out of service")
+        elif node.vm_pu is None:
+            # Hollow, not pale: a near-nominal voltage sits at the white middle
+            # of the scale, so colouring the unmeasured made "healthy" and "no
+            # data" look the same.
+            symbols.append("circle-open")
+            fills.append(_UNMEASURED_EDGE)
+            states.append("no measurement")
+        else:
+            symbols.append("circle")
+            fills.append(_voltage_colour(node.vm_pu, vm_lower, vm_upper))
+            states.append("violating" if flagged else "measured")
+
+        outlines.append("#111111" if flagged else "#5b5b5b")
+        widths.append(3.0 if flagged else 1.0)
+        size = MARKER_PX.get(node.kind, 10) * network.marker_scale
+        sizes.append(size + 3 if flagged else size)
+
+        if node.kind == "external":
+            flow = ("" if not node.gen_mw else
+                    f"<br>{'exporting' if node.gen_mw < 0 else 'importing'} "
+                    f"{abs(node.gen_mw):.2f} MW")
+            hovers.append(f"<b>{node.name}</b><br>external grid (slack)"
+                          f"<br>{node.vn_kv:g} kV{flow}")
+        else:
+            voltage = "not measured" if node.vm_pu is None else f"{node.vm_pu:.4f} pu"
+            hovers.append(
+                f"<b>{node.name}</b><br>{node.kind} · {node.vn_kv:g} kV · bus {node.index}"
+                f"<br>V = {voltage}"
+                + (f"<br>load {node.load_mw:.2f} MW" if node.load_mw else "")
+                + (f"<br>gen {node.gen_mw:.2f} MW" if node.gen_mw else "")
+                + ("<br><b>violating</b>" if flagged else "")
+                + ("" if node.in_service else "<br>out of service"))
+
+        names.append(node.name)
+        ranked.append((
+            0 if node.kind in ("slack", "external") else
+            1 if flagged else 2 if node.kind == "substation" else
+            3 if node.kind == "distribution" else 4,
+            -(abs(node.load_mw) + abs(node.gen_mw)), slot,
+        ))
+        half = (sizes[slot] / 2 + 3) * per_px
+        up = power_offset + 9 * per_px if node.gen_mw else 0.0
+        down = power_offset + 9 * per_px if node.load_mw else 0.0
+        obstacles.append((xs[slot] - half, ys[slot] - half - down,
+                          xs[slot] + half, ys[slot] + half + up))
+
+    labels, placements, dropped = _place_labels(
+        xs, ys, names, sizes, ranked, obstacles, per_px)
+
+    # Buses are split by state rather than drawn as one trace with per-point
+    # styling. Plotly's legend toggles whole traces, so a single trace would
+    # give a key that cannot filter anything — and a legend that mixes items
+    # which respond with items which do not is worse than one that does
+    # neither.
+    for state in ("violating", "measured", "no measurement",
+                  "out of service", "external grid (slack)"):
+        members = [slot for slot, node in enumerate(drawn) if states[slot] == state]
+        if not members:
+            continue
+        traces.append(go.Scatter(
+            x=[xs[i] for i in members], y=[ys[i] for i in members],
+            mode="markers+text", legendgroup=state, showlegend=True, name=state,
+            marker=dict(size=[sizes[i] for i in members],
+                        color=[fills[i] for i in members],
+                        symbol=[symbols[i] for i in members],
+                        line=dict(color=[outlines[i] for i in members],
+                                  width=[widths[i] for i in members])),
+            text=[labels[i] for i in members],
+            textposition=[placements[i] for i in members],
+            textfont=dict(size=_FONT_PX, color="#333"),
+            hoverinfo="text", hovertext=[hovers[i] for i in members],
+        ))
+
+    traces.extend(_power_traces(drawn, positions, power_offset))
+    if measured:
+        traces.append(go.Scatter(
+            x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+            marker=dict(size=0.1, color=[vm_lower, vm_upper], colorscale=_VOLTAGE_SCALE,
+                        cmin=vm_lower, cmax=vm_upper, showscale=True,
+                        # Anchored to the bottom: the legend grows downward
+                        # from the top and a centred bar ran straight into it.
+                        colorbar=dict(title=dict(text="V (pu)", side="right"),
+                                      thickness=12, len=0.38, x=1.02,
+                                      y=0.0, yanchor="bottom",
+                                      tickvals=[vm_lower, 1.0, vm_upper]))))
+
+    title = f"<b>{network.name}</b>"
+    if subtitle:
+        title += f"<br><span style='font-size:12px;color:#666'>{subtitle}</span>"
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left"),
+        hovermode="closest", plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(l=20, r=20, t=74, b=44), height=720,
+        legend=dict(orientation="v", x=1.0, y=1.0, xanchor="left",
+                    bgcolor="rgba(255,255,255,0.8)", borderwidth=0,
+                    font=dict(size=10)),
+        xaxis=dict(visible=False, showgrid=False, zeroline=False),
+        # Equal aspect: stretching one axis would misrepresent the shape.
+        yaxis=dict(visible=False, showgrid=False, zeroline=False,
+                   scaleanchor="x", scaleratio=1),
+        annotations=[dict(
+            # Said on the figure: a force-directed layout looks like a map and
+            # is not one.
+            text="schematic connectivity, not geography"
+                 + (f" · {dropped} name(s) hidden, hover for them" if dropped else ""),
+            xref="paper", yref="paper", x=0.0, y=-0.045, showarrow=False,
+            font=dict(size=10, color="#888"), xanchor="left")],
+    )
+    return fig
+
+
+def _power_traces(drawn, positions, offset):
+    peak = max((max(abs(n.load_mw), abs(n.gen_mw)) for n in drawn), default=0.0)
+    if peak <= 0:
+        return []
+    traces = []
+    for attr, symbol, colour, label in (("gen_mw", "triangle-up", _GENERATION, "generation"),
+                                        ("load_mw", "triangle-down", _DEMAND, "demand")):
+        xs, ys, sizes, hovers = [], [], [], []
+        for node in drawn:
+            value = getattr(node, attr)
+            if not value or node.kind == "external":
+                continue
+            x, y = positions[node.index]
+            xs.append(x)
+            ys.append(y + (offset if attr == "gen_mw" else -offset))
+            sizes.append(6 + 12 * (abs(value) / peak) ** 0.5)
+            hovers.append(f"<b>{node.name}</b><br>{label} {abs(value):.3f} MW")
+        if xs:
+            traces.append(go.Scatter(
+                x=xs, y=ys, mode="markers", legendgroup=label,
+                showlegend=True, name=label,
+                marker=dict(size=sizes, color=colour, symbol=symbol, line=dict(width=0)),
+                hoverinfo="text", hovertext=hovers))
+    return traces

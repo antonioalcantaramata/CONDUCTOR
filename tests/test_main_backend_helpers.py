@@ -135,3 +135,55 @@ class TestRequestModels:
         assert req.metric == "violations"
         assert req.step_size == 1
         assert req.n_steps is None
+
+
+class TestSupplyLost:
+    """What a contingency leaves without a source.
+
+    The violation table cannot answer this: an unsupplied bus has no voltage
+    to violate, so an islanded substation and a healthy one both report zero
+    violations. Asked which substations would lose supply, the agent read
+    "0 violations" and answered "none" — and on a later run, having no field
+    to read, spent its whole turn budget trying to trace the network by hand
+    instead of answering at all.
+    """
+
+    @staticmethod
+    def _radial():
+        """source — b0 — b1 — b2, with the load at the far end."""
+        import pandapower as pp
+
+        net = pp.create_empty_network()
+        buses = [pp.create_bus(net, vn_kv=20.0, name=f"B{i}") for i in range(3)]
+        pp.create_ext_grid(net, buses[0], name="Source")
+        pp.create_line(net, buses[0], buses[1], length_km=1.0,
+                       std_type="NAYY 4x50 SE", name="L0")
+        pp.create_line(net, buses[1], buses[2], length_km=1.0,
+                       std_type="NAYY 4x50 SE", name="L1")
+        pp.create_load(net, buses[2], p_mw=0.5, name="Far load")
+        return net
+
+    def test_an_intact_network_islands_nothing(self):
+        result = mb._supply_lost(self._radial(), "line", 0)
+        assert result["unsupplied_bus_count"] == 0
+        assert result["unsupplied_load_mw"] == 0.0
+        assert "nothing is islanded" in result["supply_analysis"]
+
+    def test_cutting_a_radial_feeder_names_what_goes_dark(self):
+        net = self._radial()
+        net.line.at[1, "in_service"] = False
+        result = mb._supply_lost(net, "line", 1)
+        assert result["unsupplied_buses"] == ["B2"]
+        assert result["unsupplied_load_mw"] == pytest.approx(0.5)
+
+    def test_the_load_left_unsupplied_is_reported_not_just_the_buses(self):
+        # A de-energised bus with nothing on it is not an outage anyone
+        # notices; the megawatts are what an operator means by "lost supply".
+        net = self._radial()
+        net.load.at[0, "p_mw"] = 1.25
+        net.line.at[1, "in_service"] = False
+        assert mb._supply_lost(net, "line", 1)["unsupplied_load_mw"] == pytest.approx(1.25)
+
+    def test_a_network_it_cannot_analyse_says_so_rather_than_raising(self):
+        result = mb._supply_lost(object(), "line", 0)
+        assert result == {"supply_analysis": "unavailable for this network"}

@@ -8,12 +8,14 @@ Run with:
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import pathlib
 import re
 from datetime import datetime
 
+import httpx
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -30,6 +32,7 @@ from agent.config import (
 )
 from agent.config import (
     fetch_grid_constants,
+    grid_limits,
     is_network_change,
     network_fingerprint,
 )
@@ -39,7 +42,8 @@ from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent.loop import run_agent_turn
 from agent.providers import active_provider_name, get_provider, reset_providers
 from agent.providers.ollama import probe as ollama_probe
-from agent.renderers import RENDERER_MAP
+from agent import network_map as _network_map
+from agent.renderers import RENDERER_MAP, render_network_map
 from agent import tools as _tools_module
 from agent.tools import get_current_timestamp
 
@@ -2103,6 +2107,139 @@ with st.sidebar:
                 st.session_state._box_pending = query
 
 # ---------------------------------------------------------------------------
+# System view
+#
+# The network as a picture, beside the conversation rather than inside it.
+#
+# Two costs shape this. Streamlit tabs are **not** lazy — both panes render on
+# every script run — and computing a layout takes from a tenth of a second to
+# several seconds depending on the size of the network. So the geometry is
+# cached against the network's fingerprint and recomputed only when the
+# network itself changes; joining a new operating point onto cached positions
+# is cheap.
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _fetch_topology(_fingerprint: str) -> dict | None:
+    """The live network's shape. Keyed on the fingerprint, so an upload refetches."""
+    try:
+        response = httpx.get(f"{BASE_URL}/api/network/topology", timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _layout_for(_fingerprint: str, payload: dict):
+    """Positions and the classified map. The expensive half, cached per network."""
+    network = _network_map.from_payload(payload)
+    positions = _network_map.compute_layout(network)
+    return network, positions
+
+
+def _fetch_state(timestamp: str, vm_lower: float, vm_upper: float) -> tuple[dict, dict]:
+    body = {"data_source": "measurements", "timestamp": timestamp,
+            "vm_lower_pu": vm_lower, "vm_upper_pu": vm_upper}
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        rsa = client.post(f"{BASE_URL}/api/grid/rsa", json=body)
+        rsa.raise_for_status()
+        snapshot = client.post(f"{BASE_URL}/api/network/snapshot",
+                               json={"data_source": "measurements", "timestamp": timestamp})
+        snapshot.raise_for_status()
+    return rsa.json(), snapshot.json()
+
+
+def _system_operating_point() -> str:
+    """The moment the system view describes.
+
+    The simulation clock by default, and whatever the conversation last
+    settled on when a turn ran at an explicit timestamp — so the picture
+    follows the answer on screen instead of drifting away from it.
+    """
+    return st.session_state.get("system_ts") or st.session_state.current_ts
+
+
+def _render_system_view() -> None:
+    status = last_grid_constants_status()
+    if status is not None and not status.live:
+        # A drawing of the bundled example while the backend is down would be
+        # the most confidently wrong thing in the app.
+        st.error(
+            "**The loaded network cannot be identified**, so it is not drawn. "
+            f"The backend at `{BASE_URL}` is not responding."
+        )
+        return
+
+    fingerprint = st.session_state.get("_network_fingerprint") or "unknown"
+    payload = _fetch_topology(fingerprint)
+    if not payload:
+        st.error(f"Could not read the network topology from `{BASE_URL}`.")
+        return
+
+    counts = payload.get("counts") or {}
+    columns = st.columns(5)
+    for column, (label, value) in zip(columns, (
+        ("Buses", counts.get("buses", "—")),
+        ("Lines", counts.get("lines", "—")),
+        ("Transformers", counts.get("trafos", "—")),
+        ("Loads", counts.get("loads", "—")),
+        ("Generators", counts.get("generators", "—")),
+    )):
+        column.metric(label, value)
+
+    levels = ", ".join(f"{v:g} kV" for v in payload.get("voltage_levels") or [])
+    st.caption(f"**{payload.get('name', 'network')}** · {levels or 'unknown voltage levels'}")
+
+    network, positions = _layout_for(fingerprint, payload)
+    # The cached objects are shared between reruns, so state is joined onto a
+    # copy: mutating the cache would leave last hour's voltages on the map.
+    network = copy.deepcopy(network)
+
+    timestamp = _system_operating_point()
+    following = st.session_state.get("system_ts") is None
+    limits = grid_limits()
+    problems: list[str] = []
+    violations: set[str] = set()
+
+    try:
+        rsa, snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper)
+        problems += _network_map.apply_assessment(network, rsa)
+        problems += _network_map.apply_conditions(network, snapshot)
+        violations = _network_map.violated_elements(rsa)
+        subtitle = (f"{rsa.get('timestamp', timestamp)} · "
+                    f"{rsa.get('total_violations', 0)} violation(s) · "
+                    f"band {limits.vm_lower}–{limits.vm_upper} pu")
+    except Exception as exc:  # noqa: BLE001
+        subtitle = "topology only — the operating point could not be read"
+        problems.append(str(exc))
+
+    st.plotly_chart(
+        render_network_map(network, positions, vm_lower=limits.vm_lower,
+                           vm_upper=limits.vm_upper, highlight=violations,
+                           subtitle=subtitle),
+        use_container_width=True,
+    )
+
+    st.caption(
+        f"Showing **{timestamp}** — "
+        + ("following the simulation clock." if following
+           else "the operating point the conversation last used.")
+    )
+    if not following and st.button("Follow the simulation clock", key="sys_follow"):
+        st.session_state.system_ts = None
+        st.rerun()
+
+    for note in network.notes:
+        st.caption(f"· {note}")
+    for problem in problems:
+        # Reported rather than swallowed: an element whose result did not join
+        # renders grey, and grey must not be mistaken for healthy.
+        st.warning(problem)
+
+
+# ---------------------------------------------------------------------------
 # Main chat area
 # ---------------------------------------------------------------------------
 _render_main_hero()
@@ -2110,7 +2247,13 @@ _render_main_hero()
 # Conversation history renders in the MAIN script run, so it stays solid (not
 # greyed) while the input fragment below runs the slow agent call. That fragment
 # isolation is what stops the previous answer from "ghosting" grey during the wait.
-with st.container():
+# The input box stays outside the tabs on purpose: `st.chat_input` pins itself
+# to the bottom of the viewport only at the top level, and inside a tab it
+# would render inline and appear on one pane only. Out here it stays pinned and
+# a question can be asked while looking at the diagram.
+_chat_tab, _system_tab = st.tabs(["Chat", "System"])
+
+with _chat_tab:
     if not st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(
@@ -2124,6 +2267,9 @@ with st.container():
             st.markdown(msg["text"])
             if msg.get("charts"):
                 render_charts(msg["charts"])
+
+with _system_tab:
+    _render_system_view()
 
 _TOOL_LABELS = {
     "run_rsa": "Security Assessment (RSA)",
@@ -2225,6 +2371,18 @@ def _chat_input_fragment():
                     elif event == "tool_error":
                         label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
                         st.write(f"❌ **{label}** failed: {data.get('error', '')}")
+                    elif event == "tool_rejected":
+                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        st.write(
+                            f"🛑 **{label}** not run — invalid parameters: "
+                            + "; ".join(data.get("problems", []))
+                        )
+                    elif event == "integrity_warning":
+                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        st.write(
+                            f"⚠️ **{label}** returned an internally inconsistent result: "
+                            + "; ".join(data.get("problems", []))
+                        )
                     elif event == "model_loading":
                         st.write(
                             f"⏳ Loading **{data.get('model', 'the model')}** into memory "
@@ -2265,6 +2423,13 @@ def _chat_input_fragment():
                         if new_ts:
                             st.session_state.current_ts = new_ts
                             break
+
+            # Point the system view at whatever moment this turn analysed, so
+            # the picture describes the answer on screen. A turn that spanned
+            # two operating points names none, and the view is left alone.
+            turn_point = _network_map.operating_point_of(_tools_module._last_tool_results)
+            if turn_point:
+                st.session_state.system_ts = turn_point
 
             # Capture chart data and store message
             charts_this_turn = list(_tools_module._last_tool_results)
