@@ -52,6 +52,15 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import modify_network as mn
 import load_gen_assignment as lg
 import rsa_engine as rs
+# Element naming lives in its own module so rsa_engine spells a name the same
+# way this file does. They disagreed about transformers, and the system map —
+# which joins topology to results by name — could not match any of them.
+from element_names import (
+    clean_label as _clean_label,
+    bus_display_name as _bus_display_name,
+    line_display_name as _line_display_name,
+    trafo_display_name as _trafo_display_name,
+)
 import ca_engine as ca
 
 import flex_engine as fe
@@ -112,38 +121,6 @@ def _safe_float(v, ndigits: int = 4):
         return None if not math.isfinite(f) else round(f, ndigits)
     except (TypeError, ValueError):
         return None
-
-
-def _clean_label(raw) -> str:
-    """Normalize optional labels and treat empty/nan/none as missing."""
-    s = str(raw).strip() if raw is not None else ""
-    return "" if s.lower() in {"", "nan", "none"} else s
-
-
-def _bus_display_name(net, bus_idx: int) -> str:
-    """Return a stable display name for a bus without changing any IDs."""
-    if "name" in net.bus.columns:
-        cleaned = _clean_label(net.bus.at[bus_idx, "name"])
-        if cleaned:
-            return cleaned
-    return f"Bus_{int(bus_idx)}"
-
-
-def _line_display_name(net, line_idx: int) -> str:
-    """Build a human-readable line label for API/chart display.
-
-    Format keeps original line name when present, but always appends endpoints
-    and line index to prevent ambiguity after bus/line renames.
-    """
-    from_bus = int(net.line.at[line_idx, "from_bus"])
-    to_bus = int(net.line.at[line_idx, "to_bus"])
-    from_name = _bus_display_name(net, from_bus)
-    to_name = _bus_display_name(net, to_bus)
-    endpoints = f"{from_name} -> {to_name}"
-    raw_name = _clean_label(net.line.at[line_idx, "name"]) if "name" in net.line.columns else ""
-    if raw_name:
-        return f"{raw_name} | {endpoints} [L{int(line_idx)}]"
-    return f"{endpoints} [L{int(line_idx)}]"
 
 
 # -------------------------------------------------------------------
@@ -2106,11 +2083,10 @@ async def network_topology():
             if "in_service" in net.line.columns else True,
         })
     for idx in net.trafo.index:
-        raw = _clean_label(net.trafo.at[idx, "name"]) if "name" in net.trafo.columns else ""
         hv, lv = int(net.trafo.at[idx, "hv_bus"]), int(net.trafo.at[idx, "lv_bus"])
         branches.append({
             "index": int(idx),
-            "name": raw or f"Trafo_{hv}-{lv}_{int(idx)}",
+            "name": _trafo_display_name(net, int(idx)),
             "from_bus": hv,
             "to_bus": lv,
             "kind": "trafo",
@@ -2971,14 +2947,7 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     ]
 
     df_trafo = net_calculated.res_trafo.reset_index()
-    df_trafo["trafo_name"] = [
-        (str(net_calculated.trafo.at[i, "name"]).strip()
-         if "name" in net_calculated.trafo.columns
-         and pd.notna(net_calculated.trafo.at[i, "name"])
-         and str(net_calculated.trafo.at[i, "name"]).strip()
-         else f"Trafo_{net_calculated.trafo.at[i, 'hv_bus']}-{net_calculated.trafo.at[i, 'lv_bus']}")
-        for i in df_trafo["index"]
-    ]
+    df_trafo["trafo_name"] = [_trafo_display_name(net_calculated, int(i)) for i in df_trafo["index"]]
     all_trafo_loading = [
         {"trafo_name": row["trafo_name"], "loading_percent": _safe_float(row["loading_percent"])}
         for _, row in df_trafo.iterrows()
@@ -3689,10 +3658,6 @@ def _scan_one_scenario(
     # Violated-ticks detail: only ticks with at least one violation
     violations_per_tick: list[dict] = []
 
-    has_bus_names = "name" in net.bus.columns
-    has_line_names = "name" in net.line.columns
-    has_trafo_names = "name" in net.trafo.columns
-
     for idx in indices:
         ts = timestamps[idx]
         try:
@@ -3718,7 +3683,7 @@ def _scan_one_scenario(
         for bus_idx, row in net_copy.res_bus.iterrows():
             if row["vm_pu"] > vm_upper_pu or row["vm_pu"] < vm_lower_pu:
                 viol += 1
-                name = str(net_copy.bus.at[bus_idx, "name"]) if has_bus_names else str(bus_idx)
+                name = _bus_display_name(net_copy, int(bus_idx))
                 bus_viol_counts[name] = bus_viol_counts.get(name, 0) + 1
                 tick_buses.append(name)
         for line_idx, row in net_copy.res_line.iterrows():
@@ -3730,7 +3695,7 @@ def _scan_one_scenario(
         for trafo_idx, row in net_copy.res_trafo.iterrows():
             if row["loading_percent"] > max_trafo_loading_pct:
                 viol += 1
-                name = str(net_copy.trafo.at[trafo_idx, "name"]) if has_trafo_names else str(trafo_idx)
+                name = _trafo_display_name(net_copy, int(trafo_idx))
                 trafo_viol_counts[name] = trafo_viol_counts.get(name, 0) + 1
                 tick_trafos.append(name)
 
@@ -3870,9 +3835,6 @@ def _run_probabilistic_sample(
     vm_lower_pu: float,
     max_line_loading_pct: float,
     max_trafo_loading_pct: float,
-    has_bus_names: bool,
-    has_line_names: bool,
-    has_trafo_names: bool,
 ) -> dict | None:
     """Run one Monte Carlo sample. net_base already has measurements assigned.
     Thread-safe — deep-copies net_base before any mutation."""
@@ -3906,8 +3868,7 @@ def _run_probabilistic_sample(
     excluded_buses: list[str] = []
 
     for bus_idx, row in net_copy.res_bus.iterrows():
-        raw_name = net_copy.bus.at[bus_idx, "name"] if has_bus_names else None
-        name = _clean_label(raw_name) or f"Bus_{int(bus_idx)}"
+        name = _bus_display_name(net_copy, int(bus_idx))
         vm = float(row["vm_pu"])
         # Out-of-service buses come back with vm_pu = NaN. Carried through,
         # they made the whole response unserialisable — json.dumps rejects NaN
@@ -3928,16 +3889,7 @@ def _run_probabilistic_sample(
 
     for trafo_idx, row in net_copy.res_trafo.iterrows():
         if row["loading_percent"] > max_trafo_loading_pct:
-            raw_name = net_copy.trafo.at[trafo_idx, "name"] if has_trafo_names else None
-            if has_trafo_names:
-                name = _clean_name(raw_name)
-            else:
-                name = ""
-            if not name:
-                hv_bus = int(net_copy.trafo.at[trafo_idx, "hv_bus"])
-                lv_bus = int(net_copy.trafo.at[trafo_idx, "lv_bus"])
-                name = f"Trafo_{hv_bus}-{lv_bus}_{int(trafo_idx)}"
-            viol_trafos.append(name)
+            viol_trafos.append(_trafo_display_name(net_copy, int(trafo_idx)))
 
     return {
         "viol_buses": viol_buses,
@@ -4034,13 +3986,8 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     net_base, _ = lg.assign_load_values_from_measurements(net_base, meas, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, meas, substations)
 
-    has_bus_names = "name" in net_base.bus.columns
-    has_line_names = "name" in net_base.line.columns
-    has_trafo_names = "name" in net_base.trafo.columns
-
     out_of_service_names = {
-        _clean_label(net_base.bus.at[idx, "name"] if has_bus_names else None)
-        or f"Bus_{int(idx)}"
+        _bus_display_name(net_base, int(idx))
         for idx in net_base.bus.index
         if "in_service" in net_base.bus.columns
         and not bool(net_base.bus.at[idx, "in_service"])
@@ -4090,7 +4037,6 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
                 sgen_p_base, sgen_p_ceiling, sgen_p_max,
                 request.vm_upper_pu, request.vm_lower_pu,
                 request.max_line_loading_pct, request.max_trafo_loading_pct,
-                has_bus_names, has_line_names, has_trafo_names,
             ): i
             for i in range(n)
         }
@@ -4436,14 +4382,11 @@ async def simulate_contingency(request: ContingencyRequest):
     for _, row in df_results_ca.iterrows():
         v_idx = int(row["violation_element_index"])
         if row["violation_type"] == "bus_vm_pu":
-            _raw = net_copy.bus.at[v_idx, 'name']
-            name = str(_raw).strip() if str(_raw).strip() else f"Bus_{v_idx}"
+            name = _bus_display_name(net_copy, v_idx)
         elif row["violation_type"] == "line_loading":
-            _raw = net_copy.line.at[v_idx, 'name']
-            name = str(_raw).strip() if str(_raw).strip() else f"Line_{net_copy.line.at[v_idx, 'from_bus']}-{net_copy.line.at[v_idx, 'to_bus']}"
+            name = _line_display_name(net_copy, v_idx)
         elif row["violation_type"] == "trafo_loading":
-            _raw = net_copy.trafo.at[v_idx, 'name']
-            name = str(_raw).strip() if str(_raw).strip() else f"Trafo_{net_copy.trafo.at[v_idx, 'hv_bus']}-{net_copy.trafo.at[v_idx, 'lv_bus']}"
+            name = _trafo_display_name(net_copy, v_idx)
         else:
             name = f"Element_{v_idx}"
         element_names.append(name)
@@ -4544,26 +4487,19 @@ async def simulate_all_contingencies(request: GridRequest):
             for _, row in df_results_ca.iterrows():
                 v_idx = int(row["violation_element_index"])
                 if row["violation_type"] == "bus_vm_pu":
-                    _raw = net_copy.bus.at[v_idx, 'name']
-                    name = str(_raw).strip() if str(_raw).strip() else f"Bus_{v_idx}"
+                    name = _bus_display_name(net_copy, v_idx)
                 elif row["violation_type"] == "line_loading":
-                    _raw = net_copy.line.at[v_idx, 'name']
-                    name = str(_raw).strip() if str(_raw).strip() else f"Line_{net_copy.line.at[v_idx, 'from_bus']}-{net_copy.line.at[v_idx, 'to_bus']}"
+                    name = _line_display_name(net_copy, v_idx)
                 elif row["violation_type"] == "trafo_loading":
-                    _raw = net_copy.trafo.at[v_idx, 'name']
-                    name = str(_raw).strip() if str(_raw).strip() else f"Trafo_{net_copy.trafo.at[v_idx, 'hv_bus']}-{net_copy.trafo.at[v_idx, 'lv_bus']}"
+                    name = _trafo_display_name(net_copy, v_idx)
                 else:
                     name = f"Element_{v_idx}"
                 element_names.append(name)
 
             df_results_ca["element_name"] = element_names
             df_results_ca["timestamp"] = df_results_ca["timestamp"].astype(str)
-            if el_type == "line":
-                _raw_oc = net_copy.line.at[idx, 'name']
-                _oc = str(_raw_oc).strip() if str(_raw_oc).strip() else f"Line_{net_copy.line.at[idx, 'from_bus']}-{net_copy.line.at[idx, 'to_bus']}"
-            else:
-                _raw_oc = net_copy.trafo.at[idx, 'name']
-                _oc = str(_raw_oc).strip() if str(_raw_oc).strip() else f"Trafo_{net_copy.trafo.at[idx, 'hv_bus']}-{net_copy.trafo.at[idx, 'lv_bus']}"
+            _oc = (_line_display_name(net_copy, int(idx)) if el_type == "line"
+                   else _trafo_display_name(net_copy, int(idx)))
             df_results_ca["outage_cause"] = _oc
             if "value" in df_results_ca.columns:
                 df_results_ca["value"] = df_results_ca["value"].round(3)
@@ -4763,39 +4699,13 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base.trafo["tap_pos"] = net_base.trafo["tap_neutral"]
 
-    has_bus_names = "name" in net_base.bus.columns
-    if has_bus_names:
-        bus_idx_to_name = {
-            int(idx): (
-                str(row["name"]).strip()
-                if pd.notna(row["name"]) and str(row["name"]).strip()
-                else f"Bus_{int(idx)}"
-            )
-            for idx, row in net_base.bus.iterrows()
-        }
-    else:
-        bus_idx_to_name = {int(idx): f"Bus_{int(idx)}" for idx in net_base.bus.index}
+    bus_idx_to_name = {int(idx): _bus_display_name(net_base, int(idx))
+                       for idx in net_base.bus.index}
 
-    line_idx_to_name = {}
-    for idx, row in net_base.line.iterrows():
-        line_idx = int(idx)
-        raw_name = row.get("name", None)
-        if pd.notna(raw_name) and str(raw_name).strip():
-            line_idx_to_name[line_idx] = _line_display_name(net_base, line_idx)
-        else:
-            line_idx_to_name[line_idx] = _line_display_name(net_base, line_idx)
-
-    trafo_idx_to_name = {}
-    for idx, row in net_base.trafo.iterrows():
-        trafo_idx = int(idx)
-        raw_name = row.get("name", None)
-        if pd.notna(raw_name) and str(raw_name).strip():
-            trafo_idx_to_name[trafo_idx] = str(raw_name).strip()
-        else:
-            try:
-                trafo_idx_to_name[trafo_idx] = f"Trafo_{int(row['hv_bus'])}-{int(row['lv_bus'])}_{trafo_idx}"
-            except Exception:
-                trafo_idx_to_name[trafo_idx] = f"Trafo_{trafo_idx}"
+    line_idx_to_name = {int(idx): _line_display_name(net_base, int(idx))
+                        for idx in net_base.line.index}
+    trafo_idx_to_name = {int(idx): _trafo_display_name(net_base, int(idx))
+                         for idx in net_base.trafo.index}
 
     try:
         pp.runpp(net_base, algorithm="nr", numba=False)

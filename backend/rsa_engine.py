@@ -9,6 +9,10 @@ import pandapower.networks
 import pandapower as pp
 import os
 
+# Violations are joined back onto the topology by element name, so they have
+# to be spelled exactly as /api/network/topology spells them.
+from element_names import bus_display_name, line_display_name, trafo_display_name
+
 
 # In[2]:
 
@@ -124,8 +128,7 @@ def real_time_security_assessment(
     print(f"    ⚡ Voltage Violations: {len(voltage_violations)}")
 
     for idx, row in voltage_violations.iterrows():
-        _raw = net.bus.at[idx, 'name'] if 'name' in net.bus.columns else ""
-        bus_name = str(_raw).strip() if str(_raw).strip() else f"Bus_{idx}"
+        bus_name = bus_display_name(net, int(idx))
         results.append({
             "timestamp": timestamp,
             "violation_type": "bus_vm_pu",
@@ -140,8 +143,7 @@ def real_time_security_assessment(
     print(f"    🌡️ Line Overloads: {len(overloads)}")
 
     for idx, row in overloads.iterrows():
-        _raw = net.line.at[idx, 'name'] if 'name' in net.line.columns else ""
-        line_name = str(_raw).strip() if str(_raw).strip() else f"Line_{net.line.at[idx, 'from_bus']}-{net.line.at[idx, 'to_bus']}"
+        line_name = line_display_name(net, int(idx))
         results.append({
             "timestamp": timestamp,
             "violation_type": "line_loading",
@@ -156,8 +158,7 @@ def real_time_security_assessment(
     print(f"    🌡️ Transformer Overloads: {len(trafo_overloads)}")
 
     for idx, row in trafo_overloads.iterrows():
-        _raw = net.trafo.at[idx, 'name'] if 'name' in net.trafo.columns else ""
-        trafo_name = str(_raw).strip() if str(_raw).strip() else f"Trafo_{net.trafo.at[idx, 'hv_bus']}-{net.trafo.at[idx, 'lv_bus']}"
+        trafo_name = trafo_display_name(net, int(idx))
         results.append({
             "timestamp": timestamp,
             "violation_type": "trafo_loading",

@@ -104,21 +104,27 @@ def _unique_labels(labels: list[str]) -> list[str]:
     return out
 
 
-def _compact_line_label(label: str, max_len: int = 28) -> str:
-    """Build a compact axis label for line names while keeping stable identity.
+def _compact_branch_label(label: str, max_len: int = 28) -> str:
+    """Build a compact axis label for a branch while keeping stable identity.
 
-    Expected long format: "CODE | From -> To [L12]".
-    Compact format: "CODE [L12]". Falls back to truncation when pattern is absent.
+    Expected long format: "CODE | From -> To [L12]" — the shape every backend
+    endpoint now uses for both lines ([L…]) and transformers ([T…]).
+    Compact format: "CODE [L12]", or "From -> To [L12]" where the branch
+    carries no name of its own, since the endpoints are then all that
+    distinguishes it. Falls back to truncation when the pattern is absent.
     """
     raw = str(label).strip()
     if not raw:
         return raw
 
-    # Keep stable line index when present.
-    idx_match = re.search(r"\[L\d+\]$", raw)
+    # Keep the stable element index when present.
+    idx_match = re.search(r"\[[LT]\d+\]$", raw)
     idx_suffix = f" {idx_match.group(0)}" if idx_match else ""
 
-    code = re.sub(r"\s*\[L\d+\]$", "", raw.split("|", 1)[0]).strip()
+    head, sep, _ = raw.partition("|")
+    # An unnamed branch has no code before the "|", only endpoints. Dropping
+    # them would leave every bar labelled with nothing but its index.
+    code = re.sub(r"\s*\[[LT]\d+\]$", "", (head if sep else raw)).strip()
     compact = f"{code}{idx_suffix}".strip()
     if len(compact) <= max_len:
         return compact
@@ -207,7 +213,7 @@ def render_rsa(result: dict) -> list[go.Figure]:
         fig_l = _empty_figure("No data — run the analysis first")
     else:
         line_names_raw = _safe_labels([l.get("line_name", "") for l in all_line_loading], "Line")
-        line_names_axis = [_compact_line_label(n) for n in line_names_raw]
+        line_names_axis = [_compact_branch_label(n) for n in line_names_raw]
         line_names = _unique_labels(line_names_axis)
         line_vals = [l.get("loading_percent", 0.0) for l in all_line_loading]
         line_colors = ["red" if v > max_loading else "steelblue" for v in line_vals]
@@ -244,7 +250,8 @@ def render_rsa(result: dict) -> list[go.Figure]:
         fig_t = _empty_figure("No data — run the analysis first")
     else:
         trafo_names_raw = _safe_labels([t.get("trafo_name", "") for t in all_trafo_loading], "Trafo")
-        trafo_names = _unique_labels(trafo_names_raw)
+        trafo_names_axis = [_compact_branch_label(n) for n in trafo_names_raw]
+        trafo_names = _unique_labels(trafo_names_axis)
         trafo_vals = [t.get("loading_percent", 0.0) for t in all_trafo_loading]
         trafo_colors = [
             "red" if v > max_loading else "steelblue" for v in trafo_vals

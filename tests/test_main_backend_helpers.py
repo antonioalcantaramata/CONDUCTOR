@@ -77,6 +77,69 @@ class TestLineDisplayName:
         assert label.startswith("Feeder 1 | ")
 
 
+class TestTrafoDisplayName:
+    def test_includes_endpoints_and_index(self, case14_net):
+        net = case14_net
+        trafo_idx = net.trafo.index[0]
+        hv = int(net.trafo.at[trafo_idx, "hv_bus"])
+        lv = int(net.trafo.at[trafo_idx, "lv_bus"])
+        net.bus["name"] = [f"Bus_{i}" for i in net.bus.index]
+        net.trafo.at[trafo_idx, "name"] = ""  # PGLib cases name no transformer
+
+        label = mb._trafo_display_name(net, trafo_idx)
+
+        assert label == f"Bus_{hv} -> Bus_{lv} [T{trafo_idx}]"
+
+    def test_prefixes_raw_name_when_present(self, case14_net):
+        net = case14_net
+        trafo_idx = net.trafo.index[0]
+        net.bus["name"] = [f"Bus_{i}" for i in net.bus.index]
+        net.trafo.at[trafo_idx, "name"] = "T1 63/10.5"
+
+        assert mb._trafo_display_name(net, trafo_idx).startswith("T1 63/10.5 | ")
+
+
+class TestElementNamesAgreeAcrossEndpoints:
+    """The system map joins topology to results by name, so producers must agree.
+
+    They did not: `/api/network/topology` said `Trafo_3-6_0` where the RSA
+    snapshot said `Trafo_3-6`, and every transformer in a network that names
+    none of them — every PGLib case — drew as "not measured".
+    """
+
+    def _topology_names(self, net):
+        return ([mb._line_display_name(net, int(i)) for i in net.line.index],
+                [mb._trafo_display_name(net, int(i)) for i in net.trafo.index])
+
+    def test_unnamed_branches_get_the_same_name_everywhere(self, case14_net):
+        import rsa_engine as rs
+
+        net = case14_net
+        net.line["name"] = ""
+        net.trafo["name"] = ""
+
+        lines, trafos = self._topology_names(net)
+        assert all(n.endswith(f"[L{i}]") for i, n in zip(net.line.index, lines))
+        assert all(n.endswith(f"[T{i}]") for i, n in zip(net.trafo.index, trafos))
+
+        # rsa_engine names violations through the same helpers, so a violation
+        # can be matched back to the branch the topology describes.
+        assert rs.line_display_name(net, int(net.line.index[0])) == lines[0]
+        assert rs.trafo_display_name(net, int(net.trafo.index[0])) == trafos[0]
+
+    def test_names_are_unique_even_for_parallel_branches(self, case14_net):
+        net = case14_net
+        net.trafo["name"] = ""
+        # Two transformers between the same buses is ordinary; the endpoints
+        # alone would name them identically.
+        second = int(net.trafo.index[1])
+        net.trafo.at[second, "hv_bus"] = net.trafo.at[net.trafo.index[0], "hv_bus"]
+        net.trafo.at[second, "lv_bus"] = net.trafo.at[net.trafo.index[0], "lv_bus"]
+
+        _, trafos = self._topology_names(net)
+        assert len(set(trafos)) == len(trafos)
+
+
 class TestNormalizeTapPolicy:
     @pytest.mark.parametrize("raw", ["current", "preserve", "as_is", "as-is", "uploaded", None])
     def test_normalizes_to_current(self, raw):
