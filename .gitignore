@@ -44,3 +44,8 @@ backend/convert_*
 backend/build*
 suggest*
 .venv/
+
+# ── Evaluation runner — work in progress, not released yet ────────────────
+evaluation/runner.py
+evaluation/catalog/
+evaluation/runs/

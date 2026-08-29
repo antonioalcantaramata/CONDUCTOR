@@ -13,7 +13,13 @@ from typing import NamedTuple
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
+# The .env sits beside the app, and is found whatever the working directory
+# is. Plain `load_dotenv()` searches upward from the cwd, which works when
+# Streamlit is launched from `llm_agent/` and silently finds nothing when a
+# batch run starts at the repository root — the agent then reports a missing
+# API key on a machine that has one.
+_ENV_FILE = pathlib.Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_ENV_FILE if _ENV_FILE.exists() else None)
 
 logger = logging.getLogger(__name__)
 

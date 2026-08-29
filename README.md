@@ -150,6 +150,22 @@ input-tokens-per-minute cap is below this agent's per-call overhead, so requests
 fail immediately. This does not apply to Gemma run locally through Ollama, where
 no such quota exists.
 
+## Documentation
+
+[`docs/`](docs/) explains why the system is built the way it is, and which of
+its guarantees are real:
+
+| | |
+| --- | --- |
+| [architecture.md](docs/architecture.md) | The three processes, what a turn does, where state lives |
+| [correctness.md](docs/correctness.md) | What is guaranteed, what is only checked, and what is neither |
+| [tools.md](docs/tools.md) | The tool surface and how to add one |
+| [data-pipeline.md](docs/data-pipeline.md) | Where the numbers come from |
+| [providers.md](docs/providers.md) | Hosted Gemini and local Ollama |
+| [system-view.md](docs/system-view.md) | Drawing a network with no coordinates |
+| [evaluation.md](docs/evaluation.md) | Grading a session after the fact |
+| [development.md](docs/development.md) | Tests, CI, session logs, conventions |
+
 ## Development
 
 Unit tests cover pure-logic code in `backend/` and `llm_agent/agent/` (network

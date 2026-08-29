@@ -100,6 +100,21 @@ def _session_log_path() -> pathlib.Path:
     return _log_path
 
 
+def set_session_log(path: str | pathlib.Path | None) -> None:
+    """Direct this process's turn records at a specific file.
+
+    For batch runs, which want one log per catalog entry rather than one per
+    process. Passing None restores the per-run default. Resets the in-memory
+    record too, so a caller reading `session_log` sees only the current entry.
+    """
+    global _log_path, _log_initialized
+    _log_path = pathlib.Path(path) if path else None
+    # A caller naming its own file does not want the `last_session` pointer
+    # moved to it; that path is for whoever is using the app.
+    _log_initialized = path is not None
+    session_log.clear()
+
+
 def _point_latest_at(target: pathlib.Path) -> None:
     """Keep `last_session.jsonl` resolving to the current run.
 
