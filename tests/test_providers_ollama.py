@@ -55,6 +55,18 @@ class TestSettingsAreLive:
         assert OllamaProvider().think is expected
 
 
+class TestDescribe:
+    def test_reports_identity_reasoning_and_context(self, monkeypatch):
+        from llm_agent.agent.providers.base import describe_provider
+
+        monkeypatch.setenv("OLLAMA_THINK", "false")
+        monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
+        detail = describe_provider(OllamaProvider(model="m", host=CLOSED))
+        assert detail["provider"] == "ollama"
+        assert detail["reasoning"] == "off"
+        assert detail["num_ctx"] == "16384"
+
+
 class TestContextGuard:
     def _payload(self, tokens):
         # ~4 bytes per token is the estimator's assumption.

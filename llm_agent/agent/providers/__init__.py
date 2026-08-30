@@ -6,6 +6,8 @@ the `LLMProvider` interface in `base.py`. Selection is driven by the
 `LLM_PROVIDER` environment variable (see `config.LLM_PROVIDER`):
 
     google  — Google Generative AI (default)
+    openai  — the OpenAI API, or any endpoint speaking its chat-completions
+              dialect (Azure OpenAI, OpenRouter, vLLM, …) via OPENAI_BASE_URL
     ollama  — a local Ollama server
 
 Providers are imported lazily so that selecting one backend never requires the
@@ -22,6 +24,7 @@ from .base import (
     ModelResponse,
     ToolCall,
     assistant_message,
+    describe_provider,
     iter_tool_calls,
     tool_message,
     user_message,
@@ -32,6 +35,7 @@ __all__ = [
     "ModelResponse",
     "ToolCall",
     "assistant_message",
+    "describe_provider",
     "iter_tool_calls",
     "tool_message",
     "user_message",
@@ -41,7 +45,7 @@ __all__ = [
     "reset_providers",
 ]
 
-_PROVIDERS = ("google", "ollama")
+_PROVIDERS = ("google", "openai", "ollama")
 
 _cache: dict[str, LLMProvider] = {}
 
@@ -77,6 +81,10 @@ def get_provider(name: str | None = None) -> LLMProvider:
             from .gemini import GeminiProvider
 
             _cache[key] = GeminiProvider()
+        elif key == "openai":
+            from .openai import OpenAIProvider
+
+            _cache[key] = OpenAIProvider()
         elif key == "ollama":
             from .ollama import OllamaProvider
 

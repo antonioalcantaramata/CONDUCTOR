@@ -111,6 +111,19 @@ class OllamaProvider:
         self.think = OLLAMA_THINK if _think is None else _think.strip().lower() == "true"
         self._preflighted = False
 
+    def describe(self) -> dict[str, str]:
+        """Settings worth recording in the session log.
+
+        `num_ctx` rides along because it is the setting most likely to explain
+        a bad local answer: too small a window and Ollama truncates the system
+        prompt away.
+        """
+        return {
+            "reasoning": "on" if self.think else "off",
+            "endpoint": f"{self.host}/api/chat",
+            "num_ctx": str(self.num_ctx),
+        }
+
     # -- preflight ---------------------------------------------------------
 
     def preflight(self) -> None:

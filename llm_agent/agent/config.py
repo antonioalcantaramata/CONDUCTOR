@@ -32,6 +32,8 @@ BASE_URL: str = os.environ.get("DT_BACKEND_URL", "http://localhost:8000")
 # LLM backend selection
 # ---------------------------------------------------------------------------
 # "google" = Google Generative AI (needs GEMINI_API_KEY);
+# "openai" = the OpenAI API, or anything speaking its chat-completions dialect
+#            (needs OPENAI_API_KEY);
 # "ollama" = a local Ollama server (no key, no data leaves the machine).
 LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "google").strip().lower()
 
@@ -44,6 +46,76 @@ GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 _api_key = os.environ.get("GEMINI_API_KEY", "")
 # Not raising here — the Streamlit app handles the missing-key setup flow.
 GEMINI_API_KEY: str = _api_key
+
+# How hard a thinking-capable Gemini model reasons before answering, lowest to
+# highest. Gemini's ladder is its own — four rungs where OpenAI has five, and
+# "minimal" where OpenAI says "none" — so it is spelled out here rather than
+# forced onto a shared scale that would match neither API.
+GEMINI_THINKING_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# Empty means "send nothing", which leaves the model on its own dynamic budget.
+# That is the default because it is what this provider has always done: the
+# call has only ever set include_thoughts=False, which suppresses *returning*
+# the thought trace and does not stop the model thinking. Pinning a level here
+# would quietly change latency, cost and answer quality for every existing
+# user, so the parity knob is opt-in rather than a new default.
+GEMINI_THINKING_LEVEL: str = os.environ.get(
+    "GEMINI_THINKING_LEVEL", ""
+).strip().lower()
+
+# ---------------------------------------------------------------------------
+# OpenAI (and OpenAI-compatible endpoints)
+# ---------------------------------------------------------------------------
+# Default matches llm_agent/.env.example — keep the two in sync. Any model set
+# here must support tool calling: CONDUCTOR drives the grid entirely through
+# tools, so a model without it can only chat.
+OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+
+# How hard a reasoning model thinks before answering, lowest to highest.
+# Ordered, because the settings UI renders them as a slider-like choice.
+OPENAI_REASONING_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
+
+# "medium" rather than "none", matching what the other two backends already do:
+# the Gemini path leaves the thinking budget at its default and Ollama defaults
+# OLLAMA_THINK to true. A turn here plans several tool calls and then reasons
+# over grid results, so some deliberation earns its cost.
+#
+# Sent only when non-empty, and dropped automatically if the model rejects it —
+# non-reasoning models and some OpenAI-compatible servers do not accept the
+# parameter at all.
+OPENAI_REASONING_EFFORT: str = os.environ.get(
+    "OPENAI_REASONING_EFFORT", "medium"
+).strip().lower()
+
+OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
+
+# Which OpenAI endpoint to drive.
+#
+#   auto      — /v1/responses when a reasoning level is asked for and the base
+#               URL is OpenAI's own; /v1/chat/completions otherwise.
+#   chat      — always /v1/chat/completions.
+#   responses — always /v1/responses.
+#
+# The split exists because the two endpoints can do different things. Newer
+# reasoning models refuse function tools combined with any reasoning effort on
+# chat/completions — and CONDUCTOR sends tools on every turn — so reasoning is
+# only reachable through /v1/responses. Meanwhile most OpenAI-*compatible*
+# servers (vLLM, OpenRouter, Groq) implement only chat/completions, which is
+# why a custom base URL stays on it unless told otherwise.
+OPENAI_APIS: tuple[str, ...] = ("auto", "chat", "responses")
+OPENAI_API: str = os.environ.get("OPENAI_API", "auto").strip().lower()
+
+# Overridable so the same provider serves anything speaking the OpenAI
+# chat-completions dialect — Azure OpenAI, OpenRouter, Groq, a local vLLM or
+# llama.cpp server. Only the base changes; the wire format is identical.
+OPENAI_BASE_URL: str = os.environ.get(
+    "OPENAI_BASE_URL", "https://api.openai.com/v1"
+).rstrip("/")
+
+# Hosted, so far quicker than Ollama, but this agent's turns carry ~25k tokens
+# of prompt and can fan out over several tool calls. Matches the Gemini path's
+# DT_MODEL_REQUEST_TIMEOUT_MS rather than Ollama's much longer local budget.
+OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "180"))
 
 # ---------------------------------------------------------------------------
 # Ollama (local models)

@@ -89,6 +89,53 @@ class TestWriting:
 
 
 @SYMLINKS
+class TestBackendAttribution:
+    """A turn that cannot be attributed to a model cannot be compared with one
+    from another model, which is most of what the offline graders do."""
+
+    def test_describe_provider_reads_the_interface(self):
+        from llm_agent.agent.providers.base import describe_provider
+
+        class Bare:
+            name, model = "someprovider", "some-model"
+
+        assert describe_provider(Bare()) == {
+            "provider": "someprovider", "model": "some-model",
+            "reasoning": "", "endpoint": "",
+        }
+
+    def test_custom_fields_are_merged(self):
+        from llm_agent.agent.providers.base import describe_provider
+
+        class WithDetail:
+            name, model = "p", "m"
+
+            def describe(self):
+                return {"reasoning": "high", "extra": 7}
+
+        detail = describe_provider(WithDetail())
+        assert detail["reasoning"] == "high"
+        assert detail["extra"] == "7", "values are stringified for the log"
+
+    def test_a_broken_describe_never_costs_the_log_record(self):
+        from llm_agent.agent.providers.base import describe_provider
+
+        class Broken:
+            name, model = "p", "m"
+
+            def describe(self):
+                raise RuntimeError("boom")
+
+        assert describe_provider(Broken())["provider"] == "p"
+
+    def test_a_provider_missing_both_fields_still_describes(self):
+        from llm_agent.agent.providers.base import describe_provider
+
+        assert describe_provider(object()) == {
+            "provider": "", "model": "", "reasoning": "", "endpoint": "",
+        }
+
+
 class TestLatestPointer:
     def test_points_at_the_current_run(self, log_dir):
         loop._append_to_log({"turn": 1})

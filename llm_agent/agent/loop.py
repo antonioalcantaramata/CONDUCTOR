@@ -37,6 +37,7 @@ from .validators import (
 )
 from .providers import (
     assistant_message,
+    describe_provider,
     get_provider,
     tool_message,
     user_message as make_user_message,
@@ -386,6 +387,11 @@ def run_agent_turn(
         "status": turn_status,
         "error_classification": error_classification,
         "runner_error": runner_error,
+        # Which backend answered. Without this a log cannot say whether a turn
+        # came from Gemini, a hosted OpenAI model at some reasoning level, or a
+        # local one — so answers from different backends cannot be compared,
+        # which is most of what the graders in `evaluation/` exist to do.
+        **describe_provider(provider),
         "user": user_message,
         # The grid facts the system prompt carried this turn. Recorded because
         # they are a legitimate source for a figure in the answer: asked to

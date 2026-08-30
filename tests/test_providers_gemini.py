@@ -11,8 +11,11 @@ from types import SimpleNamespace
 import pytest
 
 from llm_agent.agent.providers.base import ModelResponse, ToolCall, assistant_message
+from google.genai.errors import ClientError
+
 from llm_agent.agent.providers.gemini import (
     GeminiProvider,
+    _rejected_thinking_level,
     _decode_signature,
     _encode_signature,
     _sanitize_for_proto,
@@ -36,6 +39,84 @@ def _response(parts):
 @pytest.fixture
 def provider():
     return GeminiProvider()
+
+
+class TestDescribe:
+    def test_default_reads_as_model_default_not_off(self, monkeypatch):
+        """Gemini reasons either way; a blank field would imply it did not."""
+        from llm_agent.agent.providers.base import describe_provider
+
+        monkeypatch.delenv("GEMINI_THINKING_LEVEL", raising=False)
+        detail = describe_provider(GeminiProvider(model="gemini-x"))
+        assert detail["provider"] == "google"
+        assert detail["model"] == "gemini-x"
+        assert detail["reasoning"] == "model default"
+
+    def test_pinned_level_is_reported(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_THINKING_LEVEL", "high")
+        assert GeminiProvider().describe()["reasoning"] == "high"
+
+
+class TestThinkingLevel:
+    """`include_thoughts=False` hides the trace; it never stopped the model
+    thinking. These pin that distinction, and that the default is unchanged."""
+
+    def test_default_leaves_the_model_on_its_own_budget(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_THINKING_LEVEL", raising=False)
+        assert GeminiProvider().thinking_level == ""
+
+    def test_default_config_pins_no_level(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_THINKING_LEVEL", raising=False)
+        cfg = GeminiProvider()._config([], "S", "")
+        # The long-standing behaviour: trace suppressed, thinking untouched.
+        assert cfg.thinking_config.include_thoughts is False
+        assert cfg.thinking_config.thinking_level is None
+        assert cfg.thinking_config.thinking_budget is None
+
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high"])
+    def test_every_documented_level_reaches_the_config(self, level):
+        cfg = GeminiProvider(thinking_level=level)._config([], "S", level)
+        # genai wants the enum spelling, which is upper case.
+        assert cfg.thinking_config.thinking_level == level.upper()
+
+    def test_level_is_normalised(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_THINKING_LEVEL", "  High  ")
+        assert GeminiProvider().thinking_level == "high"
+
+    def test_empty_means_unset_not_the_import_time_default(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_THINKING_LEVEL", "")
+        assert GeminiProvider().thinking_level == ""
+
+    def test_trace_is_still_suppressed_when_a_level_is_pinned(self):
+        cfg = GeminiProvider(thinking_level="high")._config([], "S", "high")
+        assert cfg.thinking_config.include_thoughts is False
+
+    def test_other_generation_settings_are_untouched(self):
+        cfg = GeminiProvider(thinking_level="low")._config(["T"], "SYS", "low")
+        assert cfg.temperature == 0
+        assert cfg.system_instruction == "SYS"
+
+
+class TestRejectedThinkingLevel:
+    """An older model refusing the field should cost a retry, not the turn."""
+
+    def _error(self, code, message):
+        """A ClientError built the way google-genai builds one."""
+        return ClientError(code, {"error": {"code": code, "message": message,
+                                            "status": "INVALID_ARGUMENT"}})
+
+    def test_400_naming_thinking_is_recognised(self):
+        assert _rejected_thinking_level(
+            self._error(400, "Unknown name \"thinking_level\" in ThinkingConfig")
+        ) is True
+
+    def test_unrelated_400_is_not(self):
+        assert _rejected_thinking_level(
+            self._error(400, "Invalid function declaration")
+        ) is False
+
+    def test_non_400_is_not(self):
+        assert _rejected_thinking_level(self._error(429, "thinking")) is False
 
 
 class TestSignatureEncoding:

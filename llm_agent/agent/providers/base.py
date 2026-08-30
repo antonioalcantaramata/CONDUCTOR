@@ -19,8 +19,11 @@ keep their native Python structure; providers sanitise at the boundary.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -106,6 +109,34 @@ def iter_tool_calls(message: dict) -> list[ToolCall]:
 # ---------------------------------------------------------------------------
 
 
+def describe_provider(provider) -> dict[str, str]:
+    """Which backend served a turn, for the session log.
+
+    The log is the only durable evidence of what the agent did, and the offline
+    graders read nothing else — so with three backends, and reasoning settings
+    on two of them, an answer that cannot be attributed to a model cannot be
+    compared against one from another model.
+
+    Providers may define `describe()` to add their own fields; the two that
+    always exist come off the interface itself. Never raises: a log record is
+    worth writing even when one field could not be read.
+    """
+    detail = {
+        "provider": str(getattr(provider, "name", "") or ""),
+        "model": str(getattr(provider, "model", "") or ""),
+        "reasoning": "",
+        "endpoint": "",
+    }
+    custom = getattr(provider, "describe", None)
+    if callable(custom):
+        try:
+            detail.update({k: str(v) for k, v in (custom() or {}).items()})
+        except Exception:  # noqa: BLE001
+            logger.warning("Provider %r could not describe itself.",
+                           detail["provider"], exc_info=True)
+    return detail
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """
@@ -137,3 +168,8 @@ class LLMProvider(Protocol):
         the first request of a turn; cheap providers may make this a no-op.
         """
         ...
+
+    # Optional: `describe() -> dict[str, str]` adds provider-specific settings
+    # to the session log. Not part of the required contract — `name` and
+    # `model` above are enough to attribute a turn — so implementations may
+    # leave it out. See `describe_provider`.

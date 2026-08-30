@@ -22,6 +22,8 @@ import streamlit.components.v1 as components
 from agent.config import (
     BASE_URL,
     GEMINI_MODEL,
+    GEMINI_THINKING_LEVEL,
+    GEMINI_THINKING_LEVELS,
     HTTP_TIMEOUT,
     last_grid_constants_status,
     OLLAMA_HOST,
@@ -29,6 +31,12 @@ from agent.config import (
     OLLAMA_NUM_CTX,
     OLLAMA_OUTPUT_RESERVE,
     OLLAMA_TIMEOUT_S,
+    OPENAI_API,
+    OPENAI_APIS,
+    OPENAI_BASE_URL,
+    OPENAI_MODEL,
+    OPENAI_REASONING_EFFORT,
+    OPENAI_REASONING_EFFORTS,
 )
 from agent.config import (
     fetch_grid_constants,
@@ -40,8 +48,15 @@ from agent.hardware import advice as hw_advice
 from agent.hardware import detect as detect_hardware
 from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent.loop import run_agent_turn
-from agent.providers import active_provider_name, get_provider, reset_providers
+from agent.providers import (
+    active_provider_name,
+    available_providers,
+    get_provider,
+    reset_providers,
+)
 from agent.providers.ollama import probe as ollama_probe
+from agent.providers.openai import OpenAIProvider as _OpenAIProvider
+from agent.providers.openai import probe as openai_probe
 from agent import network_map as _network_map
 from agent.renderers import RENDERER_MAP, render_network_map
 from agent import tools as _tools_module
@@ -53,7 +68,11 @@ _DATA_FILES_DIR = _REPO_ROOT / "data_files"
 _SYSTEMS_DIR = _REPO_ROOT / "systems"
 _LOGO_PATH = _APP_DIR / "assets" / "conductor_logo.png"
 
-_PROVIDER_LABELS = {"google": "Google Gemini API", "ollama": "Ollama (local)"}
+_PROVIDER_LABELS = {
+    "google": "Google Gemini API",
+    "openai": "OpenAI API",
+    "ollama": "Ollama (local)",
+}
 
 
 def _active_model_label() -> str:
@@ -1197,6 +1216,8 @@ def _provider_configured(provider: str) -> bool:
     """Whether `provider` already has what it needs, so starting is one click."""
     if provider == "ollama":
         return bool(os.environ.get("OLLAMA_MODEL", "").strip())
+    if provider == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY", "").strip())
     return _has_api_key()
 
 
@@ -1220,6 +1241,7 @@ def _render_google_setup() -> None:
             placeholder="AIzaSy…",
             help="Your key is saved locally to .env and never sent anywhere else.",
         )
+        thinking = _gemini_thinking_picker(key="setup_gemini_thinking")
         submitted = st.form_submit_button("Save & Start", type="primary", use_container_width=True)
 
     if submitted:
@@ -1227,10 +1249,174 @@ def _render_google_setup() -> None:
         if not key:
             st.error("Please paste a valid API key before continuing.")
         else:
-            _write_env({"LLM_PROVIDER": "google", "GEMINI_API_KEY": key})
+            _write_env({
+                "LLM_PROVIDER": "google",
+                "GEMINI_API_KEY": key,
+                "GEMINI_THINKING_LEVEL": thinking,
+            })
             st.session_state._launched = True
             st.success("API key saved! Starting the assistant…")
             st.rerun()
+
+
+_GEMINI_DEFAULT_LABEL = "model default"
+
+
+def _gemini_thinking_picker(*, key: str) -> str:
+    """Gemini reasoning choice. Returns "" for the model's own budget.
+
+    Gemini's ladder has four rungs to OpenAI's five, and an extra "leave it to
+    the model" position that OpenAI has no equivalent for — so this is spelled
+    out separately rather than forced onto a shared scale.
+    """
+    options = [_GEMINI_DEFAULT_LABEL, *GEMINI_THINKING_LEVELS]
+    raw = os.environ.get("GEMINI_THINKING_LEVEL")
+    current = (GEMINI_THINKING_LEVEL if raw is None else raw).strip().lower()
+    value = current if current in GEMINI_THINKING_LEVELS else _GEMINI_DEFAULT_LABEL
+    picked = st.select_slider(
+        "Reasoning",
+        options=options,
+        value=value,
+        key=key,
+        help="Gemini reasons by default at a budget it chooses. Pin a level to "
+             "trade answer quality against speed and cost. Models that predate "
+             "thinking levels ignore this.",
+    )
+    return "" if picked == _GEMINI_DEFAULT_LABEL else picked
+
+
+def _openai_effort_picker(*, key: str) -> str:
+    """Reasoning-effort choice, shared by the setup and settings screens."""
+    options = list(OPENAI_REASONING_EFFORTS)
+    current = (os.environ.get("OPENAI_REASONING_EFFORT") or OPENAI_REASONING_EFFORT)
+    index = options.index(current) if current in options else options.index("medium")
+    return st.select_slider(
+        "Reasoning effort",
+        options=options,
+        value=options[index],
+        key=key,
+        help="How hard the model thinks before answering. A turn plans several "
+             "tool calls and then reasons over the results, so lowering this "
+             "trades answer quality for speed and cost. Ignored by models that "
+             "do not reason.",
+    )
+
+
+def _render_openai_setup() -> None:
+    st.markdown(
+        """
+        #### OpenAI API
+
+        Paid per token — there is no free tier — so an account with credit is
+        needed. If you would rather not pay, **Ollama** runs the same agent
+        locally at no cost.
+
+        1. Go to [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+        2. Click **Create new secret key** and copy it
+        3. Paste it below
+        """
+    )
+    with st.form("openai_setup"):
+        key_input = st.text_input(
+            "OpenAI API key",
+            type="password",
+            placeholder="sk-…",
+            help="Your key is saved locally to .env and never sent anywhere else.",
+        )
+        model_input = st.text_input(
+            "Model",
+            value=os.environ.get("OPENAI_MODEL") or OPENAI_MODEL,
+            help="Must support tool calling — CONDUCTOR drives the grid entirely "
+                 "through tools.",
+        )
+        effort = _openai_effort_picker(key="setup_openai_effort")
+        submitted = st.form_submit_button(
+            "Save & Start", type="primary", use_container_width=True
+        )
+
+    if not submitted:
+        return
+
+    key = key_input.strip()
+    if not key:
+        st.error("Please paste a valid API key before continuing.")
+        return
+
+    # Check the key and the model now rather than letting the first question
+    # fail: a typo here is otherwise only discovered mid-conversation.
+    info = openai_probe(api_key=key)
+    if not info["reachable"]:
+        st.error(info["error"] or "Could not reach the OpenAI API with that key.")
+        return
+    if info["models"] and model_input.strip() not in info["models"]:
+        st.error(
+            f"This key cannot reach `{model_input.strip()}`. "
+            f"Available: {', '.join(info['models'][:15])}"
+        )
+        return
+
+    _write_env({
+        "LLM_PROVIDER": "openai",
+        "OPENAI_API_KEY": key,
+        "OPENAI_MODEL": model_input.strip(),
+        "OPENAI_REASONING_EFFORT": effort,
+    })
+    st.session_state._launched = True
+    st.success("API key saved! Starting the assistant…")
+    st.rerun()
+
+
+def _render_openai_settings(*, key_prefix: str) -> bool:
+    """OpenAI options, editable at any time. Returns True if saved."""
+    with st.form(f"{key_prefix}_openai_settings"):
+        model = st.text_input(
+            "Model",
+            value=os.environ.get("OPENAI_MODEL") or OPENAI_MODEL,
+            help="Must support tool calling.",
+        )
+        key = st.text_input(
+            "API key (leave blank to keep the current one)",
+            type="password", placeholder="sk-…",
+        )
+        effort = _openai_effort_picker(key=f"{key_prefix}_openai_effort")
+        api = st.selectbox(
+            "Endpoint",
+            options=list(OPENAI_APIS),
+            index=list(OPENAI_APIS).index(
+                (os.environ.get("OPENAI_API") or OPENAI_API)
+                if (os.environ.get("OPENAI_API") or OPENAI_API) in OPENAI_APIS
+                else "auto"
+            ),
+            format_func=lambda a: {
+                "auto": "auto — Responses when reasoning is on",
+                "chat": "chat/completions",
+                "responses": "responses",
+            }.get(a, a),
+            key=f"{key_prefix}_openai_api",
+            help="Newer reasoning models refuse function tools together with "
+                 "reasoning on chat/completions, and CONDUCTOR uses tools on "
+                 "every turn — so reasoning needs /v1/responses. Most "
+                 "OpenAI-compatible servers implement only chat/completions.",
+        )
+        base_url = st.text_input(
+            "Base URL",
+            value=os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL,
+            help="Change this to use any OpenAI-compatible endpoint — Azure "
+                 "OpenAI, OpenRouter, a local vLLM server.",
+        )
+        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+            updates = {
+                "LLM_PROVIDER": "openai",
+                "OPENAI_MODEL": model.strip(),
+                "OPENAI_REASONING_EFFORT": effort,
+                "OPENAI_API": api,
+                "OPENAI_BASE_URL": base_url.strip() or OPENAI_BASE_URL,
+            }
+            if key.strip():
+                updates["OPENAI_API_KEY"] = key.strip()
+            _write_env(updates)
+            return True
+    return False
 
 
 def _prompt_token_estimate() -> int:
@@ -1354,12 +1540,17 @@ def _render_google_settings(*, key_prefix: str) -> bool:
             help="Free-tier Gemma models cap input well below this agent's "
                  "per-call overhead; a Flash model is the safe choice.",
         )
+        thinking = _gemini_thinking_picker(key=f"{key_prefix}_gemini_thinking")
         key = st.text_input(
             "API key (leave blank to keep the current one)",
             type="password", placeholder="AIzaSy…",
         )
         if st.form_submit_button("Save settings", type="primary", use_container_width=True):
-            updates = {"LLM_PROVIDER": "google", "GEMINI_MODEL": model.strip()}
+            updates = {
+                "LLM_PROVIDER": "google",
+                "GEMINI_MODEL": model.strip(),
+                "GEMINI_THINKING_LEVEL": thinking,
+            }
             if key.strip():
                 updates["GEMINI_API_KEY"] = key.strip()
             _write_env(updates)
@@ -1502,6 +1693,20 @@ def _render_ollama_setup() -> None:
         st.rerun()
 
 
+# One entry per backend, so adding a provider means adding its two screens and
+# a row here rather than editing every if/else that names a backend.
+_SETUP_RENDERERS = {
+    "google": _render_google_setup,
+    "openai": _render_openai_setup,
+    "ollama": _render_ollama_setup,
+}
+_SETTINGS_RENDERERS = {
+    "google": _render_google_settings,
+    "openai": _render_openai_settings,
+    "ollama": _render_ollama_settings,
+}
+
+
 def _render_ready_to_start(provider: str) -> None:
     """
     The already-configured case: confirm what will be used and get out of the way.
@@ -1510,9 +1715,32 @@ def _render_ready_to_start(provider: str) -> None:
     """
     if provider == "google":
         key = os.environ.get("GEMINI_API_KEY", "")
+        raw = os.environ.get("GEMINI_THINKING_LEVEL")
+        level = (GEMINI_THINKING_LEVEL if raw is None else raw).strip().lower()
+        reasoning = f"`{level}`" if level in GEMINI_THINKING_LEVELS else "model default"
         st.success(
             f"Ready — model `{os.environ.get('GEMINI_MODEL') or GEMINI_MODEL}`, "
-            f"key `…{key[-4:]}` loaded from `.env`."
+            f"reasoning {reasoning}, key `…{key[-4:]}` loaded from `.env`."
+        )
+    elif provider == "openai":
+        key = os.environ.get("OPENAI_API_KEY", "")
+        model = os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
+        base = os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL
+        where = "" if base == OPENAI_BASE_URL else f" via `{base}`"
+        effort = os.environ.get("OPENAI_REASONING_EFFORT") or OPENAI_REASONING_EFFORT
+        reasoning = f", reasoning `{effort}`" if effort else ""
+        # The endpoint is derived from the other settings under "auto", so
+        # naming it here is the only way the user can see which one applies.
+        #
+        # Built fresh rather than read off get_provider(): that instance is
+        # memoised, so it reports the settings in force when it was first
+        # constructed, not the ones on screen. A bare provider costs nothing —
+        # no client, no request.
+        endpoint = ("/v1/responses" if _OpenAIProvider().uses_responses
+                    else "/v1/chat/completions")
+        st.success(
+            f"Ready — model `{model}`{reasoning} via `{endpoint}`, "
+            f"key `…{key[-4:]}` loaded from `.env`{where}."
         )
     else:
         model = os.environ.get("OLLAMA_MODEL", "")
@@ -1538,10 +1766,8 @@ def _render_ready_to_start(provider: str) -> None:
         st.rerun()
 
     with st.expander("Change settings"):
-        saved = (
-            _render_google_settings(key_prefix="launch")
-            if provider == "google"
-            else _render_ollama_settings(key_prefix="launch")
+        saved = _SETTINGS_RENDERERS.get(provider, _render_ollama_settings)(
+            key_prefix="launch"
         )
         if saved:
             st.success("Saved.")
@@ -1558,6 +1784,7 @@ if not st.session_state.get("_launched"):
 
     _CHOICES = {
         "Google Gemini API": "google",
+        "OpenAI API": "openai",
         "Local model (Ollama)": "ollama",
     }
     _labels = list(_CHOICES)
@@ -1572,6 +1799,7 @@ if not st.session_state.get("_launched"):
             horizontal=True,
             captions=[
                 "Hosted, needs a free API key, fastest to set up.",
+                "Hosted, paid per token, needs a tool-capable model.",
                 "Fully local and private, needs a tool-capable model.",
             ],
             label_visibility="collapsed",
@@ -1582,7 +1810,7 @@ if not st.session_state.get("_launched"):
     if _provider_configured(_picked):
         _render_ready_to_start(_picked)
     else:
-        _render_google_setup() if _picked == "google" else _render_ollama_setup()
+        _SETUP_RENDERERS[_picked]()
 
     st.stop()  # Do not render the rest of the app until a backend is chosen
 
@@ -1899,19 +2127,18 @@ with st.sidebar:
     # a local model's context should not require a restart or a .env edit.
     _active = active_provider_name()
     with st.expander(f"Model settings — {_PROVIDER_LABELS.get(_active, _active)}"):
+        _backends = list(available_providers())
         _switch_to = st.radio(
             "Backend",
-            ["google", "ollama"],
-            index=0 if _active == "google" else 1,
+            _backends,
+            index=_backends.index(_active) if _active in _backends else 0,
             format_func=lambda p: _PROVIDER_LABELS.get(p, p),
             horizontal=True,
             key="sidebar_provider",
         )
         st.divider()
-        _saved = (
-            _render_google_settings(key_prefix="sidebar")
-            if _switch_to == "google"
-            else _render_ollama_settings(key_prefix="sidebar")
+        _saved = _SETTINGS_RENDERERS.get(_switch_to, _render_ollama_settings)(
+            key_prefix="sidebar"
         )
         if _saved:
             st.success("Saved — applies to your next message.")

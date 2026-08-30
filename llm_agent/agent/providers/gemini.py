@@ -11,6 +11,12 @@ noting:
   - the assistant role is called "model", not "assistant";
   - tool results are sent back as a *user* turn carrying FunctionResponse
     parts, and consecutive results are batched into a single turn.
+
+One setting is easy to misread. `include_thoughts=False` — set on every call
+since this provider was written — suppresses *returning* the thought trace; it
+does not stop the model thinking. Reasoning has therefore always been on here,
+at whatever dynamic budget the model chooses. `GEMINI_THINKING_LEVEL` pins it
+instead, and defaults to empty so that behaviour is unchanged unless asked for.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import time
 from typing import Any, Callable
 
@@ -28,6 +35,7 @@ from google.genai.errors import ClientError, ServerError
 
 from ..config import (
     GEMINI_MODEL,
+    GEMINI_THINKING_LEVEL,
     MODEL_OVERLOADED_RETRY_DELAY_S,
     MODEL_REQUEST_TIMEOUT_MS,
     MODEL_RETRY_ATTEMPTS,
@@ -43,16 +51,30 @@ class GeminiProvider:
 
     name = "google"
 
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(self, model: str | None = None,
+                 thinking_level: str | None = None) -> None:
         self.model = model or GEMINI_MODEL
+        # Read from the live environment so the settings panel can change it
+        # mid-session (see providers.reset_providers). Empty is a real choice —
+        # it means "leave the model on its own budget" — so `or` would be wrong.
+        if thinking_level is None:
+            raw = os.environ.get("GEMINI_THINKING_LEVEL")
+            thinking_level = GEMINI_THINKING_LEVEL if raw is None else raw
+        self.thinking_level = thinking_level.strip().lower()
         self._client: genai.Client | None = None
+
+    def describe(self) -> dict[str, str]:
+        """Settings worth recording in the session log.
+
+        "model default" rather than "" or "off": Gemini reasons either way,
+        and a blank field here would read as though it did not.
+        """
+        return {"reasoning": self.thinking_level or "model default"}
 
     # -- lifecycle ---------------------------------------------------------
 
     def preflight(self) -> None:
         """Verify an API key is available before the first request."""
-        import os
-
         if not os.environ.get("GEMINI_API_KEY", "").strip():
             raise RuntimeError(
                 "GEMINI_API_KEY is not set. "
@@ -62,8 +84,6 @@ class GeminiProvider:
     def _get_client(self) -> genai.Client:
         """Return the shared client, creating it on first use."""
         if self._client is None:
-            import os
-
             self.preflight()
             self._client = genai.Client(
                 api_key=os.environ.get("GEMINI_API_KEY", ""),
@@ -80,15 +100,41 @@ class GeminiProvider:
         system: str,
         on_event: Callable[[str, dict], None] | None = None,
     ) -> ModelResponse:
-        config = types.GenerateContentConfig(
+        contents = self._to_contents(messages)
+        try:
+            response = self._generate_with_retry(
+                contents, self._config(tools, system, self.thinking_level),
+                on_event=on_event,
+            )
+        except ClientError as exc:
+            # A model that predates thinking levels rejects the field outright.
+            # That is a fact about the model, not about this request, so fall
+            # back to its own budget rather than failing the turn over a knob.
+            if not (self.thinking_level and _rejected_thinking_level(exc)):
+                raise
+            logger.info("Model %s rejected thinking_level=%s; retrying without it.",
+                        self.model, self.thinking_level)
+            response = self._generate_with_retry(
+                contents, self._config(tools, system, ""), on_event=on_event,
+            )
+        return self._to_model_response(response)
+
+    def _config(self, tools: list, system: str, thinking_level: str):
+        """One request config, with thinking pinned only when asked for.
+
+        `include_thoughts=False` suppresses *returning* the thought trace; it
+        does not stop the model thinking. Whether it thinks, and how hard, is
+        `thinking_level` — left unset, the model uses its own dynamic budget.
+        """
+        thinking = types.ThinkingConfig(include_thoughts=False)
+        if thinking_level:
+            thinking.thinking_level = thinking_level.upper()
+        return types.GenerateContentConfig(
             tools=tools,
             system_instruction=system,
             temperature=0,
-            thinking_config=types.ThinkingConfig(include_thoughts=False),
+            thinking_config=thinking,
         )
-        contents = self._to_contents(messages)
-        response = self._generate_with_retry(contents, config, on_event=on_event)
-        return self._to_model_response(response)
 
     # -- retry -------------------------------------------------------------
 
@@ -266,6 +312,19 @@ class GeminiProvider:
 # ---------------------------------------------------------------------------
 # Proto helpers
 # ---------------------------------------------------------------------------
+
+
+def _rejected_thinking_level(exc: ClientError) -> bool:
+    """Whether this 400 is the model refusing `thinking_level`.
+
+    Both `message` and the rendered exception are searched: `str()` on a genai
+    APIError renders the raw response body, while `message` is the extracted
+    text, and which of the two carries the wording varies by error shape.
+    """
+    if getattr(exc, "code", None) != 400:
+        return False
+    haystack = f"{getattr(exc, 'message', '') or ''} {exc}".lower()
+    return "thinking" in haystack
 
 
 def _encode_signature(raw: bytes | None) -> str | None:
