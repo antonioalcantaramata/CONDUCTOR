@@ -49,3 +49,6 @@ suggest*
 evaluation/runner.py
 evaluation/catalog/
 evaluation/runs/
+
+# ── Design docs — kept locally, not published with the repo ───────────────
+docs/
