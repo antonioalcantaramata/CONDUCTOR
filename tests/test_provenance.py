@@ -60,10 +60,10 @@ class TestExtraction:
     def test_ignores_numbers_glued_to_words(self):
         # "10kV" is part of a bus name and "L0" a line label — neither is a
         # claim about a quantity.
-        assert _values("Viadukten 10kV on segment L0") == []
+        assert _values("Oscar 10kV on segment L0") == []
 
     def test_ignores_element_names_in_code_spans(self):
-        assert _values("Reduce `05 ÅKI Sgen` output") == []
+        assert _values("Reduce `05 ALP Sgen` output") == []
 
     def test_ignores_fenced_code(self):
         assert _values("Result:\n```\nvm_pu = 1.0456\n```\n") == []
@@ -75,7 +75,7 @@ class TestExtraction:
         assert _values("1. First point\n2. Second point\n") == []
 
     def test_ignores_table_alignment_rows(self):
-        table = "| Bus | V |\n| :--- | ---: |\n| Hasle | 1.05 |\n"
+        table = "| Bus | V |\n| :--- | ---: |\n| Echo | 1.05 |\n"
         assert _values(table) == [1.05]
 
     def test_empty_answer(self):
@@ -97,7 +97,7 @@ class TestSources:
     def test_mines_numerals_out_of_strings(self):
         # Element names carry digits and the answer quotes them back. Without
         # this, "all on 10 kV buses" reads as an invention.
-        record = {"tool_results": [{"name": "run_rsa", "result": {"element": "Viadukten 10kV"}}]}
+        record = {"tool_results": [{"name": "run_rsa", "result": {"element": "Oscar 10kV"}}]}
         assert 10.0 in {source.value for source in collect_sources(record)}
 
     def test_booleans_are_not_numbers(self):
@@ -257,7 +257,7 @@ class TestReport:
 def _attribution_record(assistant):
     """Two violations sharing one source — the shape that produced the failure.
 
-    05 ÅKI Sgen can clear Viadukten with 3.354 MW. It cannot clear Åkirkeby at
+    05 ALP Sgen can clear Oscar with 3.354 MW. It cannot clear Alpha at
     all: that movement was withdrawn as undeliverable, which is exactly why
     the model reached for the neighbouring number.
     """
@@ -266,20 +266,20 @@ def _attribution_record(assistant):
         "tool_calls": [{"name": "compute_violation_attribution", "args": {}}],
         "tool_results": [{"name": "compute_violation_attribution", "result": {
             "violations": [
-                {"element": "Viadukten 10kV", "value": 1.0456, "limit": 1.045,
-                 "drivers": [{"source": "05 ÅKI Sgen", "current_p_mw": 3.537,
+                {"element": "Oscar 10kV", "value": 1.0456, "limit": 1.045,
+                 "drivers": [{"source": "05 ALP Sgen", "current_p_mw": 3.537,
                               "relief_mw": -3.354, "relief_mw_feasible": True}],
                  "recommended_action": {
                      "kind": "single_source",
-                     "text": "Reduce 05 ÅKI Sgen by 3.35 MW to bring Viadukten 10kV back to 1.045.",
+                     "text": "Reduce 05 ALP Sgen by 3.35 MW to bring Oscar 10kV back to 1.045.",
                  }},
-                {"element": "Åkirkeby 10.5 kV", "value": 1.0506, "limit": 1.045,
-                 "drivers": [{"source": "05 ÅKI Sgen", "current_p_mw": 3.537,
+                {"element": "Alpha 10.5 kV", "value": 1.0506, "limit": 1.045,
+                 "drivers": [{"source": "05 ALP Sgen", "current_p_mw": 3.537,
                               "relief_mw": None, "relief_mw_feasible": False,
                               "max_deliverable_mw": -3.537}],
                  "recommended_action": {
                      "kind": "none_sufficient",
-                     "text": "No single source can clear Åkirkeby 10.5 kV.",
+                     "text": "No single source can clear Alpha 10.5 kV.",
                  }},
             ],
         }}],
@@ -290,39 +290,39 @@ def _attribution_record(assistant):
 class TestSubjectVocabulary:
     def test_only_violated_elements_can_be_subjects(self):
         record = _attribution_record("")
-        assert subject_names(record) == {"Viadukten 10kV", "Åkirkeby 10.5 kV"}
+        assert subject_names(record) == {"Oscar 10kV", "Alpha 10.5 kV"}
 
     def test_a_name_contained_in_a_longer_one_is_dropped(self):
         # The dispatch table names its rows `element` too, so the generator
-        # "Åkirkeby" entered the vocabulary and shadowed the violated bus
-        # "Åkirkeby 10.5 kV" the sentence was actually about. Prose that says
-        # "Åkirkeby" has not said which one.
+        # "Alpha" entered the vocabulary and shadowed the violated bus
+        # "Alpha 10.5 kV" the sentence was actually about. Prose that says
+        # "Alpha" has not said which one.
         record = _attribution_record("")
         record["tool_results"][0]["result"]["violations"].append(
-            {"element": "Åkirkeby", "value": 1.05, "limit": 1.045, "drivers": []}
+            {"element": "Alpha", "value": 1.05, "limit": 1.045, "drivers": []}
         )
-        assert "Åkirkeby" not in subject_names(record)
+        assert "Alpha" not in subject_names(record)
 
 
 class TestMisattribution:
     def test_a_figure_from_another_violation_is_caught(self):
-        # Observed live. 3.35 MW clears Viadukten; on Åkirkeby the movement
+        # Observed live. 3.35 MW clears Oscar; on Alpha the movement
         # was withdrawn as impossible, and the model filled the gap with the
         # neighbouring violation's number.
         record = _attribution_record(
             "### Attribution\n"
-            "The worst violation is at Åkirkeby 10.5 kV (1.0506 p.u.).\n"
-            "05 ÅKI Sgen is the main contributor, requiring a reduction of 3.35 MW."
+            "The worst violation is at Alpha 10.5 kV (1.0506 p.u.).\n"
+            "05 ALP Sgen is the main contributor, requiring a reduction of 3.35 MW."
         )
         (verdict,) = check_turn(record).misattributed
         assert verdict.claim.value == 3.35
-        assert verdict.subject == "Åkirkeby 10.5 kV"
-        assert verdict.belongs_to == "Viadukten 10kV"
+        assert verdict.subject == "Alpha 10.5 kV"
+        assert verdict.belongs_to == "Oscar 10kV"
 
     def test_the_same_figure_under_its_own_element_is_grounded(self):
         record = _attribution_record(
             "### Attribution\n"
-            "Viadukten 10kV is violating. Reduce 05 ÅKI Sgen by 3.35 MW."
+            "Oscar 10kV is violating. Reduce 05 ALP Sgen by 3.35 MW."
         )
         report = check_turn(record)
         assert report.misattributed == []
@@ -332,7 +332,7 @@ class TestMisattribution:
         # Without this the last element named in one section would still be
         # the subject halfway through the next.
         record = _attribution_record(
-            "### Attribution\nThe worst violation is at Åkirkeby 10.5 kV.\n"
+            "### Attribution\nThe worst violation is at Alpha 10.5 kV.\n"
             "### Dispatch\nThe unit moved by 3.35 MW."
         )
         assert check_turn(record).misattributed == []
@@ -343,12 +343,12 @@ class TestMisattribution:
         # about whichever bus the paragraph opened with — leaving these scoped
         # produced a false positive on every dispatch figure.
         record = _attribution_record(
-            "### Attribution\nThe worst violation is at Åkirkeby 10.5 kV.\n"
-            "Åkirkeby was reduced from 3.54 MW to 3.46 MW."
+            "### Attribution\nThe worst violation is at Alpha 10.5 kV.\n"
+            "Alpha was reduced from 3.54 MW to 3.46 MW."
         )
         record["tool_results"].append({"name": "optimize_flexibility", "result": {
             "activated_resources": [
-                {"element": "Åkirkeby", "Pg_base": 3.537, "Pg_new": 3.4612},
+                {"element": "Alpha", "Pg_base": 3.537, "Pg_new": 3.4612},
             ],
         }})
         assert check_turn(record).misattributed == []
@@ -363,7 +363,7 @@ class TestMisattribution:
 
     def test_misattributed_does_not_count_as_traceable(self):
         record = _attribution_record(
-            "### Attribution\nThe worst violation is at Åkirkeby 10.5 kV, "
+            "### Attribution\nThe worst violation is at Alpha 10.5 kV, "
             "requiring 3.35 MW."
         )
         report = check_turn(record)

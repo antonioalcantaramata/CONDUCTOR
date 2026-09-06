@@ -9,7 +9,7 @@ generate(net, n_days, resolution_min, load_profile, generation_profile, seed, st
 The output format is identical to the historical measurement_database.pkl schema so
 all existing main_backend.py endpoints work unchanged:
     measurements[timestamp_str] = pd.DataFrame({
-        "substation_name": [...],   # bus name (e.g. "Bus_3", "1", "Nexø")
+        "substation_name": [...],   # bus name (e.g. "Bus_3", "1", "Foxtrot")
         "production":      [...],   # total generator output at that bus in MW
         "consumption":     [...],   # total load at that bus in MW
     })

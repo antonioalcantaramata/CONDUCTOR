@@ -2,8 +2,8 @@
 
 A Streamlit chat app plus the LLM agent that drives the
 [backend](../backend/) power-system tools from natural language. The agent
-calls an LLM — hosted Gemini or a local model via Ollama — which decides which
-backend endpoints to invoke, then summarizes the results in text while the app
+calls an LLM — hosted Gemini or OpenAI, or a local model via Ollama — which
+decides which backend endpoints to invoke, then summarizes the results in text while the app
 renders the matching charts.
 
 > See the [root README](../README.md) for setup and how to launch (`./start.sh`
@@ -21,6 +21,7 @@ llm_agent/
 │   ├── providers/         ← pluggable LLM backends
 │   │   ├── base.py        ←   neutral message format + LLMProvider protocol
 │   │   ├── gemini.py      ←   Google Generative AI
+│   │   ├── openai.py      ←   OpenAI + OpenAI-compatible endpoints
 │   │   ├── ollama.py      ←   local models, preflight + context guard
 │   │   └── schema.py      ←   tool schemas → JSON Schema for non-Gemini backends
 │   ├── hardware.py        ← RAM/platform detection for local-model sizing advice
@@ -40,9 +41,16 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 
 | Variable                  | Required            | Default                   | Description                                        |
 | ------------------------- | ------------------- | ------------------------- | -------------------------------------------------- |
-| `LLM_PROVIDER`            | No                  | `google`                  | Backend: `google` or `ollama`                       |
+| `LLM_PROVIDER`            | No                  | `google`                  | Backend: `google`, `openai`, or `ollama`            |
 | `GEMINI_API_KEY`          | If provider=google  | —                         | Google Gemini API key                               |
 | `GEMINI_MODEL`            | No                  | gemini-3.5-flash-lite     | Model id to use                                     |
+| `GEMINI_THINKING_LEVEL`   | No                  | *(empty)*                 | `minimal`/`low`/`medium`/`high`; empty = the model's own budget |
+| `OPENAI_API_KEY`          | If provider=openai  | —                         | OpenAI API key                                      |
+| `OPENAI_MODEL`            | No                  | gpt-5.6-luna              | Model id; must support tool calling                 |
+| `OPENAI_REASONING_EFFORT` | No                  | `medium`                  | `none`/`low`/`medium`/`high`/`xhigh`; empty omits the parameter |
+| `OPENAI_API`              | No                  | `auto`                    | `auto`, `chat`, or `responses` — which endpoint to drive |
+| `OPENAI_BASE_URL`         | No                  | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint                    |
+| `OPENAI_TIMEOUT_S`        | No                  | `180`                     | Request timeout (s)                                 |
 | `OLLAMA_MODEL`            | If provider=ollama  | gemma4:12b-mlx            | Local model; must support tool calling              |
 | `OLLAMA_HOST`             | No                  | `http://localhost:11434`  | Ollama server URL                                   |
 | `OLLAMA_NUM_CTX`          | No                  | `32768`                   | Context window; must exceed the ~25k-token prompt   |
@@ -57,6 +65,25 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 All of these are editable in the app under **Model settings** in the sidebar,
 which writes them back to `.env` and applies them to your next message.
 
+### Reasoning
+
+All three backends reason by default, and each spells the setting its own way
+rather than through a shared scale that would match none of them:
+
+| Backend | Setting | Default |
+| --- | --- | --- |
+| Gemini | `GEMINI_THINKING_LEVEL` — `minimal`…`high`, or empty | empty: the model's own dynamic budget |
+| OpenAI | `OPENAI_REASONING_EFFORT` — `none`…`xhigh` | `medium` |
+| Ollama | `OLLAMA_THINK` — on/off | on |
+
+Two traps worth knowing. On Gemini, `include_thoughts=False` in the request
+suppresses *returning* the thought trace and does not stop the model thinking —
+reasoning has always been on here. On OpenAI, newer reasoning models **refuse
+function tools combined with any reasoning effort** on `/v1/chat/completions`,
+and this agent sends tools every turn, so reasoning is only reachable through
+`/v1/responses`; `OPENAI_API=auto` picks that endpoint whenever a reasoning
+level is set and the base URL is OpenAI's own.
+
 ## How a turn works
 
 1. **Tool call** — the model decides to call e.g. `run_rsa`. The matching
@@ -67,6 +94,16 @@ which writes them back to `.env` and applies them to your next message.
 3. **Charts** — after the text renders, `app.py` walks `_last_tool_results`,
    looks up each tool's renderer in `renderers.py`'s `RENDERER_MAP`, and draws
    the Plotly figures. `_last_tool_results` is cleared at the start of each turn.
+
+Steps 1 and 2 are separate requests, and **each one carries the whole system
+prompt and all tool schemas** — the APIs are stateless, so nothing is retained
+between calls. That fixed prefix measures ~20k tokens, dwarfing the
+conversation itself, which is why `OLLAMA_NUM_CTX` has to be generous and why
+keeping the prompt cache warm matters so much locally.
+
+Every turn is written to `session_logs/` as one JSON line, including which
+backend answered it (`provider`, `model`, `reasoning`, `endpoint`) — without
+that, answers from different backends cannot be compared after the fact.
 
 ## Measurements vs forecasts
 

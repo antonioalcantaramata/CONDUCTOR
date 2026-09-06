@@ -44,8 +44,8 @@ class TestCleanLabel:
 class TestBusDisplayName:
     def test_uses_clean_name_when_present(self, case14_net):
         net = case14_net
-        net.bus.at[0, "name"] = "Nexo"
-        assert mb._bus_display_name(net, 0) == "Nexo"
+        net.bus.at[0, "name"] = "Foxtrot"
+        assert mb._bus_display_name(net, 0) == "Foxtrot"
 
     def test_falls_back_to_bus_index_when_blank(self, case14_net):
         net = case14_net
@@ -160,18 +160,18 @@ class TestParseHistoricalTarget:
         assert mb._parse_historical_target("all") == ("all", None)
 
     def test_parses_kind_and_identifier(self):
-        assert mb._parse_historical_target("bus:Nexo") == ("bus", "Nexo")
+        assert mb._parse_historical_target("bus:Foxtrot") == ("bus", "Foxtrot")
         assert mb._parse_historical_target("line:Feeder 1") == ("line", "Feeder 1")
         assert mb._parse_historical_target("trafo:T1") == ("trafo", "T1")
 
     def test_unknown_kind_raises_http_exception(self):
         with pytest.raises(mb.HTTPException) as exc_info:
-            mb._parse_historical_target("substation:Nexo")
+            mb._parse_historical_target("substation:Foxtrot")
         assert exc_info.value.status_code == 400
 
     def test_missing_colon_raises_http_exception(self):
         with pytest.raises(mb.HTTPException) as exc_info:
-            mb._parse_historical_target("Nexo")
+            mb._parse_historical_target("Foxtrot")
         assert exc_info.value.status_code == 400
 
 

@@ -1050,7 +1050,7 @@ class ElementTimeseriesRequest(_TimeseriesRequest):
     element_name : str
         Partial or exact element name. Case-insensitive substring match
         against the ``name`` column of the corresponding pandapower table.
-        For buses use substation name fragments (e.g. ``'Åkirkeby'``).
+        For buses use substation name fragments (e.g. ``'Alpha'``).
         Integer string accepted as fallback index.
     start_timestamp : str | None
         Prefix of the first timestamp to include (e.g. ``'2022-01-03'``).
@@ -1180,7 +1180,7 @@ class FlexibilityEnvelopeRequest(_TimeseriesRequest):
     Attributes
     ----------
     gen_name : str
-        Substation name of the generator to sweep (e.g. ``"Hasle"``).
+        Substation name of the generator to sweep (e.g. ``"Echo"``).
     p_min_mw / p_max_mw : float | None
         Active power sweep range. Defaults to ``[0.0, PG_MAX_DATA[gen_name]]``.
     q_min_mvar / q_max_mvar : float | None
@@ -2762,7 +2762,7 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
     #
     # Each entry carries the bus it sits on as well as its own name. A unit is
     # named after its substation while a bus is named with its voltage level
-    # ("Viadukten" against "Viadukten A"), so a caller given only the name has
+    # ("Oscar" against "Oscar A"), so a caller given only the name has
     # to guess which bus is meant — and on this network three units have no
     # bus of the same name at all. The bus is known here; reporting it removes
     # the guess.
@@ -6979,7 +6979,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
     # 4 decimals (0.1 kW resolution) so the table is readable.
     # We deliberately DO NOT zero Pg_base / Pg_new below the same threshold
     # because some substations have legitimately small baselines (e.g.
-    # Rønne Syd ≈ 0.00023 MW = 0.23 kW) that we want to keep visible.
+    # Juliet South ≈ 0.00023 MW = 0.23 kW) that we want to keep visible.
     # ----------------------------------------------------------------------
     NOISE_THRESHOLD_MW = 1e-4
     DECIMALS = 4
@@ -7366,20 +7366,19 @@ EDDK_VALUES_URL = "https://admin.energydata.dk/api/v1/datastreams/values"
 
 
 # -------------------------------------------------------------------
-# Working public transformer datastream IDs.
-# Source: Aysegul's *new* EDDK_Download_ETL_CDK.ipynb (in
-# EDDK_download_data_pipeline-main-2/, cell 5). She validated these
-# IDs against her current personal-access token; the older 32-ID set
-# (1205489-1205520) used by the previous notebook is now 403 with that
-# token, so it cannot be used for live fetches.
+# Transformer datastream IDs this endpoint fetches.
 #
-# Probing showed her token is actually licensed for the entire range
-# 1205370-1205479 (110 IDs), but we use just the 3 from her notebook
-# to keep the chart readable and to match exactly what she tested.
-# Extend this list once metadata for additional datastreams is
-# documented in the engine's get_datastream_metadata_* helper.
+# A token is licensed for a specific set of datastreams, and an id outside
+# that set returns 403 rather than an empty result — an earlier, larger set
+# stopped working for exactly that reason. Only a few are fetched, which keeps
+# the resulting chart readable; extend the list once the map documents
+# metadata for the additional datastreams.
+#
+# Read from the datastream map rather than written here: real ids identify
+# real measurement points on a real utility's network. See backend/README.md,
+# "The datastream map".
 # -------------------------------------------------------------------
-EDDK_PUBLIC_IDS = [1205370, 1205373, 1205374]
+EDDK_PUBLIC_IDS = eddk_pipe.get_public_ids()
 
 
 def _resolve_eddk_token() -> tuple[str | None, str]:
@@ -7494,8 +7493,8 @@ async def fetch_eddk_data(request: FetchDataRequest):
        Returns ``{datastream_id, timestamp, value, substation, parameter}``
        per row, decorated with metadata from the engine.
     5. **Post-process labelling**: when the engine's metadata lookup
-       comes back ``"Unknown"`` (it doesn't yet recognise the new
-       1205370-range IDs), substitute ``f"ID {datastream_id}"`` so the
+       comes back ``"Unknown"`` (it does not yet carry entries for every
+       fetched datastream), substitute ``f"ID {datastream_id}"`` so the
        frontend's ``groupby('substation')`` gives one line per ID
        rather than collapsing everything onto a single "Unknown" line.
 
@@ -7544,11 +7543,7 @@ async def fetch_eddk_data(request: FetchDataRequest):
         }
 
     # Replace engine's "Unknown" label with the datastream ID or a known substation name.
-    id_to_substation = {
-        1205370: "Åkirkeby",
-        1205373: "Værket",
-        1205374: "Snorrebakken"
-    }
+    id_to_substation = eddk_pipe.get_public_id_labels()
     for row in data:
         ds_id = row.get("datastream_id")
         if ds_id in id_to_substation:

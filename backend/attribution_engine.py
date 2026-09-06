@@ -215,7 +215,7 @@ def _withdraw_infeasible(
     `relief_mw_feasible` was ``False``, and `recommended_action` said no single
     source could clear the bus. The model read that sentence, took the raw
     ``relief_mw`` of -6.2415 from the driver beside it, and wrote "Reduce
-    05 ÅKI Sgen by 6.24 MW" — about a 3.54 MW unit. Moving the decision into
+    05 ALP Sgen by 6.24 MW" — about a 3.54 MW unit. Moving the decision into
     the engine was not enough while the ingredients stayed on the table.
 
     So the impossible figure is withdrawn rather than flagged, and replaced by

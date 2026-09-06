@@ -105,15 +105,15 @@ _FIXED_SETPOINTS_DESC = (
 
 _PG_MAX_OVERRIDES_DESC = (
     "Optional dict overriding the maximum active power capacity (MW) for specific substations. "
-    'Example: {"Hasle": 5.0, "\u00c5kirkeby": 3.0} caps those generators. '
+    'Example: {"Echo": 5.0, "\u00c5kirkeby": 3.0} caps those generators. '
     "Keys are substation names; values are the new upper bound in MW. "
     "Unspecified substations keep their default capacity."
 )
 
 _PG_MIN_OVERRIDES_DESC = (
     "Optional dict overriding the minimum active power (MW) for specific substations. "
-    "Use a positive value to set a must-run constraint (e.g. {\"Hasle\": 1.0} forces "
-    "Hasle to produce at least 1 MW). Use a less-negative value to reduce curtailment headroom. "
+    "Use a positive value to set a must-run constraint (e.g. {\"Echo\": 1.0} forces "
+    "Echo to produce at least 1 MW). Use a less-negative value to reduce curtailment headroom. "
     "Unspecified substations keep their default minimum."
 )
 
@@ -190,7 +190,7 @@ _locate_network_element = genai.types.FunctionDeclaration(
         type=genai.types.Type.OBJECT,
         properties={
             "element": _str_prop(
-                "Name of a bus, line or transformer, e.g. 'Olsker' or 'OLS-ØST'."
+                "Name of a bus, line or transformer, e.g. 'Golf' or 'OLS-ØST'."
             ),
         },
         required=["element"],
@@ -594,7 +594,7 @@ _get_element_timeseries = genai.types.FunctionDeclaration(
         "line loading (%), or transformer loading (%) over time. "
         "Does NOT advance the simulation clock. "
         "Use when the user asks: "
-        "'show me the voltage at Åkirkeby over the last 24 hours', "
+        "'show me the voltage at Alpha over the last 24 hours', "
         "'plot the loading of line X between Monday and Tuesday', "
         "'how did transformer 5 behave this week', "
         "'show me the bus voltage for [substation] in a time range'. "
@@ -618,8 +618,8 @@ _get_element_timeseries = genai.types.FunctionDeclaration(
                 description=(
                     "Name (or partial name) of the element to focus on. "
                     f"For buses use substation name fragments. {_NAMES_FROM_PROMPT} "
-                    "Partial match is supported — a fragment such as 'Åkirkeby' "
-                    "matches both 'Åkirkeby 10.5 kV' and 'Åkirkeby 60 kV'. "
+                    "Partial match is supported — a fragment such as 'Alpha' "
+                    "matches both 'Alpha 10.5 kV' and 'Alpha 60 kV'. "
                     "For lines and trafos use the element name from the network "
                     "(e.g. the name shown in the contingency results)."
                 ),
@@ -710,7 +710,7 @@ _compare_results = genai.types.FunctionDeclaration(
         "Only supply label_a and label_b to name the two scenarios in the charts. "
         "Use when the user asks: 'what changed when...', 'compare X vs Y', "
         "'show the difference between the violation state and the fix', "
-        "'effect of disabling Hasle', 'difference between cable derated to 20 MW vs 70 MW', etc."
+        "'effect of disabling Echo', 'difference between cable derated to 20 MW vs 70 MW', etc."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -721,7 +721,7 @@ _compare_results = genai.types.FunctionDeclaration(
             ),
             "label_b": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description="Human-readable label for the second (scenario) run, e.g. 'Cable 1 MW' or 'No Hasle'. Default: 'Scenario'.",
+                description="Human-readable label for the second (scenario) run, e.g. 'Cable 1 MW' or 'No Echo'. Default: 'Scenario'.",
             ),
         },
     ),
@@ -916,7 +916,7 @@ _run_probabilistic_rsa = genai.types.FunctionDeclaration(
         "Use when the user asks: "
         "'what is the probability of a voltage violation at this operating point?', "
         "'how risky is the current state under uncertainty?', "
-        "'what is the chance Hasle overvoltages with load uncertainty?', "
+        "'what is the chance Echo overvoltages with load uncertainty?', "
         "'give me a probabilistic assessment', "
         "'P5/P50/P95 voltage envelope', "
         "'expected number of violations'. "
@@ -1144,7 +1144,7 @@ _compute_flexibility_envelope = genai.types.FunctionDeclaration(
                 description=(
                     "Substation name of the generator to sweep. "
                     "Must match a 'substation_name' in the network sgen table "
-                    "(e.g. 'Hasle', 'Aakirkeby', 'Nexo'). Required."
+                    "(e.g. 'Echo', 'Alpha', 'Foxtrot'). Required."
                 ),
             ),
             "p_min_mw": genai.types.Schema(

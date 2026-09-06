@@ -1,0 +1,96 @@
+{
+ "datastreams": {
+  "900001": {
+   "substation": "Alpha",
+   "parameter": "t1s_aktiveffekt"
+  },
+  "900002": {
+   "substation": "Alpha",
+   "parameter": "t1s_reaktiveffekt"
+  },
+  "900003": {
+   "substation": "Alpha",
+   "parameter": "t1s_belastning"
+  },
+  "900004": {
+   "substation": "Alpha",
+   "parameter": "lok_10kvskinnespend"
+  },
+  "900006": {
+   "substation": "Bravo",
+   "parameter": "t1s_aktiveffekt"
+  },
+  "900007": {
+   "substation": "Bravo",
+   "parameter": "t1s_reaktiveffekt"
+  },
+  "900008": {
+   "substation": "Bravo",
+   "parameter": "t1s_belastning"
+  },
+  "900009": {
+   "substation": "Bravo",
+   "parameter": "lok_10kvskinnespend"
+  },
+  "900011": {
+   "substation": "Charlie",
+   "parameter": "t1s_aktiveffekt"
+  },
+  "900012": {
+   "substation": "Charlie",
+   "parameter": "t1s_reaktiveffekt"
+  },
+  "900013": {
+   "substation": "Charlie",
+   "parameter": "t1s_belastning"
+  },
+  "900014": {
+   "substation": "Charlie",
+   "parameter": "lok_10kvskinnespend"
+  }
+ },
+ "transformer_p_c": {
+  "900005": {
+   "substation": "Alpha",
+   "parameter": "t1_p_c"
+  },
+  "900010": {
+   "substation": "Bravo",
+   "parameter": "t1_p_c"
+  },
+  "900015": {
+   "substation": "Charlie",
+   "parameter": "t1_p_c"
+  }
+ },
+ "substations": {
+  "ALPHA": {
+   "t1s_aktiveffekt": 900001,
+   "t1s_reaktiveffekt": 900002,
+   "t1s_belastning": 900003,
+   "lok_10kvskinnespend": 900004
+  },
+  "BRAVO": {
+   "t1s_aktiveffekt": 900006,
+   "t1s_reaktiveffekt": 900007,
+   "t1s_belastning": 900008,
+   "lok_10kvskinnespend": 900009
+  },
+  "CHARLIE": {
+   "t1s_aktiveffekt": 900011,
+   "t1s_reaktiveffekt": 900012,
+   "t1s_belastning": 900013,
+   "lok_10kvskinnespend": 900014
+  }
+ },
+ "public_ids": [
+  900101,
+  900102,
+  900103
+ ],
+ "public_id_labels": {
+  "900101": "Alpha",
+  "900102": "Bravo",
+  "900103": "Charlie"
+ }
+}

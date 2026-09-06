@@ -365,7 +365,7 @@ the driver fields, and do NOT describe a movement as feasible or infeasible on y
 judgement. A movement a source cannot deliver is withdrawn from the payload (`relief_mw` / \
 `relief_mvar` null); `max_deliverable_mw` / `max_deliverable_mvar` is then the most that source \
 could contribute. \
-Alongside it give: (a) the largest driver with its sensitivity, e.g. "05 ÅKI Sgen, 0.0053 p.u. \
+Alongside it give: (a) the largest driver with its sensitivity, e.g. "05 ALP Sgen, 0.0053 p.u. \
 per MVAr"; (b) whether the drivers are controllable (generators — actionable) or loads \
 (diagnostic — they explain the regime, e.g. low demand with high injection). \
 Where many violations share the same drivers or the same recommended action, group them and \

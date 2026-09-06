@@ -131,9 +131,9 @@ def aggregated_measurements_substation(timestamp_input):
     row = df.loc[[timestamp]]
 
     # Step 11: Define the names of all substations for which data will be aggregated
-    station_names = ['Åkirkeby', 'Allinge', 'Bodilsker', 'Gudhjem', 'Hasle', 'Nexø',
-                     'Olsker', 'Østerlars', 'Povlsker', 'Rønne Nord', 'Rønne Syd',
-                     'Snorrebakken', 'Svaneke', 'Værket', 'Vesthavnen', 'Viadukten']
+    station_names = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot',
+                     'Golf', 'Hotel', 'India', 'Juliet North', 'Juliet South',
+                     'Kilo', 'Lima', 'Mike', 'November', 'Oscar']
 
     # Step 12: Prepare a list to store the results for each station
     results = []
@@ -161,8 +161,8 @@ def aggregated_measurements_substation(timestamp_input):
     # Step 14: Convert the results list to a DataFrame
     measurement_prod_cons = pd.DataFrame(results)
 
-    # Step 15: Rename 'Povlsker' to 'Poulsker'
-    measurement_prod_cons['substation_name'] = measurement_prod_cons['substation_name'].replace('Povlsker', 'Poulsker')
+    # Step 15: Rename 'India' to 'India'
+    measurement_prod_cons['substation_name'] = measurement_prod_cons['substation_name'].replace('India', 'India')
     
     # Step 15: Return the final DataFrame containing the aggregated production and consumption
     return measurement_prod_cons
@@ -203,8 +203,8 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     """
 
     # -------- Step 1: Standardize names in bus and load --------
-    if 'Gl Dampværket C afg Load' in net.bus['name'].values:
-        net.bus['name'] = net.bus['name'].replace({'Gl Dampværket C afg Load': 'Værket 10kV'})
+    if 'Gl Dampmike C afg Load' in net.bus['name'].values:
+        net.bus['name'] = net.bus['name'].replace({'Gl Dampmike C afg Load': 'Mike 10kV'})
         net.load['name'] = net.load['name'].replace({'00 Gl Dampværk Load': '00 Vær Load'})
 
     # -------- Step 2: Drop unwanted load entries --------
@@ -225,8 +225,8 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
 
     # -------- Step 4: Assign substation names using helper function --------
     # Prefer matching against measurement substation names (the canonical short
-    # names like 'Allinge') so the lookup in Step 5 works for measured substation-style networks
-    # where bus names have kV suffixes ('Allinge 10 kV'). Falls back to the
+    # names like 'Bravo') so the lookup in Step 5 works for measured substation-style networks
+    # where bus names have kV suffixes ('Bravo 10 kV'). Falls back to the
     # network-derived substations list for IEEE / MATPOWER networks.
     meas_sub_names = (
         measurement_prod_cons['substation_name'].dropna().tolist()

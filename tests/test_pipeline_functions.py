@@ -1,7 +1,27 @@
+import os
+import pathlib
+
 import pandas as pd
 import pytest
 
 import pipeline_functions as pf
+
+EXAMPLE_MAP = pathlib.Path(pf.__file__).parent / "datastream_map.example.json"
+
+
+@pytest.fixture(autouse=True)
+def synthetic_map(monkeypatch):
+    """Pin every test to the example map.
+
+    Without this the tests read whichever `datastream_map.local.json` the
+    developer happens to have, so they would pass on one machine and fail on
+    another — and the real map is deliberately not in the repository.
+    """
+    monkeypatch.setenv("CONDUCTOR_DATASTREAM_MAP", str(EXAMPLE_MAP))
+    pf._datastream_map.cache_clear()
+    monkeypatch.setattr(pf, "metadata", pf._datastream_map()["substations"])
+    yield
+    pf._datastream_map.cache_clear()
 
 
 class TestDefineTimespan:
@@ -21,7 +41,7 @@ class TestConvertDatatypes:
         df = pd.DataFrame({
             "datastream_id": ["123"],
             "value": ["4.5"],
-            "substation": ["ALLINGE"],
+            "substation": ["BRAVO"],
             "parameter": ["t1s_belastning"],
             "timestamp": ["2022-08-01T00:00:00"],
         })
@@ -36,7 +56,7 @@ class TestConvertDatatypes:
         df = pd.DataFrame({
             "datastream_id": ["not_a_number"],
             "value": ["4.5"],
-            "substation": ["ALLINGE"],
+            "substation": ["BRAVO"],
             "parameter": ["t1s_belastning"],
             "timestamp": ["2022-08-01T00:00:00"],
         })
@@ -62,8 +82,8 @@ class TestShiftTimespan:
 
 class TestGetIdsBySubstation:
     def test_returns_ids_for_named_substation(self):
-        ids = pf.get_ids_by_substation("ALLINGE")
-        assert ids == list(pf.metadata["ALLINGE"].values())
+        ids = pf.get_ids_by_substation("BRAVO")
+        assert ids == list(pf.metadata["BRAVO"].values())
 
     def test_star_returns_ids_from_all_substations(self):
         ids = pf.get_ids_by_substation("*")
@@ -76,11 +96,11 @@ class TestGetIdsBySubstation:
 
 class TestGetIdBySubstationAndParameter:
     def test_returns_matching_id(self):
-        # Note: get_datastream_metadata() uses title-cased substation names
-        # ("Allinge"), unlike the module-level `metadata` dict which uses
-        # all-caps keys ("ALLINGE") — this mirrors the data as it actually is.
-        datastream_id = pf.get_id_by_substation_and_parameter("Allinge", "t1s_belastning")
-        assert datastream_id == 515613
+        # get_datastream_metadata() uses title-cased substation names
+        # ("Bravo"), unlike the module-level `metadata` dict which uses
+        # all-caps keys ("BRAVO") — the two shapes really do differ.
+        expected = pf.metadata["BRAVO"]["t1s_belastning"]
+        assert pf.get_id_by_substation_and_parameter("Bravo", "t1s_belastning") == expected
 
     def test_returns_none_when_not_found(self):
-        assert pf.get_id_by_substation_and_parameter("Allinge", "not_a_parameter") is None
+        assert pf.get_id_by_substation_and_parameter("Bravo", "not_a_parameter") is None

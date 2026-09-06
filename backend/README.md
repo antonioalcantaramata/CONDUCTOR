@@ -17,6 +17,7 @@ backend/
 ├── rsa_engine.py            ← Real-time security assessment (power flow + limits)
 ├── ca_engine.py             ← Contingency assessment (single outage)
 ├── flex_engine.py           ← Pyomo + IPOPT optimizer, Ybus helpers
+├── element_names.py         ← One spelling of every bus/line/trafo name
 ├── modify_network.py        ← Topology surgery (islanded buses, dead trafos)
 ├── load_gen_assignment.py   ← Maps measurement rows → pandapower loads/sgens
 ├── network_loader.py        ← Load networks, gen→sgen conversion, build Ybus
@@ -27,6 +28,64 @@ backend/
 
 The files other than `main_backend.py` are computation **engines**;
 `main_backend.py` is the orchestration layer the endpoints live in.
+`element_names.py` is the exception: a leaf module both the endpoints and
+`rsa_engine.py` import, so that a bus, line or transformer is named identically
+wherever it is reported.
+
+## Element names
+
+Callers join results onto topology **by name** — the system map draws
+`/api/network/topology` and colours it with `/api/grid/rsa` — so every endpoint
+has to spell a name the same way. `element_names.py` is the single place that
+decides:
+
+```
+Bus_3 -> Bus_6 [T0]                       no name of its own
+T1 60/10 | Bus_3 -> Bus_6 [T0]            the same transformer, named
+```
+
+The endpoints and the index are appended even when the element is named,
+because indices shift when a network is modified and two transformers between
+the same pair of buses are ordinary. Nothing outside this module should build
+an element name.
+
+## The datastream map
+
+`pipeline_functions.py` is an optional client for one specific utility's
+time-series API. To fetch anything it needs to know that datastream `515613`
+is transformer 1's loading at a particular substation — a table of several
+hundred rows tying numeric ids to real substation names.
+
+That table is **operational metadata about a real network**, and a literal
+`dict` in the source is a literal dict in every clone, every fork and every
+commit of this public repository. So it lives in a file instead:
+
+| file | contents | in git? |
+| --- | --- | --- |
+| `datastream_map.local.json` | the real ids and substation names | **no** — gitignored |
+| `datastream_map.example.json` | the same shape, invented ids and names | yes |
+
+`_load_datastream_map()` takes the first of `$CONDUCTOR_DATASTREAM_MAP`, the
+local file, then the example. A machine with the real file behaves exactly as
+before; a fresh clone gets the synthetic one and every code path still runs.
+Nothing else in the backend changes behaviour based on which is loaded.
+
+Five sections, all optional:
+
+```
+datastreams       id   -> {substation, parameter}    used to label fetched rows
+transformer_p_c   id   -> {substation, parameter}    the transformer P/C series
+substations       NAME -> {parameter: id}            the same facts, keyed by name
+public_ids        [id, ...]                          what /api/eddk/fetch requests
+public_id_labels  id   -> display name               labels for the above
+```
+
+Two shapes carry the same facts because both are in use: some callers look up
+by id, others by substation name.
+
+**Adding a substation** means editing your local file, not the source. The
+tests pin themselves to the example map, so they never depend on a real map
+being present and pass identically on a machine that has none.
 
 ## Startup (`lifespan`)
 

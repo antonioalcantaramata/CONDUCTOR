@@ -206,24 +206,24 @@ class TestProvenanceGrading:
                 "violations": [
                     # The engine reports the movement as a magnitude in its
                     # resolved sentence, which is where the model read it.
-                    {"element": "Viadukten 10kV", "drivers": [],
+                    {"element": "Oscar 10kV", "drivers": [],
                      "recommended_action": {
-                         "text": "Reduce 05 ÅKI Sgen by 3.35 MW to bring Viadukten 10kV back."}},
-                    {"element": "Åkirkeby 10.5 kV", "drivers": [],
+                         "text": "Reduce 05 ALP Sgen by 3.35 MW to bring Oscar 10kV back."}},
+                    {"element": "Alpha 10.5 kV", "drivers": [],
                      "recommended_action": {
-                         "text": "No single source can clear Åkirkeby 10.5 kV."}},
+                         "text": "No single source can clear Alpha 10.5 kV."}},
                 ],
             }}],
-            assistant="### Attribution\nÅkirkeby 10.5 kV needs a reduction of 3.35 MW.",
+            assistant="### Attribution\nAlpha 10.5 kV needs a reduction of 3.35 MW.",
         )
         findings, report = grade_provenance(record)
         assert [f.code for f in findings] == ["misattributed_figure"]
         assert findings[0].severity == FAIL
-        assert "Åkirkeby 10.5 kV" in findings[0].detail
+        assert "Alpha 10.5 kV" in findings[0].detail
         assert len(report.misattributed) == 1
 
     def test_fabricated_figure_fails(self):
-        record = _record(assistant="Curtail the Åkirkeby unit by 6.24 MW.")
+        record = _record(assistant="Curtail the Alpha unit by 6.24 MW.")
         findings, _ = grade_provenance(record)
         assert [f.code for f in findings] == ["ungrounded_figure"]
         assert findings[0].severity == FAIL

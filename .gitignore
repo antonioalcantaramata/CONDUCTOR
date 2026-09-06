@@ -52,3 +52,6 @@ evaluation/runs/
 
 # ── Design docs — kept locally, not published with the repo ───────────────
 docs/
+
+# Real datastream map — operational metadata, never committed.
+backend/datastream_map.local.json

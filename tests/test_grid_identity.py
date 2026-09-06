@@ -26,7 +26,7 @@ class _FakeResponse:
 
 
 LIVE = {
-    "name": "Bornholm Distribution Network",
+    "name": "Coastal Distribution Network",
     "n_substations": 2,
     "substation_names": ["SUB_A", "SUB_B"],
     "n_lines": 3,
@@ -103,7 +103,7 @@ class TestSystemPromptGuardsIdentity:
         )
         prompt = system_prompt.get_system_prompt()
         assert system_prompt.STALE_CONSTANTS_WARNING not in prompt
-        assert "Bornholm Distribution Network" in prompt
+        assert "Coastal Distribution Network" in prompt
 
     def test_degraded_prompt_carries_the_warning(self, monkeypatch):
         monkeypatch.setattr(config.httpx, "get", lambda *a, **k: _FakeResponse(503))

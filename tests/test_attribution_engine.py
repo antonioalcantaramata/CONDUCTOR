@@ -233,7 +233,7 @@ class TestReliefFeasibility:
 
         Flagging was not enough. With `relief_mw_feasible: false` beside it and
         a resolved action saying no single source could clear the bus, the
-        model still wrote "Reduce 05 ÅKI Sgen by 6.24 MW" about a 3.54 MW unit.
+        model still wrote "Reduce 05 ALP Sgen by 6.24 MW" about a 3.54 MW unit.
         An impossible movement is now withdrawn, not annotated.
         """
         for violation in report["violations"]:

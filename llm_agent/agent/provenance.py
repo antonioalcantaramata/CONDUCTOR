@@ -46,8 +46,8 @@ GROUNDED = "grounded"
 # other is a number that exists nowhere in the evidence.
 IMPRECISE = "imprecise"
 # Traceable, correctly rounded, and attached to the wrong subject. Observed
-# live: asked why Åkirkeby was violating, the answer quoted the 3.35 MW that
-# clears *Viadukten* — same source, different bus, and a movement that does
+# live: asked why Alpha was violating, the answer quoted the 3.35 MW that
+# clears *Oscar* — same source, different bus, and a movement that does
 # not clear the bus under discussion. Flat grounding cannot see this; the
 # figure is in the payload and correctly transcribed.
 MISATTRIBUTED = "misattributed"
@@ -74,7 +74,7 @@ _NUMBER_RE = re.compile(
 )
 
 # Digit groups anywhere, used to mine numerals out of *strings* in tool
-# results. Element names carry them ("Viadukten 10kV", "Nexø Trf 1") and the
+# results. Element names carry them ("Oscar 10kV", "Foxtrot Trf 1") and the
 # answer quotes them back, so without this every such mention reads as
 # fabricated.
 _DIGITS_RE = re.compile(r"\d+(?:\.\d+)?")
@@ -272,7 +272,7 @@ def _walk(node: Any, path: str, out: list[Source],
         out.append(Source(float(node), path, scopes))
         return
     if isinstance(node, str):
-        # Digits inside an identifier — "Viadukten 10kV", "[L9]" — are real
+        # Digits inside an identifier — "Oscar 10kV", "[L9]" — are real
         # sources, since the answer quotes those labels back, but they say
         # nothing about the element they name. Scoping them would blame a
         # figure on whichever label happened to contain the same digits.
@@ -340,11 +340,11 @@ def subject_names(record: dict) -> frozenset:
     in, and source names are actors in a sentence rather than its subject.
 
     Restricting to the `element` key was still not enough: the dispatch table
-    names its rows `element` too, so the *generator* "Åkirkeby" entered the
-    vocabulary and shadowed the violated bus "Åkirkeby 10.5 kV" that the
+    names its rows `element` too, so the *generator* "Alpha" entered the
+    vocabulary and shadowed the violated bus "Alpha 10.5 kV" that the
     sentence was actually about. Only elements inside a `violations` list
     qualify, and any name contained in a longer one is dropped as ambiguous —
-    prose that says "Åkirkeby" has not said which Åkirkeby.
+    prose that says "Alpha" has not said which Alpha.
     """
     found: set[str] = set()
 
@@ -548,7 +548,7 @@ def _subject_at(cleaned: str, position: int, occurrences: list[tuple[int, str]])
 def _occurrences(cleaned: str, names: Iterable[str]) -> list[tuple[int, str]]:
     """Where each element name appears, longest names first.
 
-    Longest-first so "Hasle 10kV" is not shadowed by a shorter name it
+    Longest-first so "Echo 10kV" is not shadowed by a shorter name it
     contains; overlapping shorter hits at the same offset are dropped.
     """
     found: dict[int, str] = {}

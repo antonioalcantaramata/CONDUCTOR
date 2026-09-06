@@ -598,7 +598,7 @@ def get_element_timeseries(
     bus, line, or transformer element over time. Does NOT mutate the clock.
 
     element_type : "bus" | "line" | "trafo"
-    element_name : partial name match (e.g. "Åkirkeby" matches "Åkirkeby 10.5 kV")
+    element_name : partial name match (e.g. "Alpha" matches "Alpha 10.5 kV")
     start_timestamp / end_timestamp : ISO prefix of the time window endpoints
     n_steps : cap on number of ticks to scan
     step_size : sample every Nth tick (default 1, use 4 for hourly resolution)
@@ -637,8 +637,8 @@ def locate_network_element(element: str, **kwargs) -> dict:
     tools need to act on it.
 
     Exists because the model had no way to turn a name into an index. Asked
-    which substations would lose supply if the line between Olsker and
-    Østerlars were out, it guessed `element_index=11` — the Nexø–Bodilsker
+    which substations would lose supply if the line between Golf and
+    Hotel were out, it guessed `element_index=11` — the Foxtrot–Charlie
     line — ran a perfectly good contingency on it, and reported the result as
     the answer. Every figure was real and the element was wrong.
 

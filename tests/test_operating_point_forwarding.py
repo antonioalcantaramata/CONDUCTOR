@@ -32,7 +32,7 @@ DATA_SOURCE = "forecasts"
 # Arguments a tool cannot be called without. Values are never used: the
 # request never leaves the process.
 REQUIRED_ARGS = {
-    "compute_flexibility_envelope": {"gen_name": "Åkirkeby"},
+    "compute_flexibility_envelope": {"gen_name": "Alpha"},
     "compute_hosting_capacity": {"bus": 23},
     "optimize_contingency": {"element_type": "line", "element_index": 0},
     "simulate_contingency": {"element_type": "line", "element_index": 0},

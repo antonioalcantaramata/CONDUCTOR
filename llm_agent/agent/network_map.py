@@ -21,7 +21,7 @@ is fixed by marker pixels against plot pixels; only the arrangement inside
 that budget is ours to change, and where it will not fit the markers shrink.
 
 *Results join by index, never by name.* Bus names are not unique — one real
-network has four buses called `Værket A_aux` — and a generator is named for
+network has four buses called `Mike A_aux` — and a generator is named for
 its substation while a bus is named with its voltage level. Joining those by
 name silently placed thirteen of sixteen units one voltage level above where
 they actually sat.

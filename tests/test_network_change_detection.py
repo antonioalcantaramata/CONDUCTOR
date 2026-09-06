@@ -20,7 +20,7 @@ from llm_agent.agent.config import (
 )
 
 GRID_A = {
-    "name": "Bornholm Distribution Network",
+    "name": "Coastal Distribution Network",
     "n_substations": 2,
     "n_lines": 3,
     "n_trafos": 1,

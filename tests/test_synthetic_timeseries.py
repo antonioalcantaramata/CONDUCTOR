@@ -8,8 +8,8 @@ import synthetic_timeseries as st
 class TestBusName:
     def test_uses_name_column_when_present(self, case14_net):
         net = case14_net
-        net.bus.at[0, "name"] = "Nexo"
-        assert st._bus_name(net, 0) == "Nexo"
+        net.bus.at[0, "name"] = "Foxtrot"
+        assert st._bus_name(net, 0) == "Foxtrot"
 
     def test_falls_back_to_bus_id_when_blank(self, case14_net):
         net = case14_net
