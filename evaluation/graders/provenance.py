@@ -10,6 +10,13 @@ number the model produced itself. A misattributed one is also a `fail`, and
 the more dangerous of the two: the figure is real and correctly transcribed,
 and it describes a different element than the sentence containing it. An
 imprecise one is a `warn` — right figure, wrong precision.
+
+A derived figure is also a `warn`, and the reason it is not a `fail` is worth
+stating: the model computed it, but both operands and the operation are shown
+in the prose, so an operator can check it. It stays counted here — "the LLM
+never computes" is false and this is the evidence — while `reflection.py`
+leaves it alone, because flagging a shown division penalises the transparency
+that makes it checkable.
 """
 
 from __future__ import annotations
@@ -45,6 +52,12 @@ def grade_provenance(record: dict) -> tuple[list[Finding], ProvenanceReport]:
         findings.append(Finding(
             turn, INTERPRETATION, WARN, "imprecise_figure",
             verdict.render(),
+        ))
+
+    for verdict in report.derived:
+        findings.append(Finding(
+            turn, INTERPRETATION, WARN, "derived_figure",
+            f"computed in the answer, not returned by a tool: {verdict.render()}",
         ))
 
     return findings, report

@@ -90,7 +90,14 @@ def _voltage_controlled_buses(net) -> dict[int, str]:
 
 def _collect_violations(net, vm_lower, vm_upper, max_line_loading_pct,
                         max_trafo_loading_pct) -> list[dict]:
-    """Violated quantities in the base case, with their limits."""
+    """Violated quantities in the base case, with their limits.
+
+    Every record carries `violated: True` explicitly. It is redundant — this
+    list contains nothing else — but a guard reading the payload cannot know
+    that, and an engine that leaves its own verdict implicit forces every
+    reader to re-derive it. Stating it is what lets a check catch a
+    secure-sounding sentence written over a violating element.
+    """
     found: list[dict] = []
 
     for idx, vm in net.res_bus["vm_pu"].items():
@@ -100,12 +107,12 @@ def _collect_violations(net, vm_lower, vm_upper, max_line_loading_pct,
             found.append({"element": _element_name(net, "bus", idx, "Bus"),
                           "kind": "bus", "index": int(idx), "quantity": "vm_pu",
                           "type": "overvoltage", "value": float(vm),
-                          "limit": float(vm_upper)})
+                          "limit": float(vm_upper), "violated": True})
         elif vm < vm_lower:
             found.append({"element": _element_name(net, "bus", idx, "Bus"),
                           "kind": "bus", "index": int(idx), "quantity": "vm_pu",
                           "type": "undervoltage", "value": float(vm),
-                          "limit": float(vm_lower)})
+                          "limit": float(vm_lower), "violated": True})
 
     for table, prefix, limit in (("line", "Line", max_line_loading_pct),
                                  ("trafo", "Trafo", max_trafo_loading_pct)):
@@ -119,7 +126,8 @@ def _collect_violations(net, vm_lower, vm_upper, max_line_loading_pct,
                 found.append({"element": _element_name(net, table, idx, prefix),
                               "kind": table, "index": int(idx),
                               "quantity": "loading_percent", "type": "overload",
-                              "value": float(loading), "limit": float(limit)})
+                              "value": float(loading), "limit": float(limit),
+                              "violated": True})
 
     return found
 
@@ -226,12 +234,59 @@ def _withdraw_infeasible(
     Only provably impossible movements are withdrawn. An unknown headroom
     (``None``) is left in place — the same severity split the parameter guards
     use: refuse the impossible, allow the merely unusual.
+
+    The rule this implements is now stated once in `backend/withdrawal.py` and
+    applied by other engines through it. This version stays local because its
+    replacement carries a sign — a driver's deliverable contribution is a
+    *reduction*, and dropping the sign here would produce the same class of
+    error the withdrawal exists to prevent.
     """
     if driver.get(flag_key) is not False:
         return
     current = driver.get(current_key) or 0.0
     driver[relief_key] = None
     driver[deliverable_key] = round(-current, 4) if current > 0 else 0.0
+
+
+def _reframe_uncontrollable(driver: dict) -> None:
+    """A movement nobody can command is a sensitivity, not an action.
+
+    Observed live. Every driver of an undervoltage was a load, each carrying
+    `relief_mw: -12.411` and `relief_mw_feasible: True` — feasible in the
+    arithmetic sense, since the demand is there to remove, and nothing in the
+    payload distinguishing it from a generator redispatch. Read back as a
+    recommendation it says "shed 12.4 MW of customer demand".
+
+    The engine already knows: loads are collected as *diagnostic* sources,
+    because a violation driven by low demand is the explanation an operator
+    wants. That intent was in `_collect_sources` and in `_recommended_action`,
+    which filters on `controllable` — but not in the driver rows themselves,
+    which is where the model reads.
+
+    So the figure moves rather than disappearing. `relief_mw` becomes
+    `would_require_mw`: the same number, named as the counterfactual it is.
+    Nothing is lost — the diagnosis needs that magnitude — and the field an
+    answer would quote as an action no longer exists on this row.
+
+    The feasibility flag goes too. Leaving `relief_mw_feasible: True` beside a
+    withdrawn movement would tell a guard the action is available, which is
+    the reverse of what this is for.
+    """
+    if driver.get("controllable") is not False:
+        return
+    for value_key, flag_key, target, deliverable_key in (
+        ("relief_mw", "relief_mw_feasible", "would_require_mw", "max_deliverable_mw"),
+        ("relief_mvar", "relief_mvar_feasible", "would_require_mvar", "max_deliverable_mvar"),
+    ):
+        if driver.get(value_key) is not None:
+            driver[target] = driver[value_key]
+        driver[value_key] = None
+        driver[flag_key] = False
+        # A deliverable capacity is a statement about a lever. If withdrawal
+        # already wrote one — it runs first, and cannot see controllability —
+        # it does not belong on a row nobody can act on.
+        driver.pop(deliverable_key, None)
+    driver["actionable"] = False
 
 
 def _recommended_action(violation: dict, drivers: list[dict]) -> dict:
@@ -440,10 +495,16 @@ def attribute_violations(
         entry["recommended_action"] = _recommended_action(entry, drivers)
 
         for d in drivers:
+            # Order matters. Withdrawal reports the most a source *could*
+            # deliver, which is a statement about a lever; for a driver nobody
+            # can command there is no lever, and running it after reframing
+            # would attach a deliverable capacity to a load. Reframing runs
+            # second and takes over the rows it applies to.
             _withdraw_infeasible(d, "relief_mw", "relief_mw_feasible",
                                  "current_p_mw", "max_deliverable_mw")
             _withdraw_infeasible(d, "relief_mvar", "relief_mvar_feasible",
                                  "current_q_mvar", "max_deliverable_mvar")
+            _reframe_uncontrollable(d)
 
         reported.append(entry)
 
@@ -455,6 +516,12 @@ def attribute_violations(
         "provably cannot make is withdrawn (null) rather than reported; "
         "max_deliverable_mw / max_deliverable_mvar then gives the most it "
         "could contribute.",
+        "A driver with `actionable: false` is uncontrollable — typically a "
+        "load, included because it explains the regime. Its movement is "
+        "reported as `would_require_mw` / `would_require_mvar`: a "
+        "counterfactual that quantifies the driver, not an action anyone can "
+        "take. Never present it as a recommendation; shedding demand is not "
+        "corrective redispatch.",
         "Each violation carries a `recommended_action` resolved here from the "
         "feasibility of every candidate movement. Report that rather than "
         "assembling an action from the driver fields.",

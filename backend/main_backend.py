@@ -52,6 +52,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import modify_network as mn
 import load_gen_assignment as lg
 import rsa_engine as rs
+# Never ship a number that would be wrong to state. See backend/withdrawal.py.
+import withdrawal
 # Element naming lives in its own module so rsa_engine spells a name the same
 # way this file does. They disagreed about transformers, and the system map —
 # which joins topology to results by name — could not match any of them.
@@ -2914,6 +2916,12 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     if not df_results_rsa.empty:
         df_results_rsa["timestamp"] = df_results_rsa["timestamp"].astype(str)
         violations_json = df_results_rsa.to_dict(orient="records")
+        # Each record here is a violation by construction. Saying so in the
+        # record itself costs a field and lets a reader — a guard, or the
+        # model — judge a sentence about this element without re-deriving the
+        # verdict from a value and a limit it may not have both of.
+        for _entry in violations_json:
+            _entry["violated"] = True
         # Phase 3 Placeholder: publish_rsa_results(df_results_rsa, current_ts, topic="topic6907"...)
 
     df_bus = net_calculated.res_bus.reset_index()
@@ -2987,6 +2995,11 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
 
     return {
         "timestamp": timestamp, "total_violations": len(violations_json),
+        # The engine's own verdict, stated rather than implied. An answer that
+        # calls this operating point secure can then be checked against it
+        # instead of against a violation count the prose may never mention.
+        "secure": len(violations_json) == 0,
+        "converged": True,
         "violations": violations_json, "all_voltages": all_voltages,
         "all_line_loading": all_line_loading, "all_trafo_loading": all_trafo_loading,
         "gen_dispatch": gen_dispatch,
@@ -4605,14 +4618,20 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         # Issue 1: extract post-OPF bus voltages
         voltage_data = fe.extract_post_opf_voltages(model_opt, modified_net)
         # Phase 3 Placeholder: publish_flex_ca_results(df, current_ts, topic="topic6919"...)
+        # `status` is a solver string; `feasible` and `converged` are the same
+        # verdict as booleans. A reader checking whether a dispatch may be
+        # described as deliverable should not have to know which of Pyomo's
+        # termination strings count as success.
         result = {"timestamp": current_ts, "status": "optimal", "message": "Optimization successful.",
+                  "feasible": True, "converged": True,
                   "activated_resources": regulation_data}
         result.update(voltage_data)
         app_data["last_dispatch_result"] = regulation_data
         app_data["last_dispatch_timestamp"] = current_ts
         return result
     else:
-        return {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.", "activated_resources": []}
+        return {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
+                "feasible": False, "converged": False, "activated_resources": []}
 
 
 # ---------------------------------------------------------------------------
@@ -6223,7 +6242,7 @@ def _solve_hosting_capacity_mode(
         binding_source = "best_feasible"
         termination_reason = "converged_feasible"
 
-    return {
+    payload = {
         "q_mode": mode,
         "hosting_capacity_mw": round(float(best_p), 4),
         "binding_constraint": _build_hosting_binding(
@@ -6241,6 +6260,19 @@ def _solve_hosting_capacity_mode(
             if first_infeasible_p is not None else None
         ),
     }
+    # A bisection that did not converge still carries a `hosting_capacity_mw`,
+    # and nothing in the number itself says it is the last iterate rather than
+    # an answer. Withdrawing it leaves `p_first_infeasible_mw` and the
+    # termination reason, so the turn still has true figures to report.
+    if not converged:
+        withdrawal.mark_unusable(
+            payload,
+            "The hosting-capacity bisection did not converge; the value is the "
+            "last iterate, not a determined capacity.",
+        )
+        payload["hosting_capacity_mw_unconverged"] = payload.pop("hosting_capacity_mw")
+        payload["hosting_capacity_mw"] = None
+    return payload
 
 
 def _uses_measured_dataset(grid_profile: dict) -> bool:

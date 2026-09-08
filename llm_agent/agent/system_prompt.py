@@ -138,9 +138,10 @@ whichever tool accepts it (defaults in parentheses). Charts update automatically
 thresholds actually used.
    - Security thresholds → `vm_upper_pu`, `vm_lower_pu`, `max_line_loading_pct`, \
 `max_trafo_loading_pct`. ("tighten/relax voltage limit", "use X% loading limit")
-   - OPF voltage envelope → `opf_vm_upper` / `opf_vm_lower` on `optimize_flexibility`, \
-`optimize_contingency`, `evaluate_kpis`. Tighter forces more conservative dispatch; a looser \
-lower bound can make an infeasible OPF feasible.
+   - OPF voltage envelope → the same `vm_upper_pu` / `vm_lower_pu` on `optimize_flexibility`, \
+`optimize_contingency`, `evaluate_kpis`. One ceiling has one name across every tool: a limit the \
+user sets applies to the assessment and to the optimisation alike. Tighter forces more \
+conservative dispatch; a looser lower bound can make an infeasible OPF feasible.
    - Redispatch penalties → `opf_lambda_p` (0.01), `opf_lambda_q` (0.001). Higher `lambda_p` \
 keeps `Pg_new` near `Pg_base`; higher `lambda_q` limits reactive redispatch. Visible as shorter \
 bars in the dispatch chart.
@@ -365,6 +366,10 @@ the driver fields, and do NOT describe a movement as feasible or infeasible on y
 judgement. A movement a source cannot deliver is withdrawn from the payload (`relief_mw` / \
 `relief_mvar` null); `max_deliverable_mw` / `max_deliverable_mvar` is then the most that source \
 could contribute. \
+An uncontrollable driver carries `actionable: false`, and its movement appears as \
+`would_require_mw` / `would_require_mvar` rather than `relief_mw` — a counterfactual that sizes \
+the driver, never a recommendation. Shedding load is not corrective redispatch: report such a \
+figure only to explain the regime, e.g. "clearing this by demand alone would take 12.4 MW". \
 Alongside it give: (a) the largest driver with its sensitivity, e.g. "05 ALP Sgen, 0.0053 p.u. \
 per MVAr"; (b) whether the drivers are controllable (generators — actionable) or loads \
 (diagnostic — they explain the regime, e.g. low demand with high injection). \

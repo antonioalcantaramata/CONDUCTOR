@@ -386,11 +386,11 @@ _optimize_contingency = genai.types.FunctionDeclaration(
                 type=genai.types.Type.NUMBER,
                 description=_SLACK_MAX_MW_DESC,
             ),
-            "opf_vm_upper": genai.types.Schema(
+            "vm_upper_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_UPPER_DESC,
             ),
-            "opf_vm_lower": genai.types.Schema(
+            "vm_lower_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_LOWER_DESC,
             ),
@@ -456,11 +456,11 @@ _optimize_flexibility = genai.types.FunctionDeclaration(
                 type=genai.types.Type.NUMBER,
                 description=_SLACK_Q_MAX_MVAR_DESC,
             ),
-            "opf_vm_upper": genai.types.Schema(
+            "vm_upper_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_UPPER_DESC,
             ),
-            "opf_vm_lower": genai.types.Schema(
+            "vm_lower_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_LOWER_DESC,
             ),
@@ -520,11 +520,11 @@ _evaluate_kpis = genai.types.FunctionDeclaration(
                 type=genai.types.Type.NUMBER,
                 description=_SLACK_Q_MAX_MVAR_DESC,
             ),
-            "opf_vm_upper": genai.types.Schema(
+            "vm_upper_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_UPPER_DESC,
             ),
-            "opf_vm_lower": genai.types.Schema(
+            "vm_lower_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_OPF_VM_LOWER_DESC,
             ),
@@ -894,6 +894,35 @@ _find_worst_case_timestamp = genai.types.FunctionDeclaration(
                     "rescheduling questions. If forecasts are not loaded the call "
                     "returns an error; do not assume they exist."
                 ),
+            ),
+            # The scan counts violations, so it needs the same limits as the
+            # assessment that follows it. They were absent from this schema
+            # while every other tool had them, so a turn that set a ceiling
+            # searched at the default and then assessed at the ceiling — two
+            # studies that cannot be presented as one. The scan reports what
+            # it used in `thresholds_used`; passing them makes that agree.
+            "vm_upper_pu": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=(
+                    "Upper voltage limit in p.u. used to count violations while "
+                    "scanning. Pass the same value as the assessment that follows, "
+                    "or the scan searches against a different definition of "
+                    "'worst' than the one you then report. Only affects the "
+                    "'violations' metric; the voltage and loading extrema are "
+                    "threshold-independent."
+                ),
+            ),
+            "vm_lower_pu": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="Lower voltage limit in p.u. for violation counting during the scan.",
+            ),
+            "max_line_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="Line loading limit in % for violation counting during the scan.",
+            ),
+            "max_trafo_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="Transformer loading limit in % for violation counting during the scan.",
             ),
         },
     ),

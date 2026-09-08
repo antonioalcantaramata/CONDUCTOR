@@ -6,9 +6,15 @@ contingencies, probabilistic risk, robust corrective dispatch, flexibility and
 hosting-capacity studies, KPIs) with a natural-language agent that drives those
 tools from a chat interface.
 
-The agent runs on a **hosted model** — Google Gemini or OpenAI — or a **local
-model via Ollama**. You pick which each time you start it, and no grid data
-leaves your machine in local mode.
+The agent runs on a **hosted model** — Google Gemini, OpenAI, or Anthropic
+(Claude) — or a **local model via Ollama**. You pick which each time you start
+it, and no grid data leaves your machine in local mode.
+
+The OpenAI option is not limited to OpenAI: point `OPENAI_BASE_URL` at any
+endpoint speaking the same chat-completions dialect — Kimi, DeepSeek, Qwen,
+Groq, Mistral, OpenRouter, Azure OpenAI, or a self-hosted vLLM server — and the
+same agent runs on it. The only hard requirement is **tool calling**, since
+CONDUCTOR drives the grid entirely through tools.
 
 ## Overview
 
@@ -28,7 +34,10 @@ leaves your machine in local mode.
   the launcher builds the environment for you.
 - **One LLM backend**, any of:
   - a Google Gemini API key (free tier works) — https://aistudio.google.com/apikey,
-  - an OpenAI API key (paid per token) — https://platform.openai.com/api-keys, or
+  - an OpenAI API key (paid per token) — https://platform.openai.com/api-keys —
+    **or a key for any OpenAI-compatible provider** (Kimi, DeepSeek, Qwen,
+    Groq, OpenRouter, …), set with `OPENAI_BASE_URL`,
+  - an Anthropic API key (paid per token) — https://console.anthropic.com/settings/keys, or
   - [Ollama](https://ollama.com/download) with a tool-capable model pulled
     (see [Running a local model](#running-a-local-model)).
 
@@ -56,7 +65,11 @@ launch screen where you choose the backend:
 
 - **Google Gemini API** — paste a key once; it's saved to `llm_agent/.env`.
 - **OpenAI API** — paste a key and name a model; the key and model are checked
-  before the app starts rather than at your first question.
+  before the app starts rather than at your first question. Also the route to
+  every **OpenAI-compatible** provider (Kimi, DeepSeek, Qwen, Groq, OpenRouter,
+  Azure, vLLM): set the base URL under **Model settings**.
+- **Anthropic API** — paste a key and name a Claude model; effort is set on the
+  same screen.
 - **Local model (Ollama)** — pick from the tool-capable models you have pulled.
 
 The screen appears on every start, so switching backends is a restart and one
@@ -142,13 +155,16 @@ Key choices:
 
 | Variable | Purpose |
 | --- | --- |
-| `LLM_PROVIDER` | `google`, `openai`, or `ollama` |
+| `LLM_PROVIDER` | `google`, `openai`, `anthropic`, or `ollama` |
 | `GEMINI_MODEL` | default `gemini-3.5-flash-lite` |
 | `GEMINI_THINKING_LEVEL` | `minimal`, `low`, `medium`, `high`; empty (default) = model's own budget |
 | `OPENAI_MODEL` | default `gpt-5.6-luna` — must support tool calling |
 | `OPENAI_REASONING_EFFORT` | `none`, `low`, `medium` (default), `high`, `xhigh` |
 | `OPENAI_API` | `auto` (default), `chat`, or `responses` — see below |
 | `OPENAI_BASE_URL` | any OpenAI-compatible endpoint (Azure, OpenRouter, vLLM) |
+| `ANTHROPIC_MODEL` | default `claude-haiku-4-5` (cheapest) — must support tool calling |
+| `ANTHROPIC_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
+| `ANTHROPIC_THINKING` | `1` (default) for adaptive thinking; `0` to disable |
 | `OLLAMA_MODEL` | any tool-capable model you have pulled |
 | `OLLAMA_NUM_CTX` | context window — must exceed the ~25k-token prompt |
 | `OLLAMA_KEEP_ALIVE` | how long the model and its prompt cache stay resident |

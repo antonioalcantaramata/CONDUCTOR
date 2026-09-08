@@ -51,6 +51,18 @@ IMPRECISE = "imprecise"
 # not clear the bus under discussion. Flat grounding cannot see this; the
 # figure is in the payload and correctly transcribed.
 MISATTRIBUTED = "misattributed"
+# Not in the evidence, but obtainable by one arithmetic step from figures that
+# are, and shown as such in the prose: "176.7793 / 220.1206 ≈ 0.803101". The
+# model still computed it — that remains worth counting, and the offline
+# grader counts it — but it is a different act from producing a number out of
+# nowhere, because the operands and the operation are both on the page and an
+# operator can check them.
+#
+# Separated after a live run in which the check flagged a ratio *and* the
+# division that produced it, so an agent asked to show its work was penalised
+# for doing so. Left folded into `ungrounded` that pressure is real: the
+# cheapest way to reduce findings becomes hiding the arithmetic.
+DERIVED = "derived"
 UNGROUNDED = "ungrounded"
 
 # Units the agent actually writes. Captured alongside the value because a
@@ -154,6 +166,10 @@ class ProvenanceReport(NamedTuple):
         return [v for v in self.verdicts if v.status == MISATTRIBUTED]
 
     @property
+    def derived(self) -> list[ClaimVerdict]:
+        return [v for v in self.verdicts if v.status == DERIVED]
+
+    @property
     def ungrounded(self) -> list[ClaimVerdict]:
         return [v for v in self.verdicts if v.status == UNGROUNDED]
 
@@ -163,10 +179,28 @@ class ProvenanceReport(NamedTuple):
 
         Imprecise claims count as traceable: the figure came from the
         evidence, it was just transcribed at the wrong precision.
+
+        Derived claims do not. The model computed them, which is the thing
+        this measures, and folding them in would let a turn raise its own
+        score by showing more arithmetic. They are reported separately by
+        `derived_rate` instead.
         """
         if not self.verdicts:
             return 1.0
         return (len(self.grounded) + len(self.imprecise)) / len(self.verdicts)
+
+    @property
+    def derived_rate(self) -> float:
+        """Share of claims the model computed from evidence in view.
+
+        Reported alongside `rate` rather than inside it: the interesting
+        quantity for the paper is how much of an answer is arithmetic the
+        tools did not do, and that is exactly what gets lost if it is either
+        counted as grounded or counted as invention.
+        """
+        if not self.verdicts:
+            return 0.0
+        return len(self.derived) / len(self.verdicts)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +453,8 @@ def _tolerance(decimals: int) -> float:
 
 
 def check_claim(claim: Claim, sources: Iterable[Any], subject: str | None = None,
-                vocabulary: frozenset | None = None) -> ClaimVerdict:
+                vocabulary: frozenset | None = None,
+                answer: str | None = None) -> ClaimVerdict:
     """Grade one claim against the turn's evidence.
 
     Two tolerance bands. Half a unit in the last place is a correct rounding.
@@ -507,7 +542,93 @@ def check_claim(claim: Claim, sources: Iterable[Any], subject: str | None = None
     if truncated is not None:
         return ClaimVerdict(claim, IMPRECISE, source=truncated[1], nearest=nearest,
                             subject=subject)
+
+    # The whole answer, not the claim's own window: a percentage is routinely
+    # stated a sentence after the division that produced it, and the 55-char
+    # context is cut off well before it.
+    derived = _derivation(claim, sources, answer)
+    if derived is not None:
+        return ClaimVerdict(claim, DERIVED, source=derived, nearest=nearest,
+                            subject=subject)
+
     return ClaimVerdict(claim, UNGROUNDED, nearest=nearest, subject=subject)
+
+
+def is_plausible_nearest(nearest: tuple[float, str] | None, value: float) -> bool:
+    """Is the nearest source close enough to be worth showing as a suggestion.
+
+    The verdict always carries `nearest`: for the offline grader it is
+    diagnostic context, and the distance is part of what a reader is judging —
+    a claim of 6.24 MW against an available 3.54 MW is exactly the sort of gap
+    worth seeing.
+
+    Presenting it *to the agent* is a different act. There it reads as "did you
+    mean this?", and it only means that when the two figures could be
+    transcriptions of each other. Reported live: a claim of 0.803101 was
+    offered `0.94` — the network's lower voltage limit — which is not a
+    suggestion anyone should act on, and a wrong pointer is worse than none
+    when the agent is being asked to judge.
+
+    5% of the claim, roughly the reach of a mistyped or transposed digit.
+    """
+    if nearest is None:
+        return False
+    return abs(nearest[0] - value) <= max(abs(value), 1.0) * 0.05
+
+
+# Two numbers with an operator between them, as the model writes it: plain
+# `176.7793 / 220.1206`, or LaTeX `\frac{176.7793}{220.1206}` and `\div`.
+_DIVISION_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:/|\\div|}\s*\{)\s*(\d+(?:\.\d+)?)"
+)
+
+
+def _derivation(claim: Claim, sources: Iterable[Any],
+                answer: str | None = None) -> str | None:
+    """The shown division that produces this claim, if both operands are evidence.
+
+    Deliberately narrow. Only division, only operands the answer writes out,
+    and only when each of them is itself traceable. That covers the case this
+    exists for — a share or percentage the tools do not return — without
+    becoming a licence to accept any number that happens to be expressible as
+    a ratio of two others in the payload.
+
+    Returns a description of the derivation, or None.
+    """
+    text = answer if answer is not None else (claim.context or "")
+    values = [(s[0], s[1]) for s in sources]
+
+    def trace(operand: float) -> str | None:
+        for value, path in values:
+            if abs(value - operand) <= max(abs(operand), 1.0) * 1e-6:
+                return path
+        return None
+
+    for numerator, denominator in _DIVISION_RE.findall(text):
+        try:
+            top, bottom = float(numerator), float(denominator)
+        except ValueError:
+            continue
+        if bottom == 0:
+            continue
+
+        top_path, bottom_path = trace(top), trace(bottom)
+        if not (top_path and bottom_path):
+            continue
+
+        quotient = top / bottom
+        # Two units in the last place. The model both truncates its own
+        # arithmetic and rounds its operands before dividing, so the quotient
+        # it writes can sit a little further from the exact one than a
+        # transcription band allows: 0.803101 was written for 0.8031020, which
+        # a one-unit band misses by a hair. The looseness is safe here because
+        # a derivation must already have matched both operands exactly.
+        band = 2 * 10.0 ** -claim.decimals + 1e-9 if claim.decimals else _tolerance(0)
+        # The claim is the quotient itself, or the quotient as a percentage.
+        for candidate in (quotient, quotient * 100.0):
+            if abs(candidate - claim.value) <= band:
+                return f"{top_path} / {bottom_path}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +702,8 @@ def check_answer(answer: str, sources: list[Any],
     verdicts = [
         check_claim(claim, sources,
                     subject=_subject_at(cleaned, claim.position, occurrences),
-                    vocabulary=vocabulary)
+                    vocabulary=vocabulary,
+                    answer=answer or "")
         for claim in claims
     ]
     return ProvenanceReport(verdicts=tuple(verdicts), n_sources=len(sources))

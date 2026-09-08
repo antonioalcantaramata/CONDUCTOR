@@ -30,6 +30,9 @@ from agent.config import (
     OLLAMA_KEEP_ALIVE,
     OLLAMA_NUM_CTX,
     OLLAMA_OUTPUT_RESERVE,
+    ANTHROPIC_EFFORT,
+    ANTHROPIC_EFFORTS,
+    ANTHROPIC_MODEL,
     OLLAMA_TIMEOUT_S,
     OPENAI_API,
     OPENAI_APIS,
@@ -70,7 +73,8 @@ _LOGO_PATH = _APP_DIR / "assets" / "conductor_logo.png"
 
 _PROVIDER_LABELS = {
     "google": "Google Gemini API",
-    "openai": "OpenAI API",
+    "openai": "OpenAI API (or compatible)",
+    "anthropic": "Anthropic API (Claude)",
     "ollama": "Ollama (local)",
 }
 
@@ -1218,6 +1222,8 @@ def _provider_configured(provider: str) -> bool:
         return bool(os.environ.get("OLLAMA_MODEL", "").strip())
     if provider == "openai":
         return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    if provider == "anthropic":
+        return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
     return _has_api_key()
 
 
@@ -1302,6 +1308,122 @@ def _openai_effort_picker(*, key: str) -> str:
     )
 
 
+def _anthropic_effort_picker(*, key: str) -> str:
+    """Effort choice, shared by the setup and settings screens.
+
+    Anthropic's ladder has no "none" rung — thinking is adaptive and effort
+    sets its depth — so this starts at `low` where the OpenAI picker starts at
+    `none`. Forcing both onto one scale would misrepresent either.
+    """
+    options = list(ANTHROPIC_EFFORTS)
+    current = (os.environ.get("ANTHROPIC_EFFORT") or ANTHROPIC_EFFORT)
+    index = options.index(current) if current in options else options.index("medium")
+    return st.select_slider(
+        "Effort",
+        options=options,
+        value=options[index],
+        key=key,
+        help="How hard the model thinks before answering. A turn plans several "
+             "tool calls and then reasons over the results, so lowering this "
+             "trades answer quality for speed and cost. `max` earns its cost "
+             "only on hard problems.",
+    )
+
+
+def _render_anthropic_setup() -> None:
+    st.markdown(
+        """
+        #### Anthropic API (Claude)
+
+        Paid per token — there is no free tier — so an account with credit is
+        needed. If you would rather not pay, **Ollama** runs the same agent
+        locally at no cost.
+
+        1. Go to [console.anthropic.com](https://console.anthropic.com/settings/keys)
+        2. Click **Create Key** and copy it
+        3. Paste it below
+        """
+    )
+    with st.form("anthropic_setup"):
+        key_input = st.text_input(
+            "Anthropic API key",
+            type="password",
+            placeholder="sk-ant-…",
+            help="Your key is saved locally to .env and never sent anywhere else.",
+        )
+        model_input = st.text_input(
+            "Model",
+            value=os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL,
+            help="Must support tool calling — CONDUCTOR drives the grid entirely "
+                 "through tools.",
+        )
+        effort = _anthropic_effort_picker(key="setup_anthropic_effort")
+        submitted = st.form_submit_button(
+            "Save & Start", type="primary", use_container_width=True
+        )
+
+    if not submitted:
+        return
+
+    key = key_input.strip()
+    if not key:
+        st.error("Please paste a valid API key before continuing.")
+        return
+
+    _write_env({
+        "LLM_PROVIDER": "anthropic",
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_MODEL": model_input.strip() or ANTHROPIC_MODEL,
+        "ANTHROPIC_EFFORT": effort,
+    })
+    os.environ.update({
+        "LLM_PROVIDER": "anthropic",
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_MODEL": model_input.strip() or ANTHROPIC_MODEL,
+        "ANTHROPIC_EFFORT": effort,
+    })
+    reset_providers()
+    st.session_state._launched = True
+    st.rerun()
+
+
+def _render_anthropic_settings(*, key_prefix: str) -> bool:
+    """Anthropic options, editable at any time. Returns True if saved."""
+    with st.form(f"{key_prefix}_anthropic_settings"):
+        model = st.text_input(
+            "Model",
+            value=os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL,
+            help="Must support tool calling.",
+        )
+        key = st.text_input(
+            "API key (leave blank to keep the current one)",
+            type="password", placeholder="sk-ant-…",
+        )
+        effort = _anthropic_effort_picker(key=f"{key_prefix}_anthropic_effort")
+        thinking = st.checkbox(
+            "Adaptive thinking",
+            value=(os.environ.get("ANTHROPIC_THINKING", "1").strip().lower()
+                   not in ("0", "false", "no")),
+            key=f"{key_prefix}_anthropic_thinking",
+            help="The model decides when and how much to think, with the effort "
+                 "above setting the depth. Turning it off is only accepted at "
+                 "effort `high` or below, and is rarely worth it — lowering the "
+                 "effort is the better way to spend less.",
+        )
+        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+            updates = {
+                "LLM_PROVIDER": "anthropic",
+                "ANTHROPIC_MODEL": model.strip() or ANTHROPIC_MODEL,
+                "ANTHROPIC_EFFORT": effort,
+                "ANTHROPIC_THINKING": "1" if thinking else "0",
+            }
+            if key.strip():
+                updates["ANTHROPIC_API_KEY"] = key.strip()
+            _write_env(updates)
+            return True
+    return False
+
+
 def _render_openai_setup() -> None:
     st.markdown(
         """
@@ -1314,6 +1436,12 @@ def _render_openai_setup() -> None:
         1. Go to [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
         2. Click **Create new secret key** and copy it
         3. Paste it below
+
+        **Using a different provider?** This option also drives anything
+        speaking the OpenAI chat-completions dialect — Kimi, DeepSeek, Qwen,
+        Groq, Mistral, OpenRouter, Azure OpenAI, a self-hosted vLLM server.
+        Paste that provider's key here, name its model, and set its **Base
+        URL** below. The model must support tool calling.
         """
     )
     with st.form("openai_setup"):
@@ -1330,6 +1458,16 @@ def _render_openai_setup() -> None:
                  "through tools.",
         )
         effort = _openai_effort_picker(key="setup_openai_effort")
+        # Here rather than only in Model settings: the probe below runs against
+        # this URL, so without it a key for a compatible provider is checked
+        # against OpenAI's own endpoint and rejected before the app ever starts.
+        base_url_input = st.text_input(
+            "Base URL",
+            value=os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL,
+            help="Leave as-is for OpenAI. Change it to use another provider "
+                 "speaking the same dialect — Kimi, DeepSeek, Qwen, Groq, "
+                 "OpenRouter, Azure OpenAI, or a local vLLM server.",
+        )
         submitted = st.form_submit_button(
             "Save & Start", type="primary", use_container_width=True
         )
@@ -1342,11 +1480,13 @@ def _render_openai_setup() -> None:
         st.error("Please paste a valid API key before continuing.")
         return
 
+    base_url = base_url_input.strip() or OPENAI_BASE_URL
+
     # Check the key and the model now rather than letting the first question
     # fail: a typo here is otherwise only discovered mid-conversation.
-    info = openai_probe(api_key=key)
+    info = openai_probe(api_key=key, base_url=base_url)
     if not info["reachable"]:
-        st.error(info["error"] or "Could not reach the OpenAI API with that key.")
+        st.error(info["error"] or f"Could not reach `{base_url}` with that key.")
         return
     if info["models"] and model_input.strip() not in info["models"]:
         st.error(
@@ -1360,6 +1500,7 @@ def _render_openai_setup() -> None:
         "OPENAI_API_KEY": key,
         "OPENAI_MODEL": model_input.strip(),
         "OPENAI_REASONING_EFFORT": effort,
+        "OPENAI_BASE_URL": base_url,
     })
     st.session_state._launched = True
     st.success("API key saved! Starting the assistant…")
@@ -1401,8 +1542,9 @@ def _render_openai_settings(*, key_prefix: str) -> bool:
         base_url = st.text_input(
             "Base URL",
             value=os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL,
-            help="Change this to use any OpenAI-compatible endpoint — Azure "
-                 "OpenAI, OpenRouter, a local vLLM server.",
+            help="Change this to use any OpenAI-compatible endpoint — Kimi, "
+                 "DeepSeek, Qwen, Groq, OpenRouter, Azure OpenAI, a local "
+                 "vLLM server.",
         )
         if st.form_submit_button("Save settings", type="primary", use_container_width=True):
             updates = {
@@ -1698,11 +1840,13 @@ def _render_ollama_setup() -> None:
 _SETUP_RENDERERS = {
     "google": _render_google_setup,
     "openai": _render_openai_setup,
+    "anthropic": _render_anthropic_setup,
     "ollama": _render_ollama_setup,
 }
 _SETTINGS_RENDERERS = {
     "google": _render_google_settings,
     "openai": _render_openai_settings,
+    "anthropic": _render_anthropic_settings,
     "ollama": _render_ollama_settings,
 }
 
@@ -1741,6 +1885,21 @@ def _render_ready_to_start(provider: str) -> None:
         st.success(
             f"Ready — model `{model}`{reasoning} via `{endpoint}`, "
             f"key `…{key[-4:]}` loaded from `.env`{where}."
+        )
+    elif provider == "anthropic":
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        model = os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
+        effort = os.environ.get("ANTHROPIC_EFFORT") or ANTHROPIC_EFFORT
+        thinking = (os.environ.get("ANTHROPIC_THINKING", "1").strip().lower()
+                    not in ("0", "false", "no"))
+        # Effort is meaningless without saying whether thinking is on at all —
+        # the same reason the OpenAI branch names its endpoint.
+        depth = (f"effort `{effort}`" if effort else "default effort")
+        if not thinking:
+            depth += ", thinking off"
+        st.success(
+            f"Ready — model `{model}`, {depth}, "
+            f"key `…{key[-4:]}` loaded from `.env`."
         )
     else:
         model = os.environ.get("OLLAMA_MODEL", "")
@@ -1784,7 +1943,8 @@ if not st.session_state.get("_launched"):
 
     _CHOICES = {
         "Google Gemini API": "google",
-        "OpenAI API": "openai",
+        "OpenAI API (or compatible)": "openai",
+        "Anthropic API": "anthropic",
         "Local model (Ollama)": "ollama",
     }
     _labels = list(_CHOICES)
@@ -1799,7 +1959,9 @@ if not st.session_state.get("_launched"):
             horizontal=True,
             captions=[
                 "Hosted, needs a free API key, fastest to set up.",
-                "Hosted, paid per token, needs a tool-capable model.",
+                "Hosted, paid per token — also Kimi, DeepSeek, Groq and any "
+                "other OpenAI-compatible endpoint.",
+                "Hosted, paid per token, Claude models.",
                 "Fully local and private, needs a tool-capable model.",
             ],
             label_visibility="collapsed",
@@ -1925,6 +2087,36 @@ def _reset_if_network_changed() -> str | None:
 
     _reset_conversation_state()
     return status.values.get("name") or "the loaded network"
+
+
+def _dedupe_tool_results(results):
+    """Drop repeated identical tool results, keeping the first of each.
+
+    Observed live: asked for a percentage, the agent called
+    `get_current_conditions` a second time to obtain the operands, and the
+    operator saw the same conditions table rendered twice. The two payloads
+    were byte-identical, so the second told them nothing and invited reading
+    it as a second measurement.
+
+    Identity is (tool name, serialised result). Two calls that returned
+    anything different — a different timestamp, a different element, a
+    re-solve after a topology change — are separate analyses and both render.
+    A result that will not serialise is never treated as a duplicate, since
+    the safe failure here is showing a chart twice rather than hiding one.
+    """
+    seen: set[tuple[str, str]] = set()
+    kept = []
+    for name, result in results:
+        try:
+            key = (name, json.dumps(result, sort_keys=True, default=str))
+        except (TypeError, ValueError):
+            kept.append((name, result))
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((name, result))
+    return kept
 
 
 def _reset_conversation_state() -> None:
@@ -2143,6 +2335,39 @@ with st.sidebar:
         if _saved:
             st.success("Saved — applies to your next message.")
             st.rerun()
+
+    # Answer checks. One control, not one per check: an operator choosing how
+    # much the agent second-guesses itself is making a single decision, and a
+    # switch per check would turn that into a configuration exercise. Which
+    # checks run is ours to decide; the session log still records which one
+    # produced each finding.
+    #
+    # Off by default — it is the configuration every reported result was
+    # produced under, and the other two levels are experiments.
+    with st.expander("Answer checks"):
+        _REFLECT_LABELS = {
+            "off": "Off",
+            "warn": "Check silently",
+            "inform": "Show the agent",
+        }
+        st.radio(
+            "Before answering",
+            list(_REFLECT_LABELS),
+            format_func=lambda m: _REFLECT_LABELS[m],
+            key="reflection_mode",
+            help=(
+                "Two checks run over the draft answer: every figure is traced "
+                "back to the tool result that produced it, and each figure is "
+                "compared against the fields beside it in that result — so a "
+                "movement the payload marks undeliverable is not reported as an "
+                "action. A third checks the answer still contains what the "
+                "question asked for.\n\n"
+                "**Off** grades afterwards only. **Check silently** records what "
+                "the checks found without changing the answer. **Show the agent** "
+                "hands the findings back before the answer is delivered — the "
+                "agent may keep it, revise it, or call another tool."
+            ),
+        )
 
     if "show_manage_uploads" not in st.session_state:
         st.session_state.show_manage_uploads = False
@@ -2610,6 +2835,23 @@ def _chat_input_fragment():
                             f"⚠️ **{label}** returned an internally inconsistent result: "
                             + "; ".join(data.get("problems", []))
                         )
+                    elif event == "reflection":
+                        n_g = data.get("n_findings", 0)
+                        n_c = data.get("n_conflicts", 0)
+                        n_m = data.get("n_gaps", 0)
+                        parts = []
+                        if n_g:
+                            parts.append(f"{n_g} figure(s) not traced to the evidence")
+                        if n_c:
+                            parts.append(f"{n_c} described against its own record")
+                        if n_m:
+                            parts.append(f"{n_m} thing(s) the question asked for and the answer omits")
+                        if not data.get("triggered"):
+                            st.write("🔎 Answer checks: every figure traced and consistent")
+                        elif data.get("shown"):
+                            st.write(f"🔎 Answer checks: {'; '.join(parts)} — returning to the agent")
+                        else:
+                            st.write(f"🔎 Answer checks: {'; '.join(parts)} (recorded only)")
                     elif event == "model_loading":
                         st.write(
                             f"⏳ Loading **{data.get('model', 'the model')}** into memory "
@@ -2628,6 +2870,7 @@ def _chat_input_fragment():
                     user_message=llm_input,
                     history=st.session_state.history,
                     on_event=_on_event,
+                    reflection=st.session_state.get("reflection_mode", "off"),
                 )
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
                 # The turn just refetched grid constants; if that failed, the
@@ -2658,8 +2901,16 @@ def _chat_input_fragment():
             if turn_point:
                 st.session_state.system_ts = turn_point
 
-            # Capture chart data and store message
-            charts_this_turn = list(_tools_module._last_tool_results)
+            # Capture chart data and store message.
+            #
+            # A turn can call the same tool twice with the same arguments — the
+            # agent re-reads conditions to derive a figure, say — and the second
+            # call returns the identical payload. Rendering it again shows the
+            # operator the same table twice and reads as two measurements. Only
+            # byte-identical repeats are dropped: two calls that differ in
+            # arguments or results are genuinely different analyses and both
+            # belong on screen.
+            charts_this_turn = _dedupe_tool_results(_tools_module._last_tool_results)
             assistant_text = final_text if final_text else "_No text response from agent._"
             st.session_state.messages.append({
                 "role": "assistant",

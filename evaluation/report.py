@@ -5,8 +5,11 @@ from __future__ import annotations
 import pathlib
 from typing import NamedTuple
 
+from .graders.characterisation import grade_characterisation
+from .graders.completeness import grade_completeness
 from .graders.integrity import grade_composition
 from .graders.provenance import grade_provenance
+from .graders.refusal import grade_refusal
 from .session_log import FAIL, Finding, load_records
 
 
@@ -20,6 +23,9 @@ class TurnGrade(NamedTuple):
     n_imprecise: int
     n_misattributed: int
     n_ungrounded: int
+    n_derived: int = 0
+    n_mischaracterised: int = 0
+    n_gaps: int = 0
 
     @property
     def failed(self) -> bool:
@@ -29,7 +35,11 @@ class TurnGrade(NamedTuple):
 def grade_record(record: dict) -> TurnGrade:
     """Every grader, over one turn."""
     provenance_findings, report = grade_provenance(record)
-    findings = grade_composition(record) + provenance_findings
+    characterisation_findings, conflicts = grade_characterisation(record)
+    completeness_findings, gaps = grade_completeness(record)
+    findings = (grade_composition(record) + provenance_findings
+                + characterisation_findings + grade_refusal(record)
+                + completeness_findings)
 
     return TurnGrade(
         turn=record.get("turn", 0),
@@ -41,6 +51,9 @@ def grade_record(record: dict) -> TurnGrade:
         n_imprecise=len(report.imprecise),
         n_misattributed=len(report.misattributed),
         n_ungrounded=len(report.ungrounded),
+        n_derived=len(report.derived),
+        n_mischaracterised=len(conflicts),
+        n_gaps=len(gaps),
     )
 
 

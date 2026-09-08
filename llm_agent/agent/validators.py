@@ -424,6 +424,49 @@ def requested_timestamps(text: str) -> frozenset:
     )
 
 
+# A voltage limit the user states in words. Deliberately narrow: a bare "1.045"
+# somewhere in a sentence is not a limit, and reading it as one would silently
+# re-run every study against a number the operator never meant as a ceiling.
+_REQUESTED_LIMIT_RES = (
+    ("vm_upper_pu", re.compile(
+        r"(?:max(?:imum)?|upper|no (?:more|higher) than|below|under|ceiling|cap(?:ped)?)"
+        r"[^.\n]{0,40}?\b(0?\.\d+|1\.\d+)\b", re.IGNORECASE)),
+    ("vm_lower_pu", re.compile(
+        r"(?:min(?:imum)?|lower|no (?:less|lower) than|above|at least|floor)"
+        r"[^.\n]{0,40}?\b(0?\.\d+|1\.\d+)\b", re.IGNORECASE)),
+)
+
+# Plausible p.u. voltages. A "maximum of 100" is a loading percentage, and a
+# limit parser that accepted it would propagate nonsense into every study.
+_PU_RANGE = (0.80, 1.20)
+
+
+def requested_limits(text: str) -> dict:
+    """Voltage limits the user stated in the prompt itself.
+
+    Inheritance carries a limit forward from an earlier *call*, which leaves
+    the first call of a turn uncovered. Observed live: asked a question that
+    set a 1.045 ceiling, the agent ran a week-long scan first — with nothing
+    established yet, so at the tool default of 1.06 — and then three studies at
+    1.045. The consistency guard correctly reported that these were not one
+    assessment, which is a warning about a gap rather than a fix for it.
+
+    The ceiling is in the prompt. Reading it there means the first call is
+    covered too, on the same rule the timestamps already use.
+    """
+    found: dict[str, float] = {}
+    for field, pattern in _REQUESTED_LIMIT_RES:
+        for match in pattern.finditer(text or ""):
+            try:
+                value = float(match.group(1))
+            except ValueError:  # pragma: no cover
+                continue
+            if _PU_RANGE[0] <= value <= _PU_RANGE[1]:
+                found.setdefault(field, value)
+                break
+    return found
+
+
 def operating_context(result: Any) -> dict:
     """What operating point a tool result was actually computed at."""
     if not isinstance(result, dict):
@@ -530,14 +573,59 @@ class TurnConsistency:
 # ---------------------------------------------------------------------------
 
 # Arguments that identify *which* operating point a call runs against.
-_INHERITED_ARGS = ("timestamp", "data_source")
+_OPERATING_POINT_ARGS = ("timestamp", "data_source")
+
+# Limits the user set for this turn. A request like "would it still be secure
+# with a maximum voltage of 1.045, and if contingencies happen?" decomposes
+# into two studies, and the ceiling belongs to both: an N-1 screen run at the
+# default 1.05 after an N-0 run at 1.045 answers a question nobody asked, and
+# reports a security margin the operator did not ask about.
+#
+# The submitted paper's Act 1 turns on the agent propagating this correctly.
+# It did — and nothing in the system required it to, which is the same gap the
+# operating point had before it was carried in code rather than in the prompt.
+_CONSTRAINT_ARGS = (
+    "vm_upper_pu",
+    "vm_lower_pu",
+    "max_line_loading_pct",
+    "max_trafo_loading_pct",
+)
+
+_INHERITED_ARGS = _OPERATING_POINT_ARGS + _CONSTRAINT_ARGS
+
+# The same quantity under a different name.
+#
+# The tools once spelled the OPF envelope `opf_vm_upper` while everything else
+# said `vm_upper_pu`, so a ceiling the operator set for an assessment did not
+# reach the optimisation — one limit with two names is a propagation failure
+# waiting to happen, and it happened. The tool layer now uses one name
+# everywhere and translates at the wire, which is the real fix: an alias the
+# guards must know about is a guard that can be forgotten.
+#
+# This mapping stays as a backstop. Nothing in the current schemas emits the
+# old spelling, but a model that has seen it, a hand-written call, or a future
+# tool that reintroduces it would otherwise silently bypass propagation.
+_ALIASES = {
+    "opf_vm_upper": "vm_upper_pu",
+    "opf_vm_lower": "vm_lower_pu",
+}
 
 
 class TurnOperatingPoint:
-    """Carries the operating point across the tool calls of one turn."""
+    """Carries the operating point and the turn's limits across its tool calls.
 
-    def __init__(self) -> None:
+    Named for the operating point because that is what it originally carried;
+    it now also carries user-set thresholds, on the same rule — the first
+    explicit value in a turn defines it, and later calls that leave the field
+    empty inherit rather than falling back to a default.
+    """
+
+    def __init__(self, requested: dict | None = None) -> None:
         self._established: dict[str, tuple[Any, str]] = {}
+        # Limits the user stated in the prompt establish the turn's reference
+        # before any tool runs, so the first call is covered like the rest.
+        for field, value in (requested or {}).items():
+            self._established[field] = (value, "the request")
 
     def resolve(
         self, tool_name: str, kwargs: dict, accepts: set[str] | None = None
@@ -552,6 +640,15 @@ class TurnOperatingPoint:
         """
         resolved = dict(kwargs)
         inherited: dict[str, Any] = {}
+
+        # An alias carries the same quantity under a different name, so an
+        # explicit `opf_vm_upper` establishes the turn's `vm_upper_pu` and vice
+        # versa. Without this the OPF is an island: it neither inherits the
+        # ceiling the operator set nor contributes its own to later calls.
+        for alias, canonical in _ALIASES.items():
+            explicit = resolved.get(alias)
+            if explicit not in (None, ""):
+                self._established.setdefault(canonical, (explicit, tool_name))
 
         for field in _INHERITED_ARGS:
             explicit = resolved.get(field)
@@ -568,5 +665,18 @@ class TurnOperatingPoint:
             value, source = self._established[field]
             resolved[field] = value
             inherited[field] = {"value": value, "from": source}
+
+        # Fill an alias this tool accepts from the canonical value, so a limit
+        # set as `vm_upper_pu` reaches a tool that spells it `opf_vm_upper`.
+        for alias, canonical in _ALIASES.items():
+            if resolved.get(alias) not in (None, ""):
+                continue
+            if accepts is None or alias not in accepts:
+                continue
+            if canonical not in self._established:
+                continue
+            value, source = self._established[canonical]
+            resolved[alias] = value
+            inherited[alias] = {"value": value, "from": source}
 
         return resolved, inherited

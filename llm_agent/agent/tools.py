@@ -25,7 +25,21 @@ _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _unsupported_kwargs_result(tool_name: str, kwargs: dict, supported_extra: set[str]) -> dict | None:
-    """Return a structured error when a tool receives unsupported extra args."""
+    """Return a structured error when a tool receives unsupported extra args.
+
+    The wording carries a deliberate instruction, and the reason is the
+    system-prompt ablation. Without the prompt's refusal rule, an unsupported
+    request — generator unavailability combined with N-1 screening — was not
+    declined: the model improvised a workaround and reported a result as if the
+    combined analysis were valid. With the rule it declined, but the rule is
+    prose and the model complied only most of the time.
+
+    `refusal_required` and the sentence beside it move the boundary into the
+    payload, where compliance does not depend on how much of the system prompt
+    the model is currently weighting. This is the same move `validate_call`
+    makes for impossible parameters, one level up: the study a caller asked for
+    does not exist, and no combination of the studies that do exist answers it.
+    """
     unsupported = sorted(set(kwargs) - supported_extra)
     if not unsupported:
         return None
@@ -36,10 +50,15 @@ def _unsupported_kwargs_result(tool_name: str, kwargs: dict, supported_extra: se
         {
             "error": (
                 f"Unsupported arguments for {tool_name}: {unsupported}. "
-                f"Supported extra arguments: {supported_text}."
+                f"Supported extra arguments: {supported_text}. "
+                "This analysis is not available in the requested combination. "
+                "Tell the user it is unsupported and say what is available "
+                "instead. Do NOT approximate it with a different study, and do "
+                "NOT report a result as though the requested one had run."
             ),
             "unsupported_arguments": unsupported,
             "supported_extra_arguments": sorted(supported_extra),
+            "refusal_required": True,
         },
     )
 
@@ -362,8 +381,8 @@ def optimize_contingency(
     element_index: int,
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
-    opf_vm_upper: float = 1.05,
-    opf_vm_lower: float = 0.95,
+    vm_upper_pu: float = 1.05,
+    vm_lower_pu: float = 0.95,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -377,7 +396,7 @@ def optimize_contingency(
     POST /api/contingency/optimize
 
     slack_max_mw: External-grid capacity cap in MW. Omit to use the loaded profile limit.
-    opf_vm_upper / opf_vm_lower: voltage bounds enforced inside the AC OPF.
+    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
     opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
     pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
     fixed_setpoints: pin specific generators/slack at exact MW values.
@@ -393,8 +412,12 @@ def optimize_contingency(
         "element_index": element_index,
         "load_scaling_factor": load_scaling_factor,
         "slack_max_mw": slack_max_mw,
-        "opf_vm_upper": opf_vm_upper,
-        "opf_vm_lower": opf_vm_lower,
+        # The engine spells these `opf_vm_*`; the tool layer does not, so one
+        # ceiling has one name everywhere the model can see it. Translated
+        # here rather than propagated: an alias the guards have to know about
+        # is a guard that can be forgotten.
+        "opf_vm_upper": vm_upper_pu,
+        "opf_vm_lower": vm_lower_pu,
         "opf_lambda_p": opf_lambda_p,
         "opf_lambda_q": opf_lambda_q,
         "pg_max_overrides": pg_max_overrides or {},
@@ -417,8 +440,8 @@ def optimize_flexibility(
     disabled_generators: list[str] | None = None,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    opf_vm_upper: float = 1.05,
-    opf_vm_lower: float = 0.95,
+    vm_upper_pu: float = 1.05,
+    vm_lower_pu: float = 0.95,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -434,7 +457,7 @@ def optimize_flexibility(
     disabled_generators: list of substation names whose generators are forced offline.
     slack_max_mw: External-grid capacity cap in MW. Omit to use the loaded profile limit.
     slack_q_max_mvar: separate reactive power cap on the external-grid interface (Mvar). None = same as slack_max_mw.
-    opf_vm_upper / opf_vm_lower: voltage bounds enforced inside the AC OPF.
+    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
     opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
     pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
     fixed_setpoints: pin specific generators/slack at exact MW values.
@@ -450,8 +473,12 @@ def optimize_flexibility(
         "disabled_generators": disabled_generators or [],
         "slack_max_mw": slack_max_mw,
         "slack_q_max_mvar": slack_q_max_mvar,
-        "opf_vm_upper": opf_vm_upper,
-        "opf_vm_lower": opf_vm_lower,
+        # The engine spells these `opf_vm_*`; the tool layer does not, so one
+        # ceiling has one name everywhere the model can see it. Translated
+        # here rather than propagated: an alias the guards have to know about
+        # is a guard that can be forgotten.
+        "opf_vm_upper": vm_upper_pu,
+        "opf_vm_lower": vm_lower_pu,
         "opf_lambda_p": opf_lambda_p,
         "opf_lambda_q": opf_lambda_q,
         "pg_max_overrides": pg_max_overrides or {},
@@ -473,8 +500,8 @@ def evaluate_kpis(
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    opf_vm_upper: float = 1.05,
-    opf_vm_lower: float = 0.95,
+    vm_upper_pu: float = 1.05,
+    vm_lower_pu: float = 0.95,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -489,7 +516,7 @@ def evaluate_kpis(
 
     slack_max_mw drives the constrained-scenario solve (external-grid derating).
     slack_q_max_mvar: separate reactive power cap on the external-grid interface (Mvar). None = same as slack_max_mw.
-    opf_vm_upper / opf_vm_lower: voltage bounds enforced inside the AC OPF.
+    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
     opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
     pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
     fixed_setpoints: pin specific generators/slack at exact MW values.
@@ -503,8 +530,12 @@ def evaluate_kpis(
         "load_scaling_factor": load_scaling_factor,
         "slack_max_mw": slack_max_mw,
         "slack_q_max_mvar": slack_q_max_mvar,
-        "opf_vm_upper": opf_vm_upper,
-        "opf_vm_lower": opf_vm_lower,
+        # The engine spells these `opf_vm_*`; the tool layer does not, so one
+        # ceiling has one name everywhere the model can see it. Translated
+        # here rather than propagated: an alias the guards have to know about
+        # is a guard that can be forgotten.
+        "opf_vm_upper": vm_upper_pu,
+        "opf_vm_lower": vm_lower_pu,
         "opf_lambda_p": opf_lambda_p,
         "opf_lambda_q": opf_lambda_q,
         "pg_max_overrides": pg_max_overrides or {},
@@ -526,8 +557,8 @@ def forecast_kpis(
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    opf_vm_upper: float = 1.05,
-    opf_vm_lower: float = 0.95,
+    vm_upper_pu: float = 1.05,
+    vm_lower_pu: float = 0.95,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -543,7 +574,7 @@ def forecast_kpis(
     This is a slow call (~120 s). Only invoke when user explicitly asks for a
     forecast or "next 24 hours".
     slack_q_max_mvar: separate reactive power cap on cable (Mvar). None = same as slack_max_mw.
-    opf_vm_upper / opf_vm_lower: voltage bounds enforced inside the AC OPF.
+    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
     opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
     pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
     opf_min_power_factor: minimum generator power factor (default 0.95).
@@ -555,8 +586,12 @@ def forecast_kpis(
         "load_scaling_factor": load_scaling_factor,
         "slack_max_mw": slack_max_mw,
         "slack_q_max_mvar": slack_q_max_mvar,
-        "opf_vm_upper": opf_vm_upper,
-        "opf_vm_lower": opf_vm_lower,
+        # The engine spells these `opf_vm_*`; the tool layer does not, so one
+        # ceiling has one name everywhere the model can see it. Translated
+        # here rather than propagated: an alias the guards have to know about
+        # is a guard that can be forgotten.
+        "opf_vm_upper": vm_upper_pu,
+        "opf_vm_lower": vm_lower_pu,
         "opf_lambda_p": opf_lambda_p,
         "opf_lambda_q": opf_lambda_q,
         "pg_max_overrides": pg_max_overrides or {},

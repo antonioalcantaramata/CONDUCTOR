@@ -250,10 +250,18 @@ class TestReliefFeasibility:
 
     def test_a_withdrawn_movement_says_what_the_source_could_do(self, report):
         """Being told only what cannot be done is what made an earlier version
-        of the prompt rule answer with no numbers at all."""
+        of the prompt rule answer with no numbers at all.
+
+        Scoped to controllable drivers. A `False` flag now has two meanings:
+        the source cannot deliver the movement, or nobody can command it at
+        all. Only the first has a deliverable capacity to report — a load has
+        no lever, so `max_deliverable_*` would be a lever that does not exist.
+        """
         withdrawn = 0
         for violation in report["violations"]:
             for d in violation["drivers"]:
+                if d.get("actionable") is False:
+                    continue
                 for flag, relief_key, deliverable_key, current_key in (
                     ("relief_mw_feasible", "relief_mw", "max_deliverable_mw", "current_p_mw"),
                     ("relief_mvar_feasible", "relief_mvar", "max_deliverable_mvar", "current_q_mvar"),
@@ -265,6 +273,23 @@ class TestReliefFeasibility:
                     assert d[relief_key] is None
                     assert d[deliverable_key] == pytest.approx(-d[current_key], abs=1e-3)
         assert withdrawn, "expected at least one impossible movement in this scenario"
+
+    def test_an_uncontrollable_driver_offers_no_action(self, report):
+        """A load explains the regime and offers no lever. Its movement must
+        not survive in a field an answer would read as a recommendation."""
+        seen = 0
+        for violation in report["violations"]:
+            for d in violation["drivers"]:
+                if d.get("controllable") is not False:
+                    continue
+                seen += 1
+                assert d["actionable"] is False
+                assert d["relief_mw"] is None and d["relief_mvar"] is None
+                assert "max_deliverable_mw" not in d
+                assert "max_deliverable_mvar" not in d
+                # The magnitude survives, renamed: the diagnosis needs it.
+                assert d.get("would_require_mw") is not None or d.get("would_require_mvar") is not None
+        assert seen, "expected at least one load among the drivers"
 
     def test_unknown_headroom_is_left_alone(self, report):
         """Only the provably impossible is withdrawn.

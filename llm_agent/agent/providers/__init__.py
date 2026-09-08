@@ -5,10 +5,11 @@ providers — pluggable LLM backends for the agentic loop.
 the `LLMProvider` interface in `base.py`. Selection is driven by the
 `LLM_PROVIDER` environment variable (see `config.LLM_PROVIDER`):
 
-    google  — Google Generative AI (default)
-    openai  — the OpenAI API, or any endpoint speaking its chat-completions
-              dialect (Azure OpenAI, OpenRouter, vLLM, …) via OPENAI_BASE_URL
-    ollama  — a local Ollama server
+    google    — Google Generative AI (default)
+    openai    — the OpenAI API, or any endpoint speaking its chat-completions
+                dialect (Azure OpenAI, OpenRouter, vLLM, …) via OPENAI_BASE_URL
+    anthropic — the Anthropic Messages API (Claude), via the official SDK
+    ollama    — a local Ollama server
 
 Providers are imported lazily so that selecting one backend never requires the
 other's dependencies to be installed.
@@ -45,7 +46,7 @@ __all__ = [
     "reset_providers",
 ]
 
-_PROVIDERS = ("google", "openai", "ollama")
+_PROVIDERS = ("google", "openai", "anthropic", "ollama")
 
 _cache: dict[str, LLMProvider] = {}
 
@@ -85,6 +86,10 @@ def get_provider(name: str | None = None) -> LLMProvider:
             from .openai import OpenAIProvider
 
             _cache[key] = OpenAIProvider()
+        elif key == "anthropic":
+            from .claude import AnthropicProvider
+
+            _cache[key] = AnthropicProvider()
         elif key == "ollama":
             from .ollama import OllamaProvider
 

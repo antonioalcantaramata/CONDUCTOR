@@ -30,3 +30,6 @@ openpyxl>=3.1.0
 
 httpx>=0.27.0
 google-genai>=1.0.0
+# Optional: only needed for LLM_PROVIDER=anthropic. Listed here because the
+# provider tests import it.
+anthropic>=1.0.0

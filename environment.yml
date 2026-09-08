@@ -31,3 +31,7 @@ dependencies:
     - plotly>=5.20.0
     - httpx>=0.27.0
     - google-genai>=1.0.0
+    # Only needed for LLM_PROVIDER=anthropic. The OpenAI and Ollama backends
+    # speak raw HTTP over httpx above; nothing else speaks Anthropic's dialect,
+    # so that provider uses the official SDK.
+    - anthropic>=1.0.0

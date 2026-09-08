@@ -118,6 +118,62 @@ OPENAI_BASE_URL: str = os.environ.get(
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "180"))
 
 # ---------------------------------------------------------------------------
+# Anthropic (Claude)
+# ---------------------------------------------------------------------------
+# Default matches llm_agent/.env.example — keep the two in sync. Any model set
+# here must support tool calling, as with every other backend: CONDUCTOR drives
+# the grid entirely through tools.
+#
+# Haiku by default — the cheapest Claude model, matching the cost posture of
+# the other hosted backends here (the Gemini path defaults to a Flash model).
+# Set `claude-sonnet-5` or `claude-opus-5` for a more capable tier.
+#
+# Note that Haiku 4.5 predates adaptive thinking: it takes the older
+# `budget_tokens` shape and rejects `output_config` outright. The provider
+# picks the right shape from the model id, so `ANTHROPIC_EFFORT` below works
+# either way — on Haiku it maps onto a token budget rather than an effort
+# level. Its context window is also 200K rather than 1M, which is ample for a
+# ~25k-token turn but worth knowing.
+ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+
+ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# How hard the model thinks before answering, lowest to highest. Ordered,
+# because the settings UI renders them as a slider-like choice. Empty means
+# "send nothing" — the API default, which is `high`. On a 4.5-generation model
+# these map onto thinking-token budgets instead; see providers/claude.py.
+ANTHROPIC_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+# `medium` for the same reason the OpenAI path picks it: a turn here plans
+# several tool calls and then reasons over grid results, so some deliberation
+# earns its cost, and the top of the range earns it only on hard problems.
+ANTHROPIC_EFFORT: str = os.environ.get("ANTHROPIC_EFFORT", "medium").strip().lower()
+
+# Whether the model thinks before answering. On current models this is adaptive
+# thinking — the model decides when and how much, with `effort` above setting
+# the depth; on a 4.5-generation model it enables a token budget instead.
+# Set to "0"/"false" to turn it off, which the current models accept only at
+# effort `high` or below.
+ANTHROPIC_THINKING: bool = os.environ.get(
+    "ANTHROPIC_THINKING", "1"
+).strip().lower() not in ("0", "false", "no")
+
+# Overridable for gateways and proxies that speak the Anthropic wire format.
+ANTHROPIC_BASE_URL: str = os.environ.get(
+    "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
+).rstrip("/")
+
+# Matches the OpenAI budget: hosted, but this agent's turns carry ~25k tokens
+# of prompt and schemas, and a thinking model can spend a while on top.
+ANTHROPIC_TIMEOUT_S: float = float(os.environ.get("ANTHROPIC_TIMEOUT_S", "180"))
+
+# Output cap. The skill's guidance is not to lowball this — hitting the cap
+# truncates mid-thought and costs a retry. Answers here are operator summaries
+# rather than documents, so 16k is generous without inviting a timeout on the
+# non-streaming path.
+ANTHROPIC_MAX_TOKENS: int = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
+
+# ---------------------------------------------------------------------------
 # Ollama (local models)
 # ---------------------------------------------------------------------------
 OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -181,6 +237,17 @@ MODEL_RETRY_ATTEMPTS: int = int(os.environ.get("DT_MODEL_RETRY_ATTEMPTS", "10"))
 MODEL_OVERLOADED_RETRY_DELAY_S: int = int(
     os.environ.get("DT_MODEL_OVERLOADED_RETRY_DELAY_S", "90")
 )
+
+# ---------------------------------------------------------------------------
+# Reflection
+# ---------------------------------------------------------------------------
+# Whether the agent is shown its own provenance findings before its answer is
+# delivered. `off` is the baseline every earlier result was produced under and
+# stays the default; `warn` records what a reflection loop would have fired on
+# without changing any answer; `inform` hands the findings back to the agent
+# and lets it decide. See `reflection.py` for why informing and correcting are
+# deliberately different things.
+REFLECTION_MODE: str = os.environ.get("CONDUCTOR_REFLECTION", "off").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Session logging

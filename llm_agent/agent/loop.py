@@ -22,15 +22,25 @@ from typing import Callable
 from . import tools as _tools_module
 from .config import (
     MAX_AGENT_TURNS,
+    REFLECTION_MODE,
     SESSION_LOG_DIR,
     SESSION_LOG_PATH,
     last_grid_constants_status,
 )
 from .errors import classify_error
+from .reflection import (
+    INFORM,
+    OFF,
+    Reflection,
+    check_all,
+    format_message,
+    normalise_mode,
+)
 from .validators import (
     TurnConsistency,
     TurnOperatingPoint,
     annotate,
+    requested_limits,
     requested_timestamps,
     validate_call,
     validate_result,
@@ -178,6 +188,7 @@ def run_agent_turn(
     history: list,
     conversation_id: str | None = None,
     on_event: Callable[[str, dict], None] | None = None,
+    reflection: str | None = None,
 ) -> tuple[str, list]:
     """
     Execute one user turn in the digital twin agentic loop.
@@ -187,6 +198,10 @@ def run_agent_turn(
         history:          Provider-neutral message list from previous turns
                           (see `providers.base` for the dict shapes).
         conversation_id:  Optional unique ID for grouping related turns (for attempt tracking).
+        reflection:       "off" | "warn" | "inform". Whether the agent is shown
+                          its own provenance findings before the answer is
+                          delivered. Defaults to the configured mode; see
+                          `reflection.py`.
 
     Returns:
         (final_text, updated_history)
@@ -224,9 +239,13 @@ def run_agent_turn(
     # normal request, and warning about it told the model its own correct
     # behaviour was inconsistent.
     turn_consistency = TurnConsistency(expected=requested_timestamps(user_message))
-    # Carries an explicitly stated operating point across the turn's calls,
-    # so a later tool cannot silently fall back to the simulation clock.
-    turn_operating_point = TurnOperatingPoint()
+    # Carries an explicitly stated operating point, and the limits the user
+    # set, across the turn's calls — so a later tool cannot silently fall back
+    # to the simulation clock or to a default ceiling. Seeded from the prompt
+    # because the first call of a turn has nothing earlier to inherit from,
+    # and that is exactly where a week-long scan ran at the default 1.06 while
+    # every study after it ran at the 1.045 the operator asked for.
+    turn_operating_point = TurnOperatingPoint(requested=requested_limits(user_message))
 
     # 3. Resolve the backend. The system prompt is read per turn so edits to it
     #    take effect without restarting the app.
@@ -236,6 +255,11 @@ def run_agent_turn(
     # 4. Agentic loop.
     final_text = ""
     turns_used = 0
+    # Reflection state. `reflected` guards the one-pass rule: the draft is
+    # graded once, and whatever comes back is the answer.
+    reflection_mode = normalise_mode(reflection if reflection is not None else REFLECTION_MODE)
+    reflected = False
+    reflection_record: Reflection | None = None
 
     try:
         while turns_used < MAX_AGENT_TURNS:
@@ -255,10 +279,55 @@ def run_agent_turn(
             # 4b. Append model response to history.
             history.append(assistant_message(response))
 
-            # 4c. No tool calls → we have the final answer.
+            # 4c. No tool calls → we have a draft answer.
             if not response.wants_tools:
                 final_text = response.text
                 turn_status = "completed"
+
+                # 4c-i. Optionally grade the draft and hand the findings back.
+                # Only once per turn: a second pass could oscillate, and the
+                # cost of an unbounded loop is not worth the marginal catch.
+                if reflection_mode != OFF and not reflected:
+                    reflected = True
+                    draft_record = {
+                        "user": user_message,
+                        "grid": _grid_facts(),
+                        "tool_calls": turn_tool_calls,
+                        "tool_results": turn_tool_results,
+                    }
+                    findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
+                    show = reflection_mode == INFORM and bool(findings or conflicts or gaps)
+                    reflection_record = Reflection(
+                        mode=reflection_mode,
+                        draft=final_text,
+                        findings=findings,
+                        report=prov_report,
+                        shown=show,
+                        conflicts=conflicts,
+                        gaps=gaps,
+                    )
+                    if on_event:
+                        on_event("reflection", {
+                            "mode": reflection_mode,
+                            "triggered": bool(findings or conflicts or gaps),
+                            "shown": show,
+                            "n_findings": len(findings),
+                            "n_conflicts": len(conflicts),
+                            "n_gaps": len(gaps),
+                        })
+                    if show:
+                        # The findings enter as a user-role message: the agent
+                        # is being told something about its draft, and is free
+                        # to answer again, revise, or call a tool. Nothing here
+                        # forces a change.
+                        logger.info(
+                            "Reflection surfaced %d grounding finding(s), %d "
+                            "characterisation conflict(s) and %d gap(s) to the agent.",
+                            len(findings), len(conflicts), len(gaps))
+                        history.append(make_user_message(
+                            format_message(findings, conflicts, gaps)))
+                        continue
+
                 break
 
             # 4d. Execute each tool call and append its result.
@@ -375,6 +444,15 @@ def run_agent_turn(
     # Calculate execution duration
     duration_s = round(time.perf_counter() - turn_start_time, 3)
 
+    # Close the reflection record now the answer is settled. Both the draft and
+    # the delivered answer are kept: the difference between them is the only
+    # way to tell a revision from a rationalisation after the fact.
+    if reflection_record is not None:
+        reflection_record = reflection_record._replace(
+            revised=reflection_record.shown,
+            final=final_text,
+        )
+
     _append_to_log({
         "turn": len(session_log) + 1,
         "attempt_number": attempt_number,
@@ -404,6 +482,10 @@ def run_agent_turn(
         "tool_results": turn_tool_results,
         "tool_error_count": tool_error_count,
         "assistant": final_text,
+        # Absent when reflection is off, so existing logs and the graders that
+        # read them are unaffected.
+        **({"reflection": reflection_record.as_record()}
+           if reflection_record is not None else {}),
     })
 
     return final_text, history
