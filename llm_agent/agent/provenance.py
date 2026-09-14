@@ -350,7 +350,8 @@ def _names_under(record: dict, keys: tuple[str, ...]) -> frozenset:
                 scan(value)
 
     for entry in record.get("tool_results") or []:
-        scan(entry.get("result"))
+        if isinstance(entry, dict):
+            scan(entry.get("result"))
     return frozenset(found)
 
 
@@ -398,7 +399,8 @@ def subject_names(record: dict) -> frozenset:
                 scan(value)
 
     for entry in record.get("tool_results") or []:
-        scan(entry.get("result"))
+        if isinstance(entry, dict):
+            scan(entry.get("result"))
 
     return frozenset(
         name for name in found
@@ -417,6 +419,9 @@ def collect_sources(record: dict) -> list[Source]:
     vocabulary = element_names(record)
 
     for entry in record.get("tool_results") or []:
+        # A malformed entry costs its own sources, not the whole grading pass.
+        if not isinstance(entry, dict):
+            continue
         name = entry.get("name", "tool")
         _walk(entry.get("result"), name, sources, frozenset(), vocabulary)
 
@@ -428,6 +433,8 @@ def collect_sources(record: dict) -> list[Source]:
 
     # Arguments and the prompt belong to the turn, not to any one element.
     for call in record.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
         name = call.get("name", "tool")
         _walk(call.get("args"), f"args:{name}", sources)
 
@@ -576,10 +583,26 @@ def is_plausible_nearest(nearest: tuple[float, str] | None, value: float) -> boo
     return abs(nearest[0] - value) <= max(abs(value), 1.0) * 0.05
 
 
-# Two numbers with an operator between them, as the model writes it: plain
-# `176.7793 / 220.1206`, or LaTeX `\frac{176.7793}{220.1206}` and `\div`.
+# Two numbers with a division between them, as the model actually writes it.
+#
+# Symbolic: plain `176.7793 / 220.1206`, LaTeX `\frac{176.7793}{220.1206}` and
+# `\div`, and the Unicode division sign `÷`.
+#
+# Prose: "dividing 176.7793 by 220.1206", "176.7793 divided by 220.1206". These
+# were missed by the symbolic form alone, and the omission mattered more than
+# it looks: an answer that explained its arithmetic in words was scored as
+# having invented the result, while the same arithmetic written with a slash
+# was not. That is the transparency penalty `DERIVED` exists to remove,
+# reappearing one level down.
+#
+# The connecting text is bounded and must not contain a digit, so
+# "12.4 MW divided between Alpha and Bravo, leaving 3.1 MW" cannot pair 12.4
+# with 3.1 across an unrelated clause.
 _DIVISION_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:/|\\div|}\s*\{)\s*(\d+(?:\.\d+)?)"
+    r"(\d+(?:\.\d+)?)\s*(?:/|÷|\\div|}\s*\{)\s*(\d+(?:\.\d+)?)"
+    r"|(?:divid\w+)\s+(\d+(?:\.\d+)?)\s*(?:[^\d\n]{0,12}?\bby)\s*(\d+(?:\.\d+)?)"
+    r"|(\d+(?:\.\d+)?)\s*(?:[^\d\n]{0,12}?\bdivided by)\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
 )
 
 
@@ -604,7 +627,13 @@ def _derivation(claim: Claim, sources: Iterable[Any],
                 return path
         return None
 
-    for numerator, denominator in _DIVISION_RE.findall(text):
+    for groups in _DIVISION_RE.findall(text):
+        # One alternative matched; the rest are empty. Take the populated pair.
+        pairs = [(groups[i], groups[i + 1]) for i in range(0, len(groups), 2)]
+        numerator, denominator = next(
+            ((a, b) for a, b in pairs if a and b), ("", ""))
+        if not numerator:
+            continue
         try:
             top, bottom = float(numerator), float(denominator)
         except ValueError:

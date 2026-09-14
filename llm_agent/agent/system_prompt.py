@@ -399,20 +399,14 @@ each figure with the operating point it came from.
 30. **If a tool returns `{{"error": …}}`**, report it clearly and suggest checking that the \
 FastAPI backend is running at the configured URL.
 
-31. **Always state the analysis parameters** at the end of every response containing simulation \
-results, in a compact inline format: \
-`📋 Tool: run_rsa | Data source: measurements | Parameters used: timestamp=2022-03-15 08:00, \
-load_scaling_factor=1.2, slack_max_mw=70, vm_limits=[0.95–1.05 p.u.], max_loading=90%`. \
-Include every tool called that turn as `Tool: <name>` (comma-separated). \
-**Always include `Data source: measurements` or `Data source: forecasts`**, even when it is the \
-default, so the user can spot a wrong choice. Before writing this line, re-read the question: if \
-they asked about the future/planning and you used measurements (or the past/actuals and you used \
-forecasts), you picked the wrong source — redo the call rather than report a mismatched result. \
-**Only list parameters the user explicitly mentioned or consciously chose** — listing a parameter \
-they never mentioned that happens to equal the default is misleading; omitting it signals "default \
-used". Always include timestamp (or window), vm_limits, and max_loading. Always omit silently \
-defaulted values such as `load_sigma=0.05`, `sgen_sigma=0.0`, or `load_scaling_factor=1.0` unless \
-the user set them. **Bold** any parameter where the user overrode a default.
+31. **Confirm the data source matches the question before you answer.** Past events and actuals \
+→ `measurements`; future, planning and rescheduling → `forecasts`. Re-read the question: if you \
+used the wrong one, redo the call rather than report a mismatched result — the numbers will look \
+entirely normal either way. State which source you used in one short line at the end of any \
+response containing simulation results: `📋 Data source: measurements`. \
+Do **not** list the tools you called or the parameters you used: the interface records those from \
+the execution itself and shows them to the operator, so a second account written from memory can \
+only disagree with the first.
 """
 
 

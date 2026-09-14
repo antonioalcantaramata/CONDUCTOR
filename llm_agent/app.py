@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import logging
 import os
 import pathlib
 import re
@@ -50,6 +51,8 @@ from agent.config import (
 from agent.hardware import advice as hw_advice
 from agent.hardware import detect as detect_hardware
 from agent.hardware import num_ctx_warning, recommended_num_ctx
+from agent import loop as _loop_module
+from agent import trace as _trace
 from agent.loop import run_agent_turn
 from agent.providers import (
     active_provider_name,
@@ -2702,27 +2705,6 @@ _render_main_hero()
 # The input box stays outside the tabs on purpose: `st.chat_input` pins itself
 # to the bottom of the viewport only at the top level, and inside a tab it
 # would render inline and appear on one pane only. Out here it stays pinned and
-# a question can be asked while looking at the diagram.
-_chat_tab, _system_tab = st.tabs(["Chat", "System"])
-
-with _chat_tab:
-    if not st.session_state.messages:
-        with st.chat_message("assistant"):
-            st.markdown(
-                f"Hello! I'm **{_BRAND_NAME}**, an LLM-orchestrated digital twin for uncertainty-aware distribution grid operations. "
-                "I can help you analyze deterministic security, run N-1 contingency studies, quantify probabilistic risk, "
-                "optimize robust corrective dispatch, and evaluate flexibility, hosting-capacity, and KPI studies.\n\n"
-                "Try one of the **Example queries** in the sidebar, or ask me anything about the active power-system model."
-            )
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["text"])
-            if msg.get("charts"):
-                render_charts(msg["charts"])
-
-with _system_tab:
-    _render_system_view()
-
 _TOOL_LABELS = {
     "run_rsa": "Security Assessment (RSA)",
     "run_n1_contingency": "N-1 Contingency Analysis",
@@ -2735,6 +2717,131 @@ _TOOL_LABELS = {
     "get_network_summary": "Loading network summary",
     "get_load_generation_profile": "Loading generation profile",
 }
+
+
+def _render_trace(trace, key: str) -> None:
+    """The audit panel under an answer: what ran, where the numbers came from,
+    and what was not checked.
+
+    Collapsed by default — an operator who trusts the answer never opens it —
+    but the label always carries the concern count, because a panel nobody
+    opens cannot warn anybody.
+
+    Deliberately describes rather than certifies. "12 figures traced" is a
+    statement about where numbers came from; it is not a claim that the answer
+    is correct, and the limits block at the bottom says so explicitly.
+    """
+    # `concerns` is in the guard deliberately. A turn can answer from memory —
+    # no tools, no figures — and still raise a completeness gap or a
+    # characterisation conflict, and that is precisely the answer that must not
+    # render without its warning.
+    if trace is None or not (trace.steps or trace.figures or trace.concerns):
+        return
+
+    icon = "⚠️" if trace.has_concerns else "🔍"
+    with st.expander(f"{icon} How this answer was produced — {trace.headline()}"):
+
+        # Concerns first: anything worth acting on should not be below a table
+        # the operator has to scroll past.
+        if trace.concerns:
+            st.markdown("**Worth checking**")
+            for item in trace.concerns:
+                st.markdown(f"- {item}")
+            st.divider()
+
+        if trace.steps:
+            st.markdown("**What ran**")
+            for step in trace.steps:
+                label = _TOOL_LABELS.get(step.name, step.name.replace("_", " ").title())
+                mark = "" if step.ok else " ❌"
+                st.markdown(f"`{step.order}.` **{label}**{mark}")
+                if step.args:
+                    # Each argument in its own code span. A bare "·" separator
+                    # sat flush against the preceding value — `…pct=100· data…`
+                    # reads as a decimal point, which is the one typo an
+                    # operator scanning limits must not have to second-guess.
+                    # The monospace box also gives every value a visible
+                    # boundary, so a trailing digit cannot merge into the next
+                    # key.
+                    st.markdown(
+                        "&nbsp; ".join(f"`{k}={v}`" for k, v in step.args.items()),
+                        unsafe_allow_html=True,
+                        help="Arguments this tool actually ran with.",
+                    )
+                if step.inherited:
+                    # The only place the repair guard becomes visible to a
+                    # human: a value the operator set earlier, carried forward
+                    # so this study matched the one before it. Same code-span
+                    # treatment as the arguments above — this line states a
+                    # limit, and a limit an operator has to squint at is worse
+                    # than no line.
+                    carried = "&nbsp; ".join(
+                        f"`{field}={detail.get('value')}`"
+                        f" _(from {detail.get('from')})_"
+                        if isinstance(detail, dict) else f"`{field}={detail}`"
+                        for field, detail in sorted(
+                            step.inherited.items(), key=lambda kv: str(kv[0]))
+                    )
+                    st.markdown(f"↳ carried forward: {carried}",
+                                unsafe_allow_html=True)
+                if step.error:
+                    st.caption(f"↳ {step.error}")
+            st.divider()
+
+        if trace.figures:
+            st.markdown("**Where the numbers came from**")
+            st.dataframe(
+                [
+                    {
+                        "Figure": f"{f.value:g}" + (f" {f.unit}" if f.unit else ""),
+                        "Status": f.detail,
+                        "Source": f.source or "—",
+                    }
+                    for f in trace.figures
+                ],
+                hide_index=True, use_container_width=True,
+                key=f"trace_figs_{key}",
+            )
+            st.divider()
+
+        st.markdown("**What this does not tell you**")
+        for limit in trace.limits:
+            st.caption(f"· {limit}")
+
+
+# a question can be asked while looking at the diagram.
+_chat_tab, _system_tab = st.tabs(["Chat", "System"])
+
+with _chat_tab:
+    if not st.session_state.messages:
+        with st.chat_message("assistant"):
+            st.markdown(
+                f"Hello! I'm **{_BRAND_NAME}**, an LLM-orchestrated digital twin for uncertainty-aware distribution grid operations. "
+                "I can help you analyze deterministic security, run N-1 contingency studies, quantify probabilistic risk, "
+                "optimize robust corrective dispatch, and evaluate flexibility, hosting-capacity, and KPI studies.\n\n"
+                "Try one of the **Example queries** in the sidebar, or ask me anything about the active power-system model."
+            )
+    for _msg_idx, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["text"])
+            if msg.get("charts"):
+                render_charts(msg["charts"])
+            if msg.get("trace") is not None:
+                # History re-renders on every rerun, so an exception here would
+                # not break one panel — it would permanently break the whole
+                # conversation view. The audit is worth less than the record of
+                # what was said.
+                try:
+                    _render_trace(msg["trace"], key=f"hist_{_msg_idx}")
+                except Exception:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "Could not render the audit panel for message %s.",
+                        _msg_idx, exc_info=True)
+                    st.caption("⚠️ The audit panel could not be rendered for this answer.")
+
+with _system_tab:
+    _render_system_view()
+
 
 
 @st.fragment
@@ -2912,15 +3019,47 @@ def _chat_input_fragment():
             # belong on screen.
             charts_this_turn = _dedupe_tool_results(_tools_module._last_tool_results)
             assistant_text = final_text if final_text else "_No text response from agent._"
+
+            # The audit panel is built from the turn record the loop just
+            # wrote — the same input the offline graders read, so the panel and
+            # the evaluation cannot disagree about a turn. Never allowed to
+            # break the answer: a missing panel costs an audit, a raised
+            # exception costs the reply.
+            turn_trace = None
+            try:
+                record = _loop_module.session_log[-1] if _loop_module.session_log else None
+                # Verify the record belongs to *this* question. A turn that
+                # aborts before logging leaves the previous turn's record at
+                # the end of the list, and attributing one answer's evidence to
+                # a different question is the worst thing this panel could do —
+                # it would assert provenance for numbers never produced. No
+                # panel is strictly better than a wrong one.
+                if record is not None and record.get("user") == llm_input:
+                    turn_trace = _trace.build(record)
+                elif record is not None:
+                    logging.getLogger(__name__).warning(
+                        "Skipping the audit panel: the newest log record is for "
+                        "a different prompt.")
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "Could not build the answer trace.", exc_info=True)
+
             st.session_state.messages.append({
                 "role": "assistant",
                 "text": assistant_text,
                 "charts": charts_this_turn,
+                "trace": turn_trace,
             })
 
             # Render reply inside the same chat bubble
             st.markdown(assistant_text)
             render_charts(charts_this_turn)
+            try:
+                _render_trace(turn_trace, key=f"live_{len(st.session_state.messages)}")
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "Could not render the audit panel.", exc_info=True)
+                st.caption("⚠️ The audit panel could not be rendered for this answer.")
 
     # Fold the finished turn into the main conversation history with a full app
     # rerun. It's fast now — the answer is already computed, so nothing blocks it.

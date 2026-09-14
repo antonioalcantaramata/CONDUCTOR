@@ -20,7 +20,7 @@ invisible here too.
 
 from __future__ import annotations
 
-from llm_agent.agent.characterisation import Conflict, check_turn
+from llm_agent.agent.characterisation import Conflict, check_study_claims, check_turn
 
 from ..session_log import FAIL, INTERPRETATION, Finding
 
@@ -28,9 +28,22 @@ from ..session_log import FAIL, INTERPRETATION, Finding
 def grade_characterisation(record: dict) -> tuple[list[Finding], list[Conflict]]:
     """Findings about how one turn's answer describes its figures."""
     turn = record.get("turn", 0)
-    conflicts = check_turn(record)
+    # Figure-anchored conflicts, plus the verdict-level ones that need no
+    # figure at all — an answer calling an insecure study fine quotes nothing,
+    # so the figure-anchored check has nothing to attach to.
+    figure_conflicts = check_turn(record)
+    study_conflicts = check_study_claims(record.get("assistant") or "", record)
+
+    # Distinct codes: one is a figure described against its own record, the
+    # other is a whole study described against its own verdict. Collapsing them
+    # would make the failure taxonomy unable to tell "quoted an undeliverable
+    # movement" from "called an insecure grid fine".
     findings = [
-        Finding(turn, INTERPRETATION, FAIL, "mischaracterised_figure", conflict.render())
-        for conflict in conflicts
+        Finding(turn, INTERPRETATION, FAIL, "mischaracterised_figure", c.render())
+        for c in figure_conflicts
+    ] + [
+        Finding(turn, INTERPRETATION, FAIL, "mischaracterised_study",
+                f"{c.detail} ({c.path}) — answer: \"{c.context}\"")
+        for c in study_conflicts
     ]
-    return findings, conflicts
+    return findings, figure_conflicts + study_conflicts

@@ -130,6 +130,25 @@ _INVERTED = (
 
 _QUALIFIER_FIELDS = {q.field for q in _QUALIFIERS} | {q.field for q in _INVERTED}
 
+# Fields a qualifier does NOT govern, even when they sit in the same object.
+#
+# A driver record carries the movement being judged (`relief_mw`,
+# `would_require_mw`) alongside descriptive quantities that are not actions at
+# all: the sensitivity `d_per_mw` (p.u. per MW), and the unit's present output
+# `current_p_mw`. `actionable: false` says nothing about those.
+#
+# Observed live, and the reason this exists: a sentence reading "violating the
+# lower limit by 0.001 p.u." matched `d_per_mw = -0.000509` — a sensitivity in
+# p.u./MW that rounds into the same band at three decimals — and the panel
+# reported a voltage margin as an undeliverable dispatch action. Twenty times,
+# once per driver field in the payload.
+_NOT_A_MOVEMENT = (
+    "d_per_",          # sensitivities: p.u. per MW / per MVAr
+    "current_",        # the source's present output, not a proposed change
+    "max_deliverable", # a capability statement, already the safe figure
+    "_index", "index",
+)
+
 # Negation immediately before an assertion flips it. Kept deliberately short:
 # these are the forms the model actually writes, and a longer list starts
 # matching across clause boundaries.
@@ -198,7 +217,10 @@ def _qualified_numbers(node: Any, path: str, out: dict[float, list[tuple[str, Qu
             child = f"{path}.{key}"
             if isinstance(value, bool):
                 continue
-            if isinstance(value, (int, float)) and unfavourable and key not in _QUALIFIER_FIELDS:
+            if (isinstance(value, (int, float)) and unfavourable
+                    and key not in _QUALIFIER_FIELDS
+                    and not key.startswith(_NOT_A_MOVEMENT)
+                    and not key.endswith(_NOT_A_MOVEMENT)):
                 for qualifier in unfavourable:
                     out.setdefault(float(value), []).append((child, qualifier))
             else:
@@ -214,6 +236,11 @@ def qualified_numbers(record: dict) -> dict[float, list[tuple[str, Qualifier]]]:
     """Every number in the turn's tool results that carries an unfavourable flag."""
     out: dict[float, list[tuple[str, Qualifier]]] = {}
     for entry in record.get("tool_results") or []:
+        # A malformed entry costs its own qualifiers, not the whole check. This
+        # also runs live behind the operator-facing audit panel, where a raise
+        # is far more costly than a missing finding.
+        if not isinstance(entry, dict):
+            continue
         _qualified_numbers(entry.get("result"), entry.get("name", "tool"), out)
     return out
 
@@ -270,6 +297,94 @@ def _sentence_around(text: str, position: int) -> str:
     return text[start:max(end, position)].strip()
 
 
+# Top-level verdicts an engine states about the whole study, and the words an
+# answer uses to claim the favourable reading. Separate from `_QUALIFIERS`
+# above, which qualify a *number*: these qualify the study itself, and an
+# answer can contradict them without quoting any figure at all.
+_STUDY_VERDICTS = (
+    Qualifier(
+        "secure",
+        ("secure", "within limits", "within its limits", "no violation",
+         "no violations", "compliant", "looks fine", "looks good", "all good",
+         "all clear", "nothing to report", "operating normally"),
+        "the assessment recorded this operating point as insecure",
+    ),
+    Qualifier(
+        "converged",
+        ("secure", "within limits", "no violation", "solved", "converged",
+         "successful", "succeeded"),
+        "the study did not converge, so its result is not usable",
+    ),
+    Qualifier(
+        "usable",
+        ("secure", "within limits", "no violation", "solved", "converged",
+         "successful", "succeeded", "result", "answer"),
+        "the study ran but did not produce a usable result",
+    ),
+    Qualifier(
+        "feasible",
+        ("feasible", "achievable", "deliverable", "successful", "succeeded",
+         "solved", "optimal"),
+        "the optimisation recorded this as infeasible",
+    ),
+)
+
+
+def _study_verdicts(record: dict) -> list[tuple[str, Qualifier]]:
+    """Unfavourable verdicts each tool result states about itself."""
+    out: list[tuple[str, Qualifier]] = []
+    for entry in record.get("tool_results") or []:
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict):
+            continue
+        name = entry.get("name", "tool")
+        for verdict in _STUDY_VERDICTS:
+            if result.get(verdict.field) is False:
+                out.append((name, verdict))
+        # A violation count above zero is the same statement as `secure: False`
+        # and some endpoints carry only one of the two.
+        total = result.get("total_violations")
+        if isinstance(total, int) and total > 0 and not any(
+            v.field == "secure" for _, v in out
+        ):
+            out.append((name, _STUDY_VERDICTS[0]))
+    return out
+
+
+def check_study_claims(answer: str, record: dict) -> list[Conflict]:
+    """Sentences that call a study fine when the study says otherwise.
+
+    The gap the figure-anchored check above cannot reach. Asked whether the
+    system was secure, an answer of "everything looks fine" over a result
+    carrying `secure: False` quotes no number, so nothing in the layer had
+    anything to attach a finding to — the most obviously wrong answer a reader
+    could imagine was the one it could not see.
+
+    Reported with value 0 and no unit: the subject is the study, not a figure.
+    """
+    text = answer or ""
+    if not text.strip():
+        return []
+
+    conflicts: list[Conflict] = []
+    seen: set[str] = set()
+    for name, verdict in _study_verdicts(record):
+        if verdict.field in seen:
+            continue
+        # Judged over the whole answer rather than a sentence: the claim may be
+        # a standalone "All clear." with the detail in a neighbouring sentence.
+        if _asserts_favourable(text, verdict):
+            seen.add(verdict.field)
+            conflicts.append(Conflict(
+                value=0.0, unit=None,
+                context=" ".join(text.split())[:120],
+                path=name, field=verdict.field, detail=verdict.describe,
+            ))
+    return conflicts
+
+
 def check_answer(answer: str, record: dict) -> list[Conflict]:
     """Figures the answer characterises against their own records."""
     from .provenance import extract_claims  # local: avoids an import cycle
@@ -288,30 +403,41 @@ def check_answer(answer: str, record: dict) -> list[Conflict]:
         # that got it right. The sentence containing the figure is the unit
         # of judgement.
         sentence = _sentence_around(text, claim.position)
+
+        # Every payload path whose value matches this claim and whose qualifier
+        # the sentence contradicts. Collected across all matching values, not
+        # one conflict per value: a claim of "0.001 p.u." matched twenty
+        # sensitivity fields in one attribution payload, and the panel reported
+        # the same sentence twenty times. Twenty identical warnings for one
+        # sentence is how an operator learns to stop reading them.
+        matched: list[tuple[str, Qualifier]] = []
         for value, entries in qualified.items():
             # Magnitude only. The 6.24 case was written positive against a
             # negative source, and a check that required the sign to match
             # would have missed exactly the sentence it exists for.
             if abs(abs(value) - abs(claim.value)) > 10.0 ** -claim.decimals:
                 continue
+            matched.extend(
+                (path, q) for path, q in entries if _asserts_favourable(sentence, q)
+            )
+
+        if matched:
             # One conflict per claim, and where several qualifiers fire the
             # most specific one is reported. A load's movement trips both
             # `relief_mw_feasible` and `actionable`; the first says the source
             # cannot deliver it, the second says nobody can command it, and
             # only the second tells the reader why.
-            matched = [(p, q) for p, q in entries if _asserts_favourable(sentence, q)]
-            if matched:
-                path, qualifier = min(
-                    matched, key=lambda pair: _SPECIFICITY.get(pair[1].field, 50)
-                )
-                conflicts.append(Conflict(
-                    value=claim.value,
-                    unit=claim.unit,
-                    context=claim.context,
-                    path=path,
-                    field=qualifier.field,
-                    detail=qualifier.describe,
-                ))
+            path, qualifier = min(
+                matched, key=lambda pair: _SPECIFICITY.get(pair[1].field, 50)
+            )
+            conflicts.append(Conflict(
+                value=claim.value,
+                unit=claim.unit,
+                context=claim.context,
+                path=path if len(matched) == 1 else f"{path} (+{len(matched) - 1} more)",
+                field=qualifier.field,
+                detail=qualifier.describe,
+            ))
     return conflicts
 
 

@@ -12,6 +12,7 @@ Public API:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -181,6 +182,19 @@ def _append_to_log(record: dict) -> None:
             _log_initialized = True
     except Exception:  # noqa: BLE001
         logger.warning("Session log write failed — logging silently disabled.", exc_info=True)
+
+
+def _turn_key(user_message: str, conversation_id: str, attempt: int) -> str:
+    """Identity of one turn, for consumers that read the log after the fact.
+
+    Not a hash of the whole record: the point is to answer "is this record the
+    one for the question I just asked", which the prompt, the conversation and
+    the attempt number settle.
+    """
+    digest = hashlib.sha1(
+        f"{conversation_id}|{attempt}|{user_message}".encode("utf-8")
+    ).hexdigest()
+    return digest[:16]
 
 
 def run_agent_turn(
@@ -455,6 +469,11 @@ def run_agent_turn(
 
     _append_to_log({
         "turn": len(session_log) + 1,
+        # The prompt this record belongs to. A consumer reading `session_log[-1]`
+        # — the audit panel does — cannot otherwise tell a fresh record from a
+        # stale one left behind when a turn aborted before logging, and would
+        # then attribute one answer's evidence to a different question.
+        "turn_key": _turn_key(user_message, conversation_id, attempt_number),
         "attempt_number": attempt_number,
         "conversation_id": conversation_id,
         # utcnow() is deprecated and naive; this keeps the identical wire format.

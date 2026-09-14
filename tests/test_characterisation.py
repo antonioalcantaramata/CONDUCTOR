@@ -164,3 +164,74 @@ class TestGrader:
         record = _attribution()
         record["assistant"] = "Reduce 05 AKI Sgen by 6.24 MW."
         assert check_turn(record)
+
+
+class TestNoiseFromRealPayloads:
+    """Observed on a live six-tool turn: one sentence produced twenty warnings.
+
+    Two independent causes, both of which made the panel actively misleading —
+    a voltage margin was reported as an undeliverable dispatch action, and the
+    count told the operator there were twenty things to check.
+    """
+
+    DRIVER = {
+        "source": "Load_2", "controllable": False,
+        "current_p_mw": 60.804, "current_q_mvar": 12.0,
+        # A sensitivity in p.u./MW. Rounds into the same band as a claim of
+        # "0.001 p.u." at three decimals, but it is not a movement.
+        "d_per_mw": -0.000274, "d_per_mvar": -0.000509,
+        "relief_mw": None, "would_require_mw": -12.411,
+        "actionable": False, "relief_mw_feasible": False,
+    }
+
+    def _record(self, n_drivers=5, n_violations=2):
+        return {"user": "why?", "tool_results": [{"name": "attr", "result": {
+            "violations": [
+                {"element": f"Bus_{v}", "violated": True,
+                 "drivers": [dict(self.DRIVER) for _ in range(n_drivers)]}
+                for v in range(n_violations)
+            ]}}]}
+
+    def test_a_sensitivity_is_not_a_movement(self):
+        """`actionable: false` governs the proposed change, not the p.u./MW
+        sensitivity or the unit's present output sitting beside it."""
+        conflicts = check_answer(
+            "Bus_4 is at 0.939 p.u., violating the lower limit by 0.001 p.u.",
+            self._record())
+        assert conflicts == []
+
+    def test_one_sentence_produces_at_most_one_conflict(self):
+        """Ten drivers × two movement fields once produced twenty warnings for
+        a single sentence."""
+        conflicts = check_answer("Reduce Load_2 by 12.411 MW.", self._record())
+        assert len(conflicts) == 1
+
+    def test_the_conflict_says_how_many_records_matched(self):
+        """Collapsing to one must not hide that the payload matched in several
+        places — the operator can still find them all in the log."""
+        conflict = check_answer("Reduce Load_2 by 12.411 MW.", self._record())[0]
+        assert "more" in conflict.path
+
+    def test_a_single_match_names_its_path_plainly(self):
+        """One driver field matched by one qualifier. (A driver with both
+        `actionable` and `relief_mw_feasible` false is matched twice by
+        design — one movement, two reasons — so the minimal case here carries
+        a single qualifier.)"""
+        record = {"user": "why?", "tool_results": [{"name": "attr", "result": {
+            "violations": [{"element": "Bus_0", "violated": True, "drivers": [
+                {"source": "Gen_1", "relief_mw": -6.24,
+                 "relief_mw_feasible": False}]}]}}]}
+        conflict = check_answer("Reduce Gen_1 by 6.24 MW.", record)[0]
+        assert "more" not in conflict.path
+        assert conflict.path.endswith("relief_mw")
+
+    def test_the_real_failure_is_still_caught(self):
+        """The whole point of the check. Narrowing must not cost the case it
+        exists for."""
+        assert check_answer("Reduce Load_2 by 12.411 MW to clear Bus_3.",
+                            self._record())
+
+    def test_the_diagnostic_phrasing_is_still_allowed(self):
+        assert check_answer(
+            "Clearing it by load alone would require 12.411 MW, "
+            "which is not an available action.", self._record()) == []
