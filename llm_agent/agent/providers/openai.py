@@ -119,14 +119,16 @@ def probe(base_url: str | None = None, api_key: str | None = None) -> dict:
 
     Used by the setup screen to show what the key can actually reach. Returns::
 
-        {"reachable": bool, "error": str, "models": [str, ...]}
+        {"reachable": bool, "error": str, "models": [str, ...],
+         "created": {model_id: unix_time | None}}
 
     `models` is best-effort: some compatible servers do not implement
-    `/v1/models`, which is not a reason to refuse to run.
+    `/v1/models`, which is not a reason to refuse to run. `created` lets the
+    model check say when a newer model of the same family is offered.
     """
     base = (base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
     key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
-    out: dict[str, Any] = {"reachable": False, "error": "", "models": []}
+    out: dict[str, Any] = {"reachable": False, "error": "", "models": [], "created": {}}
 
     if not key.strip():
         out["error"] = "No API key set."
@@ -151,9 +153,9 @@ def probe(base_url: str | None = None, api_key: str | None = None) -> dict:
 
     out["reachable"] = True
     try:
-        out["models"] = sorted(
-            str(m.get("id", "")) for m in resp.json().get("data", []) if m.get("id")
-        )
+        data = [m for m in resp.json().get("data", []) if m.get("id")]
+        out["models"] = sorted(str(m["id"]) for m in data)
+        out["created"] = {str(m["id"]): m.get("created") for m in data}
     except Exception:  # noqa: BLE001
         logger.debug("Could not parse the model list from %s.", base)
     return out
@@ -269,13 +271,16 @@ class OpenAIProvider:
             "model": self.model,
             "instructions": system,
             "input": self._to_responses_input(messages),
-            "tools": _responses_tools(tools),
             # Grid data must not be retained server-side; CONDUCTOR's whole
             # premise is that the operator keeps their network to themselves.
             # The cost is that reasoning state is not held for us either, which
             # is why reasoning items are replayed from history below.
             "store": False,
         }
+        # The API rejects an empty `tools` array, so a tool-less call (the
+        # suggestion agent) omits the key.
+        if tools:
+            payload["tools"] = _responses_tools(tools)
         if self.reasoning_effort:
             payload["reasoning"] = {"effort": self.reasoning_effort}
 
@@ -402,13 +407,15 @@ class OpenAIProvider:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._to_openai_messages(messages, system),
-            "tools": to_json_schema_tools(tools),
             # Deterministic, matching the Gemini and Ollama paths. Reasoning
             # models reject an explicit temperature, so it is dropped on the
             # retry that says so rather than guessed at from the model name —
             # names are not a reliable signal, and compatible servers vary.
             "temperature": 0,
         }
+        # The API rejects an empty `tools` array; see `_chat_via_responses`.
+        if tools:
+            payload["tools"] = to_json_schema_tools(tools)
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
         data = self._post_with_retry(payload, "/chat/completions", on_event=on_event)

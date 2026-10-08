@@ -35,8 +35,14 @@ class Finding(NamedTuple):
         return f"turn {self.turn}  [{self.severity}] {self.channel}/{self.code}: {self.detail}"
 
 
-def load_records(path: str | pathlib.Path) -> list[dict]:
-    """Every turn record in one JSONL session log.
+TURN = "turn"
+
+
+def load_records(path: str | pathlib.Path, kind: str | None = TURN) -> list[dict]:
+    """Every record of one kind in one JSONL session log — turns by default.
+
+    Turn records carry no `kind` field (they predate it); other records, such
+    as AI Agent Suggestions, name theirs. `kind=None` returns everything.
 
     Malformed lines are skipped rather than fatal: a log truncated by a crash
     is still worth grading, and the crash is often the thing being diagnosed.
@@ -47,9 +53,14 @@ def load_records(path: str | pathlib.Path) -> list[dict]:
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(record, dict):
+            continue
+        if kind is not None and record.get("kind", TURN) != kind:
+            continue
+        records.append(record)
     return records
 
 

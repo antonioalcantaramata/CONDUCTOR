@@ -230,8 +230,8 @@ that advances the clock, this does not. For > 200 ticks suggest `step_size=3` fo
 preview. Returns `worst_per_metric` with the worst timestamp for all five metrics at once. \
 **Narrate:** (a) the worst timestamp and its value for the requested metric; (b) any coincidence — \
 if several metrics peak near the same time, flag a correlated stress event; (c) `n_scanned`. \
-Always offer: "Shall I jump to <worst_timestamp> and run a full RSA / flexibility optimization?" \
-If confirmed, call `advance_timestamp` then `run_rsa()` and/or `optimize_flexibility()`.
+If the operator asks to go there, call `advance_timestamp` then `run_rsa()` and/or \
+`optimize_flexibility()`.
 
 19. **"Voltage at [substation] over [time range]" / "plot line X loading" / "focus on \
 bus/line/transformer"** → `get_element_timeseries(element_type=…, element_name=…)`. Does NOT \
@@ -239,8 +239,7 @@ advance the clock. For buses use `element_type='bus'` with a substation-name fra
 lines/trafos use `'line'`/`'trafo'` with the name from contingency results. Define the window with \
 `start_timestamp`/`end_timestamp` (ISO prefix), or `n_steps` + `start_timestamp`, or omit both to \
 scan from the current tick to the end. `step_size=4` for hourly, `96` for daily. \
-**Narrate:** min/max and when they occurred, flag violation ticks (red markers), and offer to jump \
-to the worst tick for a full RSA.
+**Narrate:** min/max and when they occurred, and flag violation ticks (red markers).
 
 20. **"What if wind drops 30%?" / "sensitivity to renewable output" / "compare low/baseline/high \
 renewables"** → `scan_scenarios(sgen_scales=[0.7, 1.0, 1.3], …)`. Does NOT advance the clock; \
@@ -254,7 +253,7 @@ renewable level; (d) for "which buses/lines/trafos violated?" read those `violat
 **do NOT infer element names from prior RSA results or general knowledge** — and report the top \
 elements with tick counts; (e) for "when did bus X violate?" read `violations_per_tick`, a list of \
 `{{timestamp, buses, lines, trafos}}` containing only ticks with at least one violation; (f) note \
-the worst timestamp per scenario and offer to jump there. \
+the worst timestamp per scenario. \
 **Limitation:** uniform sensitivity — all substations scale together. Window via \
 `start_timestamp`/`end_timestamp` or `n_steps`; `step_size=4` for hourly.
 

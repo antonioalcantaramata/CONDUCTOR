@@ -322,7 +322,6 @@ class OllamaProvider:
         payload = {
             "model": self.model,
             "messages": self._to_ollama_messages(messages, system),
-            "tools": to_json_schema_tools(tools),
             "stream": False,
             # Reasoning traces cost ~12s per call here and the Gemini path
             # disables them too; keep the two backends comparable.
@@ -337,6 +336,9 @@ class OllamaProvider:
                 "temperature": 0,
             },
         }
+        # A tool-less call (the suggestion agent) sends no `tools` key.
+        if tools:
+            payload["tools"] = to_json_schema_tools(tools)
         self._check_fits(payload)
 
         try:

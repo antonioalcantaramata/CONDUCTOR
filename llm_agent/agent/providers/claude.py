@@ -225,8 +225,10 @@ class AnthropicProvider:
             "max_tokens": self.max_tokens,
             "system": system,
             "messages": self._to_anthropic_messages(messages),
-            "tools": _anthropic_tools(tools),
         }
+        # A tool-less call (the suggestion agent) sends no `tools` key at all.
+        if tools:
+            payload["tools"] = _anthropic_tools(tools)
 
         payload.update(self._thinking_payload())
 

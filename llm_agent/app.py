@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import difflib
+import html
 import json
 import logging
 import os
 import pathlib
 import re
-from datetime import datetime
+import time
+import uuid
+from datetime import datetime, timezone
 
 import httpx
 import streamlit as st
@@ -52,11 +56,14 @@ from agent.hardware import advice as hw_advice
 from agent.hardware import detect as detect_hardware
 from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent import loop as _loop_module
+from agent import model_check as _model_check
+from agent import recommender as _recommender
 from agent import trace as _trace
 from agent.loop import run_agent_turn
 from agent.providers import (
     active_provider_name,
     available_providers,
+    describe_provider,
     get_provider,
     reset_providers,
 )
@@ -179,6 +186,26 @@ st.markdown(
         letter-spacing: 0.08em;
         font-weight: 700;
         margin: 0.8rem 0 0.35rem 0;
+    }
+    /* AI Agent Suggestion: a different accent from tool output, because this
+       is model reasoning, not a solver result. */
+    .conductor-ai-head {
+        color: #5b3fc4;
+        font-weight: 700;
+        font-size: 0.95rem;
+        margin-bottom: 0.1rem;
+    }
+    .conductor-ai-badge {
+        display: inline-block;
+        background: rgba(107, 79, 216, 0.10);
+        color: #5b3fc4;
+        border-radius: 0.6rem;
+        padding: 0.05rem 0.5rem;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-right: 0.4rem;
     }
     @media (max-width: 900px) {
         .conductor-brand-title {
@@ -1255,8 +1282,13 @@ def _render_google_setup() -> None:
 
     if submitted:
         key = key_input.strip()
+        mc = _model_check.check("google", api_key=key) if key else None
         if not key:
             st.error("Please paste a valid API key before continuing.")
+        elif mc is not None and mc.status == _model_check.KEY_REJECTED:
+            # No model field on this form: a missing model is reported on the
+            # next screen, where it can be changed. Only a bad key stops here.
+            st.error(_model_problem_text(mc))
         else:
             _write_env({
                 "LLM_PROVIDER": "google",
@@ -1373,6 +1405,11 @@ def _render_anthropic_setup() -> None:
         st.error("Please paste a valid API key before continuing.")
         return
 
+    # Same reason as the OpenAI setup: a typo or a retired model is otherwise
+    # only discovered on the first question.
+    if _model_rejected("anthropic", model_input.strip() or ANTHROPIC_MODEL, api_key=key):
+        return
+
     _write_env({
         "LLM_PROVIDER": "anthropic",
         "ANTHROPIC_API_KEY": key,
@@ -1422,6 +1459,9 @@ def _render_anthropic_settings(*, key_prefix: str) -> bool:
             }
             if key.strip():
                 updates["ANTHROPIC_API_KEY"] = key.strip()
+            if _model_rejected("anthropic", updates["ANTHROPIC_MODEL"],
+                               api_key=key.strip() or None):
+                return False
             _write_env(updates)
             return True
     return False
@@ -1559,6 +1599,9 @@ def _render_openai_settings(*, key_prefix: str) -> bool:
             }
             if key.strip():
                 updates["OPENAI_API_KEY"] = key.strip()
+            if _model_rejected("openai", model.strip(), api_key=key.strip() or None,
+                               base_url=base_url.strip() or OPENAI_BASE_URL):
+                return False
             _write_env(updates)
             return True
     return False
@@ -1698,6 +1741,9 @@ def _render_google_settings(*, key_prefix: str) -> bool:
             }
             if key.strip():
                 updates["GEMINI_API_KEY"] = key.strip()
+            if _model_rejected("google", model.strip() or GEMINI_MODEL,
+                               api_key=key.strip() or None):
+                return False
             _write_env(updates)
             return True
     return False
@@ -1854,12 +1900,85 @@ _SETTINGS_RENDERERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Model check — does the configured model still exist?
+#
+# Hosted providers retire models on their own schedule, and a `.env` written
+# months ago pins whatever was current then. Asking the provider before the
+# app starts turns "the first question fails" into a message on this screen.
+# The check never changes the model; see `agent/model_check.py`.
+# ---------------------------------------------------------------------------
+
+_CHECKED_PROVIDERS = ("openai", "anthropic", "google")
+
+
+def _model_check_key(provider: str) -> tuple:
+    """What a check result depends on, so a changed setting is re-checked."""
+    if provider == "openai":
+        model = os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
+        key = os.environ.get("OPENAI_API_KEY", "")
+        where = os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL
+    elif provider == "anthropic":
+        model = os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
+        key = os.environ.get("ANTHROPIC_API_KEY", "")
+        where = os.environ.get("ANTHROPIC_BASE_URL", "")
+    else:
+        model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+        key = os.environ.get("GEMINI_API_KEY", "")
+        where = ""
+    return (provider, model, key[-6:], where)
+
+
+def _cached_model_check(provider: str):
+    """One check per configuration per browser session — not one per rerun."""
+    cache = st.session_state.setdefault("_model_checks", {})
+    key = _model_check_key(provider)
+    if key not in cache:
+        with st.spinner("Checking the model with the provider…"):
+            cache[key] = _model_check.check(provider)
+    return cache[key]
+
+
+def _model_problem_text(mc) -> str:
+    if mc.status == _model_check.KEY_REJECTED:
+        return f"**The API key was not accepted.** {mc.message}"
+    text = (f"**`{mc.model}` is not available** — the provider may have retired "
+            "it, or this key cannot use it. Starting now would fail on the first "
+            "question.")
+    if mc.alternatives:
+        text += ("\n\nAvailable instead (same family first): "
+                 + ", ".join(f"`{a}`" for a in mc.alternatives) + ".")
+    return text + "\n\nPick another model under **Change settings**."
+
+
+def _model_rejected(provider: str, model: str, **kwargs) -> bool:
+    """Check a model before saving it. True — and an error shown — if it
+    cannot be used. A check that cannot reach the provider does not block."""
+    mc = _model_check.check(provider, model, **kwargs)
+    if mc is not None and mc.blocks_start:
+        st.error(_model_problem_text(mc))
+        return True
+    return False
+
+
 def _render_ready_to_start(provider: str) -> None:
     """
     The already-configured case: confirm what will be used and get out of the way.
 
     Starting is a single click — no re-entering settings that are already saved.
     """
+    mc = _cached_model_check(provider) if provider in _CHECKED_PROVIDERS else None
+    if mc is not None and mc.blocks_start:
+        st.error(_model_problem_text(mc))
+        if st.button("Check again", use_container_width=True):
+            st.session_state.pop("_model_checks", None)
+            st.rerun()
+        with st.expander("Change settings", expanded=True):
+            if _SETTINGS_RENDERERS[provider](key_prefix="launch"):
+                st.success("Saved.")
+                st.rerun()
+        return
+
     if provider == "google":
         key = os.environ.get("GEMINI_API_KEY", "")
         raw = os.environ.get("GEMINI_THINKING_LEVEL")
@@ -1919,6 +2038,20 @@ def _render_ready_to_start(provider: str) -> None:
         st.success(
             f"Ready — `{model}` on Ollama {info['version']}, "
             f"context {int(os.environ.get('OLLAMA_NUM_CTX') or OLLAMA_NUM_CTX):,} tokens."
+        )
+
+    if mc is not None and mc.status == _model_check.UNVERIFIED:
+        st.warning(
+            f"Could not confirm `{mc.model}` with the provider ({mc.message}). "
+            "Starting is still possible; a retired model would fail on the "
+            "first question."
+        )
+    elif mc is not None and mc.newer:
+        st.info(
+            f"A newer **{_model_check.family(mc.model)}** model is available: "
+            f"`{mc.newer}`. CONDUCTOR keeps using `{mc.model}` until you change "
+            "it under **Change settings** — session logs record which model "
+            "answered, so a switch is always your decision."
         )
 
     if st.button("Start CONDUCTOR", type="primary", use_container_width=True):
@@ -2021,6 +2154,11 @@ if "current_ts" not in st.session_state:
 # Charts are stored here so they survive re-runs.
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# Identifies this conversation in AI Agent Suggestion records, so a suggestion
+# and what the operator did with it can be read together from the log.
+if "ui_conversation_id" not in st.session_state:
+    st.session_state.ui_conversation_id = uuid.uuid4().hex[:12]
 
 # ---------------------------------------------------------------------------
 # Example queries
@@ -2126,9 +2264,12 @@ def _reset_conversation_state() -> None:
     """Clear chat memory so the next prompt starts a fresh LLM conversation."""
     st.session_state.history = []
     st.session_state.messages = []
-    st.session_state.pop("chat_box", None)
+    st.session_state._box_value = ""
+    st.session_state._box_n = st.session_state.get("_box_n", 0) + 1
     st.session_state.pop("_box_pending", None)
+    st.session_state.pop("_suggestion_used", None)
     st.session_state.pop("viewing_forecast_ts", None)
+    st.session_state.ui_conversation_id = uuid.uuid4().hex[:12]
     _tools_module._last_tool_results.clear()
 
 
@@ -2369,6 +2510,21 @@ with st.sidebar:
                 "the checks found without changing the answer. **Show the agent** "
                 "hands the findings back before the answer is delivered — the "
                 "agent may keep it, revise it, or call another tool."
+            ),
+        )
+
+    # AI Agent Suggestion. On demand by default: suggestions nobody asked for
+    # are more to read, which is the opposite of what they are for.
+    with st.expander("AI Agent Suggestion"):
+        st.toggle(
+            "Suggest after every answer",
+            key="auto_suggest",
+            value=False,
+            help=(
+                "Off: a ✨ AI Agent Suggestion button appears under the latest "
+                "answer, and nothing runs until you click it. On: suggestions "
+                "are generated automatically after every answer, at the cost of "
+                "one extra model call each time."
             ),
         )
 
@@ -2809,6 +2965,208 @@ def _render_trace(trace, key: str) -> None:
             st.caption(f"· {limit}")
 
 
+# ---------------------------------------------------------------------------
+# AI Agent Suggestion
+#
+# A second agent, run on demand, that reads the conversation and proposes how
+# to continue. Its output is model reasoning, not tool output, and is shown in
+# its own panel with that said plainly. A suggestion is never sent on the
+# operator's behalf: choosing one places its prompt in the chat box.
+# ---------------------------------------------------------------------------
+
+_AI_SUGGESTION_CAPTION = (
+    "Reasoning by an AI model — not a solver result. Choose one to place it in "
+    "the chat box, edit it if you like, then send."
+)
+
+
+def _suggestion_context() -> dict:
+    """Session facts the suggestion agent needs to write runnable prompts."""
+    status = last_grid_constants_status()
+    gc = dict(status.values) if status is not None else {}
+    names = list(gc.get("substation_names") or [])
+    forecast_ts = st.session_state.get("viewing_forecast_ts")
+    ctx = {
+        "network": gc.get("name"),
+        "simulation_clock": st.session_state.get("current_ts"),
+        "data_source": "forecasts" if forecast_ts else "measurements",
+        "viewing_forecast_timestamp": forecast_ts,
+        "default_voltage_band_pu": [gc.get("vm_lower"), gc.get("vm_upper")],
+        "max_loading_pct": gc.get("max_loading_pct"),
+        "substations": names[:40] + ([f"… and {len(names) - 40} more"] if len(names) > 40 else []),
+    }
+    return {k: v for k, v in ctx.items() if v not in (None, [], [None, None])}
+
+
+def _shown_suggestions() -> list[dict]:
+    """Every suggestion displayed in this conversation, so none is repeated."""
+    out: list[dict] = []
+    for m in st.session_state.messages:
+        for rnd in m.get("suggestion_rounds") or []:
+            out.extend(rnd.get("suggestions") or [])
+    return out
+
+
+def _run_ai_suggestion(idx: int, trigger: str) -> None:
+    """Call the suggestion agent for message `idx`, store and log the round."""
+    msg = st.session_state.messages[idx]
+    rounds = msg.setdefault("suggestion_rounds", [])
+    upto = st.session_state.messages[: idx + 1]
+    visible = [{"role": m["role"], "text": m.get("text", "")} for m in upto]
+    records = [m["record"] for m in upto if m.get("record")]
+
+    started = time.perf_counter()
+    with st.spinner("The AI agent is considering how to continue…"):
+        try:
+            result = _recommender.suggest(
+                visible, msg.get("record"), records, _suggestion_context(),
+                shown=_shown_suggestions(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Provider failures are already returned as results; this catches
+            # anything else, so a suggestion can never take the page down.
+            logging.getLogger(__name__).warning("AI Agent Suggestion failed.", exc_info=True)
+            result = _recommender.SuggestionResult((), error=str(exc))
+
+    round_id = f"{st.session_state.ui_conversation_id}-{idx}-{len(rounds) + 1}"
+    entry = {
+        "id": round_id,
+        "suggestions": [s.as_record() for s in result.suggestions],
+        "note": result.note,
+        "error": result.error,
+    }
+    rounds.append(entry)
+
+    try:
+        provider_info = describe_provider(get_provider())
+    except Exception:  # noqa: BLE001
+        provider_info = {}
+    _loop_module.log_event({
+        "kind": "suggestion",
+        "round_id": round_id,
+        "conversation": st.session_state.ui_conversation_id,
+        "after_turn_key": (msg.get("record") or {}).get("turn_key"),
+        "trigger": trigger,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "duration_s": round(time.perf_counter() - started, 3),
+        **provider_info,
+        "attention": msg.get("attention") or [],
+        "suggestions": entry["suggestions"],
+        "note": result.note,
+        "error": result.error,
+        # Kept only when parsing failed, to diagnose what the model returned.
+        "raw": result.raw if result.error else "",
+    })
+
+
+def _log_suggestion_outcome(sent: str) -> None:
+    """Record what the operator did after suggestions were shown.
+
+    `used` — sent a suggestion unchanged; `edited` — chose one and changed it
+    (similarity kept, so the threshold is the analyst's choice, not ours);
+    `ignored` — suggestions were on screen and the operator asked something
+    else.
+    """
+    used = st.session_state.pop("_suggestion_used", None)
+    last = st.session_state.messages[-1] if st.session_state.messages else {}
+    rounds = last.get("suggestion_rounds") or []
+    if used is None and not rounds:
+        return
+    record = {
+        "kind": "suggestion_outcome",
+        "conversation": st.session_state.ui_conversation_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "sent": sent,
+    }
+    if used is not None:
+        similarity = difflib.SequenceMatcher(None, used["prompt"].strip(), sent.strip()).ratio()
+        record.update({
+            "outcome": "used" if sent.strip() == used["prompt"].strip() else "edited",
+            "round_id": used["round_id"],
+            "index": used["index"],
+            "similarity": round(similarity, 3),
+        })
+    else:
+        record.update({"outcome": "ignored", "round_id": rounds[-1]["id"]})
+    _loop_module.log_event(record)
+
+
+def _render_suggestion_round(rnd: dict, idx: int, r_i: int) -> None:
+    with st.container(border=True):
+        st.markdown("<div class='conductor-ai-head'>✨ AI Agent Suggestion</div>",
+                    unsafe_allow_html=True)
+        st.caption(_AI_SUGGESTION_CAPTION)
+        if rnd.get("error"):
+            st.caption("The AI agent could not produce suggestions this time. "
+                       "Try again in a moment.")
+            return
+        if not rnd.get("suggestions"):
+            st.caption(rnd.get("note") or "The AI agent had nothing new to suggest.")
+            return
+        for s_i, sug in enumerate(rnd["suggestions"]):
+            c_text, c_btn = st.columns([7, 1])
+            with c_text:
+                label = _recommender.ANGLE_LABELS.get(sug["angle"], sug["angle"])
+                st.markdown(
+                    f"<span class='conductor-ai-badge'>{html.escape(label)}</span>"
+                    f"<strong>{html.escape(sug['title'])}</strong>",
+                    unsafe_allow_html=True,
+                )
+                if sug.get("why"):
+                    # `$` would otherwise be read as LaTeX.
+                    st.caption(sug["why"].replace("$", "\\$"))
+                if sug.get("unverified"):
+                    st.caption("⚠️ Not found in this conversation's results: "
+                               + ", ".join(sug["unverified"]))
+            with c_btn:
+                if st.button("Use", key=f"ais_use_{idx}_{r_i}_{s_i}",
+                             help=sug["prompt"], use_container_width=True):
+                    # Same path as the example queries: into the box, not sent.
+                    st.session_state._box_pending = sug["prompt"]
+                    st.session_state._suggestion_used = {
+                        "round_id": rnd["id"], "index": s_i, "prompt": sug["prompt"],
+                    }
+
+
+def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
+    """The suggestion button and panels under an assistant message.
+
+    The button appears only under the latest answer; earlier rounds stay
+    visible under the answer they followed. Returns how a new round was
+    requested ("button", "auto", "more"), or None — the caller runs it, outside
+    the error guard that protects the conversation view.
+    """
+    rounds = msg.get("suggestion_rounds") or []
+    is_last = idx == len(st.session_state.messages) - 1
+    trigger = None
+
+    if is_last and not rounds:
+        if st.session_state.get("auto_suggest") and not msg.get("auto_suggested"):
+            msg["auto_suggested"] = True
+            trigger = "auto"
+        else:
+            attention = msg.get("attention") or []
+            if attention:
+                # Decided in code from the result's own verdict fields — costs
+                # nothing until clicked.
+                st.caption("⚠️ This result has issues — an AI Agent Suggestion "
+                           "can help decide what to check next.")
+            if st.button("✨ AI Agent Suggestion", key=f"ais_{idx}",
+                         type="primary" if attention else "secondary",
+                         help="Ask a second AI agent how to continue from here. "
+                              "It reasons over the conversation; it runs no analysis."):
+                trigger = "button"
+
+    for r_i, rnd in enumerate(rounds):
+        _render_suggestion_round(rnd, idx, r_i)
+
+    if is_last and rounds and trigger is None:
+        if st.button("✨ More ideas", key=f"ais_more_{idx}"):
+            trigger = "more"
+
+    return trigger
+
+
 # a question can be asked while looking at the diagram.
 _chat_tab, _system_tab = st.tabs(["Chat", "System"])
 
@@ -2821,6 +3179,7 @@ with _chat_tab:
                 "optimize robust corrective dispatch, and evaluate flexibility, hosting-capacity, and KPI studies.\n\n"
                 "Try one of the **Example queries** in the sidebar, or ask me anything about the active power-system model."
             )
+    _suggestion_request: tuple[int, str] | None = None
     for _msg_idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["text"])
@@ -2838,6 +3197,24 @@ with _chat_tab:
                         "Could not render the audit panel for message %s.",
                         _msg_idx, exc_info=True)
                     st.caption("⚠️ The audit panel could not be rendered for this answer.")
+            if msg["role"] == "assistant":
+                # Same rule as the audit panel: a failure here must not take
+                # the conversation view down with it.
+                try:
+                    _trigger = _render_ai_suggestion(msg, _msg_idx)
+                    if _trigger:
+                        _suggestion_request = (_msg_idx, _trigger)
+                except Exception:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "Could not render the AI Agent Suggestion for message %s.",
+                        _msg_idx, exc_info=True)
+
+    # Run a requested suggestion round after the history is drawn, then rerun
+    # so it appears under its answer. Outside the guard above: `st.rerun`
+    # works by raising, and a broad `except` would swallow it.
+    if _suggestion_request is not None:
+        _run_ai_suggestion(*_suggestion_request)
+        st.rerun()
 
 with _system_tab:
     _render_system_view()
@@ -2856,17 +3233,29 @@ def _chat_input_fragment():
     # The in-progress turn renders here, just above the form.
     work = st.container()
 
-    # Apply a pending example prefill BEFORE the widget renders.
+    # Apply a pending prefill (example query, AI Agent Suggestion) BEFORE the
+    # widget renders — as a new widget whose initial value is the text.
+    #
+    # Assigning the text to the widget's key instead looks equivalent and is
+    # not: once the form has been submitted once, `clear_on_submit` leaves the
+    # browser holding an empty value, the assignment never reaches the box, and
+    # Send submits nothing — the operator had to type something before Send
+    # worked. A fresh key per prefill sidesteps that; verified in a real
+    # browser, which the headless app tests cannot do.
+    st.session_state.setdefault("_box_n", 0)
+    st.session_state.setdefault("_box_value", "")
     if st.session_state.get("_box_pending") is not None:
-        st.session_state.chat_box = st.session_state._box_pending
+        st.session_state._box_value = st.session_state._box_pending
         st.session_state._box_pending = None
+        st.session_state._box_n += 1
 
     with st.form("chat_form", clear_on_submit=True):
         fc_in, fc_send = st.columns([8, 1])
         with fc_in:
             typed = st.text_input(
                 "Ask about the grid…",
-                key="chat_box",
+                key=f"chat_box_{st.session_state._box_n}",
+                value=st.session_state._box_value,
                 placeholder="Ask about the grid…",
                 label_visibility="collapsed",
             )
@@ -2877,6 +3266,10 @@ def _chat_input_fragment():
         return
 
     effective_input = typed.strip()
+    # Sent: the next render starts from a fresh, empty box rather than
+    # `clear_on_submit` restoring the prefilled text as the widget's default.
+    st.session_state._box_value = ""
+    st.session_state._box_n += 1
 
     # Networks are uploaded by client-side JS straight to the backend, so no
     # Python code runs when one is swapped and nothing clears the conversation.
@@ -2897,6 +3290,13 @@ def _chat_input_fragment():
         )
     else:
         llm_input = effective_input
+
+    # Before the new message is appended: the outcome refers to suggestions
+    # shown under the previous answer.
+    try:
+        _log_suggestion_outcome(effective_input)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Could not log the suggestion outcome.", exc_info=True)
 
     st.session_state.messages.append({"role": "user", "text": effective_input, "charts": None})
 
@@ -3026,6 +3426,7 @@ def _chat_input_fragment():
             # break the answer: a missing panel costs an audit, a raised
             # exception costs the reply.
             turn_trace = None
+            turn_record = None
             try:
                 record = _loop_module.session_log[-1] if _loop_module.session_log else None
                 # Verify the record belongs to *this* question. A turn that
@@ -3035,6 +3436,7 @@ def _chat_input_fragment():
                 # it would assert provenance for numbers never produced. No
                 # panel is strictly better than a wrong one.
                 if record is not None and record.get("user") == llm_input:
+                    turn_record = record
                     turn_trace = _trace.build(record)
                 elif record is not None:
                     logging.getLogger(__name__).warning(
@@ -3049,6 +3451,10 @@ def _chat_input_fragment():
                 "text": assistant_text,
                 "charts": charts_this_turn,
                 "trace": turn_trace,
+                # Kept for the AI Agent Suggestion: the record is what it reads
+                # and what its figures are grounded against.
+                "record": turn_record,
+                "attention": _recommender.needs_attention(turn_record),
             })
 
             # Render reply inside the same chat bubble
