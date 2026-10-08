@@ -130,7 +130,8 @@ class GeminiProvider:
         if thinking_level:
             thinking.thinking_level = thinking_level.upper()
         return types.GenerateContentConfig(
-            tools=tools,
+            # None, not [], for a tool-less call (the suggestion agent).
+            tools=tools or None,
             system_instruction=system,
             temperature=0,
             thinking_config=thinking,

@@ -170,8 +170,23 @@ def _grid_facts() -> dict:
 
 def _append_to_log(record: dict) -> None:
     """Append one turn record to this run's session log."""
-    global _log_initialized
     session_log.append(record)
+    _write_record(record)
+
+
+def log_event(record: dict) -> None:
+    """Append a non-turn record (e.g. an AI Agent Suggestion) to the session log.
+
+    Written to the same file, so the sequence of what the operator saw stays in
+    one place, but carrying a `kind` and kept out of the in-memory
+    `session_log`: that list is read as "the turn records", and the audit panel
+    takes its last entry to be the latest turn.
+    """
+    _write_record(record)
+
+
+def _write_record(record: dict) -> None:
+    global _log_initialized
     try:
         path = _session_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)

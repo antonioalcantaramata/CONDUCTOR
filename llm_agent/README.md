@@ -29,6 +29,7 @@ llm_agent/
 │   ├── tool_schemas.py    ← function declarations (TOOLS) — single source of truth
 │   ├── renderers.py       ← Plotly renderers, keyed by tool name (RENDERER_MAP)
 │   ├── system_prompt.py   ← system instruction, built from live grid constants
+│   ├── recommender.py     ← AI Agent Suggestion: on-demand second agent, no tools
 │   └── errors.py          ← error classification / retry helpers
 ├── assets/                ← logo
 ├── requirements.txt       ← pip deps (installed by start.sh)
@@ -46,7 +47,7 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 | `GEMINI_MODEL`            | No                  | gemini-3.5-flash-lite     | Model id to use                                     |
 | `GEMINI_THINKING_LEVEL`   | No                  | *(empty)*                 | `minimal`/`low`/`medium`/`high`; empty = the model's own budget |
 | `OPENAI_API_KEY`          | If provider=openai  | —                         | OpenAI API key                                      |
-| `OPENAI_MODEL`            | No                  | gpt-5.6-luna              | Model id; must support tool calling                 |
+| `OPENAI_MODEL`            | No                  | gpt-6-luna                | Model id; must support tool calling                 |
 | `OPENAI_REASONING_EFFORT` | No                  | `medium`                  | `none`/`low`/`medium`/`high`/`xhigh`; empty omits the parameter |
 | `OPENAI_API`              | No                  | `auto`                    | `auto`, `chat`, or `responses` — which endpoint to drive |
 | `OPENAI_BASE_URL`         | No                  | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint                    |

@@ -69,7 +69,10 @@ GEMINI_THINKING_LEVEL: str = os.environ.get(
 # Default matches llm_agent/.env.example — keep the two in sync. Any model set
 # here must support tool calling: CONDUCTOR drives the grid entirely through
 # tools, so a model without it can only chat.
-OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+# `gpt-6-luna` is the newest Luna model and OpenAI's cheapest current tier.
+# The launch screen checks the model is still offered and mentions a newer
+# model of the same family, so this default is not the only line of defence.
+OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
 
 # How hard a reasoning model thinks before answering, lowest to highest.
 # Ordered, because the settings UI renders them as a slider-like choice.
@@ -128,13 +131,12 @@ OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "180"))
 # the other hosted backends here (the Gemini path defaults to a Flash model).
 # Set `claude-sonnet-5` or `claude-opus-5` for a more capable tier.
 #
-# Note that Haiku 4.5 predates adaptive thinking: it takes the older
-# `budget_tokens` shape and rejects `output_config` outright. The provider
-# picks the right shape from the model id, so `ANTHROPIC_EFFORT` below works
-# either way — on Haiku it maps onto a token budget rather than an effort
-# level. Its context window is also 200K rather than 1M, which is ample for a
-# ~25k-token turn but worth knowing.
-ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+# `claude-haiku-5-5` is the newest Haiku and the cheapest current Claude model.
+# It uses adaptive thinking with `effort`, like the rest of the current family.
+# Haiku 4.5, if pinned, predates both: it takes the older `budget_tokens`
+# shape and rejects `output_config` outright. The provider picks the right
+# shape from the model id, so `ANTHROPIC_EFFORT` below works either way.
+ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
 
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 

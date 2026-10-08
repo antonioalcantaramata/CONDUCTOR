@@ -847,9 +847,7 @@ _find_worst_case_timestamp = genai.types.FunctionDeclaration(
         "for charting. The simulation clock is unchanged after the call. "
         "Use when the user asks: 'when is the grid most stressed?', 'find the worst case', "
         "'which timestamp has the most violations?', 'peak import moment', "
-        "'when is voltage lowest?', 'scan the whole dataset for the worst point'. "
-        "After calling this, offer to advance_timestamp to the worst timestamp and run "
-        "run_rsa() or optimize_flexibility() for a full analysis."
+        "'when is voltage lowest?', 'scan the whole dataset for the worst point'."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,

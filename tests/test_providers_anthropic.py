@@ -304,20 +304,31 @@ class TestLegacyThinkingModels:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         return AnthropicProvider(model="claude-haiku-4-5")
 
-    def test_the_shipped_default_is_recognised_as_legacy(self):
+    def test_the_shipped_default_gets_the_shape_it_accepts(self, monkeypatch):
         """If this fails, the shipped default sends a shape its own model
         rejects — a 400 on the very first question.
+
+        The default is `claude-haiku-5-5`, which takes adaptive thinking with
+        `effort` and rejects `budget_tokens` (Haiku 4.5, the previous default,
+        was the other way round).
 
         Reads the literal out of the source rather than importing the constant:
         `config` resolves the developer's own `.env` first, so importing it
         would test whichever model this machine happens to be pinned to."""
         import re
 
+        for var in ("ANTHROPIC_EFFORT", "ANTHROPIC_THINKING"):
+            monkeypatch.delenv(var, raising=False)
         src = pathlib.Path("llm_agent/agent/config.py").read_text()
         default = re.search(
             r'ANTHROPIC_MODEL[^=]*= os\.environ\.get\("ANTHROPIC_MODEL", "([^"]+)"\)', src
         ).group(1)
-        assert AnthropicProvider(model=default).legacy_thinking, default
+        provider = AnthropicProvider(model=default)
+        assert not provider.legacy_thinking, default
+        payload = provider._thinking_payload()
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert "effort" in payload["output_config"]
+        assert "budget_tokens" not in str(payload)
 
     @pytest.mark.parametrize("model,legacy", [
         ("claude-haiku-4-5", True),

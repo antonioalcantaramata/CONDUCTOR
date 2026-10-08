@@ -77,6 +77,14 @@ click. Settings are also editable mid-session under **Model settings** in the
 sidebar. (You can pre-create `llm_agent/.env` from `llm_agent/.env.example` if
 you prefer to skip the screen.)
 
+Hosted providers retire models over time, and a saved `.env` keeps naming the
+model that was current when it was written. For Gemini, OpenAI and Anthropic
+the launch screen therefore asks the provider whether the configured model is
+still offered: a retired model blocks **Start** and lists the alternatives,
+and a newer model of the same family is mentioned but never switched to
+automatically — session logs record which model answered, so a change of model
+is always your decision.
+
 Press **Ctrl+C** in the terminal once to stop both services.
 
 To update later, pull the latest code and relaunch:
@@ -158,11 +166,11 @@ Key choices:
 | `LLM_PROVIDER` | `google`, `openai`, `anthropic`, or `ollama` |
 | `GEMINI_MODEL` | default `gemini-3.5-flash-lite` |
 | `GEMINI_THINKING_LEVEL` | `minimal`, `low`, `medium`, `high`; empty (default) = model's own budget |
-| `OPENAI_MODEL` | default `gpt-5.6-luna` — must support tool calling |
+| `OPENAI_MODEL` | default `gpt-6-luna` (cheapest current tier) — must support tool calling |
 | `OPENAI_REASONING_EFFORT` | `none`, `low`, `medium` (default), `high`, `xhigh` |
 | `OPENAI_API` | `auto` (default), `chat`, or `responses` — see below |
 | `OPENAI_BASE_URL` | any OpenAI-compatible endpoint (Azure, OpenRouter, vLLM) |
-| `ANTHROPIC_MODEL` | default `claude-haiku-4-5` (cheapest) — must support tool calling |
+| `ANTHROPIC_MODEL` | default `claude-haiku-5-5` (cheapest) — must support tool calling |
 | `ANTHROPIC_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
 | `ANTHROPIC_THINKING` | `1` (default) for adaptive thinking; `0` to disable |
 | `OLLAMA_MODEL` | any tool-capable model you have pulled |
