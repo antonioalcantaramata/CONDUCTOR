@@ -40,6 +40,7 @@ def test_no_overlap_no_error():
 
 
 def test_figure_shades_the_overlap_and_marks_the_operating_point():
+    pytest.importorskip("plotly")  # UI-only; CI does not install it
     fig = dv.figure({"measured": MEASURED, "forecast": FORECAST}, [dv.TOTAL], "consumption", marker="t2")
     assert [t.line.dash for t in fig.data] == ["solid", "dash"]
     kinds = [s.type for s in fig.layout.shapes]

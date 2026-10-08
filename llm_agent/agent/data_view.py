@@ -4,19 +4,16 @@ data_view.py — the Data tab: the loaded measurements and forecasts as they are
 Raw input data, not analysis: consumption and production per substation, as
 loaded, before any power flow. Pure functions over `/api/data/series`
 payloads (one per dataset), so they can be tested without the page.
+
+Plotly (through `renderers`) is imported only by `figure`: the series and
+forecast-error functions are plain Python, and CI installs no UI packages.
 """
 
 from __future__ import annotations
 
-import plotly.graph_objects as go
-
-from .renderers import CHART_THEME, _C
-
 TOTAL = "System total"
 QUANTITIES = {"consumption": "Consumption", "production": "Production", "net": "Net load"}
-_LINE_COLOURS = [_C.PRIMARY, _C.TEAL, _C.WARN, _C.INK, _C.OK, _C.VIOLATION]
 _DATASET_LABELS = {"measured": "measured", "forecast": "forecast"}
-_DATASET_COLOURS = {"measured": _C.PRIMARY, "forecast": _C.PURPLE}
 
 
 def values(payload: dict | None, item: str, quantity: str) -> list[float | None]:
@@ -61,7 +58,7 @@ def forecast_error(measured: dict | None, forecast: dict | None, item: str, quan
 
 
 def figure(series: dict[str, dict | None], items: list[str], quantity: str,
-           marker: str | None = None) -> go.Figure:
+           marker: str | None = None):
     """Lines per item, measured solid and forecast dashed.
 
     One item: blue measured, purple forecast — the operating-point card's
@@ -70,11 +67,17 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
     `series` maps "measured" / "forecast" to a payload (or None). Where the two
     share timestamps the window is shaded; `marker` draws the operating point.
     """
+    import plotly.graph_objects as go
+
+    from .renderers import CHART_THEME, _C
+
+    line_colours = [_C.PRIMARY, _C.TEAL, _C.WARN, _C.INK, _C.OK, _C.VIOLATION]
+    dataset_colours = {"measured": _C.PRIMARY, "forecast": _C.PURPLE}
     fig = go.Figure()
     for k, item in enumerate(items):
         for dataset in ("measured", "forecast"):
-            colour = (_DATASET_COLOURS[dataset] if len(items) == 1
-                      else _LINE_COLOURS[k % len(_LINE_COLOURS)])
+            colour = (dataset_colours[dataset] if len(items) == 1
+                      else line_colours[k % len(line_colours)])
             payload = series.get(dataset)
             ys = values(payload, item, quantity)
             if not ys:
