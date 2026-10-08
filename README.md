@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="llm_agent/assets/conductor-mark-reversed.png">
+    <img src="llm_agent/assets/conductor-mark.png" alt="CONDUCTOR logo" width="120">
+  </picture>
+</p>
+
 # CONDUCTOR
 
 An LLM-orchestrated digital twin for uncertainty-aware power-system operations.

@@ -26,6 +26,7 @@ worlds. See `_thinking_payload`.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -229,6 +230,11 @@ class AnthropicProvider:
         # A tool-less call (the suggestion agent) sends no `tools` key at all.
         if tools:
             payload["tools"] = _anthropic_tools(tools)
+        # Prompt caching. The tool schemas and the system prompt (~20k tokens)
+        # are identical on every call of a turn and across turns until the
+        # grid changes, so after the first call they are read from cache at a
+        # fraction of the input price instead of being processed again.
+        payload["cache_control"] = {"type": "ephemeral"}
 
         payload.update(self._thinking_payload())
 
@@ -298,6 +304,14 @@ class AnthropicProvider:
         API rejects two user messages in a row.
         """
         out: list[dict] = []
+        # History written by a backend that does not issue call ids (Ollama,
+        # sometimes Gemini) used to fall back to the tool *name* as the id, so
+        # two parallel calls to one tool shared an id and the API rejected the
+        # conversation from then on. Id-less calls get unique synthetic ids,
+        # and id-less results are paired with the oldest unanswered call of
+        # the same name — the position-based pairing the OpenAI adapter uses.
+        counter = itertools.count()
+        pending: list[tuple[str, str]] = []  # (name, id), oldest first
 
         for message in messages:
             role = message.get("role")
@@ -306,7 +320,8 @@ class AnthropicProvider:
                 out.append({"role": "user", "content": message.get("content", "")})
 
             elif role == "assistant":
-                content = self._assistant_content(message)
+                content = self._assistant_content(message, counter)
+                pending = [(b["name"], b["id"]) for b in content if b.get("type") == "tool_use"]
                 # An assistant turn with neither text nor tool calls is not a
                 # turn the API will accept; dropping it is safe because it
                 # carried nothing the model needs to see.
@@ -314,9 +329,17 @@ class AnthropicProvider:
                     out.append({"role": "assistant", "content": content})
 
             elif role == "tool":
+                tool_id = message.get("id")
+                name = message.get("name", "")
+                match = next((p for p in pending if p[1] == tool_id), None) if tool_id else None
+                if match is None and not tool_id:
+                    match = next((p for p in pending if p[0] == name), pending[0] if pending else None)
+                if match is not None:
+                    pending.remove(match)
+                    tool_id = match[1]
                 block = {
                     "type": "tool_result",
-                    "tool_use_id": message.get("id") or message.get("name", ""),
+                    "tool_use_id": tool_id or f"call_{next(counter)}",
                     "content": _stringify(message.get("content")),
                 }
                 # Parallel tool calls come back as several `tool` messages in a
@@ -331,7 +354,7 @@ class AnthropicProvider:
         return out
 
     @staticmethod
-    def _assistant_content(message: dict) -> list[dict]:
+    def _assistant_content(message: dict, counter=None) -> list[dict]:
         """Rebuild an assistant turn's content blocks from neutral history.
 
         Thinking blocks come first when present. A tool call made after
@@ -359,10 +382,11 @@ class AnthropicProvider:
         if text:
             content.append({"type": "text", "text": text})
 
+        counter = counter if counter is not None else itertools.count()
         for raw in message.get("tool_calls") or []:
             content.append({
                 "type": "tool_use",
-                "id": raw.get("id") or raw["name"],
+                "id": raw.get("id") or f"call_{next(counter)}",
                 "name": raw["name"],
                 "input": raw.get("args") or {},
             })

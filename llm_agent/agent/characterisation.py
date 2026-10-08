@@ -387,13 +387,17 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
 
 def check_answer(answer: str, record: dict) -> list[Conflict]:
     """Figures the answer characterises against their own records."""
-    from .provenance import extract_claims  # local: avoids an import cycle
+    from .provenance import _strip_noise, extract_claims  # local: avoids an import cycle
 
     qualified = qualified_numbers(record)
     if not qualified:
         return []
 
-    text = answer or ""
+    # Claim positions are offsets into the *cleaned* answer (markup, code and
+    # dates removed), so the sentence must be cut from that same text. Cutting
+    # it from the raw answer shifted the window by every `**` and timestamp
+    # before the figure: a false conflict and a missed one were both reproduced.
+    text = _strip_noise(answer or "")
     conflicts: list[Conflict] = []
     for claim in extract_claims(text):
         # The claim's own 55-char window is too narrow to judge by: the

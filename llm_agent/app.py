@@ -11,6 +11,7 @@ import base64
 import copy
 import difflib
 import html
+import pandas as pd
 import json
 import logging
 import os
@@ -22,7 +23,6 @@ from datetime import datetime, timezone
 
 import httpx
 import streamlit as st
-import streamlit.components.v1 as components
 
 from agent.config import (
     BASE_URL,
@@ -58,6 +58,8 @@ from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent import loop as _loop_module
 from agent import model_check as _model_check
 from agent import recommender as _recommender
+from agent import timeline as _tl
+from agent import data_view as _dv
 from agent import trace as _trace
 from agent.loop import run_agent_turn
 from agent.providers import (
@@ -79,7 +81,13 @@ _APP_DIR = pathlib.Path(__file__).parent
 _REPO_ROOT = _APP_DIR.parent
 _DATA_FILES_DIR = _REPO_ROOT / "data_files"
 _SYSTEMS_DIR = _REPO_ROOT / "systems"
-_LOGO_PATH = _APP_DIR / "assets" / "conductor_logo.png"
+# Brand marks (assets/). The colour mark sits on the light app surfaces; the
+# round app icon, legible on light and dark browser chrome, is the tab icon.
+_LOGO_PATH = _APP_DIR / "assets" / "conductor-mark.png"
+_APP_ICON_PATH = _APP_DIR / "assets" / "conductor-app-icon.png"
+# CONDUCTOR answers under its colour mark (the dark round icon looked heavy
+# on the white cards); the operator keeps Streamlit's avatar.
+_AVATARS = {"assistant": str(_LOGO_PATH)}
 
 _PROVIDER_LABELS = {
     "google": "Google Gemini API",
@@ -119,7 +127,7 @@ def _image_as_data_uri(path: pathlib.Path) -> str:
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title=_BRAND_NAME,
-    page_icon=str(_LOGO_PATH),
+    page_icon=str(_APP_ICON_PATH),
     layout="wide",
 )
 
@@ -187,13 +195,137 @@ st.markdown(
         font-weight: 700;
         margin: 0.8rem 0 0.35rem 0;
     }
+    /* ---- Visual system --------------------------------------------------
+       One set of surfaces, borders and radii for the whole app. Selectors
+       target Streamlit's data-testid attributes (checked on 1.63). */
+    :root {
+        --cd-ink: #2E3140;
+        --cd-muted: #6E7484;
+        --cd-border: #E3E7EF;
+        --cd-surface: #FFFFFF;
+        --cd-brand: #1D6FE8;
+        --cd-brand-soft: #EEF4FF;
+        --cd-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.04);
+    }
+    [data-testid="stSidebar"] {
+        background: var(--cd-surface);
+        border-right: 1px solid var(--cd-border);
+    }
+    /* Sidebar: no empty band above the first section, tighter dividers. */
+    [data-testid="stSidebarHeader"] { height: 2.25rem; min-height: 2.25rem; padding-bottom: 0; }
+    [data-testid="stSidebarUserContent"] { padding-top: 0; }
+    [data-testid="stSidebar"] hr { margin: 0.5rem 0 0.25rem 0; }
+    [data-testid="stSidebar"] .conductor-sidebar-label:first-of-type { margin-top: 0.2rem; }
+    /* Operating point card. */
+    .op-when { display: flex; justify-content: space-between; align-items: baseline; }
+    .op-date { font-weight: 600; color: var(--cd-ink); font-size: 0.9rem; }
+    .op-time { font-weight: 700; color: var(--cd-ink); font-size: 1.4rem;
+               font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+    .op-strip { position: relative; margin: 0.15rem 0 0.4rem; }
+    .op-track { position: relative; height: 6px; background: #EEF0F4; border-radius: 3px; margin: 4px 0; }
+    .op-fill { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+    .op-cursor { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+                 background: var(--cd-ink); border-radius: 1px; }
+    .op-scale { display: flex; justify-content: space-between; font-size: 0.68rem;
+                color: var(--cd-muted); margin: -0.3rem 0 0.25rem; font-variant-numeric: tabular-nums; }
+    .st-key-op_card [data-testid="stSliderThumbValue"] { display: none; }
+    /* Three datasets on one row in the narrow sidebar. */
+    .st-key-op_mode [data-testid="stButtonGroup"] > div { flex-wrap: nowrap; }
+    .st-key-op_mode button { flex: 1 1 0; min-width: 0; padding: 0.2rem 0.35rem; min-height: 2rem; }
+    .st-key-op_mode button p { font-size: 0.8rem; }
+    .op-legend { display: flex; justify-content: space-between; gap: 0.4rem;
+                 font-size: 0.72rem; color: var(--cd-muted); line-height: 1.55; }
+    .op-legend b { color: var(--cd-ink); font-weight: 600; }
+    .op-dim { opacity: 0.55; }
+    /* Example queries: a left-aligned list to scan, not a stack of buttons. */
+    .st-key-examples_list { gap: 0.1rem; }
+    [class*="st-key-eq_"] button {
+        justify-content: flex-start;
+        width: 100%;
+        padding: 0.3rem 0.45rem;
+        border-radius: 8px;
+        color: var(--cd-ink);
+    }
+    [class*="st-key-eq_"] button:hover { background: var(--cd-brand-soft); color: var(--cd-brand); }
+    [class*="st-key-eq_"] button p { text-align: left; font-size: 0.86rem; line-height: 1.35; }
+    [class*="st-key-eq_"] button > div,
+    [class*="st-key-eq_"] button > div > span { align-items: flex-start; }
+    [class*="st-key-eq_"] button [data-testid="stIconMaterial"] { color: var(--cd-brand); margin-top: 0.1rem; }
+    /* Answers on white cards; the operator's own messages on a brand tint. */
+    [data-testid="stChatMessage"] {
+        background: var(--cd-surface);
+        border: 1px solid var(--cd-border);
+        border-radius: 14px;
+        padding: 0.9rem 1.1rem;
+        box-shadow: var(--cd-shadow);
+        margin-bottom: 0.75rem;
+    }
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+        background: var(--cd-brand-soft);
+        border-color: #D6E4FF;
+        box-shadow: none;
+    }
+    [data-testid="stChatMessageContent"] p { line-height: 1.6; }
+    /* Each chart in its own soft card. */
+    [data-testid="stPlotlyChart"] {
+        background: var(--cd-surface);
+        border: 1px solid var(--cd-border);
+        border-radius: 12px;
+        padding: 0.35rem;
+    }
+    [data-testid="stExpander"] details {
+        border-radius: 12px;
+        border-color: var(--cd-border);
+        background: var(--cd-surface);
+    }
+    [data-testid="stExpander"] summary { font-weight: 600; }
+    /* The question box as a raised card. */
+    [data-testid="stForm"] {
+        background: var(--cd-surface);
+        border: 1px solid var(--cd-border);
+        border-radius: 14px;
+        box-shadow: 0 2px 8px rgba(16, 24, 40, 0.06);
+    }
+    [data-testid="stButton"] button,
+    [data-testid="stFormSubmitButton"] button {
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    [data-testid="stBaseButton-secondary"] {
+        border-color: var(--cd-border);
+    }
+    [data-testid="stBaseButton-secondary"]:hover {
+        border-color: var(--cd-brand);
+        color: var(--cd-brand);
+    }
+    [data-testid="stTab"] { font-weight: 600; }
+    [data-testid="stAlert"] { border-radius: 10px; }
+    [data-testid="stCaptionContainer"] { color: var(--cd-muted); }
+    /* Once a conversation has started, the hero shrinks to a single line so
+       the answers, not the branding, fill the screen. */
+    .conductor-hero-compact .conductor-brand img { width: 44px !important; }
+    .conductor-hero-compact .conductor-brand-title { font-size: 1.35rem; }
+    .conductor-hero-compact .conductor-brand-tagline,
+    .conductor-hero-compact .conductor-brand-support { display: none; }
+    .conductor-hero-compact { padding: 0; margin-bottom: 0; }
     /* AI Agent Suggestion: a different accent from tool output, because this
        is model reasoning, not a solver result. */
-    .conductor-ai-head {
-        color: #5b3fc4;
+    .conductor-ai-comment {
+        background: rgba(107, 79, 216, 0.06);
+        border-left: 3px solid #8E5CD9;
+        border-radius: 6px;
+        padding: 0.55rem 0.85rem;
+        margin: 0.1rem 0 0.7rem 0;
+        color: var(--cd-ink);
+        line-height: 1.55;
+    }
+    .conductor-ai-comment-label {
+        font-size: 0.72rem;
         font-weight: 700;
-        font-size: 0.95rem;
-        margin-bottom: 0.1rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: #5b3fc4;
+        margin-bottom: 0.2rem;
     }
     .conductor-ai-badge {
         display: inline-block;
@@ -240,11 +372,12 @@ def _render_brand_block(title: str, caption: str | None = None, *, image_width: 
     )
 
 
-def _render_main_hero() -> None:
+def _render_main_hero(compact: bool = False) -> None:
     logo_uri = _image_as_data_uri(_LOGO_PATH)
+    shell = "conductor-hero-shell conductor-hero-compact" if compact else "conductor-hero-shell"
     st.markdown(
         f"""
-        <div id="conductor-hero" class="conductor-hero-shell">
+        <div id="conductor-hero" class="{shell}">
             <div class="conductor-brand">
                 <img src="{logo_uri}" alt="{_BRAND_NAME} logo" style="width:150px;" />
                 <div class="conductor-brand-text">
@@ -260,7 +393,13 @@ def _render_main_hero() -> None:
         """,
         unsafe_allow_html=True,
     )
-    components.html(
+    # `st.iframe` with an HTML string: a same-origin iframe that runs
+    # JavaScript — what `st.components.v1.html` did, which is deprecated and
+    # past its announced removal date. The script reaches the page through
+    # `window.parent` as before. (`st.html` was tried first and dropped the
+    # script.) Height 1, not 0: `st.iframe` rejects a zero height. Verified
+    # in Chrome: header, Upload Network / Upload Data / Info, upload panel.
+    st.iframe(
         """
         <script>
         const parentWindow = window.parent;
@@ -374,7 +513,7 @@ def _render_main_hero() -> None:
                 }
                 .cb-check input { margin-top: 0.15rem; flex-shrink: 0; cursor: pointer; }
                 .cb-submit {
-                    background: #2a72e8;
+                    background: #1D6FE8;
                     color: #fff;
                     border: none;
                     border-radius: 6px;
@@ -403,23 +542,23 @@ def _render_main_hero() -> None:
                 .cb-fmt-guide { border-top: 1px solid rgba(46,49,64,0.08); padding-top: 0.55rem; margin-top: 0.1rem; display: flex; flex-direction: column; gap: 0.3rem; }
                 .cb-fmt-title { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.07em; color: #9aa0b0; font-weight: 700; margin-bottom: 0.1rem; }
                 .cb-fmt-row { display: flex; align-items: flex-start; gap: 0.45rem; }
-                .cb-fmt-tag { font-family: monospace; font-size: 0.73rem; font-weight: 700; color: #2a72e8; background: rgba(42,114,232,0.09); padding: 0.05rem 0.32rem; border-radius: 4px; flex-shrink: 0; margin-top: 0.08rem; }
+                .cb-fmt-tag { font-family: monospace; font-size: 0.73rem; font-weight: 700; color: #1D6FE8; background: rgba(29,111,232,0.09); padding: 0.05rem 0.32rem; border-radius: 4px; flex-shrink: 0; margin-top: 0.08rem; }
                 .cb-fmt-desc { font-size: 0.74rem; color: #5c6272; line-height: 1.4; }
                 .cb-fmt-desc code { font-family: monospace; font-size: 0.7rem; background: rgba(46,49,64,0.07); padding: 0.02rem 0.25rem; border-radius: 3px; }
                 .cb-csv-example { font-family: monospace; font-size: 0.67rem; background: rgba(46,49,64,0.06); border-radius: 4px; padding: 0.4rem 0.5rem; margin: 0.1rem 0 0; color: #2e3140; overflow-x: auto; line-height: 1.5; white-space: pre; }
                 .cb-warn-box { background: #fff8e1; border: 1px solid #f0c040; border-radius: 5px; padding: 0.45rem 0.55rem; font-size: 0.75rem; color: #7a5a00; line-height: 1.5; }
                 .cb-warn-box strong { color: #5a3e00; }
-                .cb-reload-btn { margin-top: 0.45rem; width: 100%; padding: 0.35rem 0; font-size: 0.78rem; font-weight: 600; background: #2a72e8; color: #fff; border: none; border-radius: 5px; cursor: pointer; }
+                .cb-reload-btn { margin-top: 0.45rem; width: 100%; padding: 0.35rem 0; font-size: 0.78rem; font-weight: 600; background: #1D6FE8; color: #fff; border: none; border-radius: 5px; cursor: pointer; }
                 .cb-reload-btn:hover { background: #1d5fd4; }
-                .cb-dl-btn { background: #fff; color: #2a72e8; border: 1.5px solid #2a72e8; }
+                .cb-dl-btn { background: #fff; color: #1D6FE8; border: 1.5px solid #1D6FE8; }
                 .cb-dl-btn:hover { background: #f0f7ff; }
                 .cb-bus-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; max-height: 7rem; overflow-y: auto; padding: 0.1rem 0; }
-                .cb-bus-chip { font-family: monospace; font-size: 0.67rem; background: rgba(42,114,232,0.09); color: #2a72e8; border-radius: 3px; padding: 0.05rem 0.28rem; white-space: nowrap; }
+                .cb-bus-chip { font-family: monospace; font-size: 0.67rem; background: rgba(29,111,232,0.09); color: #1D6FE8; border-radius: 3px; padding: 0.05rem 0.28rem; white-space: nowrap; }
                 .cb-success-box { background: #f0f7ff; border: 1px solid #9dc8f5; border-radius: 5px; padding: 0.45rem 0.55rem; font-size: 0.75rem; color: #1a3a5c; line-height: 1.5; }
                 .cb-ds-toggle { display: flex; gap: 0.25rem; background: rgba(46,49,64,0.07); border-radius: 7px; padding: 0.2rem; margin-bottom: 0.55rem; }
                 .cb-ds-tab { flex: 1; border: none; background: transparent; color: #5a5f6c; font-size: 0.78rem; font-weight: 600; padding: 0.32rem 0; border-radius: 5px; cursor: pointer; transition: background 0.12s, color 0.12s; }
                 .cb-ds-tab:hover { color: #2e3140; }
-                .cb-ds-tab-active { background: #fff; color: #2a72e8; box-shadow: 0 1px 2px rgba(46,49,64,0.15); }
+                .cb-ds-tab-active { background: #fff; color: #1D6FE8; box-shadow: 0 1px 2px rgba(46,49,64,0.15); }
                 .cb-ds-section { margin-bottom: 0.6rem; }
                 .cb-ds-sub { display: block; font-size: 0.69rem; color: #7a7f8c; margin-bottom: 0.35rem; }
                 .cb-adv-card { border-top: 1px solid rgba(46,49,64,0.08); margin-top: 0.2rem; padding-top: 0.55rem; }
@@ -540,7 +679,6 @@ def _render_main_hero() -> None:
             if (!brand) {
                 brand = parentDoc.createElement('div');
                 brand.id = brandId;
-                brand.setAttribute('aria-hidden', 'true');
                 parentDoc.body.appendChild(brand);
             }
             // Always refresh innerHTML so buttons survive Streamlit re-runs
@@ -1218,7 +1356,7 @@ full,,branch_to_trafo,3,33,0,,</pre>
         };
         </script>
         """.replace("DATA_URI_PLACEHOLDER", logo_uri).replace("BRAND_NAME_PLACEHOLDER", _BRAND_NAME).replace("BASE_URL_PLACEHOLDER", BASE_URL).replace("LLM_MODEL_PLACEHOLDER", _active_model_label()).replace("LLM_PROVIDER_PLACEHOLDER", _PROVIDER_LABELS.get(active_provider_name(), active_provider_name())),
-        height=0,
+        height=1,
     )
 
 
@@ -1278,7 +1416,7 @@ def _render_google_setup() -> None:
             help="Your key is saved locally to .env and never sent anywhere else.",
         )
         thinking = _gemini_thinking_picker(key="setup_gemini_thinking")
-        submitted = st.form_submit_button("Save & Start", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Save & Start", type="primary", width="stretch")
 
     if submitted:
         key = key_input.strip()
@@ -1394,7 +1532,7 @@ def _render_anthropic_setup() -> None:
         )
         effort = _anthropic_effort_picker(key="setup_anthropic_effort")
         submitted = st.form_submit_button(
-            "Save & Start", type="primary", use_container_width=True
+            "Save & Start", type="primary", width="stretch"
         )
 
     if not submitted:
@@ -1450,7 +1588,7 @@ def _render_anthropic_settings(*, key_prefix: str) -> bool:
                  "effort `high` or below, and is rarely worth it — lowering the "
                  "effort is the better way to spend less.",
         )
-        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+        if st.form_submit_button("Save settings", type="primary", width="stretch"):
             updates = {
                 "LLM_PROVIDER": "anthropic",
                 "ANTHROPIC_MODEL": model.strip() or ANTHROPIC_MODEL,
@@ -1512,7 +1650,7 @@ def _render_openai_setup() -> None:
                  "OpenRouter, Azure OpenAI, or a local vLLM server.",
         )
         submitted = st.form_submit_button(
-            "Save & Start", type="primary", use_container_width=True
+            "Save & Start", type="primary", width="stretch"
         )
 
     if not submitted:
@@ -1589,7 +1727,7 @@ def _render_openai_settings(*, key_prefix: str) -> bool:
                  "DeepSeek, Qwen, Groq, OpenRouter, Azure OpenAI, a local "
                  "vLLM server.",
         )
-        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+        if st.form_submit_button("Save settings", type="primary", width="stretch"):
             updates = {
                 "LLM_PROVIDER": "openai",
                 "OPENAI_MODEL": model.strip(),
@@ -1704,7 +1842,7 @@ def _render_ollama_settings(*, key_prefix: str) -> bool:
             value=os.environ.get("OLLAMA_HOST") or OLLAMA_HOST,
         )
 
-        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+        if st.form_submit_button("Save settings", type="primary", width="stretch"):
             _write_env({
                 "LLM_PROVIDER": "ollama",
                 "OLLAMA_MODEL": model,
@@ -1733,7 +1871,7 @@ def _render_google_settings(*, key_prefix: str) -> bool:
             "API key (leave blank to keep the current one)",
             type="password", placeholder="AIzaSy…",
         )
-        if st.form_submit_button("Save settings", type="primary", use_container_width=True):
+        if st.form_submit_button("Save settings", type="primary", width="stretch"):
             updates = {
                 "LLM_PROVIDER": "google",
                 "GEMINI_MODEL": model.strip(),
@@ -1824,7 +1962,7 @@ def _render_ollama_setup() -> None:
             "Install it from [ollama.com](https://ollama.com/download), then start it:\n\n"
             "```\nollama serve\n```"
         )
-        if st.button("Check again", use_container_width=True):
+        if st.button("Check again", width="stretch"):
             st.rerun()
         return
 
@@ -1844,7 +1982,7 @@ def _render_ollama_setup() -> None:
             "```\nollama pull gemma4:12b-mlx\n```\n\n"
             "On Apple Silicon the `-mlx` tags run noticeably faster."
         )
-        if st.button("Check again", use_container_width=True):
+        if st.button("Check again", width="stretch"):
             st.rerun()
         return
 
@@ -1871,7 +2009,7 @@ def _render_ollama_setup() -> None:
                 "windows use more memory."
             ),
         )
-        submitted = st.form_submit_button("Save & Start", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Save & Start", type="primary", width="stretch")
 
     if submitted:
         _write_env({
@@ -1970,7 +2108,7 @@ def _render_ready_to_start(provider: str) -> None:
     mc = _cached_model_check(provider) if provider in _CHECKED_PROVIDERS else None
     if mc is not None and mc.blocks_start:
         st.error(_model_problem_text(mc))
-        if st.button("Check again", use_container_width=True):
+        if st.button("Check again", width="stretch"):
             st.session_state.pop("_model_checks", None)
             st.rerun()
         with st.expander("Change settings", expanded=True):
@@ -2028,7 +2166,7 @@ def _render_ready_to_start(provider: str) -> None:
         info = ollama_probe()
         if not info["reachable"]:
             st.error("Ollama is not running. Start it with `ollama serve`, then re-check.")
-            if st.button("Check again", use_container_width=True):
+            if st.button("Check again", width="stretch"):
                 st.rerun()
             return
         if model not in {m["name"] for m in info["models"]}:
@@ -2054,7 +2192,7 @@ def _render_ready_to_start(provider: str) -> None:
             "answered, so a switch is always your decision."
         )
 
-    if st.button("Start CONDUCTOR", type="primary", use_container_width=True):
+    if st.button("Start CONDUCTOR", type="primary", width="stretch"):
         _write_env({"LLM_PROVIDER": provider})
         _warm_up_if_needed()
         st.session_state._launched = True
@@ -2163,15 +2301,17 @@ if "ui_conversation_id" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Example queries
 # ---------------------------------------------------------------------------
-EXAMPLE_QUERIES: list[str] = [
-    "Is the grid secure at the current timestamp?",
-    "Find the worst-case timestamp in this week's measurements.",
-    "Will the grid stay secure across the forecast horizon?",
-    "Which single N-1 outage is the most critical right now?",
-    "Run a probabilistic risk assessment under load and generation uncertainty.",
-    "Find a robust corrective dispatch to clear any violations.",
-    "What is the hosting capacity at the most heavily loaded bus?",
-    "Evaluate the flexibility KPIs for the current operating point.",
+# (query, icon) — one icon per study, so the list can be scanned by topic.
+EXAMPLE_QUERIES: list[tuple[str, str]] = [
+    ("Is the grid secure at the current timestamp?", ":material/verified_user:"),
+    ("Find the worst-case timestamp in this week's measurements.", ":material/trending_down:"),
+    ("Will the grid stay secure across the forecast horizon?", ":material/schedule:"),
+    ("Which single N-1 outage is the most critical right now?", ":material/account_tree:"),
+    ("Run a probabilistic risk assessment under load and generation uncertainty.",
+     ":material/casino:"),
+    ("Find a robust corrective dispatch to clear any violations.", ":material/tune:"),
+    ("What is the hosting capacity at the most heavily loaded bus?", ":material/solar_power:"),
+    ("Evaluate the flexibility KPIs for the current operating point.", ":material/speed:"),
 ]
 
 
@@ -2268,7 +2408,7 @@ def _reset_conversation_state() -> None:
     st.session_state._box_n = st.session_state.get("_box_n", 0) + 1
     st.session_state.pop("_box_pending", None)
     st.session_state.pop("_suggestion_used", None)
-    st.session_state.pop("viewing_forecast_ts", None)
+    st.session_state.pop("system_ts", None)
     st.session_state.ui_conversation_id = uuid.uuid4().hex[:12]
     _tools_module._last_tool_results.clear()
 
@@ -2408,38 +2548,192 @@ def _reset_active_backend_profile(profile_name: str = "pglib_case14") -> tuple[b
         return False, str(exc)
 
 
+_CHARTS_PER_ROW = 2      # wider charts: three to a row cut every title off
+_VISIBLE_CHART_ROWS = 2  # beyond this, charts go under "More charts"
+
+
+def _polish(fig):
+    """Presentation applied to every chart at draw time.
+
+    Two things that cost readability across many renderers: legends drawn
+    over the plot area, and a marker on every point of a week-long series
+    (672 markers make a solid band). Applied here rather than in each renderer
+    so they cannot drift apart; a renderer that positions its own legend keeps it.
+    """
+    try:
+        legend = fig.layout.legend
+        axis2 = fig.layout.to_plotly_json().get("yaxis2") or {}
+        # Only charts with a second y-axis: there the default legend, outside
+        # on the right, sits on top of that axis. Elsewhere it is fine.
+        if axis2.get("overlaying") and legend.orientation is None \
+                and legend.x is None and legend.y is None:
+            fig.update_layout(legend={"orientation": "h", "yanchor": "top", "y": -0.42,
+                                      "xanchor": "left", "x": 0, "font": {"size": 11}},
+                              margin={"b": 130})
+    except Exception:  # noqa: BLE001 — polish must never cost a chart
+        pass
+    try:
+        # One chart style for every figure, whichever renderer built it: many
+        # never set a template and rendered on Plotly's grey default. Explicit
+        # layout settings a renderer made still win over the template.
+        fig.update_layout(template="conductor")
+        # Streamlit's frontend paints its own secondary background into the
+        # plot area even with theme=None; only an explicit value survives.
+        if fig.layout.plot_bgcolor is None:
+            fig.update_layout(plot_bgcolor="white")
+        if fig.layout.paper_bgcolor is None:
+            fig.update_layout(paper_bgcolor="white")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for trace in fig.data:
+            mode = getattr(trace, "mode", None)
+            x = getattr(trace, "x", None)
+            if mode == "lines+markers" and x is not None and len(x) > 150:
+                trace.mode = "lines"
+    except Exception:  # noqa: BLE001 — polish must never cost a chart
+        pass
+    return fig
+
+
+def _status_of(fig) -> dict | None:
+    """The status a renderer returned in place of a chart, if any."""
+    meta = getattr(getattr(fig, "layout", None), "meta", None)
+    return meta if isinstance(meta, dict) and "conductor_status" in meta else None
+
+
+def _non_converged_note(result: dict) -> str | None:
+    """A warning when a scan skipped ticks whose power flow did not converge.
+
+    Scans used to drop those ticks without a word; they now report them, and
+    the operator should see it beside the charts — a tick with no converged
+    power flow is often the most stressed moment in the window.
+    """
+    stamps = list(result.get("non_converged_timestamps") or [])
+    n = result.get("n_non_converged") or 0
+    for scenario in result.get("scenarios") or []:
+        if isinstance(scenario, dict):
+            n += scenario.get("n_non_converged") or 0
+            stamps += scenario.get("non_converged_timestamps") or []
+    if not n:
+        return None
+    shown = ", ".join(sorted(set(str(t)[:16] for t in stamps))[:3])
+    more = " …" if len(set(stamps)) > 3 else ""
+    return (f"⚠️ {n} tick(s) had no converged power flow and are not in these results — "
+            f"often the most stressed moments{': ' + shown + more if shown else ''}.")
+
+
+def _chart_caption(tool_name: str, result: dict) -> str:
+    """Which analysis these charts come from, and which moment they describe."""
+    parts = [f"**{_TOOL_LABELS.get(tool_name, tool_name.replace('_', ' '))}**"]
+    when = result.get("timestamp") or result.get("worst_timestamp")
+    start, end = result.get("window_start"), result.get("window_end")
+    if when:
+        parts.append(str(when)[:16])
+    elif start and end:
+        parts.append(f"{str(start)[:16]} → {str(end)[:16]}")
+    if str(result.get("data_source", "")).startswith("forecast"):
+        parts.append("forecast")
+    return " · ".join(parts)
+
+
+def _table_of(fig) -> tuple[str, str, "pd.DataFrame"] | None:
+    """A figure that is only a table, as (title, subtitle, rows); else None.
+
+    A Plotly table is a picture: its cells cannot be selected or copied. Such
+    figures are shown with `st.dataframe` instead — select and copy (Ctrl/Cmd+C),
+    sort, search, download as CSV — while renderers keep returning figures.
+    """
+    try:
+        if len(fig.data) != 1 or fig.data[0].type != "table":
+            return None
+        table = fig.data[0]
+        headers = [re.sub(r"<[^>]+>", "", str(h)) for h in table.header.values]
+        frame = pd.DataFrame({h: list(col) for h, col in zip(headers, table.cells.values)})
+        title, _, sub = (fig.layout.title.text or "").partition("<br>")
+        return re.sub(r"<[^>]+>", "", title), re.sub(r"<[^>]+>", "", sub), frame
+    except Exception:  # noqa: BLE001 — fall back to drawing the figure
+        return None
+
+
 def render_charts(tool_results: list) -> None:
     """
     Render Plotly charts for a list of (tool_name, result) tuples.
     Works both for live results and stored results replayed from session state.
+
+    A renderer may return one figure, a list (one row), or a list of lists
+    (several rows) — or nothing at all, which several do on purpose (no
+    violations to attribute, nothing infeasible to draw). An empty result used
+    to reach `st.columns(0)`, which raises; and because the message is stored
+    before its charts are drawn, every later rerun raised too and the whole
+    conversation view was gone until the chat was reset. One failing chart now
+    costs that chart, never the conversation.
+
+    Presentation, for an operator reading the answer rather than the charts:
+    each tool's charts carry a caption naming the analysis and its moment;
+    status figures ("no violations", "infeasible") become one-line messages;
+    charts wrap at two per row, and only the first rows are shown — the rest
+    wait under "More charts" instead of pushing the conversation off screen.
     """
     for chart_idx, (tool_name, result) in enumerate(tool_results):
         renderer = RENDERER_MAP.get(tool_name)
-        if renderer is None:
-            continue
-        if "error" in result:
+        if renderer is None or not isinstance(result, dict) or "error" in result:
             continue
 
-        figs = renderer(result)
+        try:
+            figs = renderer(result)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Renderer for %s failed.", tool_name, exc_info=True)
+            label = _TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
+            st.caption(f"⚠️ The chart for {label} could not be drawn; the answer above is unaffected.")
+            continue
 
-        if isinstance(figs, list) and figs and isinstance(figs[0], list):
-            # Multi-row layout: each inner list is one row of figures
-            for row_idx, row_figs in enumerate(figs):
-                cols = st.columns(len(row_figs))
-                for fig_idx, (col, fig) in enumerate(zip(cols, row_figs)):
+        if figs is None or (isinstance(figs, list) and not figs):
+            continue
+        if not isinstance(figs, list):
+            figs = [figs]
+        flat = [fig for row in figs for fig in (row if isinstance(row, list) else [row])
+                if fig is not None]
+        if not flat:
+            continue
+
+        st.caption(_chart_caption(tool_name, result))
+        note = _non_converged_note(result)
+        if note:
+            st.warning(note)
+        statuses = [s for s in (_status_of(fig) for fig in flat) if s]
+        tables = [t for t in (_table_of(fig) for fig in flat) if t]
+        charts = [fig for fig in flat if not _status_of(fig) and not _table_of(fig)]
+        for status in {s["conductor_status"]: s for s in statuses}.values():
+            show = {"ok": st.success, "error": st.error}.get(status["tone"], st.info)
+            show(status["conductor_status"])
+        for title, subtitle, frame in tables:
+            if title:
+                st.markdown(f"**{title}**")
+            if subtitle:
+                st.caption(subtitle)
+            st.dataframe(frame, hide_index=True, width="stretch",
+                         height=min(38 + 35 * len(frame), 458))
+
+        rows = [charts[i:i + _CHARTS_PER_ROW] for i in range(0, len(charts), _CHARTS_PER_ROW)]
+        visible, hidden = rows[:_VISIBLE_CHART_ROWS], rows[_VISIBLE_CHART_ROWS:]
+
+        def _draw(row_list, offset):
+            for row_idx, row in enumerate(row_list, start=offset):
+                cols = st.columns(_CHARTS_PER_ROW if len(rows) > 1 else len(row))
+                for fig_idx, (col, fig) in enumerate(zip(cols, row)):
                     with col:
-                        st.plotly_chart(fig, use_container_width=True,
+                        # theme=None: Streamlit's own chart theme would
+                        # override the "conductor" template (fonts, colours).
+                        st.plotly_chart(_polish(fig), width="stretch", theme=None,
                                         key=f"chart_{id(tool_results)}_{chart_idx}_{row_idx}_{fig_idx}")
-        elif isinstance(figs, list):
-            # Single-row layout: all figures in one row of columns
-            cols = st.columns(len(figs))
-            for fig_idx, (col, fig) in enumerate(zip(cols, figs)):
-                with col:
-                    st.plotly_chart(fig, use_container_width=True,
-                                    key=f"chart_{id(tool_results)}_{chart_idx}_{fig_idx}")
-        else:
-            st.plotly_chart(figs, use_container_width=True,
-                            key=f"chart_{id(tool_results)}_{chart_idx}")
+
+        _draw(visible, 0)
+        if hidden:
+            n_hidden = sum(len(r) for r in hidden)
+            with st.expander(f"More charts ({n_hidden})"):
+                _draw(hidden, len(visible))
 
 
 # ---------------------------------------------------------------------------
@@ -2448,21 +2742,143 @@ def render_charts(tool_results: list) -> None:
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.image(str(_LOGO_PATH), use_container_width=True)
-    st.markdown(f"### {_BRAND_NAME}")
-    st.caption(_BRAND_TAGLINE)
-    st.markdown(f'<div class="conductor-sidebar-copy">{_SIDEBAR_BRIEF}</div>', unsafe_allow_html=True)
-    st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Operating point — which data, at what time (logic in agent/timeline.py)
+#
+# The dataset is chosen first, then the time within that dataset's own
+# timestamps. Measured moves the simulation clock; Forecast is query-only;
+# Compare (where both share a timestamp) asks for forecast against actual.
+# ---------------------------------------------------------------------------
+_DATASET_COLOURS = {_tl.MEASURED: "#1D6FE8", _tl.FORECAST: "#8E5CD9"}
+_OP_CAPTIONS = {
+    _tl.MEASURED: "Moves the simulation clock.",
+    _tl.FORECAST: "Query-only — the simulation clock does not move.",
+    _tl.COMPARE: "Forecast against measured — moves the simulation clock.",
+}
 
-    if st.button("Start New Conversation", use_container_width=True, type="secondary"):
+
+def _op_step(key: str, ticks: tuple, n: int) -> None:
+    st.session_state[key] = _tl.step(ticks, st.session_state.get(key), n)
+
+
+def _coverage_strip(timeline: _tl.Timeline, cursor: str | None, mode: str) -> str:
+    """Bars for where each dataset has data, the cursor across them, a legend."""
+    cov = _tl.coverage(timeline, cursor)
+    bars, legend = [], []
+    for row in cov["rows"]:
+        colour = _DATASET_COLOURS[row["mode"]]
+        active = mode in (row["mode"], _tl.COMPARE)
+        width = max(row["end"] - row["start"], 0.008) * 100
+        span = f"{_tl.LABELS[row['mode']]}: {row['first'][:16]} → {row['last'][:16]}"
+        bars.append(
+            f"<div class='op-track' title='{html.escape(span)}'><div class='op-fill' "
+            f"style='left:{row['start'] * 100:.2f}%;width:{width:.2f}%;background:{colour};"
+            f"opacity:{1 if active else 0.35}'></div></div>"
+        )
+        meta = " · ".join(x for x in (row["resolution"], row["source"]) if x)
+        legend.append(
+            f"<div class='op-legend{'' if active else ' op-dim'}'>"
+            f"<span><span style='color:{colour}'>●</span> <b>{_tl.LABELS[row['mode']]}</b></span>"
+            f"<span>{html.escape(meta)}</span></div>"
+        )
+    if not timeline.forecast:
+        legend.append("<div class='op-legend op-dim'><span><span style='color:#8E5CD9'>●</span> "
+                      "<b>Forecast</b></span><span>none loaded</span></div>")
+    cursor_html = ("" if cov["cursor"] is None else
+                   f"<div class='op-cursor' style='left:{cov['cursor'] * 100:.2f}%'></div>")
+    ends = [r["first"] for r in cov["rows"]] + [r["last"] for r in cov["rows"]]
+    scale = (f"<div class='op-scale'><span>{min(ends)[5:10]}</span><span>{max(ends)[5:10]}</span></div>"
+             if ends else "")
+    return f"<div class='op-strip'>{''.join(bars)}{cursor_html}</div>{scale}{''.join(legend)}"
+
+
+def _render_operating_point() -> None:
+    ss = st.session_state
+    timeline = _tl.Timeline.from_payload(_fetch_timeline())
+    modes = timeline.modes()
+    if not modes:
+        st.warning("Timeline unavailable — the backend is not responding.")
+        return
+
+    # Which data.
+    if ss.get("op_mode") not in modes:
+        ss.op_mode = modes[0]
+    if len(modes) > 1:
+        st.segmented_control("Dataset", modes, format_func=_tl.LABELS.get, key="op_mode",
+                             required=True, label_visibility="collapsed", width="stretch")
+    mode = ss.op_mode
+    ticks = timeline.ticks(mode)
+    follows_clock = mode in (_tl.MEASURED, _tl.COMPARE) and bool(timeline.measured)
+
+    # At what time: keep the moment across a dataset switch (nearest tick), and
+    # follow the clock when a tool moved it while the view is on measured data.
+    key = f"op_time_{mode}"
+    target = ss.get(key)
+    if ss.get("_op_mode_last") != mode or target not in ticks:
+        target = _tl.nearest(ticks, ss.get("op_time") or timeline.clock)
+    if (follows_clock and timeline.clock != ss.get("_op_clock_last")
+            and timeline.clock in ticks):
+        target = timeline.clock
+    ss[key] = target
+
+    when = _tl._parse(target)
+    st.markdown(
+        f"<div class='op-when'><span class='op-date'>{when:%a} {when.day} {when:%b %Y}</span>"
+        f"<span class='op-time'>{when:%H:%M}</span></div>",
+        unsafe_allow_html=True,
+    )
+    res = _tl.resolution(ticks) or "tick"
+    c_prev, c_slide, c_next = st.columns([1, 5, 1], vertical_alignment="center", gap="xsmall")
+    c_prev.button("", icon=":material/chevron_left:", type="tertiary", key="op_prev",
+                  help=f"Back {res}", on_click=_op_step, args=(key, ticks, -1))
+    value = c_slide.select_slider("Time", options=ticks, key=key,
+                                  format_func=lambda t: t[5:16], label_visibility="collapsed")
+    c_next.button("", icon=":material/chevron_right:", type="tertiary", key="op_next",
+                  help=f"Forward {res}", on_click=_op_step, args=(key, ticks, 1))
+
+    st.markdown(_coverage_strip(timeline, value, mode), unsafe_allow_html=True)
+    caption = _OP_CAPTIONS[mode]
+    if not timeline.measured:
+        caption = "No measurements loaded — the simulation clock is unavailable."
+    elif mode == _tl.FORECAST and timeline.clock:
+        caption = f"Query-only — the simulation clock stays at {timeline.clock[5:16]}."
+    st.caption(caption)
+
+    # Measured data moves the backend clock; a forecast cannot hold it.
+    if follows_clock and value in timeline.measured and value != timeline.clock:
+        _jump_to_timestamp(value)
+        ss.current_ts = value
+        ss._op_clock_last = value  # our own move: not a tool's, so do not snap back
+    else:
+        ss._op_clock_last = timeline.clock
+    ss._op_mode_last = mode
+    ss.op_time = value
+    ss.op_view = {"mode": mode, "ts": value}
+
+
+with st.sidebar:
+    # The brand is already in the page header and the hero; a third copy here
+    # pushed the controls an operator uses — the clock first — below the fold.
+    # The most used action first.
+    if st.button("New conversation", icon=":material/add_comment:", width="stretch",
+                 type="secondary", key="new_conversation"):
         _reset_conversation_state()
         st.rerun()
+
+    st.markdown("<div class='conductor-sidebar-label'>Operating point</div>", unsafe_allow_html=True)
+    with st.container(border=True, key="op_card"):
+        _render_operating_point()
+
+    st.divider()
+    st.markdown("<div class='conductor-sidebar-label'>Settings</div>", unsafe_allow_html=True)
 
     # Model settings stay reachable mid-session — switching backend or adjusting
     # a local model's context should not require a restart or a .env edit.
     _active = active_provider_name()
-    with st.expander(f"Model settings — {_PROVIDER_LABELS.get(_active, _active)}"):
+    # The header names the model in use, so it is visible without opening.
+    with st.expander(f"Model · {_active_model_label()}", icon=":material/smart_toy:",
+                     key="sb_model"):
+        st.caption(_PROVIDER_LABELS.get(_active, _active))
         _backends = list(available_providers())
         _switch_to = st.radio(
             "Backend",
@@ -2488,12 +2904,14 @@ with st.sidebar:
     #
     # Off by default — it is the configuration every reported result was
     # produced under, and the other two levels are experiments.
-    with st.expander("Answer checks"):
-        _REFLECT_LABELS = {
-            "off": "Off",
-            "warn": "Check silently",
-            "inform": "Show the agent",
-        }
+    _REFLECT_LABELS = {
+        "off": "Off",
+        "warn": "Check silently",
+        "inform": "Show the agent",
+    }
+    _reflect_now = _REFLECT_LABELS.get(st.session_state.get("reflection_mode", "off"), "Off")
+    with st.expander(f"Answer checks · {_reflect_now}", icon=":material/fact_check:",
+                     key="sb_checks"):
         st.radio(
             "Before answering",
             list(_REFLECT_LABELS),
@@ -2515,7 +2933,9 @@ with st.sidebar:
 
     # AI Agent Suggestion. On demand by default: suggestions nobody asked for
     # are more to read, which is the opposite of what they are for.
-    with st.expander("AI Agent Suggestion"):
+    _suggest_now = "Auto" if st.session_state.get("auto_suggest") else "On click"
+    with st.expander(f"AI Agent Suggestion · {_suggest_now}", icon=":material/auto_awesome:",
+                     key="sb_suggest"):
         st.toggle(
             "Suggest after every answer",
             key="auto_suggest",
@@ -2528,12 +2948,7 @@ with st.sidebar:
             ),
         )
 
-    if "show_manage_uploads" not in st.session_state:
-        st.session_state.show_manage_uploads = False
-    if st.button("Manage uploaded data", use_container_width=True):
-        st.session_state.show_manage_uploads = not st.session_state.show_manage_uploads
-
-    if st.session_state.show_manage_uploads:
+    with st.expander("Manage uploaded data", icon=":material/folder_open:", key="sb_uploads"):
         st.caption("Choose exactly what to remove from data_files and systems.")
         cleanup_groups = _collect_uploaded_cleanup_groups()
         if not cleanup_groups:
@@ -2556,7 +2971,7 @@ with st.sidebar:
                     rel = p.relative_to(_REPO_ROOT) if _path_within(p, _REPO_ROOT) else p
                     st.markdown(f"- {rel}")
 
-                if st.button("Delete selected", type="secondary", use_container_width=True):
+                if st.button("Delete selected", type="secondary", width="stretch"):
                     deleted, errs = _delete_uploaded_artifacts(selected_paths)
                     if deleted:
                         st.success(f"Removed {deleted} file(s).")
@@ -2576,143 +2991,15 @@ with st.sidebar:
                 st.caption("Select at least one group to enable deletion.")
 
     st.divider()
-    st.markdown("<div class='conductor-sidebar-label'>Workspace</div>", unsafe_allow_html=True)
-
-    # ── Simulation clock — single timeline spanning measurements + forecast ─
-    _timeline = _fetch_timeline()
-    _meas = _timeline.get("timestamps") or []
-    _fcts = _timeline.get("forecast_timestamps") or []
-    _meas_src = _timeline.get("measurements_source", "synthetic")
-
-    with st.expander("🕐 Simulation clock", expanded=True):
-        if not _meas:
-            st.info(st.session_state.current_ts)
-        else:
-            # One timeline = the time-sorted union of measurement + forecast ticks.
-            # Sorting (rather than meas+fcts) keeps the order correct even if the two
-            # series are NOT contiguous — a gap, or a forecast period that doesn't sit
-            # right after the measurements. Duplicates (a timestamp present in both)
-            # resolve to "measurement" since that is the actual/live data.
-            _meas_set = set(_meas)
-            _combined = sorted(_meas_set | set(_fcts))
-            backend_ts = _timeline.get("current_timestamp") or st.session_state.current_ts
-
-            # Infer the data's time resolution from consecutive ticks, so the step
-            # buttons are labelled with the real interval (15 min, 1 h, …).
-            def _infer_step_minutes(seq: list) -> int:
-                if len(seq) < 2:
-                    return 15
-                try:
-                    a = datetime.strptime(seq[0], "%Y-%m-%d %H:%M:%S")
-                    b = datetime.strptime(seq[1], "%Y-%m-%d %H:%M:%S")
-                    return max(1, int((b - a).total_seconds() // 60))
-                except Exception:
-                    return 15
-
-            _step_min = _infer_step_minutes(_meas)
-            if _step_min % 1440 == 0:
-                _step_label = f"{_step_min // 1440} day"
-            elif _step_min % 60 == 0:
-                _step_label = f"{_step_min // 60} h"
-            else:
-                _step_label = f"{_step_min} min"
-
-            # Sync rules: follow a tool-driven clock move only while the cursor is
-            # tracking the clock (in the measurement half); otherwise leave it where
-            # the user dragged it.
-            cur = st.session_state.get("ts_scrubber")
-            if (cur is None) or (cur not in _combined):
-                st.session_state.ts_scrubber = backend_ts if backend_ts in _combined else _combined[0]
-            elif (backend_ts != st.session_state.get("_last_backend_ts")
-                  and cur in _meas_set and backend_ts in _combined):
-                st.session_state.ts_scrubber = backend_ts
-            st.session_state._last_backend_ts = backend_ts
-
-            def _shift_clock(n: int):
-                i = _combined.index(st.session_state.ts_scrubber)
-                st.session_state.ts_scrubber = _combined[max(0, min(len(_combined) - 1, i + n))]
-
-            pos_ts = st.session_state.ts_scrubber
-            ci = _combined.index(pos_ts)
-            is_meas = pos_ts in _meas_set
-            # When the cursor sits on a forecast tick the clock can't follow it
-            # (it's the future / query-only). Remember it so the chat handler can
-            # tell the LLM to analyse that forecast timestamp instead of the clock.
-            st.session_state.viewing_forecast_ts = None if is_meas else pos_ts
-            try:
-                _wd = datetime.strptime(pos_ts, "%Y-%m-%d %H:%M:%S").strftime("%a")
-            except ValueError:
-                _wd = ""
-            if is_meas:
-                _mi = _meas.index(pos_ts) + 1
-                _sub = f"clock · tick {_mi} / {len(_meas)} · measurements ({_meas_src})"
-            else:
-                _fi = _fcts.index(pos_ts) + 1 if pos_ts in _fcts else ci + 1
-                _sub = (f"forecast · point {_fi} / {len(_fcts)} · query-only"
-                        f" · clock at {backend_ts[5:16]}")
-            st.markdown(
-                f"<div style='font-size:0.95rem;font-weight:600;color:#2e3140'>{_wd} {pos_ts}</div>"
-                f"<div style='font-size:0.76rem;color:#7a7f8c;margin-bottom:0.3rem'>{_sub}</div>",
-                unsafe_allow_html=True,
-            )
-
-            # Tint the slider to match the region: blue on measurements, purple on
-            # forecast (same colours as the legend dots). Streamlit has no native
-            # per-state slider colour, so this targets the BaseWeb slider internals
-            # — the thumb + value label are reliable; the track fill is best-effort.
-            _bar = "#2a72e8" if is_meas else "#b07cd6"
-            st.markdown(
-                "<style>"
-                f"section[data-testid='stSidebar'] div[data-baseweb='slider'] [role='slider']"
-                f"{{background-color:{_bar} !important;border-color:{_bar} !important}}"
-                f"section[data-testid='stSidebar'] div[data-baseweb='slider'] [data-testid='stSliderThumbValue']"
-                f"{{color:{_bar} !important}}"
-                f"section[data-testid='stSidebar'] div[data-baseweb='slider'] > div > div > div:first-child"
-                f"{{background:{_bar} !important}}"
-                "</style>",
-                unsafe_allow_html=True,
-            )
-            st.select_slider(
-                "Timeline",
-                options=_combined,
-                key="ts_scrubber",
-                format_func=lambda t: t[5:16],  # MM-DD HH:MM
-                label_visibility="collapsed",
-            )
-            if _fcts:
-                st.markdown(
-                    "<div style='display:flex;justify-content:space-between;font-size:0.7rem;"
-                    "color:#7a7f8c;margin:-0.2rem 0 0.5rem'>"
-                    "<span><span style='color:#2a72e8'>●</span> measurements "
-                    f"{_meas[0][5:10]}–{_meas[-1][5:10]}</span>"
-                    "<span><span style='color:#b07cd6'>●</span> forecast "
-                    f"{_fcts[0][5:10]}–{_fcts[-1][5:10]}</span></div>",
-                    unsafe_allow_html=True,
-                )
-
-            bcol = st.columns(2)
-            bcol[0].button(f"− {_step_label}", on_click=_shift_clock, args=(-1,),
-                           use_container_width=True, key="b_prev")
-            bcol[1].button(f"+ {_step_label}", on_click=_shift_clock, args=(1,),
-                           use_container_width=True, key="b_next")
-
-            # Push to the backend clock only when the cursor is in the measurement
-            # half — the clock cannot occupy a forecast (future) timestamp.
-            if pos_ts in _meas_set and pos_ts != backend_ts:
-                _jump_to_timestamp(pos_ts)
-                st.session_state.current_ts = pos_ts
-                # Record that *we* moved the backend, so next run's follow-logic
-                # doesn't mistake our own push for a tool-driven move and snap back.
-                st.session_state._last_backend_ts = pos_ts
-
-    st.divider()
     st.markdown("<div class='conductor-sidebar-label'>Prompt Starters</div>", unsafe_allow_html=True)
 
     # ── Example queries ──────────────────────────────────────────────────
-    with st.expander("💡 Example queries", expanded=True):
+    with st.expander("Example queries", expanded=True, icon=":material/lightbulb:"):
         st.caption("Click to drop into the chat box — edit if you like, then send.")
-        for query in EXAMPLE_QUERIES:
-            if st.button(query, use_container_width=True, key=f"eq_{hash(query)}"):
+        examples = st.container(key="examples_list")
+        for q_i, (query, q_icon) in enumerate(EXAMPLE_QUERIES):
+            if examples.button(query, icon=q_icon, type="tertiary", width="stretch",
+                               key=f"eq_{q_i}"):
                 # Copy into the input box (applied before the widget renders below);
                 # do NOT auto-run — the user sends it themselves.
                 st.session_state._box_pending = query
@@ -2750,7 +3037,16 @@ def _layout_for(_fingerprint: str, payload: dict):
     return network, positions
 
 
-def _fetch_state(timestamp: str, vm_lower: float, vm_upper: float) -> tuple[dict, dict]:
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_state(timestamp: str, vm_lower: float, vm_upper: float,
+                 fingerprint: str = "") -> tuple[dict, dict]:
+    """RSA and snapshot at one moment, cached per (moment, limits, network).
+
+    Uncached, every rerun — any click anywhere in the app, every suggestion,
+    every finished turn — ran a full assessment because Streamlit tabs are not
+    lazy. `fingerprint` is part of the key only so a network swap is never
+    answered from the previous network's cache.
+    """
     body = {"data_source": "measurements", "timestamp": timestamp,
             "vm_lower_pu": vm_lower, "vm_upper_pu": vm_upper}
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
@@ -2815,7 +3111,8 @@ def _render_system_view() -> None:
     violations: set[str] = set()
 
     try:
-        rsa, snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper)
+        rsa, snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper,
+                                     st.session_state.get("_network_fingerprint") or "")
         problems += _network_map.apply_assessment(network, rsa)
         problems += _network_map.apply_conditions(network, snapshot)
         violations = _network_map.violated_elements(rsa)
@@ -2829,8 +3126,8 @@ def _render_system_view() -> None:
     st.plotly_chart(
         render_network_map(network, positions, vm_lower=limits.vm_lower,
                            vm_upper=limits.vm_upper, highlight=violations,
-                           subtitle=subtitle),
-        use_container_width=True,
+                           subtitle=subtitle, max_loading=limits.max_loading),
+        width="stretch", theme=None,
     )
 
     st.caption(
@@ -2853,7 +3150,7 @@ def _render_system_view() -> None:
 # ---------------------------------------------------------------------------
 # Main chat area
 # ---------------------------------------------------------------------------
-_render_main_hero()
+_render_main_hero(compact=bool(st.session_state.messages))
 
 # Conversation history renders in the MAIN script run, so it stays solid (not
 # greyed) while the input fragment below runs the slow agent call. That fragment
@@ -2861,17 +3158,34 @@ _render_main_hero()
 # The input box stays outside the tabs on purpose: `st.chat_input` pins itself
 # to the bottom of the viewport only at the top level, and inside a tab it
 # would render inline and appear on one pane only. Out here it stays pinned and
+# One label per tool the agent can call — shown in the live status box, the
+# audit panel and chart captions. Kept complete by
+# `tests/test_app_labels.py`: four entries here once named tools that do not
+# exist, and the deterministic OPF was labelled "Robust OPF", telling the
+# operator a dispatch carried a robustness guarantee it did not.
 _TOOL_LABELS = {
-    "run_rsa": "Security Assessment (RSA)",
-    "run_n1_contingency": "N-1 Contingency Analysis",
-    "run_probabilistic_risk": "Probabilistic Risk Assessment",
-    "optimize_flexibility": "Robust OPF / Flexibility",
-    "evaluate_kpis": "KPI Evaluation",
-    "scan_rsa_over_time": "Time-series Scan",
+    "locate_network_element": "Element lookup",
     "get_current_timestamp": "Reading timestamp",
     "advance_timestamp": "Advancing timestamp",
-    "get_network_summary": "Loading network summary",
-    "get_load_generation_profile": "Loading generation profile",
+    "get_current_conditions": "Current conditions",
+    "get_element_timeseries": "Element time series",
+    "run_rsa": "Security assessment (RSA)",
+    "simulate_contingency": "Single N-1 contingency",
+    "simulate_all_contingencies": "N-1 contingency screen",
+    "find_worst_case_timestamp": "Worst-case scan",
+    "scan_rsa_over_time": "Security scan over time",
+    "compute_violation_attribution": "Violation attribution",
+    "compare_results": "Result comparison",
+    "run_probabilistic_rsa": "Probabilistic security assessment",
+    "scan_scenarios": "Renewable scenario scan",
+    "compute_historical_risk": "Historical risk",
+    "optimize_contingency": "Post-contingency OPF",
+    "optimize_flexibility": "Flexibility OPF (deterministic)",
+    "optimize_robust_flexibility": "Robust flexibility OPF",
+    "compute_flexibility_envelope": "Flexibility envelope",
+    "compute_hosting_capacity": "Hosting capacity",
+    "evaluate_kpis": "KPI evaluation",
+    "forecast_kpis": "KPI forecast",
 }
 
 
@@ -2955,7 +3269,7 @@ def _render_trace(trace, key: str) -> None:
                     }
                     for f in trace.figures
                 ],
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
                 key=f"trace_figs_{key}",
             )
             st.divider()
@@ -2985,12 +3299,14 @@ def _suggestion_context() -> dict:
     status = last_grid_constants_status()
     gc = dict(status.values) if status is not None else {}
     names = list(gc.get("substation_names") or [])
-    forecast_ts = st.session_state.get("viewing_forecast_ts")
+    view = st.session_state.get("op_view") or {}
+    mode = view.get("mode", _tl.MEASURED)
     ctx = {
         "network": gc.get("name"),
         "simulation_clock": st.session_state.get("current_ts"),
-        "data_source": "forecasts" if forecast_ts else "measurements",
-        "viewing_forecast_timestamp": forecast_ts,
+        "data_source": {_tl.FORECAST: "forecasts",
+                        _tl.COMPARE: "measurements and forecasts"}.get(mode, "measurements"),
+        "viewing_timestamp": view.get("ts") if mode != _tl.MEASURED else None,
         "default_voltage_band_pu": [gc.get("vm_lower"), gc.get("vm_upper")],
         "max_loading_pct": gc.get("max_loading_pct"),
         "substations": names[:40] + ([f"… and {len(names) - 40} more"] if len(names) > 40 else []),
@@ -3031,6 +3347,8 @@ def _run_ai_suggestion(idx: int, trigger: str) -> None:
     round_id = f"{st.session_state.ui_conversation_id}-{idx}-{len(rounds) + 1}"
     entry = {
         "id": round_id,
+        "comment": result.comment,
+        "comment_unverified": list(result.comment_unverified),
         "suggestions": [s.as_record() for s in result.suggestions],
         "note": result.note,
         "error": result.error,
@@ -3051,6 +3369,8 @@ def _run_ai_suggestion(idx: int, trigger: str) -> None:
         "duration_s": round(time.perf_counter() - started, 3),
         **provider_info,
         "attention": msg.get("attention") or [],
+        "comment": result.comment,
+        "comment_unverified": entry["comment_unverified"],
         "suggestions": entry["suggestions"],
         "note": result.note,
         "error": result.error,
@@ -3091,20 +3411,32 @@ def _log_suggestion_outcome(sent: str) -> None:
     _loop_module.log_event(record)
 
 
-def _render_suggestion_round(rnd: dict, idx: int, r_i: int) -> None:
-    with st.container(border=True):
-        st.markdown("<div class='conductor-ai-head'>✨ AI Agent Suggestion</div>",
-                    unsafe_allow_html=True)
+def _render_suggestion_round(rnd: dict, idx: int, r_i: int, expanded: bool = True) -> None:
+    # Collapsible, so suggestions the operator has read or does not want can
+    # be folded away; open under the latest answer, folded under older ones.
+    with st.expander(":violet[**✨ AI Agent Suggestion**]", expanded=expanded):
         st.caption(_AI_SUGGESTION_CAPTION)
         if rnd.get("error"):
             st.caption("The AI agent could not produce suggestions this time. "
                        "Try again in a moment.")
             return
+        if rnd.get("comment"):
+            # Its reading of what happened, above the ways to continue.
+            text = html.escape(rnd["comment"]).replace("$", "&#36;")
+            st.markdown(
+                "<div class='conductor-ai-comment'>"
+                "<div class='conductor-ai-comment-label'>AI Agent Comment</div>"
+                f"{text}</div>",
+                unsafe_allow_html=True,
+            )
+            if rnd.get("comment_unverified"):
+                st.caption("⚠️ Not found in this conversation's results: "
+                           + ", ".join(rnd["comment_unverified"]))
         if not rnd.get("suggestions"):
             st.caption(rnd.get("note") or "The AI agent had nothing new to suggest.")
             return
         for s_i, sug in enumerate(rnd["suggestions"]):
-            c_text, c_btn = st.columns([7, 1])
+            c_text, c_btn = st.columns([6, 2])
             with c_text:
                 label = _recommender.ANGLE_LABELS.get(sug["angle"], sug["angle"])
                 st.markdown(
@@ -3118,9 +3450,15 @@ def _render_suggestion_round(rnd: dict, idx: int, r_i: int) -> None:
                 if sug.get("unverified"):
                     st.caption("⚠️ Not found in this conversation's results: "
                                + ", ".join(sug["unverified"]))
-            with c_btn:
+            # The full prompt sits behind an ⓘ next to "Use" — a popover, not
+            # an expander, because expanders cannot be nested.
+            with c_btn, st.container(horizontal=True, horizontal_alignment="right",
+                                     vertical_alignment="center"):
+                with st.popover("", icon=":material/info:", type="tertiary",
+                                help="Show the full prompt"):
+                    st.caption(sug["prompt"].replace("$", "\\$"))
                 if st.button("Use", key=f"ais_use_{idx}_{r_i}_{s_i}",
-                             help=sug["prompt"], use_container_width=True):
+                             help="Place this prompt in the chat box"):
                     # Same path as the example queries: into the box, not sent.
                     st.session_state._box_pending = sug["prompt"]
                     st.session_state._suggestion_used = {
@@ -3149,8 +3487,9 @@ def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
             if attention:
                 # Decided in code from the result's own verdict fields — costs
                 # nothing until clicked.
-                st.caption("⚠️ This result has issues — an AI Agent Suggestion "
-                           "can help decide what to check next.")
+                first = attention[0].split(": ", 1)[-1]
+                st.caption(f"⚠️ This result has issues ({first}) — an AI Agent "
+                           "Suggestion can help decide what to check next.")
             if st.button("✨ AI Agent Suggestion", key=f"ais_{idx}",
                          type="primary" if attention else "secondary",
                          help="Ask a second AI agent how to continue from here. "
@@ -3158,7 +3497,7 @@ def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
                 trigger = "button"
 
     for r_i, rnd in enumerate(rounds):
-        _render_suggestion_round(rnd, idx, r_i)
+        _render_suggestion_round(rnd, idx, r_i, expanded=is_last)
 
     if is_last and rounds and trigger is None:
         if st.button("✨ More ideas", key=f"ais_more_{idx}"):
@@ -3167,12 +3506,100 @@ def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
     return trigger
 
 
+# ---------------------------------------------------------------------------
+# Data view — the loaded measurements and forecasts, as they are
+# (logic in agent/data_view.py; data from /api/data/series)
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_series(signature: str, data_source: str, substations: tuple) -> dict | None:
+    """One dataset's series. `signature` changes when the loaded data does."""
+    try:
+        r = httpx.post(f"{BASE_URL}/api/data/series", timeout=HTTP_TIMEOUT,
+                       json={"data_source": data_source, "substations": list(substations)})
+        r.raise_for_status()
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _render_data_view() -> None:
+    timeline = _tl.Timeline.from_payload(_fetch_timeline())
+    if not timeline.modes():
+        st.warning("No data to show — the backend is not responding.")
+        return
+    signature = "|".join(str(x) for x in (
+        st.session_state.get("_network_fingerprint"), timeline.measured_source, timeline.forecast_source,
+        len(timeline.measured), timeline.measured[:1], timeline.measured[-1:],
+        len(timeline.forecast), timeline.forecast[:1], timeline.forecast[-1:]))
+
+    datasets = [d for d, ticks in (("Measured", timeline.measured), ("Forecast", timeline.forecast)) if ticks]
+    if len(datasets) == 2:
+        datasets.append("Both")
+    base = _fetch_series(signature, "measurements" if timeline.measured else "forecasts", ())
+    names = (base or {}).get("available_substations") or []
+
+    c_ds, c_items, c_qty = st.columns([2, 4, 3])
+    choice = c_ds.radio("Dataset", datasets, index=len(datasets) - 1, horizontal=True, key="dv_dataset")
+    picked = c_items.multiselect("Substations", names, key="dv_items", placeholder="System total",
+                                 help="Leave empty for the system total.")
+    quantity = c_qty.segmented_control("Quantity", list(_dv.QUANTITIES), format_func=_dv.QUANTITIES.get,
+                                       default="consumption", required=True, key="dv_quantity")
+    items = list(picked) or [_dv.TOTAL]
+
+    subs = tuple(sorted(picked))
+    series = {
+        "measured": (_fetch_series(signature, "measurements", subs)
+                     if choice in ("Measured", "Both") and timeline.measured else None),
+        "forecast": (_fetch_series(signature, "forecasts", subs)
+                     if choice in ("Forecast", "Both") and timeline.forecast else None),
+    }
+    view = st.session_state.get("op_view") or {}
+    st.plotly_chart(_polish(_dv.figure(series, items, quantity, marker=view.get("ts"))),
+                    width="stretch", theme=None, key="dv_chart")
+
+    facts = []
+    for label, payload, ticks in (("Measured", series["measured"], timeline.measured),
+                                  ("Forecast", series["forecast"], timeline.forecast)):
+        if payload:
+            res = _tl.resolution(ticks) or "—"
+            facts.append(f"**{label}** {ticks[0][:16]} → {ticks[-1][:16]} · {len(ticks)} ticks · "
+                         f"{res} · {payload.get('source') or '—'}"
+                         + (f" · shown every {payload['stride']}th tick" if payload.get("stride", 1) > 1 else ""))
+    st.caption("  \n".join(facts))
+
+    if choice == "Both":
+        for item in items:
+            err = _dv.forecast_error(series["measured"], series["forecast"], item, quantity)
+            if err:
+                st.caption(
+                    f"Forecast error, {item}, {_dv.QUANTITIES[quantity].lower()}, over the {err['n']} "
+                    f"shared ticks ({err['first'][5:16]} → {err['last'][5:16]}): "
+                    f"bias {err['bias']:+.2f} MW · MAE {err['mae']:.2f} MW"
+                    + (f" · MAPE {err['mape_pct']:.1f} %" if err["mape_pct"] is not None else ""))
+
+    with st.expander("Table", icon=":material/table:"):
+        columns = {}
+        for dataset, payload in series.items():
+            for item in items:
+                ys = _dv.values(payload, item, quantity)
+                if ys:
+                    columns[f"{item} — {dataset} (MW)"] = pd.Series(ys, index=payload["timestamps"])
+        if columns:
+            frame = pd.DataFrame(columns)
+            frame.index.name = "timestamp"
+            st.dataframe(frame, width="stretch", height=360)
+        else:
+            st.caption("Nothing to show for this selection.")
+
+
 # a question can be asked while looking at the diagram.
-_chat_tab, _system_tab = st.tabs(["Chat", "System"])
+_chat_tab, _system_tab, _data_tab = st.tabs(["Chat", "System", "Data"])
 
 with _chat_tab:
     if not st.session_state.messages:
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
             st.markdown(
                 f"Hello! I'm **{_BRAND_NAME}**, an LLM-orchestrated digital twin for uncertainty-aware distribution grid operations. "
                 "I can help you analyze deterministic security, run N-1 contingency studies, quantify probabilistic risk, "
@@ -3181,7 +3608,7 @@ with _chat_tab:
             )
     _suggestion_request: tuple[int, str] | None = None
     for _msg_idx, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"]):
+        with st.chat_message(msg["role"], avatar=_AVATARS.get(msg["role"])):
             st.markdown(msg["text"])
             if msg.get("charts"):
                 render_charts(msg["charts"])
@@ -3218,6 +3645,13 @@ with _chat_tab:
 
 with _system_tab:
     _render_system_view()
+
+with _data_tab:
+    try:
+        _render_data_view()
+    except Exception:  # noqa: BLE001 — the viewer must never take the page down
+        logging.getLogger(__name__).warning("Data view failed.", exc_info=True)
+        st.caption("⚠️ The data view could not be drawn.")
 
 
 
@@ -3260,7 +3694,7 @@ def _chat_input_fragment():
                 label_visibility="collapsed",
             )
         with fc_send:
-            send = st.form_submit_button("Send", use_container_width=True, type="primary")
+            send = st.form_submit_button("Send", width="stretch", type="primary")
 
     if not (send and typed and typed.strip()):
         return
@@ -3277,19 +3711,11 @@ def _chat_input_fragment():
     # — rather than trusting any particular upload path to announce itself.
     _swapped = _reset_if_network_changed()
 
-    # If the timeline scrubber is parked on a forecast tick, the simulation clock
-    # can't be there (forecasts are query-only), so steer the LLM to analyse that
-    # forecast timestamp explicitly.
-    _vft = st.session_state.get("viewing_forecast_ts")
-    if _vft:
-        llm_input = (
-            f"[The user is viewing the FORECAST timestamp {_vft} on the timeline. "
-            f"Treat this as the timestamp of interest: use data_source=\"forecasts\" and "
-            f"timestamp=\"{_vft}\" for time-specific tools unless they ask otherwise.]\n\n"
-            + effective_input
-        )
-    else:
-        llm_input = effective_input
+    # On a forecast, or comparing, the simulation clock is not the moment of
+    # interest, so the agent is told which data and which time (agent/timeline.py).
+    _view = st.session_state.get("op_view") or {}
+    _note = _tl.agent_note(_view.get("mode", _tl.MEASURED), _view.get("ts"))
+    llm_input = f"{_note}\n\n{effective_input}" if _note else effective_input
 
     # Before the new message is appended: the outcome refers to suggestions
     # shown under the previous answer.
@@ -3312,7 +3738,7 @@ def _chat_input_fragment():
         with st.chat_message("user"):
             st.markdown(effective_input)
 
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
             status_box = st.status("Thinking…", expanded=True)
 
             def _on_event(event: str, data: dict) -> None:
@@ -3376,6 +3802,9 @@ def _chat_input_fragment():
                 final_text, updated_history = run_agent_turn(
                     user_message=llm_input,
                     history=st.session_state.history,
+                    # One id per conversation, so its turns group in the log;
+                    # without it every turn got a fresh `id(history)`.
+                    conversation_id=st.session_state.ui_conversation_id,
                     on_event=_on_event,
                     reflection=st.session_state.get("reflection_mode", "off"),
                 )

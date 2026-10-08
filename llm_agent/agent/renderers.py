@@ -26,8 +26,53 @@ from .network_map import MARKER_PX, NetworkMap
 # Shared theme
 # ---------------------------------------------------------------------------
 
+import plotly.io as pio
+
+
+class _C:
+    """One meaning per colour, for every chart.
+
+    Before this, ~35 literal colours carried overlapping meanings — red marked
+    violations but also "max voltage", "before" bars and decreases; orange was a
+    violation in one chart and a decrease in the next. Hues follow a
+    colour-blind-aware scheme; violations also get a dashed line or an `x`
+    marker where it matters, so meaning never rests on hue alone.
+    """
+    VIOLATION = "#D64545"   # a violation, a limit line — and nothing else
+    OK = "#2E9E6B"          # secure, feasible, within limits
+    WARN = "#E8A317"        # near a limit, the worst moment, attention
+    PRIMARY = "#1D6FE8"     # the main data series (the brand blue)
+    TEAL = "#0E9F9A"        # a second data series; an increase
+    PURPLE = "#8E5CD9"      # a third data series; a decrease
+    NEUTRAL = "#9AA3B2"     # no data, uncontrollable, reference
+    INK = "#2E3140"         # text, zero lines
+    GRID = "#ECEFF5"
+
+
+pio.templates["conductor"] = go.layout.Template(
+    layout={
+        "font": {"family": "Source Sans 3, Source Sans Pro, Inter, system-ui, sans-serif",
+                 "size": 12, "color": _C.INK},
+        "title": {"font": {"size": 15, "color": _C.INK}, "x": 0.0, "xanchor": "left",
+                  "xref": "paper"},
+        "colorway": [_C.PRIMARY, _C.TEAL, _C.PURPLE, _C.WARN, _C.NEUTRAL, _C.OK],
+        "paper_bgcolor": "white",
+        "plot_bgcolor": "white",
+        "xaxis": {"gridcolor": _C.GRID, "linecolor": "#D5DAE3", "zerolinecolor": "#C9CFDA",
+                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}}},
+        "yaxis": {"gridcolor": _C.GRID, "linecolor": "#D5DAE3", "zerolinecolor": "#C9CFDA",
+                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}}},
+        "legend": {"font": {"size": 11}, "bgcolor": "rgba(255,255,255,0.8)"},
+        "hoverlabel": {"bgcolor": "white", "bordercolor": "#D5DAE3",
+                       "font": {"size": 12, "color": _C.INK}},
+        "bargap": 0.25,
+    }
+)
+pio.templates.default = "conductor"
+
+
 CHART_THEME: dict = {
-    "template": "plotly_white",
+    "template": "conductor",
     "margin": {"l": 40, "r": 20, "t": 50, "b": 60},
 }
 
@@ -56,10 +101,45 @@ def _float_or_none(value) -> float | None:
         return None
 
 
+# Colour for an element with no value — out of service, or not solved. Never
+# the "healthy" colour: an element with no reading has not been shown to be fine.
+_NO_DATA_COLOR = "#bbbbbb"
+
+
+def _over(value, limit) -> bool:
+    """`value > limit`, False when either is missing.
+
+    The backend reports NaN results (an out-of-service transformer's loading,
+    for one) as None, and a bare comparison raised TypeError — which, before
+    the chart guard in app.py, took the whole conversation view down.
+    """
+    v, lim = _float_or_none(value), _float_or_none(limit)
+    return v is not None and lim is not None and v > lim
+
+
+def _voltage_range(series: list, lower, upper, pad: float = 0.02) -> list[float]:
+    """A voltage axis that shows every value and both limits.
+
+    The fixed [0.88, 1.12] it replaces dropped a 0.85 p.u. bus off the chart
+    without notice — hiding exactly the severe undervoltage the operator is
+    looking for.
+    """
+    values = [v for v in (_float_or_none(x) for seq in series for x in (seq or [])) if v is not None]
+    limits = [v for v in (_float_or_none(lower), _float_or_none(upper)) if v is not None]
+    pool = values + limits or [0.9, 1.1]
+    return [min(min(pool) - pad, 0.88), max(max(pool) + pad, 1.12)]
+
+
 def _empty_figure(title: str, color: str = "#333") -> go.Figure:
-    """Return a blank figure with a descriptive centred title."""
+    """Return a blank figure with a descriptive centred title.
+
+    Tagged in `layout.meta` as a status rather than a chart, so the app can
+    show it as a one-line message instead of a 450 px empty canvas.
+    """
+    tone = {_C.VIOLATION: "error", _C.OK: "ok"}.get(color, "info")
     fig = go.Figure()
     fig.update_layout(
+        meta={"conductor_status": title, "tone": tone},
         title={"text": title, "font": {"color": color}},
         **CHART_THEME,
         xaxis={"visible": False},
@@ -172,7 +252,7 @@ def render_rsa(result: dict) -> list[go.Figure]:
             bus_names = _safe_labels([name for name, _ in valid_points], "Bus")
             vm_values = [vm for _, vm in valid_points]
             colors = [
-                "red" if (v < vm_lower or v > vm_upper) else "steelblue"
+                _C.VIOLATION if (v < vm_lower or v > vm_upper) else _C.PRIMARY
                 for v in vm_values
             ]
             fig_v = go.Figure()
@@ -190,9 +270,10 @@ def render_rsa(result: dict) -> list[go.Figure]:
                 fig_v.add_hline(
                     y=limit,
                     line_dash="dash",
-                    line_color="red",
+                    line_color=_C.VIOLATION,
                     annotation_text=label,
-                    annotation_position="right",
+                    annotation_position="top right" if limit == vm_upper else "bottom right",
+                    annotation_font_color=_C.VIOLATION,
                 )
             _v_min = min(vm_values)
             _v_max = max(vm_values)
@@ -215,8 +296,9 @@ def render_rsa(result: dict) -> list[go.Figure]:
         line_names_raw = _safe_labels([l.get("line_name", "") for l in all_line_loading], "Line")
         line_names_axis = [_compact_branch_label(n) for n in line_names_raw]
         line_names = _unique_labels(line_names_axis)
-        line_vals = [l.get("loading_percent", 0.0) for l in all_line_loading]
-        line_colors = ["red" if v > max_loading else "steelblue" for v in line_vals]
+        line_vals = [_float_or_none(l.get("loading_percent")) for l in all_line_loading]
+        line_colors = [_NO_DATA_COLOR if v is None else (_C.VIOLATION if _over(v, max_loading) else _C.PRIMARY)
+                       for v in line_vals]
 
         fig_l = go.Figure(
             go.Bar(
@@ -231,9 +313,10 @@ def render_rsa(result: dict) -> list[go.Figure]:
         fig_l.add_hline(
             y=max_loading,
             line_dash="dash",
-            line_color="red",
+            line_color=_C.VIOLATION,
             annotation_text=f"{max_loading:.0f}% limit",
-            annotation_position="right",
+            annotation_position="top right",
+            annotation_font_color=_C.VIOLATION,
         )
         fig_l.update_layout(
             title="Line Loading (%)",
@@ -252,9 +335,10 @@ def render_rsa(result: dict) -> list[go.Figure]:
         trafo_names_raw = _safe_labels([t.get("trafo_name", "") for t in all_trafo_loading], "Trafo")
         trafo_names_axis = [_compact_branch_label(n) for n in trafo_names_raw]
         trafo_names = _unique_labels(trafo_names_axis)
-        trafo_vals = [t.get("loading_percent", 0.0) for t in all_trafo_loading]
+        trafo_vals = [_float_or_none(t.get("loading_percent")) for t in all_trafo_loading]
         trafo_colors = [
-            "red" if v > max_loading else "steelblue" for v in trafo_vals
+            _NO_DATA_COLOR if v is None else (_C.VIOLATION if _over(v, max_loading) else _C.PRIMARY)
+            for v in trafo_vals
         ]
 
         fig_t = go.Figure(
@@ -270,9 +354,10 @@ def render_rsa(result: dict) -> list[go.Figure]:
         fig_t.add_hline(
             y=max_loading,
             line_dash="dash",
-            line_color="red",
+            line_color=_C.VIOLATION,
             annotation_text=f"{max_loading:.0f}% limit",
-            annotation_position="right",
+            annotation_position="top right",
+            annotation_font_color=_C.VIOLATION,
         )
         fig_t.update_layout(
             title="Transformer Loading (%)",
@@ -289,70 +374,108 @@ def render_rsa(result: dict) -> list[go.Figure]:
 # ---------------------------------------------------------------------------
 
 _VIOLATION_COLORS = {
-    "bus_vm_pu": "orange",
-    "line_loading": "red",
-    "trafo_loading": "darkred",
+    "bus_vm_pu": _C.WARN,
+    "line_loading": _C.VIOLATION,
+    "trafo_loading": _C.VIOLATION,
 }
 
 
-def render_contingency_violations(result: dict) -> go.Figure:
-    """
-    Single figure for simulate_contingency or simulate_all_contingencies results.
-    Returns a green placeholder if no violations.
+_PROBLEM_LABELS = {"line_loading": "Line overload", "trafo_loading": "Transformer overload"}
+
+
+def render_contingency_violations(result: dict):
+    """N-1 results: which outage causes what, worst first.
+
+    The previous chart drew one bar per violated element, every bar of length
+    1, and left out the outage that caused each violation — the question an
+    N-1 screen exists to answer. A sorted table answers it directly. Outages
+    with no converged power flow are stated first: they are the most severe
+    result an N-1 screen can return, not an absence of violations.
     """
     is_full_sweep = "total_outages_tested" in result
-    title_prefix = "N-1 Sweep — Violations by Element" if is_full_sweep else "Contingency Violations by Element"
+    thresholds = result.get("thresholds_used") or {}
+    non_converged = result.get("non_converged_outages") or []
 
-    # Secure system
-    if result.get("system_secure") or result.get("system_n1_secure"):
-        fig = _empty_figure("✅ No violations detected", color="green")
-        fig.update_layout(title={"text": "✅ No violations detected", "font": {"color": "green"}})
-        return fig
+    if result.get("converged") is False:
+        return _empty_figure(
+            "The power flow did not converge after this outage — the system has no "
+            "stable operating point without this element. Treat it as insecure.",
+            color=_C.VIOLATION)
 
-    violations = result.get("violations", [])
+    figs = []
+    if non_converged:
+        listed = ", ".join(non_converged[:6]) + (" …" if len(non_converged) > 6 else "")
+        figs.append(_empty_figure(
+            f"{len(non_converged)} outage(s) with no converged power flow — no stable "
+            f"operating point, treat as insecure: {listed}", color=_C.VIOLATION))
+
+    violations = result.get("violations") or []
     if not violations:
-        return _empty_figure("No violation data available")
+        if result.get("system_secure") or result.get("system_n1_secure"):
+            return _empty_figure("✅ No violations detected", color=_C.OK)
+        return figs or _empty_figure("No violation data available")
 
-    total_count = result.get("total_violations", len(violations))
-
-    # Count occurrences per element + violation_type
-    element_counts: dict[tuple[str, str], int] = {}
+    vlo = _float_or_none(thresholds.get("vm_lower_pu"))
+    vhi = _float_or_none(thresholds.get("vm_upper_pu"))
+    rows = []
     for v in violations:
-        raw_name = v.get("element_name") or ""
-        name = str(raw_name).strip() if str(raw_name).strip() else f"Element_{v.get('element_index', '?')}"
-        key = (name, v.get("violation_type", "unknown"))
-        element_counts[key] = element_counts.get(key, 0) + 1
+        kind = v.get("violation_type", "")
+        value = _float_or_none(v.get("value"))
+        if kind == "bus_vm_pu":
+            # Which side of the band, judged by the midpoint: values arrive
+            # rounded to 3 decimals, so a 0.9396 p.u. violation of a 0.94
+            # floor reads as exactly 0.940 and a `< floor` test calls it an
+            # overvoltage.
+            mid = (vlo + vhi) / 2 if vlo is not None and vhi is not None else 1.0
+            low = value is not None and value < mid
+            problem = "Undervoltage" if low else "Overvoltage"
+            limit = vlo if low else vhi
+            # Distance past the limit, in % of nominal, so voltage and loading
+            # violations sort on one scale.
+            if value is not None and limit is not None:
+                severity = max((limit - value) if low else (value - limit), 0.0) * 100
+            else:
+                severity = 0.0
+            shown_value = f"{value:.3f} p.u." if value is not None else "—"
+            shown_limit = f"{limit:.3f} p.u." if limit is not None else "—"
+        else:
+            problem = _PROBLEM_LABELS.get(kind, kind or "Violation")
+            key = "max_trafo_loading_pct" if kind == "trafo_loading" else "max_line_loading_pct"
+            limit = _float_or_none(thresholds.get(key))
+            severity = value - limit if value is not None and limit is not None else 0.0
+            shown_value = f"{value:.1f} %" if value is not None else "—"
+            shown_limit = f"{limit:.0f} %" if limit is not None else "—"
+        rows.append((severity, str(v.get("outage_cause") or "—"),
+                     str(v.get("element_name") or f"Element_{v.get('element_index', '?')}"),
+                     problem, shown_value, shown_limit))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    # Every row: the app shows this figure as a scrollable, copyable table
+    # (app.py `_table_of`), so there is no height to cap it for.
+    shown = rows
 
-    elements = [k[0] for k in element_counts]
-    vtypes = [k[1] for k in element_counts]
-    counts = list(element_counts.values())
-    colors = [_VIOLATION_COLORS.get(vt, "grey") for vt in vtypes]
-
-    fig = go.Figure(
-        go.Bar(
-            x=counts,
-            y=elements,
-            orientation="h",
-            marker_color=colors,
-            text=vtypes,
-            textposition="inside",
-            insidetextanchor="start",
-            textfont={"color": "white", "size": 12},
-        )
-    )
-    subtitle = f"Total: {total_count} violation(s)"
+    columns = list(zip(*[r[1:] for r in shown]))
+    headers = ["Outage", "Violated element", "Problem", "Value", "Limit"]
+    if not is_full_sweep:
+        columns, headers = columns[1:], headers[1:]
+    fig = go.Figure(go.Table(
+        header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7",
+                "align": "left", "font": {"size": 12}},
+        cells={"values": columns, "align": "left", "height": 26, "font": {"size": 12},
+               "fill_color": [["#fdecea" if r[3] != "—" else "white" for r in shown]]},
+    ))
     if is_full_sweep:
-        subtitle += (
-            f" | {result.get('total_outages_causing_violations', '?')} outages "
-            f"out of {result.get('total_outages_tested', '?')} tested"
-        )
+        title = (f"N-1 screen — {result.get('total_outages_causing_violations', '?')} of "
+                 f"{result.get('total_outages_tested', '?')} outages cause violations")
+    else:
+        title = "Violations after the outage"
+    note = f" (worst {len(shown)} of {len(rows)} shown)" if len(rows) > len(shown) else ""
     fig.update_layout(
-        title=f"{title_prefix}<br><sup>{subtitle}</sup>",
-        xaxis={"title": "Violation count"},
-        yaxis={"title": "Element", "automargin": True},
-        **CHART_THEME,
+        title=f"{title}<br><sup>{len(rows)} violation(s), worst first{note}</sup>",
+        height=min(700, 110 + 27 * len(shown)),
+        **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}},
     )
-    return fig
+    figs.append(fig)
+    return figs if len(figs) > 1 else fig
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +496,7 @@ def _render_post_opf_voltages(result: dict) -> go.Figure | None:
 
     # Dots are red when outside the OPF bounds (should not happen, but surface if so)
     colors = [
-        "red" if (v < vm_lower - 1e-4 or v > vm_upper + 1e-4) else "#1f77b4"
+        _C.VIOLATION if (v < vm_lower - 1e-4 or v > vm_upper + 1e-4) else _C.PRIMARY
         for v in vm_pu
     ]
 
@@ -388,11 +511,11 @@ def _render_post_opf_voltages(result: dict) -> go.Figure | None:
         )
     )
     fig.add_hline(
-        y=vm_upper, line_dash="dash", line_color="red",
+        y=vm_upper, line_dash="dash", line_color=_C.VIOLATION,
         annotation_text=f"Upper {vm_upper} p.u.", annotation_position="top right",
     )
     fig.add_hline(
-        y=vm_lower, line_dash="dash", line_color="red",
+        y=vm_lower, line_dash="dash", line_color=_C.VIOLATION,
         annotation_text=f"Lower {vm_lower} p.u.", annotation_position="bottom right",
     )
     y_pad = 0.02
@@ -423,18 +546,14 @@ def render_dispatch(result: dict) -> list[go.Figure]:
       2. Grey       — P_base (operating point OPF departs from).
       3. Green/orange — P_new (OPF result).
     """
-    if result.get("status") == "infeasible":
-        fig = _empty_figure(
-            "❌ Optimizer infeasible — violations cannot be resolved by local flexibility",
-            color="red",
-        )
-        fig.update_layout(
-            title={
-                "text": "❌ Optimizer infeasible",
-                "font": {"color": "red"},
-            }
-        )
-        return [fig]
+    # Any failed solve, not just the one spelled "infeasible": an iteration
+    # limit or a capped solve that cannot meet its cap used to fall through to
+    # "No dispatch data — run the optimizer first".
+    if result.get("status") == "infeasible" or result.get("feasible") is False:
+        reason = result.get("message") or "violations cannot be resolved by local flexibility"
+        if str(reason).strip().rstrip(".").lower() == "infeasible":
+            reason = "violations cannot be resolved by local flexibility"
+        return [_empty_figure(f"❌ Optimizer did not find a usable dispatch — {reason}", color=_C.VIOLATION)]
 
     resources = result.get("activated_resources", [])
     dispatch_pre_disable = result.get("dispatch_pre_disable")  # dict or None
@@ -464,7 +583,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
     pg_new = [resource_map[e]["Pg_new"] if e in resource_map else None for e in all_elements]
 
     pg_new_colors = [
-        ("green" if (n >= b) else "orange") if (n is not None and b is not None) else "grey"
+        (_C.OK if (n >= b) else _C.WARN) if (n is not None and b is not None) else _C.NEUTRAL
         for n, b in zip(pg_new, pg_base)
     ]
 
@@ -484,7 +603,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
                 name="P pre-disable (MW)",
                 x=all_elements,
                 y=pg_pre,
-                marker_color="lightgrey",
+                marker_color=_C.NEUTRAL,
                 opacity=0.9,
             )
         )
@@ -494,7 +613,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
             name="P_base (MW)",
             x=all_elements,
             y=pg_base,
-            marker_color="grey",
+            marker_color=_C.NEUTRAL,
             opacity=0.7,
         )
     )
@@ -530,7 +649,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
     # --- Reactive power traces (hidden by default, revealed via toggle button) ---
     if has_q:
         qg_new_colors_q = [
-            "teal" if (v is not None and v >= 0) else "orange"
+            "teal" if (v is not None and v >= 0) else _C.WARN
             for v in qg_new
         ]
         fig.add_trace(
@@ -613,14 +732,14 @@ def render_dispatch(result: dict) -> list[go.Figure]:
         for e in delta_p_elems
     ]
     if any(abs(v) > 1e-6 for v in delta_p):
-        dp_colors = ["#2ca02c" if v >= 0 else "#ff7f0e" for v in delta_p]
+        dp_colors = [_C.OK if v >= 0 else _C.WARN for v in delta_p]
         fig_dp = go.Figure(go.Bar(
             x=delta_p_elems, y=delta_p,
             marker_color=dp_colors,
             text=[f"{v:+.4f}" if abs(v) > 1e-5 else "" for v in delta_p],
             textposition="outside",
         ))
-        fig_dp.add_hline(y=0, line_color="black", line_width=0.8)
+        fig_dp.add_hline(y=0, line_color=_C.INK, line_width=0.8)
         fig_dp.update_layout(
             title="ΔP — Active Power Change (MW)",
             xaxis={"title": "Generator", "tickangle": 45},
@@ -641,14 +760,14 @@ def render_dispatch(result: dict) -> list[go.Figure]:
         for e in delta_q_elems
     ]
     if any(abs(v) > 1e-6 for v in delta_q):
-        dq_colors = ["#2ca02c" if v >= 0 else "#d62728" for v in delta_q]
+        dq_colors = [_C.OK if v >= 0 else _C.VIOLATION for v in delta_q]
         fig_dq = go.Figure(go.Bar(
             x=delta_q_elems, y=delta_q,
             marker_color=dq_colors,
             text=[f"{v:+.4f}" if abs(v) > 1e-5 else "" for v in delta_q],
             textposition="outside",
         ))
-        fig_dq.add_hline(y=0, line_color="black", line_width=0.8)
+        fig_dq.add_hline(y=0, line_color=_C.INK, line_width=0.8)
         fig_dq.update_layout(
             title="ΔQ — Reactive Power Change (MVAr)",
             xaxis={"title": "Generator", "tickangle": 45},
@@ -673,7 +792,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
                 dv = round(float(bv["vm_pu"]) - base_map[bname], 6)
                 dv_names.append(bname)
                 dv_vals.append(dv)
-                dv_colors.append("#d62728" if dv > 0 else "#1f77b4")
+                dv_colors.append(_C.VIOLATION if dv > 0 else _C.PRIMARY)
         if dv_names and any(abs(v) > 1e-5 for v in dv_vals):
             fig_dv = go.Figure(go.Bar(
                 x=dv_names, y=dv_vals,
@@ -681,7 +800,7 @@ def render_dispatch(result: dict) -> list[go.Figure]:
                 text=[f"{v:+.5f}" if abs(v) > 1e-5 else "" for v in dv_vals],
                 textposition="outside",
             ))
-            fig_dv.add_hline(y=0, line_color="black", line_width=0.8)
+            fig_dv.add_hline(y=0, line_color=_C.INK, line_width=0.8)
             fig_dv.update_layout(
                 title="ΔV — Bus Voltage Change (p.u.)",
                 xaxis={"title": "Bus", "tickangle": 45},
@@ -746,16 +865,22 @@ def render_kpis(result: dict) -> go.Figure:
 
     if not metrics:
         return _empty_figure("No KPI data — run evaluate_kpis first")
+    status = str(result.get("status", "success")).lower()
+    if status not in ("success", "optimal"):
+        # A failed evaluation used to be drawn as three red 0 % gauges — read
+        # as measured values. Say it failed, with the backend's reason.
+        reason = result.get("message") or result.get("detail") or status
+        return _empty_figure(f"KPI evaluation did not complete: {reason}", color=_C.VIOLATION)
 
-    kpi1 = metrics.get("kpi_1_target_demand_flex_pct", 0.0)
-    kpi2 = metrics.get("kpi_2_flex_utilization_pct", 0.0)
-    kpi3 = metrics.get("kpi_3_prevented_violation_ratio_pct", 0.0)
+    kpi1 = _float_or_none(metrics.get("kpi_1_target_demand_flex_pct"))
+    kpi2 = _float_or_none(metrics.get("kpi_2_flex_utilization_pct"))
+    kpi3 = _float_or_none(metrics.get("kpi_3_prevented_violation_ratio_pct"))
 
     has_constrained = bool(constrained) and constrained.get("status") == "optimal"
     n_rows = 2 if has_constrained else 1
 
     specs = [[{"type": "indicator"}] * 3 for _ in range(n_rows)]
-    subplot_titles = ["KPI-3: Violations Prevented", "KPI-2: Flex Utilization", "KPI-1: Flex Headroom"]
+    subplot_titles = ["KPI-3: Violations prevented", "KPI-2: Flexibility used", "KPI-1: Demand flexibility available"]
     if has_constrained:
         slack = constrained.get("slack_max_mw", "?")
         subplot_titles += [
@@ -778,11 +903,11 @@ def render_kpis(result: dict) -> go.Figure:
         go.Indicator(
             mode="gauge+number",
             value=kpi3,
-            title={"text": "KPI-3: Violations Prevented (%)"},
             gauge={
                 "axis": {"range": [0, 100]},
                 "bar": {
-                    "color": "green" if kpi3 == 100 else ("orange" if kpi3 > 50 else "red")
+                    "color": _NO_DATA_COLOR if kpi3 is None else
+                    (_C.OK if kpi3 == 100 else (_C.WARN if kpi3 > 50 else _C.VIOLATION))
                 },
             },
             number={"suffix": "%"},
@@ -793,11 +918,11 @@ def render_kpis(result: dict) -> go.Figure:
         go.Indicator(
             mode="gauge+number",
             value=kpi2,
-            title={"text": "KPI-2: Flex Utilization (%)"},
             gauge={
                 "axis": {"range": [0, 100]},
                 "bar": {
-                    "color": "green" if kpi2 > 90 else ("orange" if kpi2 > 50 else "red")
+                    "color": _NO_DATA_COLOR if kpi2 is None else
+                    (_C.OK if kpi2 > 90 else (_C.WARN if kpi2 > 50 else _C.VIOLATION))
                 },
             },
             number={"suffix": "%"},
@@ -808,10 +933,9 @@ def render_kpis(result: dict) -> go.Figure:
         go.Indicator(
             mode="gauge+number",
             value=kpi1,
-            title={"text": "KPI-1: Target Demand Flex (%)"},
             gauge={
                 "axis": {"range": [0, 100]},
-                "bar": {"color": "steelblue"},
+                "bar": {"color": _C.PRIMARY},
             },
             number={"suffix": "%"},
         ),
@@ -820,9 +944,9 @@ def render_kpis(result: dict) -> go.Figure:
 
     # Row 2: constrained scenario (optional)
     if has_constrained:
-        ck1 = constrained.get("kpi_1_target_demand_flex_pct", 0.0)
-        ck2 = constrained.get("kpi_2_flex_utilization_pct", 0.0)
-        ck3 = constrained.get("kpi_3_prevented_violation_ratio_pct", 0.0)
+        ck1 = _float_or_none(constrained.get("kpi_1_target_demand_flex_pct"))
+        ck2 = _float_or_none(constrained.get("kpi_2_flex_utilization_pct"))
+        ck3 = _float_or_none(constrained.get("kpi_3_prevented_violation_ratio_pct"))
 
         fig.add_trace(
             go.Indicator(
@@ -831,7 +955,8 @@ def render_kpis(result: dict) -> go.Figure:
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {
-                        "color": "green" if ck3 == 100 else ("orange" if ck3 > 50 else "red")
+                        "color": _NO_DATA_COLOR if ck3 is None else
+                        (_C.OK if ck3 == 100 else (_C.WARN if ck3 > 50 else _C.VIOLATION))
                     },
                 },
                 number={"suffix": "%"},
@@ -845,7 +970,8 @@ def render_kpis(result: dict) -> go.Figure:
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {
-                        "color": "green" if ck2 > 90 else ("orange" if ck2 > 50 else "red")
+                        "color": _NO_DATA_COLOR if ck2 is None else
+                        (_C.OK if ck2 > 90 else (_C.WARN if ck2 > 50 else _C.VIOLATION))
                     },
                 },
                 number={"suffix": "%"},
@@ -858,7 +984,7 @@ def render_kpis(result: dict) -> go.Figure:
                 value=ck1,
                 gauge={
                     "axis": {"range": [0, 100]},
-                    "bar": {"color": "steelblue"},
+                    "bar": {"color": _C.PRIMARY},
                 },
                 number={"suffix": "%"},
             ),
@@ -874,6 +1000,12 @@ def render_kpis(result: dict) -> go.Figure:
         height=350 * n_rows,
         **CHART_THEME,
     )
+    if constrained and not has_constrained:
+        # The constrained scenario ran and was not optimal; it used to vanish.
+        slack = constrained.get("slack_max_mw", "?")
+        why = constrained.get("message") or constrained.get("status") or "not solved"
+        return [fig, _empty_figure(
+            f"Constrained scenario (±{slack} MW external grid): {why}", color=_C.VIOLATION)]
     return fig
 
 
@@ -896,7 +1028,7 @@ def render_kpi_forecast(result: dict) -> go.Figure:
             x=timestamps,
             y=kpi1_vals,
             mode="lines+markers",
-            line={"color": "steelblue"},
+            line={"color": _C.PRIMARY},
             marker={"size": 5},
             name="KPI-1 (%)",
         )
@@ -953,7 +1085,7 @@ def render_time_series(result: dict) -> list[go.Figure]:
                 x=timestamps,
                 y=min_v,
                 mode="lines+markers",
-                line={"color": "steelblue", "dash": "dot", "width": 2},
+                line={"color": _C.PRIMARY, "dash": "dot", "width": 2},
                 marker={"size": 5},
                 name="Min Voltage (p.u.)",
             )
@@ -964,23 +1096,24 @@ def render_time_series(result: dict) -> list[go.Figure]:
                 x=timestamps,
                 y=max_v,
                 mode="lines+markers",
-                line={"color": "tomato", "dash": "dot", "width": 2},
+                line={"color": _C.PURPLE, "dash": "dot", "width": 2},
                 marker={"size": 5},
                 name="Max Voltage (p.u.)",
             )
         )
 
     # Reference lines via shapes (reliable with overlaying dual-axis)
-    max_violations = max(violations) if violations else 1
+    known = [v for v in (_float_or_none(x) for x in violations) if v is not None]
+    max_violations = max(known) if known else 1
     voltage_fig.update_layout(
         title="Grid Security Evolution Over Time",
         xaxis={"title": "Timestamp", "tickangle": 45},
         yaxis={
             "title": "Voltage (p.u.)",
-            "range": [0.88, 1.12],
+            "range": _voltage_range([min_v, max_v], vm_lower, vm_upper),
         },
         yaxis2={
-            "title": "Violation Count",
+            "title": "Violation Count", "tickformat": "d",
             "overlaying": "y",
             "side": "right",
             "showgrid": False,
@@ -991,24 +1124,24 @@ def render_time_series(result: dict) -> list[go.Figure]:
             {
                 "type": "line", "xref": "paper", "x0": 0, "x1": 1,
                 "yref": "y", "y0": vm_upper, "y1": vm_upper,
-                "line": {"dash": "dash", "color": "red", "width": 1},
+                "line": {"dash": "dash", "color": _C.VIOLATION, "width": 1},
             },
             {
                 "type": "line", "xref": "paper", "x0": 0, "x1": 1,
                 "yref": "y", "y0": vm_lower, "y1": vm_lower,
-                "line": {"dash": "dash", "color": "red", "width": 1},
+                "line": {"dash": "dash", "color": _C.VIOLATION, "width": 1},
             },
         ],
         annotations=[
             {
                 "x": 1.01, "y": vm_upper, "xref": "paper", "yref": "y",
                 "text": f"V_max {vm_upper:.2f}", "showarrow": False,
-                "xanchor": "left", "font": {"color": "red"},
+                "xanchor": "left", "font": {"color": _C.VIOLATION},
             },
             {
                 "x": 1.01, "y": vm_lower, "xref": "paper", "yref": "y",
                 "text": f"V_min {vm_lower:.2f}", "showarrow": False,
-                "xanchor": "left", "font": {"color": "red"},
+                "xanchor": "left", "font": {"color": _C.VIOLATION},
             },
         ],
         barmode="overlay",
@@ -1022,7 +1155,7 @@ def render_time_series(result: dict) -> list[go.Figure]:
                 x=timestamps,
                 y=max_line_loading,
                 mode="lines+markers",
-                line={"color": "darkorange", "width": 2},
+                line={"color": _C.WARN, "width": 2},
                 marker={"size": 5},
                 name="Max Line Loading (%)",
             )
@@ -1033,7 +1166,7 @@ def render_time_series(result: dict) -> list[go.Figure]:
                 x=timestamps,
                 y=max_trafo_loading,
                 mode="lines+markers",
-                line={"color": "seagreen", "dash": "dot", "width": 2},
+                line={"color": _C.TEAL, "dash": "dot", "width": 2},
                 marker={"size": 5},
                 name="Max Trafo Loading (%)",
             )
@@ -1053,24 +1186,24 @@ def render_time_series(result: dict) -> list[go.Figure]:
             {
                 "type": "line", "xref": "paper", "x0": 0, "x1": 1,
                 "yref": "y", "y0": max_loading, "y1": max_loading,
-                "line": {"dash": "dash", "color": "darkorange", "width": 1},
+                "line": {"dash": "dash", "color": _C.WARN, "width": 1},
             },
             {
                 "type": "line", "xref": "paper", "x0": 0, "x1": 1,
                 "yref": "y", "y0": max_trafo_loading_pct, "y1": max_trafo_loading_pct,
-                "line": {"dash": "dash", "color": "seagreen", "width": 1},
+                "line": {"dash": "dash", "color": _C.TEAL, "width": 1},
             },
         ],
         annotations=[
             {
                 "x": 1.01, "y": max_loading, "xref": "paper", "yref": "y",
                 "text": f"Line limit {max_loading:.0f}%", "showarrow": False,
-                "xanchor": "left", "font": {"color": "darkorange"},
+                "xanchor": "left", "font": {"color": _C.WARN},
             },
             {
                 "x": 1.01, "y": max_trafo_loading_pct, "xref": "paper", "yref": "y",
                 "text": f"Trafo limit {max_trafo_loading_pct:.0f}%", "showarrow": False,
-                "xanchor": "left", "font": {"color": "seagreen"},
+                "xanchor": "left", "font": {"color": _C.TEAL},
             },
         ],
         **CHART_THEME,
@@ -1098,10 +1231,10 @@ def render_conditions(result: dict) -> list[go.Figure]:
         fig_gen = _empty_figure("No generator data")
     else:
         names    = [g["name"]       for g in generators]
-        pg_mw    = [g["Pg_mw"]      for g in generators]
+        pg_mw    = [_float_or_none(g.get("Pg_mw")) for g in generators]
         pg_max   = [g.get("Pg_max_mw") for g in generators]
-        # Colour bars: green when producing, grey when idle (≈0)
-        colors = ["#2ca02c" if p > 0.01 else "#aaaaaa" for p in pg_mw]
+        # Colour bars: green when producing, grey when idle (≈0) or unknown
+        colors = [_C.OK if _over(p, 0.01) else _C.NEUTRAL for p in pg_mw]
 
         fig_gen = go.Figure()
         fig_gen.add_trace(go.Bar(
@@ -1115,8 +1248,8 @@ def render_conditions(result: dict) -> list[go.Figure]:
                 name="Pg_max (MW)",
                 x=names, y=pg_max,
                 mode="markers",
-                marker={"symbol": "line-ew", "size": 12, "color": "red",
-                        "line": {"width": 2, "color": "red"}},
+                marker={"symbol": "line-ew", "size": 12, "color": _C.VIOLATION,
+                        "line": {"width": 2, "color": _C.VIOLATION}},
             ))
 
         # Add ext grid as a separate bar at the end
@@ -1126,7 +1259,7 @@ def render_conditions(result: dict) -> list[go.Figure]:
             fig_gen.add_trace(go.Bar(
                 name=f"{ext_label} (MW)",
                 x=[ext_label], y=[ext.get("P_import_mw", 0)],
-                marker_color="#1f77b4",
+                marker_color=_C.PRIMARY,
             ))
 
         totals = result.get("totals", {})
@@ -1152,7 +1285,7 @@ def render_conditions(result: dict) -> list[go.Figure]:
         p_mw      = [l["P_mw"] for l in loads]
         fig_load = go.Figure(go.Bar(
             x=bus_names, y=p_mw,
-            marker_color="steelblue",
+            marker_color=_C.PRIMARY,
             name="Load (MW)",
         ))
         fig_load.update_layout(
@@ -1191,7 +1324,7 @@ def render_diff(result: dict) -> list[go.Figure]:
         names = _safe_labels([d["name"] for d in dispatch_diff], "Gen")
         deltas_pg = [d["delta_Pg"] for d in dispatch_diff]
         colors = [
-            "tomato" if d < -0.01 else ("seagreen" if d > 0.01 else "#888888")
+            _C.PURPLE if d < -0.01 else (_C.TEAL if d > 0.01 else _C.NEUTRAL)
             for d in deltas_pg
         ]
         fig_pg = go.Figure(
@@ -1204,7 +1337,7 @@ def render_diff(result: dict) -> list[go.Figure]:
                 textposition="outside",
             )
         )
-        fig_pg.add_hline(y=0, line_color="rgba(255,255,255,0.4)", line_width=1)
+        fig_pg.add_hline(y=0, line_color=_C.NEUTRAL, line_width=1)
         fig_pg.update_layout(
             title=f"Active Power Dispatch Diff (MW) — {title_suffix}",
             xaxis={"title": "Generator", "tickangle": 45},
@@ -1217,7 +1350,7 @@ def render_diff(result: dict) -> list[go.Figure]:
     if dispatch_diff:
         deltas_qg = [d["delta_Qg"] for d in dispatch_diff]
         qg_colors = [
-            "tomato" if d < -0.001 else ("seagreen" if d > 0.001 else "#888888")
+            _C.PURPLE if d < -0.001 else (_C.TEAL if d > 0.001 else _C.NEUTRAL)
             for d in deltas_qg
         ]
         fig_qg = go.Figure(
@@ -1230,7 +1363,7 @@ def render_diff(result: dict) -> list[go.Figure]:
                 textposition="outside",
             )
         )
-        fig_qg.add_hline(y=0, line_color="rgba(255,255,255,0.4)", line_width=1)
+        fig_qg.add_hline(y=0, line_color=_C.NEUTRAL, line_width=1)
         fig_qg.update_layout(
             title=f"Reactive Power Dispatch Diff (MVAr) — {title_suffix}",
             xaxis={"title": "Generator", "tickangle": 45},
@@ -1245,7 +1378,7 @@ def render_diff(result: dict) -> list[go.Figure]:
         bus_names = _safe_labels([v["bus_name"] for v in voltage_diff], "Bus")
         deltas_vm = [v["delta_vm"] for v in voltage_diff]
         vm_colors = [
-            "tomato" if abs(d) > 0.005 else "steelblue" for d in deltas_vm
+            _C.PURPLE if abs(d) > 0.005 else _C.PRIMARY for d in deltas_vm
         ]
         fig_vm = go.Figure(
             go.Bar(
@@ -1257,7 +1390,7 @@ def render_diff(result: dict) -> list[go.Figure]:
                 textposition="outside",
             )
         )
-        fig_vm.add_hline(y=0, line_color="rgba(255,255,255,0.4)", line_width=1)
+        fig_vm.add_hline(y=0, line_color=_C.NEUTRAL, line_width=1)
         fig_vm.update_layout(
             title=f"Bus Voltage Diff (p.u.) — {title_suffix}",
             xaxis={"title": "Bus", "tickangle": 45},
@@ -1289,7 +1422,8 @@ def render_worst_case(result: dict) -> list:
     vm_lower = thresholds.get("vm_lower_pu", grid_limits().vm_lower)
     vm_upper = thresholds.get("vm_upper_pu", grid_limits().vm_upper)
 
-    max_violations = max(violations) if violations else 1
+    known = [v for v in (_float_or_none(x) for x in violations) if v is not None]
+    max_violations = max(known) if known else 1
 
     fig = go.Figure()
 
@@ -1306,7 +1440,7 @@ def render_worst_case(result: dict) -> list:
         fig.add_trace(go.Scatter(
             x=timestamps, y=min_v,
             mode="lines+markers",
-            line={"color": "steelblue", "dash": "dot", "width": 2},
+            line={"color": _C.PRIMARY, "dash": "dot", "width": 2},
             marker={"size": 4},
             name="Min Voltage (p.u.)",
         ))
@@ -1314,7 +1448,7 @@ def render_worst_case(result: dict) -> list:
         fig.add_trace(go.Scatter(
             x=timestamps, y=max_v,
             mode="lines+markers",
-            line={"color": "tomato", "dash": "dot", "width": 2},
+            line={"color": _C.PURPLE, "dash": "dot", "width": 2},
             marker={"size": 4},
             name="Max Voltage (p.u.)",
         ))
@@ -1339,11 +1473,11 @@ def render_worst_case(result: dict) -> list:
             fig.add_trace(go.Scatter(
                 x=[worst_ts], y=[highlight_y],
                 mode="markers+text",
-                marker={"symbol": "star", "size": 16, "color": "gold",
-                        "line": {"color": "darkorange", "width": 1.5}},
+                marker={"symbol": "star", "size": 16, "color": _C.WARN,
+                        "line": {"color": _C.WARN, "width": 1.5}},
                 text=[highlight_name],
                 textposition="top center",
-                textfont={"color": "darkorange", "size": 11},
+                textfont={"color": _C.WARN, "size": 11},
                 name="Worst point",
                 yaxis="y2" if metric == "violations" else "y",
             ))
@@ -1352,37 +1486,37 @@ def render_worst_case(result: dict) -> list:
     shapes = [
         {"type": "line", "xref": "paper", "x0": 0, "x1": 1,
          "yref": "y", "y0": vm_upper, "y1": vm_upper,
-         "line": {"dash": "dash", "color": "red", "width": 1}},
+         "line": {"dash": "dash", "color": _C.VIOLATION, "width": 1}},
         {"type": "line", "xref": "paper", "x0": 0, "x1": 1,
          "yref": "y", "y0": vm_lower, "y1": vm_lower,
-         "line": {"dash": "dash", "color": "red", "width": 1}},
+         "line": {"dash": "dash", "color": _C.VIOLATION, "width": 1}},
     ]
     annotations = [
         {"x": 1.01, "y": vm_upper, "xref": "paper", "yref": "y",
          "text": f"V_max {vm_upper:.2f}", "showarrow": False,
-         "xanchor": "left", "font": {"color": "red"}},
+         "xanchor": "left", "font": {"color": _C.VIOLATION}},
         {"x": 1.01, "y": vm_lower, "xref": "paper", "yref": "y",
          "text": f"V_min {vm_lower:.2f}", "showarrow": False,
-         "xanchor": "left", "font": {"color": "red"}},
+         "xanchor": "left", "font": {"color": _C.VIOLATION}},
     ]
     if worst_ts:
         shapes.append(
             {"type": "line", "xref": "x", "x0": worst_ts, "x1": worst_ts,
              "yref": "paper", "y0": 0, "y1": 1,
-             "line": {"dash": "dash", "color": "darkorange", "width": 1.5}}
+             "line": {"dash": "dash", "color": _C.WARN, "width": 1.5}}
         )
         annotations.append(
             {"x": worst_ts, "y": 1, "xref": "x", "yref": "paper",
              "text": f"Worst ({metric})", "showarrow": False,
-             "xanchor": "left", "font": {"color": "darkorange", "size": 10}}
+             "xanchor": "left", "font": {"color": _C.WARN, "size": 10}}
         )
 
     fig.update_layout(
         title=f"Worst-case Scan — {n_scanned} timestamps ({metric})",
         xaxis={"title": "Timestamp", "tickangle": 45},
-        yaxis={"title": "Voltage (p.u.)", "range": [0.88, 1.12]},
+        yaxis={"title": "Voltage (p.u.)", "range": _voltage_range([min_v, max_v], vm_lower, vm_upper)},
         yaxis2={
-            "title": "Violation Count",
+            "title": "Violation Count", "tickformat": "d",
             "overlaying": "y", "side": "right",
             "showgrid": False, "rangemode": "nonnegative",
             "range": [0, max(max_violations * 4, 4)],
@@ -1400,7 +1534,7 @@ def render_worst_case(result: dict) -> list:
         fig2.add_trace(go.Scatter(
             x=timestamps, y=slack,
             mode="lines+markers",
-            line={"color": "steelblue", "width": 2},
+            line={"color": _C.PRIMARY, "width": 2},
             marker={"size": 4},
             name="External Grid import (MW)",
         ))
@@ -1409,11 +1543,11 @@ def render_worst_case(result: dict) -> list:
             fig2.add_trace(go.Scatter(
                 x=[worst_ts], y=[slack[wi]],
                 mode="markers+text",
-                marker={"symbol": "star", "size": 16, "color": "gold",
-                        "line": {"color": "darkorange", "width": 1.5}},
+                marker={"symbol": "star", "size": 16, "color": _C.WARN,
+                        "line": {"color": _C.WARN, "width": 1.5}},
                 text=[f"Worst: {slack[wi]:.2f} MW"],
                 textposition="top center",
-                textfont={"color": "darkorange", "size": 11},
+                textfont={"color": _C.WARN, "size": 11},
                 name="Worst point",
             ))
         fig2_shapes = []
@@ -1421,7 +1555,7 @@ def render_worst_case(result: dict) -> list:
             fig2_shapes.append(
                 {"type": "line", "xref": "x", "x0": worst_ts, "x1": worst_ts,
                  "yref": "paper", "y0": 0, "y1": 1,
-                 "line": {"dash": "dash", "color": "darkorange", "width": 1.5}}
+                 "line": {"dash": "dash", "color": _C.WARN, "width": 1.5}}
             )
         fig2.update_layout(
             title="External Grid Import (MW) — Scan",
@@ -1440,7 +1574,7 @@ def render_worst_case(result: dict) -> list:
         fig3.add_trace(go.Scatter(
             x=timestamps, y=max_line,
             mode="lines+markers",
-            line={"color": "seagreen", "width": 2},
+            line={"color": _C.TEAL, "width": 2},
             marker={"size": 4},
             name="Max line loading (%)",
         ))
@@ -1449,28 +1583,28 @@ def render_worst_case(result: dict) -> list:
             fig3.add_trace(go.Scatter(
                 x=[worst_ts], y=[max_line[wi]],
                 mode="markers+text",
-                marker={"symbol": "star", "size": 16, "color": "gold",
-                        "line": {"color": "darkorange", "width": 1.5}},
+                marker={"symbol": "star", "size": 16, "color": _C.WARN,
+                        "line": {"color": _C.WARN, "width": 1.5}},
                 text=[f"Worst: {max_line[wi]:.0f}%"],
                 textposition="top center",
-                textfont={"color": "darkorange", "size": 11},
+                textfont={"color": _C.WARN, "size": 11},
                 name="Worst point",
             ))
         fig3_shapes = [
             {"type": "line", "xref": "paper", "x0": 0, "x1": 1,
              "yref": "y", "y0": max_load_pct, "y1": max_load_pct,
-             "line": {"dash": "dash", "color": "red", "width": 1}},
+             "line": {"dash": "dash", "color": _C.VIOLATION, "width": 1}},
         ]
         fig3_annotations = [
             {"x": 1.01, "y": max_load_pct, "xref": "paper", "yref": "y",
              "text": f"Limit {max_load_pct:.0f}%", "showarrow": False,
-             "xanchor": "left", "font": {"color": "red"}},
+             "xanchor": "left", "font": {"color": _C.VIOLATION}},
         ]
         if worst_ts and worst_ts in timestamps and metric == "max_loading":
             fig3_shapes.append(
                 {"type": "line", "xref": "x", "x0": worst_ts, "x1": worst_ts,
                  "yref": "paper", "y0": 0, "y1": 1,
-                 "line": {"dash": "dash", "color": "darkorange", "width": 1.5}}
+                 "line": {"dash": "dash", "color": _C.WARN, "width": 1.5}}
             )
         fig3.update_layout(
             title="Max Line Loading (%) — Scan",
@@ -1490,7 +1624,7 @@ def render_worst_case(result: dict) -> list:
 # ---------------------------------------------------------------------------
 
 # Colour palette for scenario lines (up to 6 scenarios)
-_SCENARIO_COLOURS = ["steelblue", "tomato", "seagreen", "darkorchid", "darkorange", "teal"]
+_SCENARIO_COLOURS = [_C.PRIMARY, _C.PURPLE, _C.TEAL, "darkorchid", _C.WARN, "teal"]
 
 
 def render_scenarios(result: dict) -> list[go.Figure]:
@@ -1502,7 +1636,7 @@ def render_scenarios(result: dict) -> list[go.Figure]:
       [2] Summary bar chart: total violations per scenario
     """
     if "error" in result:
-        return [_empty_figure(f"Error: {result['error']}", color="red")]
+        return [_empty_figure(f"Error: {result['error']}", color=_C.VIOLATION)]
 
     scenarios = result.get("scenarios", [])
     if not scenarios:
@@ -1582,7 +1716,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
     Violation timestamps are highlighted with larger red markers.
     """
     if "error" in result:
-        return [_empty_figure(f"Error: {result['error']}", color="red")]
+        return [_empty_figure(f"Error: {result['error']}", color=_C.VIOLATION)]
 
     etype = result.get("element_type", "unknown")
     ename = result.get("element_name", "?")
@@ -1601,7 +1735,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
         vm = series.get("vm_pu", [])
         vm_upper = thresholds.get("vm_upper_pu", grid_limits().vm_upper)
         vm_lower = thresholds.get("vm_lower_pu", grid_limits().vm_lower)
-        violation_mask = [v > vm_upper or v < vm_lower for v in vm]
+        violation_mask = [_over(v, vm_upper) or _over(vm_lower, v) for v in vm]
 
         fig = go.Figure()
         fig.add_hrect(
@@ -1613,17 +1747,17 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
         fig.add_trace(go.Scatter(
             x=timestamps, y=vm,
             mode="lines+markers",
-            line={"color": "steelblue", "width": 2},
+            line={"color": _C.PRIMARY, "width": 2},
             marker={
-                "color": ["red" if v else "steelblue" for v in violation_mask],
+                "color": [_C.VIOLATION if v else _C.PRIMARY for v in violation_mask],
                 "size": [9 if v else 4 for v in violation_mask],
             },
             name="vm_pu",
         ))
-        fig.add_hline(y=vm_upper, line_dash="dash", line_color="red",
+        fig.add_hline(y=vm_upper, line_dash="dash", line_color=_C.VIOLATION,
                       annotation_text=f"V_max {vm_upper:.2f}",
                       annotation_position="top right")
-        fig.add_hline(y=vm_lower, line_dash="dash", line_color="red",
+        fig.add_hline(y=vm_lower, line_dash="dash", line_color=_C.VIOLATION,
                       annotation_text=f"V_min {vm_lower:.2f}",
                       annotation_position="bottom right")
         y_pad = 0.015
@@ -1645,7 +1779,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
         if p_mw:
             fig2 = go.Figure(go.Scatter(
                 x=timestamps, y=p_mw, mode="lines",
-                line={"color": "darkorange", "width": 1.5},
+                line={"color": _C.WARN, "width": 1.5},
                 name="P injection (MW)",
             ))
             fig2.update_layout(
@@ -1663,7 +1797,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
             if etype == "line"
             else thresholds.get("max_trafo_loading_pct", grid_limits().max_loading)
         )
-        violation_mask = [v > threshold_pct for v in loading]
+        violation_mask = [_over(v, threshold_pct) for v in loading]
         n_viol = sum(violation_mask)
         elem_label = "Line" if etype == "line" else "Transformer"
 
@@ -1671,9 +1805,9 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
         fig.add_trace(go.Scatter(
             x=timestamps, y=loading,
             mode="lines+markers",
-            line={"color": "steelblue", "width": 2},
+            line={"color": _C.PRIMARY, "width": 2},
             marker={
-                "color": ["red" if v else "steelblue" for v in violation_mask],
+                "color": [_C.VIOLATION if v else _C.PRIMARY for v in violation_mask],
                 "size": [9 if v else 4 for v in violation_mask],
             },
             fill="tozeroy",
@@ -1681,7 +1815,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
             name="Loading (%)",
         ))
         fig.add_hline(
-            y=threshold_pct, line_dash="dash", line_color="red",
+            y=threshold_pct, line_dash="dash", line_color=_C.VIOLATION,
             annotation_text=f"{threshold_pct:.0f}% limit",
             annotation_position="top right",
         )
@@ -1703,7 +1837,7 @@ def render_element_timeseries(result: dict) -> list[go.Figure]:
         if p_vals:
             fig2 = go.Figure(go.Scatter(
                 x=timestamps, y=p_vals, mode="lines",
-                line={"color": "darkorange", "width": 1.5},
+                line={"color": _C.WARN, "width": 1.5},
                 name=p_label,
             ))
             fig2.update_layout(
@@ -1730,7 +1864,7 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
       [2] Histogram — distribution of total violation count across samples
     """
     if "error" in result:
-        return [_empty_figure(f"Error: {result['error']}", color="red")]
+        return [_empty_figure(f"Error: {result['error']}", color=_C.VIOLATION)]
 
     ts = result.get("timestamp", "")
     n_samples = result.get("n_samples", "?")
@@ -1766,17 +1900,17 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
         names   = _safe_labels([e[0] for e in all_elements], "Elem")
         probs   = [e[1] for e in all_elements]
         etypes  = [e[2] for e in all_elements]
-        colour_map = {"Bus": "steelblue", "Line": "darkorange", "Trafo": "seagreen"}
-        colours = [colour_map.get(t, "grey") for t in etypes]
+        colour_map = {"Bus": _C.PRIMARY, "Line": _C.WARN, "Trafo": _C.TEAL}
+        colours = [colour_map.get(t, _C.NEUTRAL) for t in etypes]
         fig_bar = go.Figure(go.Bar(
             x=names, y=probs,
             marker_color=colours,
             text=[f"{p:.1%}" for p in probs],
             textposition="outside",
         ))
-        fig_bar.add_hline(y=0.05, line_dash="dot", line_color="orange",
+        fig_bar.add_hline(y=0.05, line_dash="dot", line_color=_C.WARN,
                           annotation_text="5%", annotation_position="top right")
-        fig_bar.add_hline(y=0.20, line_dash="dot", line_color="red",
+        fig_bar.add_hline(y=0.20, line_dash="dot", line_color=_C.VIOLATION,
                           annotation_text="20%", annotation_position="top right")
         fig_bar.update_layout(
             title=f"Violation Probability per Element — {ts}<br><sup>{subtitle}</sup>",
@@ -1791,7 +1925,7 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
     else:
         fig_bar = _empty_figure(
             f"No violations in any sample — grid fully secure ({subtitle})",
-            color="green",
+            color=_C.OK,
         )
     figs.append(fig_bar)
 
@@ -1821,17 +1955,17 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
             ))
         fig_box.add_trace(go.Scatter(
             x=bnames, y=p50_vals, mode="markers",
-            marker={"color": "steelblue", "size": 8},
+            marker={"color": _C.PRIMARY, "size": 8},
             name="P50 (median)",
         ))
         fig_box.add_trace(go.Scatter(
             x=bnames, y=p95_vals, mode="markers",
-            marker={"color": "tomato", "size": 6, "symbol": "triangle-up"},
+            marker={"color": _C.PURPLE, "size": 6, "symbol": "triangle-up"},
             name="P95",
         ))
-        fig_box.add_hline(y=vm_upper, line_dash="dash", line_color="red",
+        fig_box.add_hline(y=vm_upper, line_dash="dash", line_color=_C.VIOLATION,
                           annotation_text=f"{vm_upper} p.u. limit")
-        fig_box.add_hline(y=vm_lower, line_dash="dash", line_color="red",
+        fig_box.add_hline(y=vm_lower, line_dash="dash", line_color=_C.VIOLATION,
                           annotation_text=f"{vm_lower} p.u. limit")
         fig_box.update_layout(
             title=f"Voltage P5 / P50 / P95 Envelope — Top 15 Buses by P95 — {ts}",
@@ -1846,7 +1980,7 @@ def render_probabilistic_rsa(result: dict) -> list[go.Figure]:
     if hist_data:
         counts = sorted(int(k) for k in hist_data.keys())
         freqs  = [hist_data[str(k)] for k in counts]
-        colours = ["tomato" if c > 0 else "steelblue" for c in counts]
+        colours = [_C.PURPLE if c > 0 else _C.PRIMARY for c in counts]
         fig_hist = go.Figure(go.Bar(
             x=[str(c) for c in counts], y=freqs,
             marker_color=colours,
@@ -1911,7 +2045,7 @@ def render_robust_flexibility(result: dict) -> list:
         fig1.add_trace(go.Bar(
             x=buses_sorted,
             y=deltas_up,
-            marker_color="#d62728",
+            marker_color=_C.VIOLATION,
             name="Upper back-off Δu",
             customdata=list(zip(deltas_up, tight_up_sorted)),
             hovertemplate=(
@@ -1923,7 +2057,7 @@ def render_robust_flexibility(result: dict) -> list:
         fig1.add_trace(go.Bar(
             x=buses_sorted,
             y=deltas_low,
-            marker_color="#1f77b4",
+            marker_color=_C.PRIMARY,
             name="Lower back-off Δl",
             customdata=list(zip(deltas_low, tight_low_sorted)),
             hovertemplate=(
@@ -1956,11 +2090,11 @@ def render_robust_flexibility(result: dict) -> list:
         point_colors = []
         for v, ub, lb in zip(vm_vals, tight_ubs, tight_lbs):
             if v > vm_upper_global or v < vm_lower_global:
-                point_colors.append("#d62728")   # red: constraint violated
+                point_colors.append(_C.VIOLATION)   # red: constraint violated
             elif v > ub or v < lb:
-                point_colors.append("#ff7f0e")   # amber: in the back-off margin
+                point_colors.append(_C.WARN)   # amber: in the back-off margin
             else:
-                point_colors.append("#2ca02c")   # green: within tightened bound
+                point_colors.append(_C.OK)   # green: within tightened bound
 
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
@@ -1974,21 +2108,21 @@ def render_robust_flexibility(result: dict) -> list:
         fig2.add_trace(go.Scatter(
             x=bus_names, y=tight_ubs,
             mode="lines",
-            line=dict(color="#ff7f0e", dash="dot", width=1.5),
+            line=dict(color=_C.WARN, dash="dot", width=1.5),
             name="Tightened upper bound",
             hovertemplate="<b>%{x}</b><br>Tightened UB: %{y:.4f}<extra></extra>",
         ))
         fig2.add_trace(go.Scatter(
             x=bus_names, y=tight_lbs,
             mode="lines",
-            line=dict(color="#1f77b4", dash="dot", width=1.5),
+            line=dict(color=_C.PRIMARY, dash="dot", width=1.5),
             name="Tightened lower bound",
             hovertemplate="<b>%{x}</b><br>Tightened LB: %{y:.4f}<extra></extra>",
         ))
         # Global limits
-        fig2.add_hline(y=vm_upper_global, line_dash="dash", line_color="red",
+        fig2.add_hline(y=vm_upper_global, line_dash="dash", line_color=_C.VIOLATION,
                        annotation_text=f"Original UB {vm_upper_global:.3f}", annotation_position="top right")
-        fig2.add_hline(y=vm_lower_global, line_dash="dash", line_color="blue",
+        fig2.add_hline(y=vm_lower_global, line_dash="dash", line_color=_C.PRIMARY,
                        annotation_text=f"LB {vm_lower_global:.3f}", annotation_position="bottom right")
         fig2.update_layout(
             title="Post-OPF Bus Voltages vs Tightened Bounds",
@@ -2010,22 +2144,22 @@ def render_robust_flexibility(result: dict) -> list:
     if p_before is not None:
         labels = ["Before Robust OPF"]
         values = [float(p_before) * 100]
-        bar_cols = ["#d62728"]
+        bar_cols = [_C.VIOLATION]
         text = [f"{values[0]:.1f}%"]
         if p_after_validation is not None:
             labels.append("After Robust OPF (Certified)")
             values.append(float(p_after_validation) * 100)
-            bar_cols.append("#1f77b4")
+            bar_cols.append(_C.PRIMARY)
             text.append(f"{values[-1]:.1f}%")
         elif p_after is not None:
             labels.append("After Robust OPF")
             values.append(float(p_after) * 100)
-            bar_cols.append("#2ca02c")
+            bar_cols.append(_C.OK)
             text.append(f"{values[-1]:.1f}%")
         else:
             labels.append("After Robust OPF")
             values.append(0.0)
-            bar_cols.append("#9e9e9e")
+            bar_cols.append(_C.NEUTRAL)
             text.append("N/A")
 
         fig3 = go.Figure(go.Bar(
@@ -2035,9 +2169,9 @@ def render_robust_flexibility(result: dict) -> list:
             text=text,
             textposition="outside",
         ))
-        fig3.add_hline(y=100 * (1 - confidence), line_dash="dash", line_color="orange",
-                   annotation_text=f"Reference: {100*(1-confidence):.0f}% (not guaranteed system-wide)",
-                       annotation_position="right")
+        fig3.add_hline(y=100 * (1 - confidence), line_dash="dash", line_color=_C.WARN,
+                       annotation_text=f"Reference: {100*(1-confidence):.0f}% (not guaranteed system-wide)",
+                       annotation_position="top right")
         fig3.update_layout(
             title=(
                 f"Risk Reduction — P(any violation) at {confidence*100:.0f}% confidence "
@@ -2072,8 +2206,8 @@ def render_robust_flexibility(result: dict) -> list:
         ]
 
         fig_split = go.Figure()
-        fig_split.add_trace(go.Bar(x=split_labels, y=split_before, name="Before", marker_color="#d62728"))
-        fig_split.add_trace(go.Bar(x=split_labels, y=split_after, name="After", marker_color="#2ca02c"))
+        fig_split.add_trace(go.Bar(x=split_labels, y=split_before, name="Before", marker_color=_C.VIOLATION))
+        fig_split.add_trace(go.Bar(x=split_labels, y=split_after, name="After", marker_color=_C.OK))
         fig_split.update_layout(
             title="Risk Split by Voltage Side",
             xaxis_title="Violation side",
@@ -2096,8 +2230,8 @@ def render_robust_flexibility(result: dict) -> list:
             y=loop_p_any,
             mode="lines+markers",
             name="P(any) calibration [%]",
-            marker=dict(color="#d62728"),
-            line=dict(color="#d62728"),
+            marker=dict(color=_C.VIOLATION),
+            line=dict(color=_C.VIOLATION),
             yaxis="y1",
         ))
         fig_loop.add_trace(go.Scatter(
@@ -2105,8 +2239,8 @@ def render_robust_flexibility(result: dict) -> list:
             y=loop_curt,
             mode="lines+markers",
             name="Expected curtailment [MW]",
-            marker=dict(color="#17becf"),
-            line=dict(color="#17becf", dash="dot"),
+            marker=dict(color=_C.TEAL),
+            line=dict(color=_C.TEAL, dash="dot"),
             yaxis="y2",
         ))
         fig_loop.update_layout(
@@ -2136,7 +2270,7 @@ def render_robust_flexibility(result: dict) -> list:
         fig_curt = go.Figure(go.Bar(
             x=labels,
             y=vals,
-            marker_color=["#9467bd", "#17becf", "#7f7f7f"],
+            marker_color=[_C.PURPLE, _C.TEAL, _C.NEUTRAL],
             text=[f"{v:.3f}" for v in vals],
             textposition="outside",
         ))
@@ -2171,8 +2305,8 @@ def render_robust_flexibility(result: dict) -> list:
         after_vals = [100.0 * float(bus_after.get(b, 0.0)) for b in buses]
 
         fig_bus = go.Figure()
-        fig_bus.add_trace(go.Bar(x=buses, y=before_vals, name="Before", marker_color="#d62728"))
-        fig_bus.add_trace(go.Bar(x=buses, y=after_vals, name="After", marker_color="#2ca02c"))
+        fig_bus.add_trace(go.Bar(x=buses, y=before_vals, name="Before", marker_color=_C.VIOLATION))
+        fig_bus.add_trace(go.Bar(x=buses, y=after_vals, name="After", marker_color=_C.OK))
         fig_bus.update_layout(
             title="Bus Violation Risk (Top 12)",
             xaxis_title="Bus",
@@ -2194,8 +2328,8 @@ def render_robust_flexibility(result: dict) -> list:
         after_vals = [100.0 * float(line_after.get(l, 0.0)) for l in lines]
 
         fig_line = go.Figure()
-        fig_line.add_trace(go.Bar(x=lines, y=before_vals, name="Before", marker_color="#d62728"))
-        fig_line.add_trace(go.Bar(x=lines, y=after_vals, name="After", marker_color="#2ca02c"))
+        fig_line.add_trace(go.Bar(x=lines, y=before_vals, name="Before", marker_color=_C.VIOLATION))
+        fig_line.add_trace(go.Bar(x=lines, y=after_vals, name="After", marker_color=_C.OK))
         fig_line.update_layout(
             title="Line Violation Risk (Top 12)",
             xaxis_title="Line",
@@ -2217,8 +2351,8 @@ def render_robust_flexibility(result: dict) -> list:
         after_vals = [100.0 * float(trafo_after.get(t, 0.0)) for t in trafos]
 
         fig_trafo = go.Figure()
-        fig_trafo.add_trace(go.Bar(x=trafos, y=before_vals, name="Before", marker_color="#d62728"))
-        fig_trafo.add_trace(go.Bar(x=trafos, y=after_vals, name="After", marker_color="#2ca02c"))
+        fig_trafo.add_trace(go.Bar(x=trafos, y=before_vals, name="Before", marker_color=_C.VIOLATION))
+        fig_trafo.add_trace(go.Bar(x=trafos, y=after_vals, name="After", marker_color=_C.OK))
         fig_trafo.update_layout(
             title="Transformer Violation Risk (Top 12)",
             xaxis_title="Transformer",
@@ -2347,16 +2481,16 @@ def render_flexibility_envelope(result: dict) -> list:
                 x=[base_point.get("p_mw")], y=[base_point.get("q_mvar")],
                 mode="markers",
                 marker=dict(symbol="star", size=14, color=star_color,
-                            line=dict(color="black", width=1.5)),
+                            line=dict(color=_C.INK, width=1.5)),
                 name="Base operating point",
             ))
     colorscale_feas = [
         [0.0,  "#aec7e8"],   # -1 → grey (no convergence)
         [0.49, "#aec7e8"],
-        [0.50, "#d62728"],   #  0 → red (infeasible)
-        [0.74, "#d62728"],
-        [0.75, "#2ca02c"],   #  1 → green (feasible)
-        [1.0,  "#2ca02c"],
+        [0.50, _C.VIOLATION],   #  0 → red (infeasible)
+        [0.74, _C.VIOLATION],
+        [0.75, _C.OK],   #  1 → green (feasible)
+        [1.0,  _C.OK],
     ]
 
     fig1 = go.Figure()
@@ -2411,7 +2545,7 @@ def render_flexibility_envelope(result: dict) -> list:
         ),
         name="Max bus voltage",
     ))
-    _add_overlays(fig2, star_color="black")
+    _add_overlays(fig2, star_color=_C.INK)
     fig2.update_layout(
         title=f"System Max Bus Voltage — {gen_name} PQ Sweep" + (f"<br><sup>{ts}</sup>" if ts else ""),
         xaxis={"title": "P (MW)"},
@@ -2436,7 +2570,7 @@ def render_flexibility_envelope(result: dict) -> list:
         ),
         name="Min bus voltage",
     ))
-    _add_overlays(fig3, star_color="black")
+    _add_overlays(fig3, star_color=_C.INK)
     fig3.update_layout(
         title=f"System Min Bus Voltage — {gen_name} PQ Sweep" + (f"<br><sup>{ts}</sup>" if ts else ""),
         xaxis={"title": "P (MW)"},
@@ -2456,7 +2590,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
     First slice: duration curve plus a compact summary/episodes panel.
     """
     if result.get("error"):
-        return [_empty_figure(str(result["error"]), color="red")]
+        return [_empty_figure(str(result["error"]), color=_C.VIOLATION)]
 
     duration_curve = result.get("duration_curve", []) or []
     if not duration_curve:
@@ -2478,7 +2612,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
         x=x_vals,
         y=y_vals,
         mode="lines",
-        line=dict(color="#1f77b4", width=2),
+        line=dict(color=_C.PRIMARY, width=2),
         customdata=list(zip(hover_vals, hover_ts)),
         hovertemplate=(
             "Window fraction: %{x:.1f}%<br>"
@@ -2491,9 +2625,9 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
     fig_curve.add_hline(
         y=float(result.get("duration_curve_limit", 0.0)),
         line_dash="dash",
-        line_color="red",
+        line_color=_C.VIOLATION,
         annotation_text="Limit boundary",
-        annotation_position="right",
+        annotation_position="top right",
     )
     fig_curve.update_layout(
         title=f"Historical Risk Duration Curve — {target_label}{title_suffix}",
@@ -2508,7 +2642,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
     fig_summary.add_trace(go.Bar(
         x=["Exceedance", "Near miss"],
         y=[exceedance_pct, near_miss_pct],
-        marker_color=["#d62728", "#ff7f0e"],
+        marker_color=[_C.VIOLATION, _C.WARN],
         text=[f"{exceedance_pct:.1f}%", f"{near_miss_pct:.1f}%"],
         textposition="outside",
         name="Frequency",
@@ -2526,8 +2660,8 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
             x=ep_labels,
             y=ep_vals,
             mode="markers+lines",
-            marker=dict(color="#9467bd", size=9),
-            line=dict(color="#9467bd", dash="dot"),
+            marker=dict(color=_C.PURPLE, size=9),
+            line=dict(color=_C.PURPLE, dash="dot"),
             yaxis="y2",
             name="Worst episodes [min]",
             customdata=[float(ep.get("peak_severity", 0.0)) for ep in episodes_for_plot],
@@ -2556,7 +2690,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
         fig_cond.add_trace(go.Bar(
             x=bin_labels,
             y=exc_vals,
-            marker_color="#d62728",
+            marker_color=_C.VIOLATION,
             name="Exceedance [%]",
             text=[f"{v:.1f}%" for v in exc_vals],
             textposition="outside",
@@ -2565,7 +2699,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
         fig_cond.add_trace(go.Bar(
             x=bin_labels,
             y=near_vals,
-            marker_color="#ff7f0e",
+            marker_color=_C.WARN,
             name="Near miss [%]",
             text=[f"{v:.1f}%" for v in near_vals],
             textposition="outside",
@@ -2575,7 +2709,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
             x=bin_labels,
             y=n_steps,
             mode="lines+markers",
-            line=dict(color="#1f77b4", dash="dot"),
+            line=dict(color=_C.PRIMARY, dash="dot"),
             marker=dict(size=8),
             name="Samples",
             yaxis="y2",
@@ -2604,7 +2738,7 @@ def render_historical_risk(result: dict) -> list[go.Figure]:
 def render_hosting_capacity(result: dict) -> list[go.Figure]:
     """Render hosting capacity with deterministic/probabilistic-specific views."""
     if result.get("error"):
-        return [_empty_figure(str(result["error"]), color="red")]
+        return [_empty_figure(str(result["error"]), color=_C.VIOLATION)]
 
     mode_name = str(result.get("mode", "deterministic")).strip().lower()
     scan_scope = str(result.get("scan_scope") or "single_bus").strip().lower()
@@ -2651,9 +2785,9 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
 
         fig_rank = go.Figure()
         mode_colors = {
-            "unity": "#0b7285",
-            "fixed_pf": "#2b8a3e",
-            "reactive_proxy": "#c92a2a",
+            "unity": _C.TEAL,
+            "fixed_pf": _C.OK,
+            "reactive_proxy": _C.VIOLATION,
         }
         for m in available_modes:
             mode_map = rows_by_mode[m]
@@ -2663,7 +2797,7 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
                 x=x_vals,
                 y=top_buses,
                 orientation="h",
-                marker_color=mode_colors.get(m, "#2b8a3e"),
+                marker_color=mode_colors.get(m, _C.OK),
                 customdata=bindings,
                 hovertemplate=(
                     "Mode: " + m + "<br>Bus: %{y}<br>Hosting capacity: %{x:.3f} MW"
@@ -2694,7 +2828,7 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
             fig_mode.add_trace(go.Bar(
                 x=[r["q_mode"] for r in per_mode_avg],
                 y=[r["avg"] for r in per_mode_avg],
-                marker_color=["#0b7285", "#2b8a3e", "#c92a2a"][: len(per_mode_avg)],
+                marker_color=[_C.TEAL, _C.OK, _C.VIOLATION][: len(per_mode_avg)],
                 text=[f"{r['avg']:.2f} MW" for r in per_mode_avg],
                 textposition="outside",
                 name="Average hosting",
@@ -2728,17 +2862,17 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
     uncertainty_scope = str(result.get("uncertainty_scope") or "")
     risk_threshold = result.get("risk_threshold")
     mode_color_map = {
-        "unity": "#0b7285",
-        "fixed_pf": "#2b8a3e",
-        "reactive_proxy": "#c92a2a",
-        "voltage_control": "#c92a2a",
+        "unity": _C.TEAL,
+        "fixed_pf": _C.OK,
+        "reactive_proxy": _C.VIOLATION,
+        "voltage_control": _C.VIOLATION,
     }
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=modes,
         y=capacities,
-        marker_color=[mode_color_map.get(str(m).strip().lower(), "#2b8a3e") for m in modes],
+        marker_color=[mode_color_map.get(str(m).strip().lower(), _C.OK) for m in modes],
         text=[f"{v:.2f} MW" for v in capacities],
         textposition="outside",
         customdata=bindings,
@@ -2784,9 +2918,9 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
         return [fig]
 
     mode_color_map = {
-        "unity": "#0b7285",
-        "fixed_pf": "#2b8a3e",
-        "reactive_proxy": "#c92a2a",
+        "unity": _C.TEAL,
+        "fixed_pf": _C.OK,
+        "reactive_proxy": _C.VIOLATION,
     }
     risk_mode_colors = [mode_color_map.get(str(m).strip().lower(), "#495057") for m in modes]
 
@@ -2796,8 +2930,8 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
         y=risk_vals,
         marker={
             "color": risk_mode_colors,
-            "pattern": {"shape": "/", "fgcolor": "#1f2937", "size": 7, "solidity": 0.22},
-            "line": {"color": "#1f2937", "width": 1.0},
+            "pattern": {"shape": "/", "fgcolor": _C.INK, "size": 7, "solidity": 0.22},
+            "line": {"color": _C.INK, "width": 1.0},
         },
         opacity=0.55,
         text=[f"{v:.1%}" for v in risk_vals],
@@ -2815,8 +2949,8 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
         y=boundary_risk_vals,
         marker={
             "color": risk_mode_colors,
-            "pattern": {"shape": "x", "fgcolor": "#111827", "size": 7, "solidity": 0.38},
-            "line": {"color": "#111827", "width": 1.0},
+            "pattern": {"shape": "x", "fgcolor": _C.INK, "size": 7, "solidity": 0.38},
+            "line": {"color": _C.INK, "width": 1.0},
         },
         opacity=0.95,
         text=[
@@ -2835,7 +2969,7 @@ def render_hosting_capacity(result: dict) -> list[go.Figure]:
         fig_risk.add_hline(
             y=float(risk_threshold),
             line_dash="dot",
-            line_color="#c92a2a",
+            line_color=_C.VIOLATION,
             annotation_text=f"risk threshold {float(risk_threshold):.1%}",
             annotation_position="top left",
         )
@@ -2864,24 +2998,24 @@ def render_violation_attribution(result: dict) -> list[go.Figure]:
     the former are an action the operator can take.
     """
     figures: list[go.Figure] = []
-    for violation in (result.get("violations") or [])[:4]:
+    all_violations = result.get("violations") or []
+    for violation in all_violations[:4]:
         drivers = violation.get("drivers") or []
         if not drivers:
             continue
 
         is_voltage = violation.get("quantity") == "vm_pu"
-        unit = "p.u. / MVAr" if is_voltage else "% / MVAr"
+        unit = "p.u. / MVAr" if is_voltage else "% / MW"
         key = "d_per_mvar" if is_voltage else "d_per_mw"
         axis = "MVAr" if is_voltage else "MW"
 
-        names, values, colors = [], [], []
-        for d in reversed(drivers):
-            sensitivity = d.get(key)
-            if sensitivity is None:
-                continue
-            names.append(str(d.get("source", "?")))
-            values.append(sensitivity)
-            colors.append("#1f77b4" if d.get("controllable") else "#aaaaaa")
+        # Largest effect at the top: plotted bottom-up, so ascending by size.
+        rows = [(abs(d[key]), str(d.get("source", "?")), d[key], bool(d.get("controllable")))
+                for d in drivers if _float_or_none(d.get(key)) is not None]
+        rows.sort()
+        names = [r[1] for r in rows]
+        values = [r[2] for r in rows]
+        colors = [_C.PRIMARY if r[3] else _C.NEUTRAL for r in rows]
 
         if not names:
             continue
@@ -2890,15 +3024,28 @@ def render_violation_attribution(result: dict) -> list[go.Figure]:
             x=values, y=names, orientation="h", marker_color=colors,
             hovertemplate="%{y}: %{x:+.5f} " + unit + "<extra></extra>",
         ))
+        value, limit = _float_or_none(violation.get("value")), _float_or_none(violation.get("limit"))
+        if value is not None and limit is not None:
+            # The raw value printed with 16 digits ("0.9365962009235865").
+            shown = (f"{value:.3f} p.u. vs limit {limit:.3f}" if is_voltage
+                     else f"{value:.1f} % vs limit {limit:.0f} %")
+        else:
+            shown = "value unavailable"
         fig.update_layout(
             **CHART_THEME,
-            title=(f"What drives {violation.get('element', '?')} "
-                   f"({violation.get('value')} vs limit {violation.get('limit')})"),
-            xaxis_title=f"Sensitivity per {axis}  •  blue = controllable, grey = load",
+            title=f"What drives {violation.get('element', '?')} ({shown})",
+            xaxis={"title": f"Change in {'voltage (p.u.)' if is_voltage else 'loading (%)'} "
+                            f"per {axis} injected  •  blue = controllable, grey = load",
+                   "exponentformat": "power"},
             yaxis_title="",
             height=max(220, 40 * len(names) + 120),
         )
         figures.append(fig)
+    if len(all_violations) > 4 and figures:
+        # Said, not silently cut: the list is ordered, the rest exist.
+        figures.append(_empty_figure(
+            f"Showing the drivers of 4 of {len(all_violations)} violations; "
+            "the answer and the audit panel cover all of them."))
     return figures
 
 
@@ -2946,12 +3093,15 @@ RENDERER_MAP: dict[str, Callable] = {
 
 _VOLTAGE_SCALE = [
     [0.00, "#2166ac"], [0.35, "#92c5de"], [0.50, "#eef0f2"],
-    [0.65, "#f4a582"], [1.00, "#b2182b"],
+    [0.65, "#f4a582"], [1.00, _C.VIOLATION],
 ]
 _LOADING_BANDS = ((60.0, "#4d9221", "≤ 60 % loaded"),
-                  (90.0, "#e08214", "60–90 %"),
-                  (float("inf"), "#b2182b", "> 90 %"))
+                  (90.0, _C.WARN, "60–90 %"),
+                  (float("inf"), _C.VIOLATION, "> 90 %"))
 _UNMEASURED_EDGE = "#b8b8b8"
+# Above the network's own loading limit — a violation, not just "heavily
+# loaded". 91 % and 160 % used to share the "> 90 %" band.
+_OVER_LIMIT_EDGE = "#67001f"
 _OUT_OF_SERVICE = "#d4d4d4"
 _EXTERNAL = "#3f3f46"
 _GENERATION = "#1b7837"
@@ -3061,7 +3211,8 @@ def _place_labels(xs, ys, names, sizes, ranked, obstacles, per_px):
 def render_network_map(network: NetworkMap, positions: dict, *,
                        vm_lower: float = 0.95, vm_upper: float = 1.05,
                        highlight: set | None = None,
-                       subtitle: str = "") -> go.Figure:
+                       subtitle: str = "",
+                       max_loading: float | None = None) -> go.Figure:
     """The loaded network, coloured by whatever state has been joined onto it."""
     highlight = highlight or set()
     measured = any(n.vm_pu is not None for n in network.nodes.values())
@@ -3091,11 +3242,26 @@ def render_network_map(network: NetworkMap, positions: dict, *,
             width = 1.6 if edge.loading_pct is None else 1.6 + 3.4 * min(edge.loading_pct, 120.0) / 120.0
             detail = ("not measured" if edge.loading_pct is None
                       else f"{edge.loading_pct:.1f}% loaded")
+            # Over the limit, or named among the violations: drawn as one. The
+            # highlight used to reach buses only, so an overloaded line looked
+            # like any other heavily loaded one.
+            over = (edge.in_service and (
+                edge.name in highlight
+                or (max_loading is not None and edge.loading_pct is not None
+                    and edge.loading_pct > max_loading)))
+            if over:
+                colour, width = _OVER_LIMIT_EDGE, max(width, 5.5)
+                detail += f" — over the {max_loading:g} % limit" if max_loading else " — violation"
 
         # Every legend entry is a real trace in a group, so clicking one hides
         # the branches it describes. They used to be empty placeholder traces:
         # the key looked interactive, and clicking it did nothing at all.
-        group = "external" if edge.kind == "ext_grid" else _band_label(edge)
+        if edge.kind == "ext_grid":
+            group = "external"
+        elif over:
+            group = f"{'transformer' if edge.kind == 'trafo' else 'line'} over its limit"
+        else:
+            group = _band_label(edge)
         first = group not in shown_groups
         shown_groups.add(group)
 

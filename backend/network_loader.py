@@ -103,6 +103,28 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
 # MATPOWER gen → sgen conversion
 # ---------------------------------------------------------------------------
 
+def apply_voltage_setpoints(net: pp.pandapowerNet, profile: dict) -> dict:
+    """Set the external-grid and generator voltage setpoints a profile declares.
+
+    ``ext_grid_vm_pu`` sets every external grid; ``gen_vm_pu`` maps a bus index
+    to the setpoint of the voltage-controlled generators on it. A MATPOWER OPF
+    benchmark such as PGLib ships placeholder setpoints (1.0 everywhere); held
+    in a power flow they demand more reactive power than its condensers have,
+    so a profile states setpoints its case can actually hold. Returns what was
+    applied, for the startup log.
+    """
+    applied = {}
+    if profile.get("ext_grid_vm_pu") is not None and len(net.ext_grid):
+        net.ext_grid["vm_pu"] = float(profile["ext_grid_vm_pu"])
+        applied["ext_grid"] = float(profile["ext_grid_vm_pu"])
+    for bus, vm in (profile.get("gen_vm_pu") or {}).items():
+        rows = net.gen.index[net.gen["bus"] == int(bus)]
+        if len(rows):
+            net.gen.loc[rows, "vm_pu"] = float(vm)
+            applied[f"gen@bus{int(bus)}"] = float(vm)
+    return applied
+
+
 def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
     """Convert ``net.gen`` PV-bus generators to ``net.sgen`` for OPF/flexibility
     tool compatibility.  The slack bus generator (already represented by
@@ -133,7 +155,15 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
         if max_p < 1.0:
             kept_condenser_names.append(f"Gen_bus{bus_id}")
             continue
+        # Unique per unit: two generators on one bus both used to become
+        # `Gen_bus{b}`, and every table keyed by name (capacities, OPF sets)
+        # silently kept one of them.
         name = f"Gen_bus{bus_id}"
+        taken = set(created_names) | set(net.sgen["name"].astype(str)) if len(net.sgen) else set(created_names)
+        suffix = 2
+        while name in taken:
+            name = f"Gen_bus{bus_id}_{suffix}"
+            suffix += 1
         min_p = float(row["min_p_mw"]) if "min_p_mw" in row.index and not np.isnan(float(row["min_p_mw"])) else 0.0
         pp.create_sgen(
             net,

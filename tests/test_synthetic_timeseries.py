@@ -99,3 +99,66 @@ class TestGenerate:
         assert row["substation_name"] == "EXT_GRID"
         assert row["production"] == 0.0
         assert row["consumption"] == 0.0
+
+
+class TestPeakLoadFactor:
+    """The network's own load is its design point; the usual daily peak sits
+    there, not at the profile shape's ~1.22× (which ran PGLib case14 past its
+    reactive capability every afternoon)."""
+
+    def _ratio(self, net, **kw):
+        base = net.load.groupby("bus")["p_mw"].sum()
+        _, meas = st.generate(net, n_days=7, resolution_min=60, seed=3, stress_events=False, **kw)
+        totals = [df["consumption"].sum() for df in meas.values()]
+        return max(totals) / base.sum(), min(totals) / base.sum()
+
+    def test_default_peaks_at_the_networks_load(self, case14_net):
+        high, low = self._ratio(case14_net)
+        assert 0.97 <= high <= 1.06 and low < 0.75
+
+    def test_explicit_factor(self, case14_net):
+        high, _ = self._ratio(case14_net, peak_load_factor=0.9)
+        assert 0.87 <= high <= 0.95
+
+    def test_none_keeps_the_raw_shape(self, case14_net):
+        high, _ = self._ratio(case14_net, peak_load_factor=None)
+        assert high > 1.15
+
+    def test_same_seed_same_series_up_to_scale(self, case14_net):
+        _, a = st.generate(case14_net, n_days=1, resolution_min=60, seed=5, peak_load_factor=None)
+        _, b = st.generate(case14_net, n_days=1, resolution_min=60, seed=5)
+        ratio = {round(b[t]["consumption"].sum() / a[t]["consumption"].sum(), 6) for t in a}
+        assert len(ratio) == 1
+
+
+class TestForecast:
+    """The synthetic forecast covers the last measured days (measured values
+    with a day-ahead-sized error) and the days after — so forecast and
+    measured can be compared on shared timestamps."""
+
+    def _series(self, net, **kw):
+        ts, meas = st.generate(net, n_days=3, resolution_min=60, seed=2)
+        fts, fc = st.forecast(net, ts, meas, n_days=2, resolution_min=60, seed=9, **kw)
+        return ts, meas, fts, fc
+
+    def test_overlaps_the_last_days_then_looks_ahead(self, case14_net):
+        ts, _, fts, _ = self._series(case14_net, overlap_days=1)
+        shared = sorted(set(ts) & set(fts))
+        assert shared == ts[-24:]
+        assert fts[24] > ts[-1] and len(fts) == 24 + 48
+        assert fts == sorted(fts)
+
+    def test_shared_hours_are_a_forecast_of_what_was_measured(self, case14_net):
+        ts, meas, fts, fc = self._series(case14_net, overlap_days=1, load_error=0.04)
+        ratios = [fc[t]["consumption"].sum() / meas[t]["consumption"].sum() for t in ts[-24:]]
+        assert all(0.8 < r < 1.2 for r in ratios)
+        assert len({round(r, 6) for r in ratios}) > 1  # an error, not a copy
+
+    def test_no_overlap_is_the_old_look_ahead(self, case14_net):
+        ts, _, fts, _ = self._series(case14_net, overlap_days=0)
+        assert not set(ts) & set(fts) and fts[0] > ts[-1]
+
+    def test_deterministic(self, case14_net):
+        a = self._series(case14_net)[3]
+        b = self._series(case14_net)[3]
+        assert all(a[t].equals(b[t]) for t in a)

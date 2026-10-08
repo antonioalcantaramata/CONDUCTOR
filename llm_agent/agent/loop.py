@@ -41,6 +41,7 @@ from .validators import (
     TurnConsistency,
     TurnOperatingPoint,
     annotate,
+    compares_datasets,
     requested_limits,
     requested_timestamps,
     validate_call,
@@ -267,7 +268,10 @@ def run_agent_turn(
     # Seeded with the moments the question names: comparing two of them is a
     # normal request, and warning about it told the model its own correct
     # behaviour was inconsistent.
-    turn_consistency = TurnConsistency(expected=requested_timestamps(user_message))
+    turn_consistency = TurnConsistency(
+        expected=requested_timestamps(user_message),
+        datasets_compared=compares_datasets(user_message),
+    )
     # Carries an explicitly stated operating point, and the limits the user
     # set, across the turn's calls — so a later tool cannot silently fall back
     # to the simulation clock or to a default ceiling. Seeded from the prompt
@@ -374,6 +378,7 @@ def run_agent_turn(
                 if tool_fn is None:
                     result = {"error": f"Unknown tool: {tool_name}"}
                     tool_error_count += 1
+                    turn_operating_point.rollback()
                 elif verdict.rejected:
                     # A validated solver given invalid parameters returns a
                     # confidently wrong answer, so impossible parameterisations
@@ -381,6 +386,7 @@ def run_agent_turn(
                     # structured error and corrects itself.
                     result = verdict.as_tool_error(tool_name)
                     tool_error_count += 1
+                    turn_operating_point.rollback()
                     logger.warning("Rejected %s call: %s", tool_name,
                                    [i.render() for i in verdict.rejections])
                     if on_event:
@@ -393,6 +399,9 @@ def run_agent_turn(
                         if on_event:
                             on_event("tool_start", {"name": tool_name, "args": kwargs})
                         result = tool_fn(**kwargs)
+                        if isinstance(result, dict) and "error" in result:
+                            # Values that produced no result are not the turn's.
+                            turn_operating_point.rollback()
                         # Check the result against itself before the model sees
                         # it; findings are attached, never substituted.
                         integrity = validate_result(tool_name, result)
@@ -412,6 +421,7 @@ def run_agent_turn(
                         logger.exception("Tool %s raised an exception", tool_name)
                         result = {"error": str(exc), "tool": tool_name}
                         tool_error_count += 1
+                        turn_operating_point.rollback()
                         if on_event:
                             on_event("tool_error", {"name": tool_name, "error": str(exc)})
 
@@ -449,9 +459,12 @@ def run_agent_turn(
 
         if turn_tool_results and classification.is_retryable:
             tool_names = ", ".join(call["name"] for call in turn_tool_calls) or "the requested tool"
+            # Named from the classification: a quota or overload error used to
+            # be reported as the model having "timed out".
+            reason = classification.category.replace("_", " ")
             final_text = (
                 "⚠️ The analysis data was generated successfully and the charts below are valid, "
-                "but the model timed out while composing the written summary. "
+                f"but the model could not compose the written summary ({reason}). "
                 f"Retry if you want a narrative explanation of {tool_names}."
             )
             turn_status = "completed_with_warning"
@@ -530,8 +543,50 @@ def run_agent_turn(
 # ---------------------------------------------------------------------------
 
 
+def _without_long_series(tool_name: str, result: dict) -> dict:
+    """The answer-bearing part of a scan, without its per-tick series.
+
+    A week-long worst-case scan carried ~9.5k tokens of series the model never
+    needs to answer — and it is replayed with every later call of the
+    conversation. On a year of data it would not fit the context at all. The
+    charts and the guard layer still read the full result; only what the model
+    is sent is reduced. Whatever stays is copied verbatim, so provenance can
+    still trace every figure the answer quotes.
+    """
+    out = {k: v for k, v in result.items() if k != "series"}
+    series = result.get("series")
+    if tool_name == "get_element_timeseries" and isinstance(series, dict):
+        stamps = result.get("timestamps") or []
+        summary = {}
+        for name, values in series.items():
+            pairs = [(v, t) for v, t in zip(values or [], stamps)
+                     if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if pairs:
+                lo, hi = min(pairs), max(pairs)
+                summary[name] = {"min": lo[0], "min_at": lo[1], "max": hi[0], "max_at": hi[1]}
+        out["series_summary"] = summary
+        out.pop("timestamps", None)
+        out["n_points"] = len(stamps)
+    if tool_name == "scan_scenarios":
+        for scenario in out.get("scenarios") or []:
+            if isinstance(scenario, dict):
+                scenario.pop("series", None)
+                scenario.pop("timestamps", None)
+                ticks = scenario.get("violations_per_tick")
+                if isinstance(ticks, list) and len(ticks) > 20:
+                    scenario["violations_per_tick"] = ticks[:20]
+                    scenario["violations_per_tick_truncated"] = len(ticks)
+    return out
+
+
+_SERIES_TOOLS = frozenset({"find_worst_case_timestamp", "get_element_timeseries", "scan_scenarios"})
+
+
 def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001
     """Keep full tool payloads for charting, but return compact summaries to the model when needed."""
+    if tool_name in _SERIES_TOOLS and isinstance(result, dict) and "error" not in result:
+        import copy
+        return _without_long_series(tool_name, copy.deepcopy(result))
     if tool_name != "scan_rsa_over_time" or not isinstance(result, dict):
         return result
 
@@ -554,6 +609,8 @@ def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001
         "window_end": timestamps[-1] if timestamps else "",
         "n_steps": len(timestamps),
         "any_violations": bool(result.get("any_violations", False)),
+        "reached_end_of_data": bool(result.get("reached_end_of_data", False)),
+        "thresholds_used": result.get("thresholds_used"),
         "violating_step_count": len(violating_steps),
         "max_violation_count": max(violation_counts) if violation_counts else 0,
         "first_violation_timestamps": first_violations,

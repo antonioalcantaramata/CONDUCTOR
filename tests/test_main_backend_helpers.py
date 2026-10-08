@@ -176,12 +176,16 @@ class TestParseHistoricalTarget:
 
 
 class TestRequestModels:
-    def test_grid_request_defaults(self):
+    def test_grid_request_defaults(self, monkeypatch):
+        # Unset limits are the loaded network's own (see _NetworkLimitsMixin).
+        monkeypatch.setitem(mb.app_data, "default_vm_lower", 0.94)
+        monkeypatch.setitem(mb.app_data, "default_vm_upper", 1.06)
         req = mb.GridRequest()
         assert req.load_scaling_factor == 1.0
-        assert req.vm_upper_pu == 1.05
-        assert req.vm_lower_pu == 0.95
+        assert req.vm_upper_pu == 1.06
+        assert req.vm_lower_pu == 0.94
         assert req.data_source == "measurements"
+        assert mb.GridRequest(vm_upper_pu=1.05).vm_upper_pu == 1.05
 
     def test_contingency_request_requires_element_fields(self):
         with pytest.raises(Exception):  # pydantic ValidationError

@@ -6,6 +6,27 @@ synthetic_n_days: 7
 synthetic_resolution_min: 15
 synthetic_load_profile: "residential"
 synthetic_generation_profile: "wind"
+# Usual daily peak as a multiple of the case's own load (its design point);
+# the 2-hour stress windows go about 15 % above it.
+synthetic_peak_load_factor: 1.05
+# The synthetic forecast covers the last days of the measurements (measured
+# values with a day-ahead-sized error) as well as the week after, so forecast
+# and measured can be compared on shared timestamps.
+synthetic_forecast_overlap_days: 2
+# Voltage setpoints. PGLib ships 1.0 p.u. everywhere — placeholders for an OPF
+# benchmark. Held in a power flow they made the condensers deliver up to 3.8×
+# their reactive limit in every hour of the synthetic week. These come from an
+# AC OPF of this network at its base load with the external grid at 1.02 p.u.
+# and each condenser keeping 35 % of its reactive range in reserve (October
+# 2026 calibration). Over the synthetic week: undervoltage in ~3 % of hours,
+# inside the stress windows; the flexibility OPF resolves them; the condensers
+# exceed their reactive limits in ~13 % of hours (at most 1.6×, against up to
+# 3.8× in every hour before) — the assessments do not enforce those limits.
+ext_grid_vm_pu: 1.02
+gen_vm_pu:
+  2: 0.942
+  5: 1.003
+  7: 1.017
 precomputed_ybus_path: null
 slack_max_mw: 999.0
 vm_lower: 0.94

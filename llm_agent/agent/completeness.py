@@ -89,7 +89,11 @@ _KINDS = (
     ),
     Kind(
         "timestamp",
-        re.compile(r"\b(?:when|what time|which (?:timestamp|hour|moment)|worst timestamp)\b", re.IGNORECASE),
+        # "When" asks for a time only as a question ("When is…", "…, when
+        # does…"); a conditional — "what happens to voltages when wind drops"
+        # — asks for something else, and was reported as a missing timestamp.
+        re.compile(r"(?:^|[.?!]\s*)when\b|\bwhen (?:is|are|was|were|does|do|did|will|would|could|can|should|has|have)\b"
+                   r"|\bwhat time\b|\bwhich (?:timestamp|hour|moment)\b|\bworst timestamp\b", re.IGNORECASE),
         re.compile(r"\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}", re.IGNORECASE),
         "a timestamp",
     ),
