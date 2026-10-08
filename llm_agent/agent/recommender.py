@@ -2,9 +2,10 @@
 recommender.py — the AI Agent Suggestion.
 
 A second agent, run only when the operator asks for it. It reads the
-conversation and the latest turn and proposes three or four ways to continue:
-going deeper, testing robustness, trying a change to the system, or stepping
-back to see something the operator has not asked about.
+conversation, a digest of every earlier turn and the latest turn in full, gives
+a short comment — its reading of what happened — and proposes three or four
+ways to continue: going deeper, testing robustness, trying a change to the
+system, or stepping back to see something the operator has not asked about.
 
 It is deliberately not a tool, and it runs nothing. Tool output in CONDUCTOR is
 solver output; this is model reasoning, and the interface labels it as such.
@@ -50,6 +51,10 @@ _EXCLUDED_CAPABILITIES = frozenset({"get_current_timestamp", "advance_timestamp"
 # the cost of sending them on every request.
 _MAX_MESSAGES = 10
 _MAX_MESSAGE_CHARS = 2500
+# Every earlier turn, one line each, built in code from its tool results — so a
+# long session is not forgotten beyond the last few messages. Bounded: the
+# newest lines are kept when it grows past this.
+_MAX_DIGEST_CHARS = 6000
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +83,10 @@ class Suggestion(NamedTuple):
 
 class SuggestionResult(NamedTuple):
     suggestions: tuple[Suggestion, ...]
+    # The agent's reading of what happened, a few sentences, shown above the
+    # suggestions. Opinion, labelled as such; its figures are checked like `why`.
+    comment: str = ""
+    comment_unverified: tuple[str, ...] = ()
     # The agent's own explanation when it has nothing useful to suggest.
     note: str = ""
     # Set when the call or the parse failed; the UI shows a short message,
@@ -111,14 +120,23 @@ you do not compute anything. Your only job is to help the operator decide what \
 to look at next.
 
 You receive:
-- the conversation so far;
+- the most recent messages of the conversation;
+- a digest of every earlier turn: the question, the tools run with their key \
+arguments, and the verdicts they returned — use it to see patterns across a \
+long session;
 - a compact record of the latest turn (tools run, their arguments, key \
 results, and any concerns the system raised);
 - the session context (network, simulation time, data source);
 - the list of capabilities the orchestrator can run;
 - suggestions already given in this conversation.
 
-Propose 3 or 4 next steps for the operator, each from a different angle:
+First, write a short "comment": 2 to 4 sentences giving your reading of \
+what happened in the latest turn and what it means for the operator — \
+whether the result answers the question, what is surprising or uncertain, \
+and how it fits with earlier turns. It is your opinion, so say what the \
+results show and where they stop; never present a guess as a result.
+
+Then propose 3 or 4 next steps for the operator, each from a different angle:
 - deeper:    follow the current line of analysis one step further;
 - stress:    test how robust the current conclusion is (contingencies, \
 uncertainty, other hours, forecasts);
@@ -134,9 +152,9 @@ idea needs data or tools CONDUCTOR does not have, do not suggest it.
 2. Write each "prompt" as a complete, self-contained request the orchestrator \
 can execute: name the timestamp, the data source, and the elements by name. \
 Never rely on "the same as before" or "that bus".
-3. Do not state engineering figures except those that appear in the turn \
-record or the conversation, copied exactly. Never estimate, extrapolate or \
-calculate.
+3. Do not state engineering figures — in the comment or the suggestions — \
+except those that appear in the turn records or the conversation, copied \
+exactly. Never estimate, extrapolate or calculate.
 4. You suggest analyses and options to explore; you do not instruct \
 operational actions. Never write "you should curtail…" or "dispatch…". Write \
 "Study…", "Compare…", "Check whether…".
@@ -150,11 +168,11 @@ then say what changed.
 in the conversation motivates the suggestion.
 8. Match the operator's language.
 9. If there is nothing useful to suggest, return an empty list and a one-line \
-"note" explaining why.
+"note" explaining why; still write the comment.
 
 Respond with JSON only, in this format:
-{{"suggestions": [{{"angle": "deeper|stress|change|step_back", "title": "...", \
-"prompt": "...", "why": "..."}}], "note": "optional"}}
+{{"comment": "...", "suggestions": [{{"angle": "deeper|stress|change|step_back", \
+"title": "...", "prompt": "...", "why": "..."}}], "note": "optional"}}
 """
 
 
@@ -297,11 +315,64 @@ def _conversation_text(messages: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+# Fields that state what a result concluded. Top-level only, as in
+# `needs_attention`: per-sample or per-element detail is the latest turn's job.
+_VERDICT_KEYS = (
+    "status", "secure", "system_secure", "system_n1_secure", "feasible", "converged",
+    "usable", "total_violations", "total_outages_tested", "total_outages_causing_violations",
+    "p_any_violation", "worst_timestamp", "worst_value", "guarantee_met",
+)
+_ARG_KEYS = (
+    "timestamp", "data_source", "element_type", "element_index", "gen_name", "bus",
+    "metric", "load_scaling_factor", "slack_max_mw", "disabled_generators",
+)
+
+
+def turn_digest(record: dict, number: int) -> str:
+    """One line for one turn: question, tools with key arguments, verdicts."""
+    question = " ".join(str(record.get("user") or "").split())
+    if len(question) > 140:
+        question = question[:137] + "..."
+    tools = []
+    for call, entry in zip(record.get("tool_calls") or [], record.get("tool_results") or []):
+        args = call.get("args") or {}
+        shown_args = ", ".join(f"{k}={args[k]}" for k in _ARG_KEYS
+                               if k in args and args[k] not in (None, "", []))
+        result = entry.get("result")
+        if isinstance(result, dict) and result.get("error"):
+            verdict = "error"
+        elif isinstance(result, dict):
+            verdict = ", ".join(f"{k}={result[k]}" for k in _VERDICT_KEYS
+                                if k in result and isinstance(result[k], (bool, int, float, str))
+                                and len(str(result[k])) <= 40)
+        else:
+            verdict = ""
+        tools.append(f"{call.get('name')}({shown_args})" + (f" → {verdict}" if verdict else ""))
+    return f"T{number} · Q: {question} · " + ("; ".join(tools) if tools else "no tools")
+
+
+def session_digest(records: list[dict], latest: dict | None) -> str:
+    """Every turn before the latest, newest kept when the digest is too long."""
+    earlier = [r for r in records if r is not latest]
+    lines = [turn_digest(r, i) for i, r in enumerate(earlier, start=1)]
+    kept: list[str] = []
+    size = 0
+    for line in reversed(lines):
+        if size + len(line) > _MAX_DIGEST_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    omitted = len(lines) - len(kept)
+    head = [f"({omitted} earlier turn(s) omitted)"] if omitted else []
+    return "\n".join(head + list(reversed(kept)))
+
+
 def build_request(messages: list[dict], record: dict | None, context: dict,
-                  shown: list[dict]) -> str:
+                  shown: list[dict], records: list[dict] | None = None) -> str:
     """The single user message sent to the suggestion agent."""
     parts = [
-        "## Conversation\n" + (_conversation_text(messages) or "(empty)"),
+        "## Conversation (most recent messages)\n" + (_conversation_text(messages) or "(empty)"),
+        "## Earlier turns (digest)\n" + (session_digest(records or [], record) or "(none)"),
         "## Latest turn record\n" + (
             json.dumps(compact_turn(record), ensure_ascii=False, default=str)
             if record else "(no tools were run in the latest turn)"),
@@ -372,7 +443,8 @@ def parse_response(text: str, shown: list[dict] | None = None) -> SuggestionResu
             break
 
     note = str(data.get("note") or "").strip()
-    return SuggestionResult(tuple(out), note=note, raw=raw)
+    comment = str(data.get("comment") or "").strip()
+    return SuggestionResult(tuple(out), comment=comment, note=note, raw=raw)
 
 
 def ground(suggestions: tuple[Suggestion, ...], records: list[dict]) -> tuple[Suggestion, ...]:
@@ -382,20 +454,26 @@ def ground(suggestions: tuple[Suggestion, ...], records: list[dict]) -> tuple[Su
     grid. A prompt carries parameters the operator is invited to try ("at 120 %
     load"), which are proposals, not claims.
     """
+    check = _figure_check(records)
+    return tuple(s._replace(unverified=check(s.why)) for s in suggestions)
+
+
+def _figure_check(records: list[dict]):
+    """A function returning the figures in a text that no record contains."""
     sources = []
     subjects: set[str] = set()
     for record in records:
         sources.extend(collect_sources(record))
         subjects |= set(subject_names(record))
-    out = []
-    for suggestion in suggestions:
-        report = check_answer(suggestion.why, sources, subjects=subjects)
-        flagged = tuple(
+
+    def unverified(text: str) -> tuple[str, ...]:
+        report = check_answer(text, sources, subjects=subjects)
+        return tuple(
             f"{v.claim.value:g}" + (f" {v.claim.unit}" if v.claim.unit else "")
             for v in report.verdicts if v.status in (UNGROUNDED, MISATTRIBUTED)
         )
-        out.append(suggestion._replace(unverified=flagged))
-    return tuple(out)
+
+    return unverified
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +502,7 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
 
     shown = list(shown or [])
     provider = provider or get_provider()
-    request = build_request(messages, latest, context, shown)
+    request = build_request(messages, latest, context, shown, records)
     try:
         response = provider.chat(
             messages=[user_message(request)],
@@ -436,11 +514,14 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
         return SuggestionResult((), error=f"The suggestion agent could not be reached: {exc}")
 
     result = parse_response(response.text or "", shown)
-    if result.suggestions:
-        # Grounding is a check: if it fails, the suggestions are still shown,
-        # unmarked, rather than lost.
+    if result.suggestions or result.comment:
+        # Grounding is a check: if it fails, the comment and suggestions are
+        # still shown, unmarked, rather than lost.
         try:
-            result = result._replace(suggestions=ground(result.suggestions, records))
+            result = result._replace(
+                suggestions=ground(result.suggestions, records),
+                comment_unverified=_figure_check(records)(result.comment) if result.comment else (),
+            )
         except Exception:  # noqa: BLE001
             logger.warning("Could not ground suggestion figures.", exc_info=True)
     return result

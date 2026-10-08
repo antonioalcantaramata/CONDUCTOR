@@ -201,7 +201,7 @@ def check_llm_config() -> None:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
-                values[key.strip()] = value.strip()
+                values[key.strip()] = value.strip().strip('"').strip("'")
 
     provider = values.get("LLM_PROVIDER", "").lower() or "google"
 
@@ -209,8 +209,12 @@ def check_llm_config() -> None:
         if not values.get("OLLAMA_MODEL"):
             warn(f"No OLLAMA_MODEL set in {env_file}")
             warn("The app will let you pick one from your installed models.")
-    elif not values.get("GEMINI_API_KEY"):
-        warn(f"No GEMINI_API_KEY found in {env_file}")
+        return
+    # Each hosted backend has its own key; asking an OpenAI or Anthropic user
+    # for a Gemini key was a warning about the wrong thing.
+    key_var = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}.get(provider, "GEMINI_API_KEY")
+    if not values.get(key_var):
+        warn(f"No {key_var} found in {env_file}")
         warn("The app will guide you through setup on first open.")
 
 

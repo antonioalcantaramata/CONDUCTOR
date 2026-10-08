@@ -14,7 +14,7 @@ renders the matching charts.
 
 ```
 llm_agent/
-├── app.py                 ← Streamlit UI: sidebar clock/scrubber, chat, charts
+├── app.py                 ← Streamlit UI: sidebar operating point, chat, charts
 ├── agent/
 │   ├── config.py          ← env vars + live grid-constants fetch
 │   ├── loop.py            ← the agentic turn loop, provider-agnostic
@@ -30,8 +30,10 @@ llm_agent/
 │   ├── renderers.py       ← Plotly renderers, keyed by tool name (RENDERER_MAP)
 │   ├── system_prompt.py   ← system instruction, built from live grid constants
 │   ├── recommender.py     ← AI Agent Suggestion: on-demand second agent, no tools
+│   ├── timeline.py        ← operating point: measured / forecast / compare, and at what time
+│   ├── data_view.py       ← Data tab: the loaded series, forecast against measured
 │   └── errors.py          ← error classification / retry helpers
-├── assets/                ← logo
+├── assets/                ← logo marks (colour, reversed, black) and app icon
 ├── requirements.txt       ← pip deps (installed by start.sh)
 └── .env.example           ← copy to .env and add your key
 ```

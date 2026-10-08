@@ -390,3 +390,42 @@ class TestRecommendedAction:
 
     def test_notes_tell_the_reader_to_use_the_resolved_action(self, report):
         assert any("recommended_action" in n for n in report["notes"])
+
+
+class TestReactiveFeasibility:
+    """Reactive power is signed by nature: the "cannot go below zero" rule
+    belongs to active power. Applied to Q, it withdrew a −5 Mvar absorption
+    against an overvoltage as impossible (code review 4.1)."""
+
+    def test_absorption_from_zero_is_not_impossible(self):
+        import attribution_engine as ae
+        assert ae._relief_feasible_q(-5.0, 0.0) is None  # capability unknown, not False
+
+    def test_within_demonstrated_magnitude_is_deliverable(self):
+        import attribution_engine as ae
+        assert ae._relief_feasible_q(-4.0, 3.0) is True  # +3 → −1 Mvar
+
+    def test_never_false(self):
+        import attribution_engine as ae
+        assert all(ae._relief_feasible_q(r, c) is not False
+                   for r in (-50, -1, 0.5, 50) for c in (-3, 0, 3))
+
+    def test_unknown_headroom_is_not_reported_as_exceeded(self):
+        """It used to say the movement 'exceeds its available 0.00 MVAr'."""
+        import attribution_engine as ae
+        action = ae._recommended_action(
+            {"element": "Bus_3", "limit": 0.94},
+            [{"source": "G", "controllable": True,
+              "relief_mw": 169.0, "relief_mw_feasible": None, "current_p_mw": 29.5,
+              "relief_mvar": 72.06, "relief_mvar_feasible": None, "current_q_mvar": 0.0}])
+        assert action["kind"] == "headroom_unknown"
+        assert "exceeds" not in action["text"] and "not known" in action["text"]
+
+    def test_provably_impossible_still_says_so(self):
+        import attribution_engine as ae
+        action = ae._recommended_action(
+            {"element": "Bus_3", "limit": 1.05},
+            [{"source": "G", "controllable": True,
+              "relief_mw": -6.24, "relief_mw_feasible": False, "current_p_mw": 3.54,
+              "relief_mvar": None, "relief_mvar_feasible": None, "current_q_mvar": 0.0}])
+        assert action["kind"] == "none_sufficient" and "exceeds" in action["text"]

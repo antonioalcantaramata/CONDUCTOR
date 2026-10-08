@@ -61,9 +61,8 @@ def _get_max_ref(row: pd.Series) -> float:
     return 0.0
 
 
-def _load_scale(hours: np.ndarray, dow: np.ndarray,
-                profile: str, rng: np.random.Generator) -> np.ndarray:
-    """Per-step load scale factor in [0.05, 1.5]."""
+def _load_shape(hours: np.ndarray, dow: np.ndarray, profile: str) -> np.ndarray:
+    """The noise-free load shape of a profile."""
     n = len(hours)
     if profile == "residential":
         # Morning peak ~8 h, evening peak ~19 h
@@ -71,17 +70,29 @@ def _load_scale(hours: np.ndarray, dow: np.ndarray,
                  + 0.4 * np.sin(np.pi * (hours - 7.0) / 12.0) ** 2
                  + 0.3 * np.sin(np.pi * (hours - 18.0) / 6.0) ** 2)
         # Weekend (Sat=5, Sun=6): 15% lower
-        alpha *= 1.0 - 0.15 * (dow >= 5).astype(float)
-        # ±5 % white noise
-        alpha *= rng.uniform(0.95, 1.05, n)
-    elif profile == "industrial":
+        return alpha * (1.0 - 0.15 * (dow >= 5).astype(float))
+    if profile == "industrial":
         alpha = np.full(n, 0.85)
         alpha[(hours < 6) | (hours >= 22)] *= 0.70
-        alpha *= rng.uniform(0.97, 1.03, n)
-    else:  # "flat"
-        alpha = np.ones(n)
-        alpha *= rng.uniform(0.98, 1.02, n)
+        return alpha
+    return np.ones(n)  # "flat"
+
+
+_NOISE = {"residential": 0.05, "industrial": 0.03}
+
+
+def _load_scale(hours: np.ndarray, dow: np.ndarray,
+                profile: str, rng: np.random.Generator) -> np.ndarray:
+    """Per-step load scale factor in [0.05, 1.5]: the shape with white noise."""
+    noise = _NOISE.get(profile, 0.02)
+    alpha = _load_shape(hours, dow, profile) * rng.uniform(1.0 - noise, 1.0 + noise, len(hours))
     return np.clip(alpha, 0.05, 1.5)
+
+
+def _shape_peak(profile: str) -> float:
+    """A profile's noise-free weekday maximum."""
+    hours = np.linspace(0.0, 24.0, 2881)
+    return float(_load_shape(hours, np.zeros_like(hours), profile).max())
 
 
 def _gen_scale(profile: str, n_steps: int,
@@ -120,6 +131,7 @@ def generate(
     seed: int = 42,
     stress_events: bool = True,
     start_dt: datetime = _ORIGIN,
+    peak_load_factor: float | None = 1.0,
 ) -> tuple[list[str], dict[str, pd.DataFrame]]:
     """Generate a synthetic measurement timeseries from a static pandapower network.
 
@@ -143,6 +155,13 @@ def generate(
     start_dt : datetime
         First timestamp of the series. Defaults to 2000-01-01. Used to place a
         forecast series on a time range immediately after the measurement series.
+    peak_load_factor : float or None
+        The usual daily peak as a multiple of the network's own load. A
+        network's loads are its design point (a PGLib or IEEE case is built
+        to be operable there), so the default 1.0 peaks at that load; stress
+        windows go above it. The profile shapes alone peak higher (residential
+        at ~1.22×), which pushed a test case past its reactive capability every
+        afternoon. ``None`` keeps the raw shape.
 
     Returns
     -------
@@ -186,6 +205,8 @@ def generate(
     # --- Generate profile timeseries ---
     load_alpha = _load_scale(hours, dow, load_profile, rng)
     gen_alpha  = _gen_scale(generation_profile, n_steps, hours, rng)
+    if peak_load_factor is not None:
+        load_alpha = load_alpha * (float(peak_load_factor) / _shape_peak(load_profile))
 
     # --- Stress events: occasional, mild 2-hour high-load / low-gen windows ---
     # The twin should read as *mostly secure*, with the odd stressed window —
@@ -222,3 +243,68 @@ def generate(
         measurements[ts_str] = pd.DataFrame(rows)
 
     return timestamps, measurements
+
+
+def _ar1(n: int, sigma: float, rng: np.random.Generator, phi: float = 0.97) -> np.ndarray:
+    """A slowly varying error: forecast errors persist for hours, they are not white noise."""
+    e = np.empty(n)
+    e[0] = rng.normal(0.0, sigma)
+    step = sigma * np.sqrt(1.0 - phi ** 2)
+    for t in range(1, n):
+        e[t] = phi * e[t - 1] + rng.normal(0.0, step)
+    return e
+
+
+def forecast(
+    net: pp.pandapowerNet,
+    timestamps: list[str],
+    measurements: dict[str, pd.DataFrame],
+    overlap_days: float = 2.0,
+    n_days: int = 7,
+    resolution_min: int = 15,
+    load_profile: str = "residential",
+    generation_profile: str = "wind",
+    seed: int = 137,
+    peak_load_factor: float | None = 1.0,
+    load_error: float = 0.04,
+    generation_error: float = 0.20,
+) -> tuple[list[str], dict[str, pd.DataFrame]]:
+    """A synthetic forecast that overlaps the end of the measurements.
+
+    Two parts:
+
+    - the last ``overlap_days`` of measured ticks, forecast as the measured
+      values times a slowly varying error (~``load_error`` on consumption,
+      ~``generation_error`` on production — typical day-ahead sizes for load
+      and wind). This is a forecast *of* those hours, so comparing it with what
+      was measured means something; an independent series would not;
+    - ``n_days`` after the measurements: an independent synthetic realisation
+      (``generate`` with ``seed``), the look-ahead.
+
+    ``overlap_days=0`` gives the look-ahead alone.
+    """
+    rng = np.random.default_rng(seed)
+    steps_per_day = int(24 * 60 / resolution_min)
+    n_overlap = min(len(timestamps), int(round(overlap_days * steps_per_day)))
+    overlap = timestamps[len(timestamps) - n_overlap:] if n_overlap else []
+
+    out: dict[str, pd.DataFrame] = {}
+    if overlap:
+        load_err = _ar1(len(overlap), load_error, rng)
+        gen_err = _ar1(len(overlap), generation_error, rng)
+        for t, ts in enumerate(overlap):
+            df = measurements[ts].copy()
+            df["consumption"] = (df["consumption"] * (1.0 + load_err[t])).clip(lower=0.0)
+            df["production"] = (df["production"] * (1.0 + gen_err[t])).clip(lower=0.0)
+            out[ts] = df
+
+    ahead_ts: list[str] = []
+    if n_days > 0 and timestamps:
+        start = datetime.strptime(timestamps[-1], "%Y-%m-%d %H:%M:%S") + timedelta(minutes=resolution_min)
+        ahead_ts, ahead = generate(
+            net, n_days=n_days, resolution_min=resolution_min, load_profile=load_profile,
+            generation_profile=generation_profile, seed=seed, start_dt=start,
+            peak_load_factor=peak_load_factor,
+        )
+        out.update(ahead)
+    return list(overlap) + ahead_ts, out

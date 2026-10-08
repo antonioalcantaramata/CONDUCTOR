@@ -376,3 +376,61 @@ class TestLegacyThinkingModels:
         """On a legacy model `medium` is a token count this provider chose. A
         log that recorded only the label could not be compared with anything."""
         assert haiku.describe()["reasoning"].startswith("budget ")
+
+
+class TestIdlessHistory:
+    """History from a backend that issues no call ids (Ollama, sometimes
+    Gemini) must still give every tool_use a unique id and pair each result
+    with its own call — the name fallback made two parallel calls to one tool
+    share an id, and the API rejects that for the rest of the conversation."""
+
+    def _convert(self, provider, messages):
+        return provider._to_anthropic_messages(messages)
+
+    def test_parallel_calls_to_one_tool_get_distinct_ids(self, provider):
+        out = self._convert(provider, [
+            {"role": "user", "content": "rank the generators"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"name": "optimize_flexibility", "args": {"disabled_generators": ["A"]}},
+                {"name": "optimize_flexibility", "args": {"disabled_generators": ["B"]}},
+            ]},
+            {"role": "tool", "name": "optimize_flexibility", "content": {"r": "A"}},
+            {"role": "tool", "name": "optimize_flexibility", "content": {"r": "B"}},
+        ])
+        uses = [b["id"] for b in out[1]["content"] if b["type"] == "tool_use"]
+        results = [b["tool_use_id"] for b in out[2]["content"]]
+        assert len(set(uses)) == 2
+        assert results == uses  # each result answers its own call, in order
+
+    def test_ids_that_exist_are_kept(self, provider):
+        out = self._convert(provider, [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"name": "run_rsa", "args": {}, "id": "toolu_1"}]},
+            {"role": "tool", "name": "run_rsa", "content": {}, "id": "toolu_1"},
+        ])
+        assert out[1]["content"][0]["id"] == "toolu_1"
+        assert out[2]["content"][0]["tool_use_id"] == "toolu_1"
+
+    def test_ids_are_unique_across_turns(self, provider):
+        turn = [{"role": "assistant", "content": "", "tool_calls": [{"name": "run_rsa", "args": {}}]},
+                {"role": "tool", "name": "run_rsa", "content": {}}]
+        out = self._convert(provider, [{"role": "user", "content": "q"}, *turn,
+                                       {"role": "user", "content": "again"}, *turn])
+        ids = [b["id"] for m in out if m["role"] == "assistant"
+               for b in m["content"] if b["type"] == "tool_use"]
+        assert len(ids) == len(set(ids)) == 2
+
+
+def test_requests_ask_for_prompt_caching(provider, monkeypatch):
+    """The ~20k-token tools + system prefix repeats on every call (review 7.2)."""
+    sent = {}
+
+    def fake_create(**kwargs):
+        sent.update(kwargs)
+        return _reply([_block(type="text", text="ok")])
+
+    monkeypatch.setattr(type(provider), "client", property(
+        lambda self: types.SimpleNamespace(messages=types.SimpleNamespace(create=fake_create))))
+    provider.chat([{"role": "user", "content": "hi"}], [], "SYSTEM")
+    assert sent["cache_control"] == {"type": "ephemeral"}

@@ -61,11 +61,17 @@ def match_substation(name, substations):
     for i, sub in enumerate(normalized_subs):
         if name_norm.startswith(sub + " ") or name_norm.startswith(sub + "-"):
             return substations[i]
+    # Last resort: a three-letter prefix shared by a word of the name and a
+    # substation. Accepted only when it points at exactly one substation —
+    # "Bus_13" shares "bus" with every "Bus_*", and the first-match version
+    # gave it Bus_1's load while reporting nothing unmatched.
     parts = re.split(r'[\s\-()]', name_norm)
-    for part in parts:
-        for i, sub in enumerate(normalized_subs):
-            if part[:3] == sub[:3]:
-                return substations[i]
+    candidates = {
+        i for part in parts if len(part) >= 3
+        for i, sub in enumerate(normalized_subs) if part[:3] == sub[:3]
+    }
+    if len({substations[i] for i in candidates}) == 1:
+        return substations[candidates.pop()]
     return None
 
 
@@ -245,6 +251,7 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     # Create a mapping from substation name to consumption value
     consumption_map = measurement_prod_cons.set_index('substation_name')['consumption']
     net.load['consumption'] = net.load['substation_name'].map(consumption_map)
+    net.load['_meas_key'] = net.load['substation_name'].where(net.load['consumption'].notna())
 
     # T6 fallback: for generic/IEEE networks where fuzzy substation matching returns
     # None, try a direct match on the raw bus name (measurement rows use bus names).
@@ -253,6 +260,25 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
         net.load.loc[unmatched, 'consumption'] = (
             net.load.loc[unmatched, 'bus_name'].map(consumption_map)
         )
+        net.load.loc[unmatched, '_meas_key'] = net.load.loc[unmatched, 'bus_name'].where(
+            net.load.loc[unmatched, 'consumption'].notna())
+
+    # A measurement is the total of its substation (or bus). Every load matched
+    # to it used to receive that whole total, so two loads on one bus doubled
+    # the measured demand (309 MW against 223 measured in a reproduction).
+    # Split it across them by their share in the network as first loaded —
+    # kept in `_meas_weight`, which is set once, before any measured value
+    # has overwritten `p_mw`. A substation with one load is unaffected.
+    if '_meas_weight' not in net.load.columns:
+        net.load['_meas_weight'] = net.load['p_mw'].clip(lower=0).fillna(0.0)
+    keyed = net.load['_meas_key'].notna()
+    if keyed.any():
+        weights = net.load.loc[keyed, '_meas_weight'].astype(float)
+        keys = net.load.loc[keyed, '_meas_key']
+        totals = weights.groupby(keys).transform('sum')
+        counts = keys.groupby(keys).transform('count')
+        share = (weights / totals).where(totals > 0, 1.0 / counts)
+        net.load.loc[keyed, 'consumption'] = net.load.loc[keyed, 'consumption'] * share
 
     # Identify buses that are still unmatched after both attempts.
     still_unmatched = net.load['consumption'].isna()
@@ -272,7 +298,7 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     # -------- Step 6 (old): reactive power already handled above --------
 
     # -------- Step 7: Clean up --------
-    net.load.drop(columns=['consumption'], inplace=True)
+    net.load.drop(columns=['consumption', '_meas_key'], inplace=True)
     net.load.index = original_index  # Restore original indices
 
     return net, unmatched_bus_names
@@ -312,6 +338,37 @@ def _update_gen_table_inplace(gen_df: pd.DataFrame, bus_id_to_prod: dict, scale_
             if scale_q and 'q_mvar' in gen_df.columns and old_p != 0.0:
                 ratio = new_p / old_p
                 gen_df.at[idx, 'q_mvar'] = float(gen_df.at[idx, 'q_mvar']) * ratio
+
+
+def _capacity_on_bus(gen_df: pd.DataFrame, bus_id) -> tuple[float, int]:
+    """(total max_p_mw, number of units) of `gen_df` on one bus."""
+    rows = gen_df[gen_df['bus'] == bus_id] if len(gen_df) else gen_df
+    if 'max_p_mw' in rows.columns:
+        cap = float(rows['max_p_mw'].clip(lower=0).fillna(0.0).sum())
+    else:
+        cap = 0.0
+    return cap, len(rows)
+
+
+def _split_between_tables(gen_df: pd.DataFrame, sgen_df: pd.DataFrame,
+                          bus_id_to_prod: dict) -> tuple[dict, dict]:
+    """Divide each bus's production between net.gen and net.sgen.
+
+    By installed capacity when known, otherwise by number of units; a bus with
+    units in only one table gives that table everything, as before.
+    """
+    gen_share: dict = {}
+    sgen_share: dict = {}
+    for bus_id, total in bus_id_to_prod.items():
+        cap_g, n_g = _capacity_on_bus(gen_df, bus_id)
+        cap_s, n_s = _capacity_on_bus(sgen_df, bus_id)
+        if n_g == 0 or n_s == 0:
+            gen_share[bus_id] = sgen_share[bus_id] = total
+            continue
+        frac_g = cap_g / (cap_g + cap_s) if cap_g + cap_s > 0 else n_g / (n_g + n_s)
+        gen_share[bus_id] = total * frac_g
+        sgen_share[bus_id] = total * (1.0 - frac_g)
+    return gen_share, sgen_share
 
 
 def assign_generators_values_from_measurements(net, measurement_prod_cons, substations):
@@ -360,9 +417,12 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
             for bus_id, bname in bus_name_map_local.items()
             if bname in prod_map.index
         }
-        _update_gen_table_inplace(net.gen, bus_id_to_prod, scale_q=False)
+        # A bus with both a `gen` and an `sgen` used to receive its full
+        # production in each table. Split it once across both, by capacity.
+        gen_share, sgen_share = _split_between_tables(net.gen, net.sgen, bus_id_to_prod)
+        _update_gen_table_inplace(net.gen, gen_share, scale_q=False)
         if len(net.sgen) > 0:
-            _update_gen_table_inplace(net.sgen, bus_id_to_prod, scale_q=True)
+            _update_gen_table_inplace(net.sgen, sgen_share, scale_q=True)
 
         # Identify generator buses that had no matching row in the CSV.
         gen_buses = set(net.gen['bus'].tolist()) | set(net.sgen['bus'].tolist())

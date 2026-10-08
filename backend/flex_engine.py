@@ -26,6 +26,252 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------------------------------------------------------
 # Helper: extract Pg_max from the network object (T1)
 # ---------------------------------------------------------------------------
+def _neutral_tap(net, trafo_idx) -> int:
+    """A transformer's neutral tap as an integer key; 0 when unset.
+
+    `pn.case14()` (the `ieee14` profile) leaves `tap_neutral` NaN on two
+    transformers, and `int(nan)` failed every OPF on that profile. 0 is the
+    rule `network_loader._build_ybus_entry` already applies when it builds the
+    admittance database these keys index.
+    """
+    if "tap_neutral" not in net.trafo.columns:
+        return 0
+    value = net.trafo.at[trafo_idx, "tap_neutral"]
+    return 0 if pd.isna(value) else int(value)
+
+
+def _fix_slack_voltage(var, vm: float) -> None:
+    """Fix the slack bus voltage at its measured value, inside its own bounds.
+
+    The slack voltage carries the OPF's voltage band like every bus. A slack
+    measured outside that band (1.06 p.u. against a 1.05 ceiling, common on
+    IEEE cases) made Pyomo refuse the fixed variable as trivially infeasible
+    in both folds, which reached the operator as a bare HTTP 500. The slack is
+    not a decision variable, so its bounds are widened to admit the setpoint.
+    """
+    if var.lb is not None and vm < var.lb:
+        var.setlb(vm)
+    if var.ub is not None and vm > var.ub:
+        var.setub(vm)
+    var.fix(vm)
+
+
+def diagnose_infeasible(model, branch_label=None) -> dict | None:
+    """Why a flexibility OPF has no solution, in an operator's terms.
+
+    The grid-connection (slack) voltage is fixed at its measured value on
+    purpose — local flexibility cannot set the transmission voltage — and a
+    failed solve used to say only "Infeasible.". One re-solve with that voltage
+    free inside its bounds (the OPF band) tells the two cases apart:
+
+      - solvable: local resources fall short at the measured voltage; the
+        voltage the connection would need is reported, with the reactive
+        sources that are at their limits there. Raising it is a transmission
+        operator's or a substation tap changer's action, not local flexibility;
+      - still infeasible: a second re-solve, voltage fixed again, lifts the
+        branch-current limits. If that solves, line loading is the binding
+        limit — losing the main import line pushes the import onto what is
+        left, which no voltage can fix — and the branches that would be
+        overloaded are named (`branch_label(i, j)` gives their names).
+
+    Reported, never applied: the caller's result stays infeasible. The model
+    is restored afterwards. Returns None when the model has no single fixed
+    slack voltage or the re-solve itself fails.
+    """
+    from pyomo.environ import SolverFactory
+
+    fixed = [b for b in model.V if model.V[b].fixed]
+    if len(fixed) != 1:
+        return None
+    var = model.V[fixed[0]]
+    measured, lb, ub = float(var.value), var.lb, var.ub
+    band = [round(float(lb), 4) if lb is not None else None,
+            round(float(ub), 4) if ub is not None else None]
+    var.unfix()
+    # The smallest move of the connection voltage that works, not wherever the
+    # solver happens to land: the dispatch objective does not price it.
+    original = next(iter(model.component_objects(Objective, active=True)))
+    original.deactivate()
+    model._diagnosis_obj = Objective(expr=1e3 * (var - measured) ** 2 + original.expr, sense=minimize)
+    _restart(model)
+    try:
+        res = SolverFactory("ipopt").solve(model, tee=False, load_solutions=False)
+        solvable = res.solver.termination_condition == TerminationCondition.optimal
+        at_limit = []
+        needed = None
+        if solvable:
+            model.solutions.load_from(res)
+            needed = round(float(value(var)), 4)
+            cond = set(getattr(model, "CondSet", []) or [])
+            for g in model.G:
+                q = float(value(model.Qg_new[g]))
+                if g in cond and q >= float(value(model.Qg_cond_max[g])) - 1e-3:
+                    at_limit.append({"name": g, "q_mvar": round(q, 2),
+                                     "limit": f"max {float(value(model.Qg_cond_max[g])):.1f} Mvar"})
+                elif g in cond and q <= float(value(model.Qg_cond_min[g])) + 1e-3:
+                    at_limit.append({"name": g, "q_mvar": round(q, 2),
+                                     "limit": f"min {float(value(model.Qg_cond_min[g])):.1f} Mvar"})
+                elif g in set(model.PF_set):
+                    p = float(value(model.Pg_new[g]))
+                    if q * q >= float(value(model.tan_phi_sq)) * p * p - 1e-3 and abs(q) > 1e-3:
+                        at_limit.append({"name": g, "q_mvar": round(q, 2),
+                                         "limit": "power-factor limit"})
+    except Exception:  # noqa: BLE001 — a diagnosis must never break the reply
+        return None
+    finally:
+        var.fix(measured)
+        model.del_component("_diagnosis_obj")
+        original.activate()
+
+    overloads = []
+    thermal_solvable = combined_solvable = False
+    if not solvable:
+        try:
+            overloads, thermal_solvable = _thermal_check(model, branch_label)
+            if not thermal_solvable:
+                # Each lever alone failed; both together tells "needs both"
+                # from "beyond either".
+                overloads, combined_solvable = _thermal_check(model, branch_label, slack=var)
+        except Exception:  # noqa: BLE001
+            overloads, thermal_solvable, combined_solvable = [], False, False
+
+    band_text = f"{band[0]:.2f}–{band[1]:.2f} p.u" if None not in band else "its bounds"
+    if solvable:
+        sources = ", ".join(f"{s['name']} ({s['q_mvar']:.1f} Mvar, {s['limit']})" for s in at_limit)
+        explanation = (
+            f"local flexibility cannot clear the violations with the grid-connection voltage "
+            f"held at its measured {measured:.3f} p.u. A solution exists if that voltage is "
+            f"raised to {needed:.3f} p.u. (within {band_text}.) — a transmission-operator or "
+            f"substation tap-changer action, not local flexibility."
+            + (f" Reactive sources at their limits there: {sources}." if sources else "")
+        )
+    elif thermal_solvable and overloads:
+        listed = ", ".join(f"{o['branch']} ({o['loading_pct_of_rating']:.0f} % of its rating; "
+                           f"allowed {o['allowed_pct_of_rating']:.0f} %)" for o in overloads[:4])
+        explanation = (
+            f"local flexibility cannot clear the violations, even with the grid-connection "
+            f"voltage free within {band_text}. The binding limit is line loading: a dispatch "
+            f"exists only if branch limits are lifted, and then {listed} "
+            f"{'carries' if len(overloads) == 1 else 'carry'} more than allowed — redispatch of "
+            f"local units cannot move enough power off {'it' if len(overloads) == 1 else 'them'}."
+        )
+    elif combined_solvable and overloads:
+        listed = ", ".join(f"{o['branch']} ({o['loading_pct_of_rating']:.0f} % of its rating; "
+                           f"allowed {o['allowed_pct_of_rating']:.0f} %)" for o in overloads[:4])
+        explanation = (
+            f"local flexibility cannot clear the violations by raising the grid-connection "
+            f"voltage within {band_text} or by lifting branch limits alone; only both together "
+            f"give a dispatch, with {listed} overloaded."
+        )
+    else:
+        explanation = (
+            f"local flexibility cannot clear the violations: neither raising the grid-connection "
+            f"voltage within {band_text} nor lifting branch limits gives a dispatch, even both "
+            f"together. The violations exceed what redispatch can reach within the voltage band."
+        )
+    return {
+        "grid_voltage_fixed_pu": round(measured, 4),
+        "voltage_band_pu": band,
+        "solvable_with_grid_voltage_free": solvable,
+        "grid_voltage_needed_pu": needed,
+        "reactive_sources_at_limit": at_limit,
+        "binding_limit": ("voltage_support" if solvable
+                          else "branch_loading" if thermal_solvable and overloads
+                          else "voltage_support_and_branch_loading" if combined_solvable and overloads
+                          else "beyond_voltage_and_branch_levers"),
+        "branch_overloads": overloads,
+        "explanation": explanation,
+    }
+
+
+def _restart(model) -> None:
+    """Put the variables back at the power-flow operating point.
+
+    IPOPT is local: started from the point a failed solve stopped at, a
+    re-solve can report "locally infeasible" for a problem that is not —
+    lifting every branch limit at a 20 % current margin came back infeasible
+    while the same hour solves outright at 30 %.
+    """
+    start = getattr(model, "_diagnosis_start", None)
+    if not start:
+        return
+    for b in model.V:
+        if not model.V[b].fixed and b in start["V"]:
+            lb, ub = model.V[b].lb, model.V[b].ub
+            v = start["V"][b]
+            model.V[b].value = min(max(v, lb if lb is not None else v), ub if ub is not None else v)
+    for b in model.theta:
+        if not model.theta[b].fixed and b in start["theta"]:
+            model.theta[b].value = start["theta"][b]
+    for g in model.G:
+        if not model.Pg_new[g].fixed and g in start["Pg"]:
+            lb, ub = model.Pg_new[g].lb, model.Pg_new[g].ub
+            p = start["Pg"][g]
+            model.Pg_new[g].value = min(max(p, lb if lb is not None else p), ub if ub is not None else p)
+        if not model.Qg_new[g].fixed and g in start["Qg"]:
+            model.Qg_new[g].value = start["Qg"][g]
+
+
+def _thermal_check(model, branch_label=None, slack=None) -> tuple[list[dict], bool]:
+    """Re-solve with the branch-current limits lifted.
+
+    The slack voltage stays fixed unless `slack` (its variable) is given, in
+    which case it is freed inside its bounds for this solve. Returns the
+    branches whose current would exceed their rating at that solution, worst
+    first, and whether the re-solve found one at all. Limits and the slack
+    voltage are restored afterwards.
+    """
+    from pyomo.environ import SolverFactory
+
+    limits = [getattr(model, name) for name in ("branch_current_from_limit", "branch_current_to_limit")
+              if hasattr(model, name)]
+    if not limits:
+        return [], False
+    for c in limits:
+        c.deactivate()
+    fixed_at = float(slack.value) if slack is not None else None
+    if slack is not None:
+        slack.unfix()
+    _restart(model)
+    try:
+        res = SolverFactory("ipopt").solve(model, tee=False, load_solutions=False)
+        if res.solver.termination_condition != TerminationCondition.optimal:
+            return [], False
+        model.solutions.load_from(res)
+        worst: dict = {}
+        for c in limits:
+            for (i, j) in c:
+                rating_sq = None
+                for a, b in ((i, j), (j, i)):
+                    if (a, b) in model.I_from_max and float(value(model.Ibase_from_kA[a, b])):
+                        rating_sq = (float(value(model.I_from_max[a, b])) / float(value(model.Ibase_from_kA[a, b]))) ** 2
+                        break
+                if not rating_sq:
+                    continue
+                current_sq = max(float(value(c[i, j].body)), 0.0)
+                # The OPF's own bound (the rating shrunk by the current safety
+                # margin), not the rating: that is what the solve had to meet.
+                allowed_sq = float(value(c[i, j].upper)) if c[i, j].upper is not None else rating_sq
+                if current_sq <= allowed_sq * (1 + 1e-4):
+                    continue
+                key = tuple(sorted((int(i), int(j))))
+                pct = 100.0 * math.sqrt(current_sq / rating_sq)
+                if pct > worst.get(key, (0.0, 0.0))[0]:
+                    worst[key] = (pct, 100.0 * math.sqrt(allowed_sq / rating_sq))
+        overloads = [
+            {"branch": (branch_label(*key) if branch_label else f"Bus_{key[0]}–Bus_{key[1]}"),
+             "loading_pct_of_rating": round(pct, 1),
+             "allowed_pct_of_rating": round(allowed, 1)}
+            for key, (pct, allowed) in sorted(worst.items(), key=lambda kv: -kv[1][0])
+        ]
+        return overloads, True
+    finally:
+        for c in limits:
+            c.activate()
+        if slack is not None:
+            slack.fix(fixed_at)
+
+
 def _extract_pg_max(net) -> dict:
     """Build {name -> Pg_max_mw} from net.sgen and net.gen.
 
@@ -258,7 +504,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     #     external grid voltage as a free lever to absorb local overvoltages.
     slack_bus = int(net.ext_grid['bus'].iloc[0])
     model.theta[slack_bus].fix(va_rad_map[slack_bus])
-    model.V[slack_bus].fix(vm_pu_map[slack_bus])
+    _fix_slack_voltage(model.V[slack_bus], vm_pu_map[slack_bus])
 
         
     # -------------------------
@@ -403,6 +649,12 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     ###################################################
     # Reactive power variable (no bounds here)
     model.Qg_new = Var(model.G)
+    # The power-flow operating point, kept for `diagnose_infeasible`: its
+    # re-solves start here, not from wherever a failed solve stopped.
+    model._diagnosis_start = {
+        "V": dict(vm_pu_map), "theta": dict(va_rad_map),
+        "Pg": dict(P_base_data), "Qg": dict(Q_base_data),
+    }
 
     # -------------------------
     # PF coupling parameters
@@ -587,14 +839,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
             # Transformer branch — get its trafo index and neutral tap
             trafo_idx = branch_to_trafo[(i, j)]
     
-            # Get neutral tap position from pandapower (default to 0 if not available)
-            if "tap_neutral" in net.trafo.columns:
-                t_default = net.trafo.at[trafo_idx, "tap_neutral"]
-            else:
-                t_default = 0
-    
-            # Make sure it's an integer key present in your Y dictionaries
-            t_default = int(t_default)
+            # Neutral tap as an integer key into the Y dictionaries.
+            t_default = _neutral_tap(net, trafo_idx)
 
             model.Yff_real_used[i, j].fix(Yff_r[(i, j), t_default])
             model.Yff_imag_used[i, j].fix(Yff_i[(i, j), t_default])
@@ -1249,7 +1495,7 @@ def scenario_optimization_model_base(
     for (i, j) in branches_list:
         if (i, j) in branch_to_trafo:
             trafo_idx = branch_to_trafo[(i, j)]
-            t_default = int(net.trafo.at[trafo_idx, "tap_neutral"]) if "tap_neutral" in net.trafo.columns else 0
+            t_default = _neutral_tap(net, trafo_idx)
         else:
             t_default = 1
         Yff_real_used[(i, j)] = float(Yff_r[(i, j), t_default])
@@ -1299,7 +1545,7 @@ def scenario_optimization_model_base(
     slack_bus = int(net.ext_grid['bus'].iloc[0])
     for k in model.K:
         model.theta[slack_bus, k].fix(va_rad_map[slack_bus])
-        model.V[slack_bus, k].fix(vm_pu_map[slack_bus])
+        _fix_slack_voltage(model.V[slack_bus, k], vm_pu_map[slack_bus])
 
     # Scenario AC balance constraints.
     def active_balance_rule(m, b, k):

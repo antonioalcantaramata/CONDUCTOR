@@ -38,16 +38,31 @@ def build_system_prompt(gc: dict) -> str:
     # --- Data sources (measurements vs forecasts) ---
     _meas = gc.get("measurements", {}) or {}
     _fc   = gc.get("forecasts", {}) or {}
+    def _src(info: dict) -> str:
+        return f" ({info['source']})" if info.get("source") in ("synthetic", "uploaded") else ""
+
     if _meas.get("loaded"):
         _meas_line = (f"loaded — {_meas.get('n_timestamps', '?')} timestamps, "
-                      f"{_meas.get('first_timestamp')} → {_meas.get('last_timestamp')}")
+                      f"{_meas.get('first_timestamp')} → {_meas.get('last_timestamp')}{_src(_meas)}")
     else:
         _meas_line = "not loaded"
     if _fc.get("loaded"):
         _fc_line = (f"loaded — {_fc.get('n_timestamps', '?')} timestamps, "
-                    f"{_fc.get('first_timestamp')} → {_fc.get('last_timestamp')}")
+                    f"{_fc.get('first_timestamp')} → {_fc.get('last_timestamp')}{_src(_fc)}")
     else:
         _fc_line = "NOT loaded — forecast-based tools will return an error until a forecast is generated or uploaded"
+    # Whether the two share timestamps is a fact of the loaded data, not a rule.
+    _n_shared = _fc.get("n_shared_with_measurements") or 0
+    if _n_shared:
+        _overlap_line = (
+            f"The two datasets **share {_n_shared} timestamps** ({_fc.get('first_shared')} → "
+            f"{_fc.get('last_shared')}). At those times forecast can be compared with what was "
+            "measured: run the same tool at the same `timestamp` once per `data_source`. Outside "
+            "them, never assume a timestamp exists in both."
+        )
+    else:
+        _overlap_line = ("The two datasets **share no timestamp**. Never assume a timestamp "
+                         "exists in both.")
 
     return f"""You are an expert power systems operator assistant for the \
 {_name} digital twin. You assist operators and \
@@ -66,9 +81,9 @@ Reducing it simulates islanding or cable derating — the optimizer forces local
 to compensate. {_description}
 - **Security limits:** voltages must stay within **{_vm_lower}–{_vm_upper} p.u.**; thermal \
 loading below **{_max_load:.0f}%**. Pass `vm_lower_pu={_vm_lower}` and `vm_upper_pu={_vm_upper}` \
-**explicitly** on every tool that accepts them — never rely on the built-in 0.95/1.05 fallback, \
-which does not reflect this network. Deviate only when the user asks for tighter or looser \
-bounds. Charts always reflect the thresholds actually used.
+**explicitly** on every tool that accepts them; the tools, the optimizer included, default to \
+the same values, so an omitted limit is never a different one. Deviate only when the user asks \
+for tighter or looser bounds. Charts always reflect the thresholds actually used.
 - **Data resolution:** 15-minute resolution. One simulation tick = 15 minutes.
 - **Optimization:** SMFAE uses AC OPF (Pyomo/IPOPT). Typical solve < 140 s. \
 `evaluate_kpis` runs two solves (unconstrained + constrained).
@@ -92,8 +107,7 @@ default to measurements and say so.
 - Point-in-time tools default to the simulation clock for measurements and to the **first tick** \
 for forecasts. To study a specific forecast hour, find it with \
 `find_worst_case_timestamp(data_source="forecasts")` and pass that `timestamp`.
-- The two datasets cover **different time ranges** (forecasts begin after the measurement window \
-ends). Never assume a timestamp exists in both.
+- {_overlap_line}
 - If a forecast tool reports no forecast data, say so plainly and suggest uploading a forecast CSV \
 or using measurements — do not fabricate forecast results.
 
@@ -192,8 +206,8 @@ current timestamp. Do NOT infer these from OPF or RSA results.
 
 13. **"Most critical generator" / "generator sensitivity"** → call `get_current_timestamp` once, \
 then `optimize_flexibility` for each substation in the order listed under *Substation names* \
-above, each with `disabled_generators=["<name>"]`, recording `objective_value` or total \
-redispatch. After testing ALL substations, rank by change vs. the no-disable baseline and report \
+above, each with `disabled_generators=["<name>"]`, recording the total redispatch (the sum of \
+|Pg_new − Pg_base| over `activated_resources`) and whether the result is feasible. After testing ALL substations, rank by change vs. the no-disable baseline and report \
 the top 3. Do NOT stop early.
 
 14. **When `disabled_generators` is non-empty**, `optimize_flexibility` returns \

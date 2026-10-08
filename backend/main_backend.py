@@ -27,8 +27,11 @@ Overview
    results back(remains to be completed).
 """
 
+import asyncio
+import functools
 import json
 import math
+import threading
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,7 +45,8 @@ import copy
 import pandas as pd
 import numpy as np
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+import anyio
 from pyomo.environ import value
 from pyomo.opt import TerminationCondition
 import time
@@ -110,10 +114,32 @@ def _persist_uploaded_bytes(
 ) -> str:
     _ensure_storage_dirs()
     stored_name = _sanitize_upload_name(filename, fallback_stem, suffix)
+    if filename:
+        # Prefixed with its kind: a measurement file and a forecast file that
+        # share a name (`data.csv`) used to land on the same path, so the
+        # measurements on disk were silently replaced by the forecast.
+        stored_name = f"{fallback_stem}__{stored_name}"
     stored_path = os.path.join(target_dir, stored_name)
     with open(stored_path, "wb") as fh:
         fh.write(content)
     return stored_path
+
+
+_MAX_UPLOAD_BYTES = int(float(os.environ.get("CONDUCTOR_MAX_UPLOAD_MB", "200")) * 1024 * 1024)
+
+
+def _check_upload_size(content: bytes, label: str) -> None:
+    """Refuse an upload larger than the configured cap (HTTP 413).
+
+    Uploads were read whole with no limit; a mistaken multi-gigabyte file
+    would exhaust memory in the one process every tool runs in.
+    """
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} is {len(content) / 1e6:.0f} MB; the limit is "
+                   f"{_MAX_UPLOAD_BYTES / 1e6:.0f} MB (set CONDUCTOR_MAX_UPLOAD_MB to change it).",
+        )
 
 
 def _safe_float(v, ndigits: int = 4):
@@ -820,7 +846,72 @@ class AdvanceTimeRequest(BaseModel):
     target_timestamp: str | None = None
 
 
-class _TimeseriesRequest(BaseModel):
+# Generic limits, used only when no network is loaded to supply its own.
+_STATIC_VM_LOWER = 0.95
+_STATIC_VM_UPPER = 1.05
+_STATIC_MAX_LOADING = 90.0
+
+
+def _network_limits() -> dict[str, float]:
+    """The loaded network's own security limits.
+
+    Also the default voltage band inside the OPF (`opf_vm_*`): a corrective
+    dispatch is judged against the same limits the assessment flagged it by,
+    unless the caller asks for different ones. The OPF used to default to a
+    generic 0.95–1.05 whatever the network's band.
+    """
+    gp = app_data.get("grid_profile") or {}
+    loading = float(gp.get("max_loading_pct", 100.0) or 100.0)
+    vlo = float(app_data.get("default_vm_lower", _STATIC_VM_LOWER))
+    vhi = float(app_data.get("default_vm_upper", _STATIC_VM_UPPER))
+    return {
+        "vm_lower_pu": vlo,
+        "vm_upper_pu": vhi,
+        "max_line_loading_pct": loading,
+        "max_trafo_loading_pct": loading,
+        "opf_vm_lower": vlo,
+        "opf_vm_upper": vhi,
+    }
+
+
+def _fill_network_limits(request) -> None:
+    """Give every limit field the caller did not send the network's own value.
+
+    Called from `_NetworkLimitsMixin` on every request model. An explicit
+    value always wins — including one equal to a generic default.
+    """
+    sent = request.model_fields_set
+    for field, limit in _network_limits().items():
+        # (`opf_vm_*` exist only on the OPF requests; the check below skips
+        # every field a request does not declare.)
+        if field in type(request).model_fields and field not in sent:
+            setattr(request, field, limit)
+
+
+class _NetworkLimitsMixin(BaseModel):
+    """Fills every security limit the caller did not send with the network's own.
+
+    Request models declare `vm_upper_pu`, `vm_lower_pu`, `max_line_loading_pct`
+    and `max_trafo_loading_pct` with generic defaults. Those defaults used to
+    double as "not specified": `_effective_thresholds` replaced any value equal
+    to 0.95 / 1.05 / 90 with the network's limits, so an operator who *asked*
+    for exactly 0.95–1.05 p.u. or 90 % was silently given 0.94–1.06 / 100 on
+    the bundled networks. And endpoints that never called it (N-1, envelope,
+    hosting capacity, robust OPF) judged the same state against different
+    limits from the RSA.
+
+    Whether a field was sent is now what decides, read from pydantic's own
+    record of the fields set — one rule, applied to every request that carries
+    limits, wherever it is built.
+    """
+
+    @model_validator(mode="after")
+    def _fill_unset_limits(self):
+        _fill_network_limits(self)
+        return self
+
+
+class _TimeseriesRequest(_NetworkLimitsMixin):
     """Mixin for every tool that reads the timeseries.
 
     ``data_source`` lets the LLM choose which dataset the tool operates on:
@@ -830,7 +921,7 @@ class _TimeseriesRequest(BaseModel):
         first forecast tick.
     ``timestamp`` optionally targets one tick within the chosen source (ISO
     prefix matching, e.g. ``'2000-01-09 18'``). When omitted the default above
-    applies. The two series cover disjoint time ranges.
+    applies. The two series may share timestamps (a forecast of measured days).
     """
     data_source: str = "measurements"
     timestamp: str | None = None
@@ -862,7 +953,7 @@ class GridRequest(_TimeseriesRequest):
     # island_mode: bool = False was meant to be added for testing without the swedish slack bus as a contingency event
 
 
-class WorstCaseRequest(BaseModel):
+class WorstCaseRequest(_NetworkLimitsMixin):
     """Request body for ``POST /api/rsa/worst_case``.
 
     Attributes
@@ -1910,6 +2001,10 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
                 f"created={created_names}, kept_condensers={kept_condensers}"
             )
 
+    applied = nl.apply_voltage_setpoints(net, profile)
+    if applied:
+        print(f"[lifespan] Voltage setpoints from the profile: {applied}")
+
     # Initial power flow to establish an operating point.
     try:
         pp.runpp(net, algorithm="nr", calculate_voltage_angles=True)
@@ -1923,11 +2018,23 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
     load_prof   = profile.get("synthetic_load_profile", "residential")
     gen_prof    = profile.get("synthetic_generation_profile", "wind")
     print(f"[lifespan] Generating synthetic timeseries ({n_days}d, {resolution}min)...")
+    peak = profile.get("synthetic_peak_load_factor", 1.0)
     timestamps, measurements = st.generate(
         net, n_days=n_days, resolution_min=resolution,
         load_profile=load_prof, generation_profile=gen_prof, seed=42,
+        peak_load_factor=peak,
     )
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
+    # A synthetic forecast, as a network upload gets — so the default network
+    # shows the forecast path too. It covers the last days of the measurements
+    # (measured values with a day-ahead-sized error, so forecast and measured
+    # can be compared) and the days after (an independent realisation).
+    forecast_timestamps, forecasts = st.forecast(
+        net, timestamps, measurements,
+        overlap_days=float(profile.get("synthetic_forecast_overlap_days", 2)),
+        n_days=n_days, resolution_min=resolution,
+        load_profile=load_prof, generation_profile=gen_prof, seed=137, peak_load_factor=peak,
+    )
 
     # Assign first-tick measurements to initialise operating point.
     initial_meas = measurements[timestamps[0]]
@@ -1959,6 +2066,9 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
     }
     app_data["default_vm_lower"] = float(profile.get("vm_lower", 0.95))
     app_data["default_vm_upper"] = float(profile.get("vm_upper", 1.05))
+    app_data["forecasts"] = forecasts
+    app_data["forecast_timestamps"] = forecast_timestamps
+    app_data["forecasts_source"] = "synthetic"
 
     PG_MAX_DATA.update(get_pg_max_data(net))
     print(f"[lifespan] PG_MAX_DATA: {len(PG_MAX_DATA)} generators.")
@@ -1967,6 +2077,12 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
     _build_and_store_ybus(net)
     _restore_timeseries_from_sentinel()
     _restore_forecast_from_sentinel()
+    # Uploaded measurements never come with an invented forecast (the same rule
+    # as uploading them at runtime): a forecast appears only when uploaded.
+    if app_data.get("measurements_source") == "uploaded" and app_data.get("forecasts_source") == "synthetic":
+        app_data["forecasts"] = {}
+        app_data["forecast_timestamps"] = []
+        app_data["forecasts_source"] = "none"
 
     print("\n !API IS READY TO RECEIVE REQUESTS! \n")
 
@@ -2024,9 +2140,45 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+# Endpoints are `async def` but do blocking pandapower / IPOPT work, so on the
+# event loop one long scan stalled every request, `/health` and the clock
+# included. Each endpoint that reads or changes `app_data` now runs in a worker
+# thread instead. They share the network, the clock and the admittance
+# database, so one lock still runs them one at a time — as before — while the
+# cheap reads below stay answerable.
+_STATE_LOCK = threading.Lock()
+_holds_state = threading.local()
+
+
+def _off_event_loop(endpoint):
+    @functools.wraps(endpoint)
+    async def run_in_worker(*args, **kwargs):
+        if getattr(_holds_state, "active", False):
+            # One locked endpoint calling another (robust → optimise): this
+            # thread already holds the lock.
+            return await endpoint(*args, **kwargs)
+
+        def locked():
+            with _STATE_LOCK:
+                _holds_state.active = True
+                try:
+                    return asyncio.run(endpoint(*args, **kwargs))
+                finally:
+                    _holds_state.active = False
+
+        return await anyio.to_thread.run_sync(locked)
+
+    return run_in_worker
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Only pages served from this machine (the Streamlit app, on whatever port)
+    # may call the backend from a browser. `*` let any website the operator
+    # happened to open post uploads or resets to the local backend. A LAN
+    # deployment adds its origins in CONDUCTOR_CORS_ORIGINS (comma-separated).
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_origins=[o.strip() for o in os.environ.get("CONDUCTOR_CORS_ORIGINS", "").split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -2049,6 +2201,7 @@ async def health():
 
 
 @app.get("/api/network/topology")
+@_off_event_loop
 async def network_topology():
     """Buses and branches of the network currently loaded.
 
@@ -2138,17 +2291,25 @@ async def get_grid_constants_endpoint():
 
     meas_ts = app_data.get("timestamps") or []
     fc_ts = app_data.get("forecast_timestamps") or []
+    # A forecast uploaded for a period that was also measured shares its
+    # timestamps; the agent is told how many rather than assuming none.
+    shared = sorted(set(meas_ts) & set(fc_ts))
     measurements_info = {
         "loaded": bool(meas_ts),
         "n_timestamps": len(meas_ts),
         "first_timestamp": meas_ts[0] if meas_ts else None,
         "last_timestamp": meas_ts[-1] if meas_ts else None,
+        "source": app_data.get("measurements_source", "synthetic"),
     }
     forecast_info = {
         "loaded": bool(fc_ts),
         "n_timestamps": len(fc_ts),
         "first_timestamp": fc_ts[0] if fc_ts else None,
         "last_timestamp": fc_ts[-1] if fc_ts else None,
+        "source": app_data.get("forecasts_source", "synthetic"),
+        "n_shared_with_measurements": len(shared),
+        "first_shared": shared[0] if shared else None,
+        "last_shared": shared[-1] if shared else None,
     }
     return {
         "name": profile.get("name", "Unknown Grid"),
@@ -2209,7 +2370,60 @@ async def get_timeline():
     }
 
 
+class DataSeriesRequest(BaseModel):
+    """What the data viewer asks for: one dataset, system totals, and the
+    substations named in `substations` (none by default)."""
+    data_source: str = "measurements"
+    substations: list[str] = []
+    max_points: int = 2000
+
+
+@app.post("/api/data/series")
+@_off_event_loop
+async def data_series(request: DataSeriesRequest):
+    """The loaded measurement or forecast series, for the UI's data viewer.
+
+    Raw data as it was loaded — consumption and production per substation, no
+    power flow. Long series are thinned to about `max_points` evenly spaced
+    ticks (a year of 15-minute data is ~35k), and the response says so.
+    """
+    timestamps, dataset, label = _resolve_dataset(request.data_source)
+    if not timestamps:
+        return {"data_source": label, "timestamps": [], "n_total": 0, "available_substations": [],
+                "totals": {"consumption": [], "production": []}, "substations": {}}
+    stride = max(1, -(-len(timestamps) // max(1, int(request.max_points))))
+    picked = timestamps[::stride]
+    wanted = set(request.substations or [])
+    totals_c, totals_p = [], []
+    per: dict = {name: {"consumption": [], "production": []} for name in wanted}
+    available: set = set()
+    for ts in picked:
+        df = prepare_measurement_df(dataset[ts])
+        totals_c.append(round(float(df["consumption"].sum()), 4))
+        totals_p.append(round(float(df["production"].sum()), 4))
+        by_name = df.set_index("substation_name")
+        available.update(str(n) for n in by_name.index)
+        for name in wanted:
+            row = by_name.loc[name] if name in by_name.index else None
+            if isinstance(row, pd.DataFrame):  # a name listed twice: its total
+                row = row.sum(numeric_only=True)
+            per[name]["consumption"].append(None if row is None else round(float(row["consumption"]), 4))
+            per[name]["production"].append(None if row is None else round(float(row["production"]), 4))
+    source = app_data.get("measurements_source" if label == "measurements" else "forecasts_source")
+    return {
+        "data_source": label,
+        "source": source,
+        "timestamps": picked,
+        "n_total": len(timestamps),
+        "stride": stride,
+        "available_substations": sorted(available),
+        "totals": {"consumption": totals_c, "production": totals_p},
+        "substations": per,
+    }
+
+
 @app.post("/api/time/advance")
+@_off_event_loop
 async def advance_time(request: AdvanceTimeRequest = AdvanceTimeRequest()):
     """Advance the simulation clock by one tick (typically 15 minutes).
 
@@ -2242,6 +2456,7 @@ async def advance_time(request: AdvanceTimeRequest = AdvanceTimeRequest()):
 
 
 @app.post("/api/data/upload")
+@_off_event_loop
 async def upload_timeseries(
     file: UploadFile = File(...),
     kind: str = Form("measurements"),
@@ -2307,6 +2522,15 @@ async def upload_timeseries(
             }
 
     content = await file.read()
+    _check_upload_size(content, "The uploaded file")
+    # Parsed before anything is written: a file that fails to parse must not
+    # replace the one the next restart would load.
+    try:
+        new_measurements, new_timestamps = _parse_timeseries_csv(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {exc}")
     stored_path = _persist_uploaded_bytes(
         DATA_FILES_DIR,
         file.filename,
@@ -2314,12 +2538,6 @@ async def upload_timeseries(
         f"uploaded_{kind_norm}",
         ".csv",
     )
-    try:
-        new_measurements, new_timestamps = _parse_timeseries_csv(content)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {exc}")
 
     # --- Forecast path: store as read-only look-ahead; never touch live net/clock.
     if kind_norm == "forecasts":
@@ -2392,6 +2610,7 @@ async def upload_timeseries(
 
 
 @app.post("/api/network/upload")
+@_off_event_loop
 async def upload_network(
     file: UploadFile = File(...),
     convert_gen_to_sgen: bool = Form(True),
@@ -2417,6 +2636,7 @@ async def upload_network(
         ``first_timestamp``, ``bus_names`` (first 30), ``note``.
     """
     content = await file.read()
+    _check_upload_size(content, "The uploaded file")
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
@@ -2428,6 +2648,28 @@ async def upload_network(
             detail=f"Unsupported format '{ext}'. Accepted: .m  .json  .xlsx  .uct",
         )
 
+    # The converters read from a path, so the upload is parsed from a
+    # temporary copy and kept only once it has parsed. Writing it to its final
+    # name first meant a broken upload with the active network's filename
+    # overwrote that network on disk even though the request returned 400.
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        probe_path = os.path.join(scratch, f"upload{ext}")
+        with open(probe_path, "wb") as fh:
+            fh.write(content)
+        try:
+            if ext == ".m":
+                from pandapower.converter.matpower import from_mpc
+                net = from_mpc(probe_path, f_hz=50, validate_conversion=False)
+            elif ext == ".json":
+                net = pp.from_json(probe_path)
+            elif ext == ".xlsx":
+                net = pp.from_excel(probe_path)
+            elif ext == ".uct":
+                from pandapower.converter.ucte.from_ucte import from_ucte
+                net = from_ucte(probe_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not parse {ext} file: {exc}")
     stored_path = _persist_uploaded_bytes(
         SYSTEMS_DIR,
         file.filename,
@@ -2435,20 +2677,6 @@ async def upload_network(
         "uploaded_system",
         ext,
     )
-
-    try:
-        if ext == ".m":
-            from pandapower.converter.matpower import from_mpc
-            net = from_mpc(stored_path, f_hz=50, validate_conversion=False)
-        elif ext == ".json":
-            net = pp.from_json(stored_path)
-        elif ext == ".xlsx":
-            net = pp.from_excel(stored_path)
-        elif ext == ".uct":
-            from pandapower.converter.ucte.from_ucte import from_ucte
-            net = from_ucte(stored_path)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse {ext} file: {exc}")
 
     try:
         tap_policy_norm = _normalize_tap_policy(tap_policy)
@@ -2498,13 +2726,12 @@ async def upload_network(
     timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42)
     print(f"[upload] Timeseries ready: {len(timestamps)} timestamps from {timestamps[0]} to {timestamps[-1]}.")
 
-    # Build a synthetic forecast series on the 7 days immediately following the
-    # measurements (different seed → distinct realization). Measurements are the
-    # historical actuals that drive the simulation clock; forecasts are read-only
-    # look-ahead data for planning/rescheduling tools.
-    forecast_start = (pd.Timestamp(timestamps[-1]) + pd.Timedelta(minutes=15)).to_pydatetime()
-    forecast_timestamps, forecasts = st.generate(
-        net, n_days=7, resolution_min=15, seed=137, start_dt=forecast_start
+    # A synthetic forecast: the last 2 measured days with a day-ahead-sized
+    # error (so forecast and measured can be compared) and the 7 days after
+    # (an independent realisation). Measurements are the historical actuals
+    # that drive the simulation clock; forecasts are read-only, for planning.
+    forecast_timestamps, forecasts = st.forecast(
+        net, timestamps, measurements, overlap_days=2, n_days=7, resolution_min=15, seed=137
     )
     print(f"[upload] Forecast ready: {len(forecast_timestamps)} timestamps from "
           f"{forecast_timestamps[0]} to {forecast_timestamps[-1]}.")
@@ -2635,6 +2862,7 @@ async def upload_network(
 
 
 @app.post("/api/network/upload_advanced_admittance")
+@_off_event_loop
 async def upload_advanced_admittance(
     core_file: UploadFile = File(...),
     meta_file: UploadFile = File(...),
@@ -2661,6 +2889,8 @@ async def upload_advanced_admittance(
 
     core_content = await core_file.read()
     meta_content = await meta_file.read()
+    _check_upload_size(core_content, "The admittance core file")
+    _check_upload_size(meta_content, "The admittance metadata file")
     if not core_content or not meta_content:
         raise HTTPException(status_code=400, detail="Both core_file and meta_file must be non-empty CSV files.")
 
@@ -2704,11 +2934,23 @@ async def upload_advanced_admittance(
 
 
 @app.post("/api/network/reset_active")
+@_off_event_loop
 async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveNetworkRequest()):
     """Reload active in-memory state from a YAML profile without restarting the backend."""
     profile_name = (request.profile_name or DEFAULT_GRID_PROFILE).strip().lower()
     if not profile_name:
         profile_name = DEFAULT_GRID_PROFILE
+
+    # The reset used to reload the profile and then re-apply the previous
+    # network's saved measurements and forecasts — none of whose names match,
+    # so every tick silently fell back to the same static load — and left the
+    # upload record in place, so the next restart loaded the old network again.
+    # Only the records go; the uploaded files themselves stay on disk.
+    for record in (_LAST_UPLOAD_SENTINEL, _LAST_TIMESERIES_SENTINEL, _LAST_FORECAST_SENTINEL):
+        try:
+            os.remove(record)
+        except FileNotFoundError:
+            pass
 
     try:
         _lifespan_generic(profile_name, BACKEND_DIR)
@@ -2740,19 +2982,29 @@ async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveN
 
 
 @app.post("/api/network/snapshot")
+@_off_event_loop
 async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
-    """Return the raw network state at a timestamp.
+    """Return the network state at a timestamp.
 
-    Reads directly from the measurement-assigned network tables (no power flow
-    required) so it is always fast and never fails due to convergence issues.
+    Loads and generator set-points come from the measurement-assigned tables.
+    Reactive output of voltage-controlled units, the external grid's exchange
+    and the losses are results of a power flow, so one is run; they used to be
+    reported as 0.0 without it — the agent then told an operator that
+    condensers holding their bus voltages produced no reactive power. If the
+    power flow does not converge, those fields are None and say so.
     Honors ``data_source`` / ``timestamp`` (defaults to the live measurement clock).
     """
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    meas_df = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    meas_df = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy = copy.deepcopy(app_data["net"])
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas_df, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas_df, substations)
+    try:
+        pp.runpp(net_copy)
+        solved = bool(net_copy.converged)
+    except Exception:  # noqa: BLE001 — reported as unknown below
+        solved = False
 
     if not net_copy.ext_grid.empty and "name" in net_copy.ext_grid.columns:
         _raw = net_copy.ext_grid["name"].iloc[0]
@@ -2784,7 +3036,7 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
                 "Pg_min_mw": 0.0,
             })
     if not net_copy.gen.empty:
-        for _, row in net_copy.gen.iterrows():
+        for gen_idx, row in net_copy.gen.iterrows():
             bus_id = int(row.get("bus", 0))
             raw_name = row.get("name", None)
             name = str(raw_name).strip() if (raw_name and str(raw_name).strip()) else f"Gen_bus{bus_id}"
@@ -2793,7 +3045,9 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
                 "bus": _bus_display_name(net_copy, bus_id),
                 "bus_index": bus_id,
                 "Pg_mw": _safe_float(row["p_mw"]) or 0.0,
-                "Qg_mvar": 0.0,
+                # Voltage-controlled: its Q is whatever holds the bus voltage.
+                "Qg_mvar": _safe_float(net_copy.res_gen.at[gen_idx, "q_mvar"]) if solved else None,
+                "vm_setpoint_pu": _safe_float(row.get("vm_pu")),
                 "Pg_max_mw": _safe_float(row.get("max_p_mw") or 0.0) or 0.0,
                 "Pg_min_mw": _safe_float(row.get("min_p_mw") or 0.0) or 0.0,
             })
@@ -2813,18 +3067,28 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
             "Q_mvar": _safe_float(row.get("q_mvar") or 0.0) or 0.0,
         })
 
-    # --- External grid: estimate from power balance ---
+    # --- External grid: from the power flow; without one, only the balance ---
     total_gen_mw = round(sum(g["Pg_mw"] for g in generators), 4)
     total_load_mw = round(sum(l["P_mw"] for l in loads), 4)
-    total_import_mw = round(total_load_mw - total_gen_mw, 4)
+    if solved and not net_copy.res_ext_grid.empty:
+        total_import_mw = round(float(net_copy.res_ext_grid["p_mw"].sum()), 4)
+        ext_q = round(float(net_copy.res_ext_grid["q_mvar"].sum()), 4)
+        losses = round(float(net_copy.res_line["pl_mw"].sum()
+                             + (net_copy.res_trafo["pl_mw"].sum() if len(net_copy.trafo) else 0.0)), 4)
+    else:
+        # Load minus generation: an estimate that leaves out the losses.
+        total_import_mw = round(total_load_mw - total_gen_mw, 4)
+        ext_q = None
+        losses = None
     ext_grid = {
         "name": slack_name,
         "P_import_mw": total_import_mw,
-        "Q_mvar": 0.0,
+        "Q_mvar": ext_q,
     }
 
     return {
         "timestamp": current_ts,
+        "data_source": _dataset_label(request),
         "generators": generators,
         "loads": loads,
         "ext_grid": ext_grid,
@@ -2832,53 +3096,136 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
             "total_generation_mw": total_gen_mw,
             "total_load_mw": total_load_mw,
             "net_import_mw": total_import_mw,
-            "total_losses_mw": 0.0,
+            # From the power flow; None (never an invented 0.0, which the
+            # provenance check would treat as grounded) when it did not converge.
+            "total_losses_mw": losses,
         },
+        "power_flow_converged": solved,
+        **({} if solved else {"note": "The power flow did not converge: reactive output of "
+                                      "voltage-controlled units, the external grid's reactive "
+                                      "exchange and the losses are unknown; import is load minus "
+                                      "generation."}),
     }
 
 
-# Static scan/RSA defaults baked into the request models. When a request still
-# carries these exact values it means the caller did not specify limits, so the
-# security-assessment endpoints fall back to the *loaded network's own* limits
-# (e.g. 0.94–1.06 for case30) rather than these tighter generic defaults — which
-# otherwise flag buses that sit within the network's real limits.
-_STATIC_VM_LOWER = 0.95
-_STATIC_VM_UPPER = 1.05
-_STATIC_MAX_LOADING = 90.0
+def _sgen_names(net) -> pd.Series:
+    """Each static generator's name, as the OPF engine names it.
+
+    `substation_name` exists only on networks whose measurements were matched
+    to substations; MATPOWER and pandapower cases (the default profile among
+    them) have just `name`, often empty. Indexing `substation_name` directly
+    made contingency optimisation, and any `disabled_generators` request, fail
+    with a KeyError on those networks. Same fallback as
+    `flex_engine._sgen_name`, so the names the agent sees in a dispatch result
+    are the names these endpoints match against.
+    """
+    col = "substation_name" if "substation_name" in net.sgen.columns else "name"
+
+    def _name(idx):
+        value = net.sgen.at[idx, col] if col in net.sgen.columns else None
+        text = str(value).strip() if value is not None and not pd.isna(value) else ""
+        return text or f"sgen_{idx}"
+
+    return pd.Series({idx: _name(idx) for idx in net.sgen.index}, dtype=object)
+
+
+def _drop_disabled_sgens(net, disabled: list) -> None:
+    """Remove the named static generators from `net` (in place)."""
+    keep = ~_sgen_names(net).isin(disabled)
+    net.sgen = net.sgen[keep.reindex(net.sgen.index).fillna(True).values].reset_index(drop=True)
+
+
+def _branch_labeller(net):
+    """(bus, bus) → the branch's display name, as tables and N-1 results show it."""
+    names = {}
+    for idx, row in net.line.iterrows():
+        names.setdefault(tuple(sorted((int(row.from_bus), int(row.to_bus)))), _line_display_name(net, idx))
+    for idx, row in net.trafo.iterrows():
+        names.setdefault(tuple(sorted((int(row.hv_bus), int(row.lv_bus)))), _trafo_display_name(net, idx))
+
+    def label(i: int, j: int) -> str:
+        return names.get(tuple(sorted((int(i), int(j)))), f"Bus_{i}–Bus_{j}")
+    return label
+
+
+def _with_infeasibility_diagnosis(failed: dict, model, net=None) -> dict:
+    """A failed OPF result, with the reason when one can be found.
+
+    "Infeasible." alone left the operator — and the agent — to guess. See
+    `flex_engine.diagnose_infeasible`: it re-solves with the grid-connection
+    voltage free, then with branch limits lifted, and reports what that would
+    take. The result stays a failure either way.
+    """
+    try:
+        label = _branch_labeller(net) if net is not None else None
+        diagnosis = fe.diagnose_infeasible(model, label) if model is not None else None
+    except Exception:  # noqa: BLE001
+        diagnosis = None
+    if diagnosis:
+        failed["infeasibility_diagnosis"] = diagnosis
+        failed["message"] = diagnosis["explanation"]
+    return failed
+
+
+def _check_outage_element(element_type: str, element_index: int) -> None:
+    """Refuse an outage of something that is not a line or transformer of
+    this network, before any copy of it is touched.
+
+    An unknown index used to be written with `.at[...]`, which silently
+    *appended* a garbage row and then failed the power flow with a 500; an
+    unknown type reached an unbound variable in contingency optimisation.
+    """
+    if element_type not in ("line", "trafo"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"element_type must be 'line' or 'trafo' for an outage; got {element_type!r}.",
+        )
+    table = app_data["net"].line if element_type == "line" else app_data["net"].trafo
+    if element_index not in table.index:
+        valid = [int(i) for i in table.index]
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {element_type} with index {element_index}. Valid indices: "
+                   f"{valid[:40]}{' …' if len(valid) > 40 else ''}. "
+                   "Use locate_network_element to find an index by name.",
+        )
+
+
+_WORST_CASE_METRICS = frozenset(
+    {"violations", "slack_import", "max_voltage", "min_voltage", "max_loading"})
+
+
+def _dataset_label(request) -> str:
+    """The dataset a result was computed from, normalised ("measurements" or
+    "forecasts") so the agent's consistency check compares like with like."""
+    return _resolve_dataset(request.data_source)[2]
+
+
+def _thresholds_used(request) -> dict[str, float]:
+    """The limits a result was judged against, echoed so the agent's
+    consistency check can compare them across the tools of one turn."""
+    return {
+        "vm_upper_pu": request.vm_upper_pu,
+        "vm_lower_pu": request.vm_lower_pu,
+        "max_line_loading_pct": request.max_line_loading_pct,
+        "max_trafo_loading_pct": request.max_trafo_loading_pct,
+    }
 
 
 def _effective_thresholds(request) -> tuple[float, float, float, float]:
-    """Resolve (vm_lower, vm_upper, max_line_loading, max_trafo_loading).
+    """(vm_lower, vm_upper, max_line_loading, max_trafo_loading) for a request.
 
-    Substitutes the network's own limits wherever the request still holds the
-    generic static default, so "is it secure?" is judged against the limits the
-    network was defined with.
+    The request already holds the effective values — anything the caller did
+    not send was filled with the network's limits when it was validated.
     """
-    gp = app_data.get("grid_profile") or {}
-    net_vlo = float(app_data.get("default_vm_lower", _STATIC_VM_LOWER))
-    net_vhi = float(app_data.get("default_vm_upper", _STATIC_VM_UPPER))
-    net_ml = float(gp.get("max_loading_pct", 100.0) or 100.0)
-
-    vlo = getattr(request, "vm_lower_pu", _STATIC_VM_LOWER)
-    vhi = getattr(request, "vm_upper_pu", _STATIC_VM_UPPER)
-    mll = getattr(request, "max_line_loading_pct", _STATIC_MAX_LOADING)
-    mtl = getattr(request, "max_trafo_loading_pct", _STATIC_MAX_LOADING)
-
-    if vlo == _STATIC_VM_LOWER:
-        vlo = net_vlo
-    if vhi == _STATIC_VM_UPPER:
-        vhi = net_vhi
-    if mll == _STATIC_MAX_LOADING:
-        mll = net_ml
-    if mtl == _STATIC_MAX_LOADING:
-        mtl = net_ml
-    return vlo, vhi, mll, mtl
+    return (request.vm_lower_pu, request.vm_upper_pu,
+            request.max_line_loading_pct, request.max_trafo_loading_pct)
 
 
 def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     """Run the existing RSA pipeline for one explicit timestamp."""
     net_copy = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(timestamp))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(timestamp, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
@@ -3006,6 +3353,7 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
         "total_load_mw": total_load_mw,
         "slack_import_mw": slack_import_mw,
         "flexibility_metrics": {"total_available_capacity_mw": round(total_available_flex_mw, 3)},
+        "data_source": _dataset_label(request),
         "thresholds_used": {
             "vm_upper_pu": _vhi,
             "vm_lower_pu": _vlo,
@@ -3015,14 +3363,22 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     }
 
 
-def _lookup_measurement_df(ts: str):
-    """Return the measurement slice for a timestamp, regardless of dataset.
+def _lookup_measurement_df(ts: str, data_source: str | None = None):
+    """Return the measurement slice for a timestamp.
 
-    Measurement and forecast time ranges are disjoint (forecasts begin after the
-    measurement window ends), so a timestamp string maps to exactly one dataset.
-    This lets point-in-time tools read the right slice without threading the
-    dataset object through every call.
+    With `data_source`, only that dataset is read. Without it, measurements
+    are tried before forecasts — which is only safe while the two time ranges
+    are disjoint. Nothing enforces that: an uploaded forecast for days already
+    measured is the obvious way to compare a forecast with what happened, and
+    the old lookup then answered every `data_source="forecasts"` request with
+    the measurements, while tools reading the dataset directly used the
+    forecast — two answers in one turn, both labelled as the forecast.
     """
+    if data_source is not None:
+        _timestamps, dataset, label = _resolve_dataset(data_source)
+        if ts in dataset:
+            return dataset[ts]
+        raise HTTPException(status_code=404, detail=f"Timestamp {ts!r} not found in {label}.")
     meas = app_data.get("measurements", {}) or {}
     if ts in meas:
         return meas[ts]
@@ -3275,6 +3631,7 @@ def _build_conditional_bins(
 
 
 @app.post("/api/grid/rsa")
+@_off_event_loop
 async def run_security_assessment(request: GridRequest):
     """Real-Time Security Assessment on the current timestamp.
 
@@ -3312,6 +3669,7 @@ async def run_security_assessment(request: GridRequest):
 
 
 @app.post("/api/rsa/historical_risk")
+@_off_event_loop
 async def compute_historical_risk(request: HistoricalRiskRequest):
     """Empirical risk statistics over a historical window.
 
@@ -3377,6 +3735,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
 
     target_kind, target_name = _parse_historical_target(request.target)
     rsa_request = GridRequest(
+        data_source=request.data_source,
         load_scaling_factor=request.load_scaling_factor,
         vm_upper_pu=request.vm_upper_pu,
         vm_lower_pu=request.vm_lower_pu,
@@ -3393,17 +3752,34 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
 
     metric_rows: list[dict] = []
     condition_rows: list[float | int | None] = []
+    # One tick whose power flow does not converge used to fail the whole
+    # window with a 503 — the opposite of the other scans, which dropped such
+    # ticks silently. Both were wrong: the tick is recorded and reported, and
+    # the window goes on.
+    non_converged: list[str] = []
+
+    def _snapshot(timestamp):
+        try:
+            return _run_rsa_snapshot(timestamp, rsa_request)
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                return None
+            raise
+
     if use_parallel:
         indexed_rows: list[tuple[int, dict, float | int | None]] = []
         with ThreadPoolExecutor(max_workers=effective_max_workers) as pool:
             future_map = {
-                pool.submit(_run_rsa_snapshot, timestamp, rsa_request): idx
+                pool.submit(_snapshot, timestamp): idx
                 for idx, timestamp in enumerate(selected_timestamps)
             }
             for future in as_completed(future_map):
                 idx = future_map[future]
                 snapshot = future.result()
                 timestamp = selected_timestamps[idx]
+                if snapshot is None:
+                    non_converged.append(timestamp)
+                    continue
                 metric_row = _extract_historical_metric(snapshot, target_kind, target_name, request)
                 cond_val = _extract_condition_value(snapshot, timestamp, normalized_condition)
                 indexed_rows.append((idx, metric_row, cond_val))
@@ -3412,10 +3788,19 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
         condition_rows = [cond_val for _, _, cond_val in indexed_rows]
     else:
         for timestamp in selected_timestamps:
-            snapshot = _run_rsa_snapshot(timestamp, rsa_request)
+            snapshot = _snapshot(timestamp)
+            if snapshot is None:
+                non_converged.append(timestamp)
+                continue
             metric_rows.append(_extract_historical_metric(snapshot, target_kind, target_name, request))
             condition_rows.append(_extract_condition_value(snapshot, timestamp, normalized_condition))
 
+    non_converged.sort()
+    if not metric_rows:
+        raise HTTPException(
+            status_code=503,
+            detail=f"The power flow did not converge at any of the {len(non_converged)} "
+                   "ticks in the window, so no statistics can be computed.")
     exceedance_rows = [row for row in metric_rows if row["is_violation"]]
     near_miss_rows = [row for row in metric_rows if row.get("near_miss")]
     exceedance_count = len(exceedance_rows)
@@ -3488,6 +3873,10 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
     notes = [
         "First implementation slice uses a signed limit-margin metric for the duration curve.",
     ]
+    if non_converged:
+        notes.append(
+            f"{len(non_converged)} tick(s) had no converged power flow and are excluded from "
+            "the statistics; exceedance_frequency_upper_bound counts them as exceedances.")
     if normalized_condition is None:
         notes.append("Conditional binning disabled for this request (condition not set).")
     elif conditional_bins:
@@ -3506,6 +3895,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
         "window_start": selected_timestamps[0],
         "window_end": selected_timestamps[-1],
         "n_timestamps": total_steps,
+        "data_source": _dataset_label(request),
         "thresholds_used": {
             "vm_upper_pu": request.vm_upper_pu,
             "vm_lower_pu": request.vm_lower_pu,
@@ -3514,6 +3904,13 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
         },
         "exceedance_count": exceedance_count,
         "exceedance_frequency": (exceedance_count / total_steps) if total_steps else 0.0,
+        # Over converged ticks only. The bound counts every non-converged tick
+        # as an exceedance — a tick with no solution is often the worst one.
+        "n_non_converged": len(non_converged),
+        "non_converged_timestamps": non_converged[:50],
+        "exceedance_frequency_upper_bound": (
+            (exceedance_count + len(non_converged)) / (total_steps + len(non_converged))
+            if total_steps + len(non_converged) else 0.0),
         "near_miss_count": near_miss_count,
         "near_miss_frequency": (near_miss_count / total_steps) if total_steps else 0.0,
         "worst_timestamp": worst_timestamp,
@@ -3531,6 +3928,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
 
 
 @app.post("/api/rsa/worst_case")
+@_off_event_loop
 async def worst_case_scan(request: WorstCaseRequest):
     """Scan timestamps for the worst-case grid operating point.
 
@@ -3552,6 +3950,16 @@ async def worst_case_scan(request: WorstCaseRequest):
     min_voltage  : lowest bus voltage (p.u.) — worst = most negative
     max_loading  : highest line loading (%)
     """
+    # Refused rather than guessed: an unknown metric used to scan for
+    # "violations" while echoing the requested name, and n_steps <= 0 became
+    # a 500 after scanning nothing.
+    if request.metric not in _WORST_CASE_METRICS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown metric {request.metric!r}; use one of {sorted(_WORST_CASE_METRICS)}.",
+        )
+    if request.n_steps is not None and request.n_steps <= 0:
+        raise HTTPException(status_code=400, detail="n_steps must be a positive number of ticks.")
     timestamps, dataset, source_label = _resolve_dataset(request.data_source)
     vlo, vhi, mll, mtl = _effective_thresholds(request)
     # Forecasts have no simulation clock — always scan from their start.
@@ -3570,6 +3978,10 @@ async def worst_case_scan(request: WorstCaseRequest):
         arr = np.asarray(values, dtype=float)
         return arr[np.isfinite(arr)]
 
+    # Ticks whose power flow did not converge used to vanish from the scan
+    # without trace — and a tick that does not converge is often the voltage
+    # collapse the scan is looking for. They are now reported.
+    non_converged: list[str] = []
     for idx in indices:
         ts = timestamps[idx]
         try:
@@ -3579,6 +3991,7 @@ async def worst_case_scan(request: WorstCaseRequest):
             net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
             pp.runpp(net_copy, algorithm="nr", numba=False)
         except Exception:
+            non_converged.append(ts)
             continue
 
         vm_series = net_copy.res_bus["vm_pu"]
@@ -3591,6 +4004,7 @@ async def worst_case_scan(request: WorstCaseRequest):
 
         # Skip timestamps that produce unusable metrics (typically islanding/non-converged residue).
         if vm.size == 0:
+            non_converged.append(ts)
             continue
 
         v_viol = int(((vm < vlo) | (vm > vhi)).sum())
@@ -3633,6 +4047,8 @@ async def worst_case_scan(request: WorstCaseRequest):
         "current_timestamp": timestamps[start],
         "scan_window": {"start": series["timestamps"][0], "end": series["timestamps"][-1]},
         "n_scanned": len(series["timestamps"]),
+        "n_non_converged": len(non_converged),
+        "non_converged_timestamps": non_converged[:50],
         "series": series,
         "worst_per_metric": worst_per_metric,
         "thresholds_used": {
@@ -3671,6 +4087,10 @@ def _scan_one_scenario(
     # Violated-ticks detail: only ticks with at least one violation
     violations_per_tick: list[dict] = []
 
+    # Ticks whose power flow did not converge used to vanish from the scan
+    # without trace — and a tick that does not converge is often the voltage
+    # collapse the scan is looking for. They are now reported.
+    non_converged: list[str] = []
     for idx in indices:
         ts = timestamps[idx]
         try:
@@ -3686,6 +4106,7 @@ def _scan_one_scenario(
                 net_copy.sgen["q_mvar"] *= sgen_scale
             pp.runpp(net_copy, algorithm="nr", numba=False)
         except Exception:
+            non_converged.append(ts)
             continue
 
         # ---- count violations and track which elements violated ------------
@@ -3697,7 +4118,8 @@ def _scan_one_scenario(
             if row["vm_pu"] > vm_upper_pu or row["vm_pu"] < vm_lower_pu:
                 viol += 1
                 name = _bus_display_name(net_copy, int(bus_idx))
-                bus_viol_counts[name] = bus_viol_counts.get(name, 0) + 1
+                if name not in tick_buses:  # a tick count, once per name
+                    bus_viol_counts[name] = bus_viol_counts.get(name, 0) + 1
                 tick_buses.append(name)
         for line_idx, row in net_copy.res_line.iterrows():
             if row["loading_percent"] > max_line_loading_pct:
@@ -3751,6 +4173,8 @@ def _scan_one_scenario(
         "sgen_scale": sgen_scale,
         "label": label,
         "n_scanned": len(out_timestamps),
+        "n_non_converged": len(non_converged),
+        "non_converged_timestamps": non_converged[:50],
         "timestamps": out_timestamps,
         "series": series,
         "summary": {
@@ -3769,6 +4193,7 @@ def _scan_one_scenario(
 
 
 @app.post("/api/rsa/scan_scenarios")
+@_off_event_loop
 async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     """Run RSA across a time range for multiple sgen scaling factors in parallel.
 
@@ -3785,18 +4210,19 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     # Forecasts have no simulation clock — default the window start to index 0.
     default_start = app_data["current_index"] if source_label == "measurements" else 0
 
-    # ---- resolve time window (same pattern as element_timeseries_scan) -----
-    if request.start_timestamp is not None:
-        matched = [i for i, t in enumerate(all_timestamps) if t.startswith(request.start_timestamp)]
-        start = matched[0] if matched else default_start
-    else:
-        start = default_start
-
-    if request.end_timestamp is not None:
-        matched = [i for i, t in enumerate(all_timestamps) if t.startswith(request.end_timestamp)]
-        end = matched[-1] + 1 if matched else n
-    else:
-        end = n
+    # ---- resolve time window (same rule as element_timeseries_scan) --------
+    # An unmatched bound is an error, not the whole dataset: a request for May
+    # 2022 used to scan every tick of January 2000 and report it as May.
+    start = _window_index(all_timestamps, request.start_timestamp, "start_timestamp",
+                          source_label, last=False, default=default_start)
+    end = _window_index(all_timestamps, request.end_timestamp, "end_timestamp",
+                        source_label, last=True, default=n - 1) + 1
+    if end <= start:
+        raise HTTPException(
+            status_code=400,
+            detail=f"end_timestamp ({request.end_timestamp}) is before start "
+                   f"({all_timestamps[start]}).",
+        )
 
     if request.n_steps is not None:
         end = min(start + request.n_steps, end)
@@ -3852,7 +4278,6 @@ def _run_probabilistic_sample(
     """Run one Monte Carlo sample. net_base already has measurements assigned.
     Thread-safe — deep-copies net_base before any mutation."""
     try:
-        import numpy as np
 
         net_copy = copy.deepcopy(net_base)
 
@@ -3970,6 +4395,7 @@ def _run_envelope_point(
 
 
 @app.post("/api/rsa/probabilistic")
+@_off_event_loop
 async def probabilistic_rsa(request: ProbabilisticRSARequest):
     """Monte Carlo probabilistic security assessment at the current timestamp.
 
@@ -3994,7 +4420,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     ts = _resolve_tick(request.data_source, request.timestamp)
 
     # Assign measurements once; net_base is read-only after this
-    meas = prepare_measurement_df(_lookup_measurement_df(ts))
+    meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
     net_base = copy.deepcopy(net)
     net_base, _ = lg.assign_load_values_from_measurements(net_base, meas, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, meas, substations)
@@ -4009,7 +4435,6 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     # Generation uncertainty inputs (Step 2), with all sgens treated as
     # uncertain generators for now (Step 1 intentionally skipped).
     if len(net_base.sgen.index) > 0:
-        import numpy as np
 
         sgen_p_base = net_base.sgen["p_mw"].to_numpy(dtype=float, copy=True)
         sgen_p_ceiling = sgen_p_base.copy()  # pre-OPF probabilistic RSA
@@ -4070,11 +4495,15 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     any_violation_count = 0
 
     for r in converged:
-        for name in r["viol_buses"]:
+        # Each name once per sample. Several buses can share a display name
+        # (one real network has four called "Værket A_aux"), and counting each
+        # of them made a "probability" of 5.0. Shared names are reported
+        # together: the probability that any element of that name violates.
+        for name in set(r["viol_buses"]):
             bus_viol_counts[name] = bus_viol_counts.get(name, 0) + 1
-        for name in r["viol_lines"]:
+        for name in set(r["viol_lines"]):
             line_viol_counts[name] = line_viol_counts.get(name, 0) + 1
-        for name in r["viol_trafos"]:
+        for name in set(r["viol_trafos"]):
             trafo_viol_counts[name] = trafo_viol_counts.get(name, 0) + 1
         for bname, vm in r["bus_vm"].items():
             bus_vm_samples.setdefault(bname, []).append(vm)
@@ -4117,6 +4546,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
 
     return {
         "timestamp": ts,
+        "data_source": _dataset_label(request),
         "n_samples": n,
         "n_converged": n_converged,
         "excluded_buses": excluded_buses,
@@ -4143,7 +4573,84 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     }
 
 
+def _window_index(timestamps: list, prefix: str | None, label: str, source: str,
+                  *, last: bool, default: int) -> int:
+    """Index of the first (or last) timestamp starting with `prefix`.
+
+    `default` when no bound was given; HTTP 404 when one was given and nothing
+    matches — never a silent substitute.
+    """
+    if prefix is None or not str(prefix).strip():
+        return default
+    prefix = str(prefix).strip().replace("T", " ")
+    matched = [i for i, t in enumerate(timestamps) if t.startswith(prefix)]
+    if not matched:
+        span = f"{timestamps[0]} to {timestamps[-1]}" if timestamps else "no data"
+        raise HTTPException(
+            status_code=404,
+            detail=f"{label} {prefix!r} matches no timestamp in the {source} ({span}).",
+        )
+    return matched[-1] if last else matched[0]
+
+
+_DISPLAY_NAMES = {
+    "bus": _bus_display_name,
+    "line": _line_display_name,
+    "trafo": _trafo_display_name,
+}
+
+
+def _resolve_element(net, etype: str, tbl, name: str) -> tuple[int, str]:
+    """(index, display name) for a bus, line or transformer named by the agent.
+
+    In order: the display name other tools report ("Bus_3",
+    "Bus_1 -> Bus_2 [L2]"), the raw `name` column, an integer index, and only
+    then a substring — and a substring only when it picks out exactly one
+    element. The previous lookup matched substrings of the raw column first, so
+    the names in every other result (raw names are empty on MATPOWER cases)
+    were never found, and "Oscar" silently resolved to "Oscar A".
+    """
+    wanted = str(name).strip()
+    key = wanted.lower()
+    plural = {"bus": "buses", "line": "lines", "trafo": "transformers"}[etype]
+    display = {int(i): str(_DISPLAY_NAMES[etype](net, int(i))) for i in tbl.index}
+    raw = ({int(i): str(v) for i, v in tbl["name"].items() if isinstance(v, str)}
+           if "name" in tbl.columns else {})
+
+    for names in (display, raw):
+        exact = [i for i, n in names.items() if n.strip().lower() == key]
+        if len(exact) == 1:
+            return exact[0], display[exact[0]]
+        if len(exact) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{len(exact)} {plural} are named {wanted!r} (indices "
+                       f"{exact[:10]}); pass the index instead.",
+            )
+    try:
+        idx = int(wanted)
+        if idx in display:
+            return idx, display[idx]
+    except ValueError:
+        pass
+    partial = sorted({i for names in (display, raw) for i, n in names.items()
+                      if key and key in n.lower()})
+    if len(partial) == 1:
+        return partial[0], display[partial[0]]
+    if len(partial) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{wanted!r} matches {len(partial)} {plural}: "
+                   f"{[display[i] for i in partial[:12]]}. Use the full name.",
+        )
+    raise HTTPException(
+        status_code=404,
+        detail=f"No {etype} named {wanted!r}. First names: {list(display.values())[:20]}",
+    )
+
+
 @app.post("/api/grid/element_timeseries")
+@_off_event_loop
 async def element_timeseries_scan(request: ElementTimeseriesRequest):
     """Scan a time range and return the evolution of one specific element.
 
@@ -4163,21 +4670,20 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
     n = len(all_timestamps)
     default_start = app_data["current_index"] if ets_source == "measurements" else 0
 
-    # ---- resolve start index -----------------------------------------------
-    if request.start_timestamp is not None:
-        matched = [i for i, t in enumerate(all_timestamps)
-                   if t.startswith(request.start_timestamp)]
-        start = matched[0] if matched else default_start
-    else:
-        start = default_start
-
-    # ---- resolve end index -------------------------------------------------
-    if request.end_timestamp is not None:
-        matched = [i for i, t in enumerate(all_timestamps)
-                   if t.startswith(request.end_timestamp)]
-        end = matched[-1] + 1 if matched else n
-    else:
-        end = n
+    # ---- resolve the window --------------------------------------------------
+    # A window bound that matches nothing is an error. It used to fall back to
+    # the simulation clock (start) or the end of the data (end), so asking for
+    # 2022-01-02 returned a series from 2000-01-01 described as the day asked.
+    start = _window_index(all_timestamps, request.start_timestamp, "start_timestamp",
+                          ets_source, last=False, default=default_start)
+    end = _window_index(all_timestamps, request.end_timestamp, "end_timestamp",
+                        ets_source, last=True, default=n - 1) + 1
+    if end <= start:
+        raise HTTPException(
+            status_code=400,
+            detail=f"end_timestamp ({request.end_timestamp}) is before start "
+                   f"({all_timestamps[start]}).",
+        )
 
     if request.n_steps is not None:
         end = min(start + request.n_steps, end)
@@ -4186,7 +4692,6 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
 
     # ---- locate the element ------------------------------------------------
     etype = request.element_type.lower().strip()
-    ename_lower = request.element_name.lower().strip()
     net_ref = app_data["net"]
 
     if etype == "bus":
@@ -4201,33 +4706,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
             detail=f"element_type must be 'bus', 'line', or 'trafo'; got '{request.element_type}'.",
         )
 
-    if "name" not in tbl.columns:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Network {etype} table has no 'name' column.",
-        )
-
-    matches = tbl[
-        tbl["name"].astype(str).str.lower().str.contains(ename_lower, na=False, regex=False)
-    ]
-    if matches.empty:
-        # Fallback: treat element_name as integer index
-        try:
-            idx_int = int(request.element_name)
-            if idx_int in tbl.index:
-                matches = tbl.loc[[idx_int]]
-        except (ValueError, KeyError):
-            pass
-    if matches.empty:
-        available = tbl["name"].astype(str).tolist()[:20]
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {etype} matching '{request.element_name}' found. "
-                   f"First 20 available names: {available}",
-        )
-
-    elem_idx = int(matches.index[0])
-    elem_name = str(matches.iloc[0]["name"])
+    elem_idx, elem_name = _resolve_element(net_ref, etype, tbl, request.element_name)
 
     # ---- prepare series containers -----------------------------------------
     out_timestamps: list[str] = []
@@ -4242,6 +4721,8 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
         primary_metric = "loading_percent"
 
     # ---- scan --------------------------------------------------------------
+    # Non-converged ticks are reported, not silently dropped (see worst case).
+    non_converged: list[str] = []
     for idx in indices:
         ts = all_timestamps[idx]
         try:
@@ -4254,6 +4735,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
                 net_copy.load["q_mvar"] *= request.load_scaling_factor
             pp.runpp(net_copy, algorithm="nr", numba=False)
         except Exception:
+            non_converged.append(ts)
             continue
 
         out_timestamps.append(ts)
@@ -4290,6 +4772,8 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
         "timestamps": out_timestamps,
         "series": series,
         "n_scanned": len(out_timestamps),
+        "n_non_converged": len(non_converged),
+        "non_converged_timestamps": non_converged[:50],
         "start_timestamp": out_timestamps[0],
         "end_timestamp": out_timestamps[-1],
         "thresholds": {
@@ -4342,6 +4826,7 @@ def _supply_lost(net, element_type: str, element_index: int) -> dict:
 
 
 @app.post("/api/contingency/simulate")
+@_off_event_loop
 async def simulate_contingency(request: ContingencyRequest):
     """Single-element N-1 outage simulation *without* corrective action.
 
@@ -4356,11 +4841,11 @@ async def simulate_contingency(request: ContingencyRequest):
     No optimization is performed — see ``/api/contingency/optimize`` for
     the cure-the-blackout variant.
     """
-    if request.element_type not in ["line", "trafo"]: raise HTTPException(status_code=400)
+    _check_outage_element(request.element_type, request.element_index)
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_copy = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
@@ -4386,9 +4871,24 @@ async def simulate_contingency(request: ContingencyRequest):
 
     if isinstance(df_results_ca, list): df_results_ca = pd.DataFrame(df_results_ca)
 
+    # The engine returns an empty violation table when the post-outage power
+    # flow does not converge, which this endpoint used to report as secure —
+    # an outage that collapses the system, presented as harmless.
+    if not getattr(net_copy, "converged", True):
+        return {"timestamp": current_ts, "system_secure": False, "converged": False,
+                "total_violations": None, "violations": [],
+                "message": "The power flow did not converge after this outage — the "
+                           "system has no stable operating point without this element. "
+                           "Treat it as insecure.",
+                "data_source": _dataset_label(request),
+                "thresholds_used": _thresholds_used(request),
+                **_supply_lost(net_copy, request.element_type, request.element_index)}
+
     if df_results_ca.empty:
         return {"timestamp": current_ts, "system_secure": True, "total_violations": 0,
                 "violations": [],
+                "data_source": _dataset_label(request),
+                "thresholds_used": _thresholds_used(request),
                 **_supply_lost(net_copy, request.element_type, request.element_index)}
 
     element_names = []
@@ -4411,10 +4911,13 @@ async def simulate_contingency(request: ContingencyRequest):
 
     return {"timestamp": current_ts, "system_secure": False, "total_violations": len(df_results_ca),
             "violations": df_results_ca.to_dict(orient="records"),
+            "data_source": _dataset_label(request),
+            "thresholds_used": _thresholds_used(request),
             **_supply_lost(net_copy, request.element_type, request.element_index)}
 
 
 @app.post("/api/contingency/simulate_all")
+@_off_event_loop
 async def simulate_all_contingencies(request: GridRequest):
     """Full N-1 sweep in a single backend call.
 
@@ -4460,16 +4963,24 @@ async def simulate_all_contingencies(request: GridRequest):
     """
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_copy = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
+    # Accepted by the request and the agent's wrapper, but never applied: the
+    # sweep ran at measured renewable output whatever was asked.
+    if request.sgen_scaling_factor != 1.0:
+        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
+        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
 
     all_violations: list[dict] = []
     outages_with_violations = 0
     total_tested = 0
+    # Outages after which the power flow did not converge, or the assessment
+    # failed. They used to count as zero violations — i.e. as secure.
+    non_converged_outages: list[str] = []
 
     for el_type, table in (("line", net_copy.line), ("trafo", net_copy.trafo)):
         for idx in table.index:
@@ -4484,10 +4995,19 @@ async def simulate_all_contingencies(request: GridRequest):
                     max_trafo_loading_pct=request.max_trafo_loading_pct,
                 )
             except Exception:
-                # One bad outage (e.g. islanded topology) — skip, restore, continue.
+                # One bad outage must not abort the sweep — but it is reported.
                 table.at[idx, "in_service"] = True
+                non_converged_outages.append(
+                    _line_display_name(net_copy, int(idx)) if el_type == "line"
+                    else _trafo_display_name(net_copy, int(idx)))
                 continue
+            converged = getattr(net_copy, "converged", True)
             table.at[idx, "in_service"] = True
+            if not converged:
+                non_converged_outages.append(
+                    _line_display_name(net_copy, int(idx)) if el_type == "line"
+                    else _trafo_display_name(net_copy, int(idx)))
+                continue
 
             if isinstance(df_results_ca, list):
                 df_results_ca = pd.DataFrame(df_results_ca)
@@ -4523,12 +5043,17 @@ async def simulate_all_contingencies(request: GridRequest):
         "total_outages_tested": total_tested,
         "total_outages_causing_violations": outages_with_violations,
         "total_violations": len(all_violations),
-        "system_n1_secure": len(all_violations) == 0,
+        "system_n1_secure": len(all_violations) == 0 and not non_converged_outages,
+        "n_non_converged_outages": len(non_converged_outages),
+        "non_converged_outages": non_converged_outages,
         "violations": all_violations,
+        "data_source": _dataset_label(request),
+        "thresholds_used": _thresholds_used(request),
     }
 
 
 @app.post("/api/contingency/optimize")
+@_off_event_loop
 async def optimize_contingency(request: ContingencyOptimizeRequest):
     """Sever an element, then run the Pyomo optimizer to cure the blackout.
 
@@ -4560,10 +5085,11 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     """
     if app_data["db_n1_line"] is None or app_data["db_n1_trafo"] is None:
         raise HTTPException(status_code=503, detail="N-1 Admittance databases not loaded.")
+    _check_outage_element(request.element_type, request.element_index)
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_copy = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
@@ -4586,7 +5112,7 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         pass
 
     # Find Islanded Generators
-    missing_list = list(set(net_base.sgen['substation_name']) - set(modified_net.sgen['substation_name']))
+    missing_list = list(set(_sgen_names(net_base)) - set(_sgen_names(modified_net)))
     missing_sub = missing_list[0] if missing_list else None
 
     try:
@@ -4630,8 +5156,9 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         app_data["last_dispatch_timestamp"] = current_ts
         return result
     else:
-        return {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
-                "feasible": False, "converged": False, "activated_resources": []}
+        failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
+                  "feasible": False, "converged": False, "activated_resources": []}
+        return _with_infeasibility_diagnosis(failed, model_opt, modified_net)
 
 
 # ---------------------------------------------------------------------------
@@ -4665,6 +5192,7 @@ class RobustFlexibilityRequest(_TimeseriesRequest):
 
 
 @app.post("/api/flexibility/robust")
+@_off_event_loop
 async def robust_flexibility(request: RobustFlexibilityRequest):
     """Robust OPF with selectable methods.
 
@@ -4713,7 +5241,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_base = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base.trafo["tap_pos"] = net_base.trafo["tap_neutral"]
@@ -4970,7 +5498,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
                     any_bus_over += 1
                 if bus_under:
                     any_bus_under += 1
-                for name in bus_viol:
+                for name in set(bus_viol):  # once per sample; see probabilistic_rsa
                     if name in bus_viol_counts:
                         bus_viol_counts[name] += 1
                 for name in bus_over:
@@ -5470,8 +5998,6 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
     vm_lower_per_bus: dict[str, float] = {}
     stop_reason = "max_iter"
 
-    import httpx
-
     for iter_idx in range(1, max_iter + 1):
         eval_cal = _evaluate_dispatch(p_ceiling_current, q_set_current, sgen_mults_cal, load_mults_cal, collect_vm=True)
         if eval_cal is None:
@@ -5524,10 +6050,14 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             vm_upper_per_bus=vm_upper_per_bus,
             vm_lower_per_bus=vm_lower_per_bus,
         )
+        # Called in-process. It used to go over HTTP to a hard-coded
+        # localhost:8000, which ignores BACKEND_PORT — on any other port the
+        # sub-call failed, or reached a different backend with a different
+        # network loaded. A refused OPF ends the loop exactly as before.
         try:
-            async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=120.0) as client:
-                opf_resp = await client.post("/api/flexibility/optimize", json=flex_req.model_dump())
-            opf_result = opf_resp.json()
+            opf_result = await optimise_flexibility(flex_req)
+        except HTTPException as e:
+            opf_result = {"status": "error", "detail": e.detail}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"OPF sub-call failed: {e}")
 
@@ -5816,6 +6346,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
 
 
 @app.post("/api/flexibility/envelope")
+@_off_event_loop
 async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     """PQ feasibility map for a single generator at the current operating point.
 
@@ -5832,7 +6363,7 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
 
     net = app_data["net"]
     ts = _resolve_tick(request.data_source, request.timestamp)
-    meas = prepare_measurement_df(_lookup_measurement_df(ts))
+    meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
 
     net_base = copy.deepcopy(net)
     net_base, _ = lg.assign_load_values_from_measurements(net_base, meas, substations)
@@ -6607,6 +7138,7 @@ def _solve_hosting_capacity_mode_probabilistic(
 
 
 @app.post("/api/flexibility/hosting_capacity")
+@_off_event_loop
 async def compute_hosting_capacity(request: HostingCapacityRequest):
     """Hosting-capacity scan for one bus.
 
@@ -6661,7 +7193,7 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
         }
 
     target_ts = _resolve_tick(request.data_source, request.timestamp)
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(target_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(target_ts, request.data_source))
     net_base = copy.deepcopy(app_data["net"])
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
@@ -6857,6 +7389,7 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
             }
             if requested_run_mode == "probabilistic" else None
         ),
+        "data_source": _dataset_label(request),
         "thresholds_used": {
             "vm_upper_pu": float(request.vm_upper_pu),
             "vm_lower_pu": float(request.vm_lower_pu),
@@ -6871,6 +7404,7 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
 
 
 @app.post("/api/flexibility/optimize")
+@_off_event_loop
 async def optimise_flexibility(request: FlexibilityRequest):
     """Run the Pyomo AI to find the cheapest dispatch that cures the grid.
 
@@ -6907,7 +7441,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_base = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
@@ -6923,9 +7457,10 @@ async def optimise_flexibility(request: FlexibilityRequest):
         _net_pre = copy.deepcopy(net_base)
         try:
             pp.runpp(_net_pre)
+            names = _sgen_names(_net_pre)
             dispatch_pre_disable = {
-                row['substation_name']: round(float(_net_pre.res_sgen.at[idx, 'p_mw']), 4)
-                for idx, row in _net_pre.sgen.iterrows()
+                names[idx]: round(float(_net_pre.res_sgen.at[idx, 'p_mw']), 4)
+                for idx in _net_pre.sgen.index
             }
             slack_label = str((app_data.get("grid_profile") or {}).get("slack_name") or "External Grid")
             dispatch_pre_disable[slack_label] = round(
@@ -6933,7 +7468,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
             )
         except Exception:
             dispatch_pre_disable = None
-        net_base.sgen = net_base.sgen[~net_base.sgen['substation_name'].isin(disabled_gens)].reset_index(drop=True)
+        _drop_disabled_sgens(net_base, disabled_gens)
 
     try:
         pp.runpp(net_base)
@@ -6975,8 +7510,10 @@ async def optimise_flexibility(request: FlexibilityRequest):
     if tc != TerminationCondition.optimal:
         _phys_cap = app_data.get("slack_max_mw", 70.0)
         _reported_cap = float(_phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap))
-        return {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
-                "activated_resources": [], "slack_max_mw": _reported_cap}
+        failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
+                  "feasible": False, "converged": False,
+                  "activated_resources": [], "slack_max_mw": _reported_cap}
+        return _with_infeasibility_diagnosis(failed, model_opt, net)
 
     # Constrained-slack re-solve so the dispatch respects the global
     # Sweden-cable slider. If the constrained solve fails we fall back
@@ -6989,7 +7526,15 @@ async def optimise_flexibility(request: FlexibilityRequest):
     # constrained re-solve is infeasible the snapshot is the physically valid fallback.
     df_reg_flex_rsa = fe.prepare_regulation_df_rsa(model_opt, net, net_base, current_ts)
     voltage_data = fe.extract_post_opf_voltages(model_opt, net)
-    note = ""
+    # Whether the dispatch returned actually respects the cap. When it does
+    # not, the result used to say status "optimal" and "Grid restored at slack
+    # cap ±X MW" — with the uncapped dispatch (190 MW against a 10 MW cap, in
+    # a reproduction) as the answer, cached for the envelope tool. A failed
+    # capped solve is now a failed result; the uncapped dispatch is kept only
+    # as a labelled reference (the withhold rule: never hand over a figure as
+    # an answer to a question it does not answer).
+    cap_respected = True
+    cap_failure = ""
     try:
         cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar, fixed_setpoints=request.fixed_setpoints or None)
         cscen_tc = (getattr(cscen_results.solver, "termination_condition", None)
@@ -6998,10 +7543,11 @@ async def optimise_flexibility(request: FlexibilityRequest):
             df_reg_flex_rsa = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, current_ts)
             voltage_data = fe.extract_post_opf_voltages(cscen_model, net)
         else:
-            note = (f" (constrained-slack solve at ±{slack_cap:.0f} MW was "
-                    f"infeasible; showing connected dispatch instead)")
+            cap_respected = False
+            cap_failure = f"the capped solve ended {cscen_tc or 'without a solution'}"
     except Exception as e:
-        note = f" (constrained-slack solve crashed: {e}; showing connected dispatch instead)"
+        cap_respected = False
+        cap_failure = f"the capped solve failed: {e}"
 
     # ----------------------------------------------------------------------
     # Numerical-noise filter for the dispatch table.
@@ -7028,7 +7574,12 @@ async def optimise_flexibility(request: FlexibilityRequest):
     df_reg_flex_rsa = df_reg_flex_rsa.replace([np.inf, -np.inf], np.nan)
     df_reg_flex_rsa = df_reg_flex_rsa.where(pd.notna(df_reg_flex_rsa), None)
     regulation_data = df_reg_flex_rsa.to_dict(orient="records")
-    msg = f"Grid restored at slack cap ±{slack_cap:.0f} MW.{note}"
+    if cap_respected:
+        msg = f"Grid restored at slack cap ±{slack_cap:.0f} MW."
+    else:
+        msg = (f"No dispatch keeps the external-grid exchange within ±{slack_cap:.0f} MW "
+               f"({cap_failure}). The dispatch without the cap is attached only as "
+               "`uncapped_reference_dispatch`; it does not respect the cap.")
     excluded_count = int(voltage_data.get("excluded_bus_count_post_opf") or 0)
     if excluded_count > 0:
         msg += f" Excluded {excluded_count} bus(es) from post-OPF voltage output; see excluded_buses_post_opf for details."
@@ -7052,8 +7603,16 @@ async def optimise_flexibility(request: FlexibilityRequest):
         bus_voltages_base = []
 
     # Phase 3 Placeholder: publish_flex_rsa_results(df, current_ts, topic="topic6916"...)
+    if not cap_respected:
+        return {
+            "timestamp": current_ts, "status": "cap_infeasible", "message": msg,
+            "feasible": False, "converged": True, "slack_cap_respected": False,
+            "activated_resources": [], "slack_max_mw": slack_cap,
+            "uncapped_reference_dispatch": regulation_data,
+        }
     response = {
         "timestamp": current_ts, "status": "optimal", "message": msg,
+        "feasible": True, "converged": True, "slack_cap_respected": True,
         "activated_resources": regulation_data, "slack_max_mw": slack_cap,
     }
     response.update(voltage_data)
@@ -7067,6 +7626,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
 
 
 @app.post("/api/kpi/evaluate")
+@_off_event_loop
 async def evaluate_kpis(request: KPIRequest):
     """Compute the 3 official KPIs from ``main_KPIs_Included.ipynb`` in
     both a **connected** scenario (external-grid interface at engine
@@ -7125,7 +7685,7 @@ async def evaluate_kpis(request: KPIRequest):
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_base = copy.deepcopy(app_data["net"])
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
@@ -7133,7 +7693,7 @@ async def evaluate_kpis(request: KPIRequest):
 
     disabled_gens = request.disabled_generators
     if disabled_gens:
-        net_base.sgen = net_base.sgen[~net_base.sgen['substation_name'].isin(disabled_gens)].reset_index(drop=True)
+        _drop_disabled_sgens(net_base, disabled_gens)
 
     try:
         pp.runpp(net_base)
@@ -7312,6 +7872,7 @@ async def evaluate_kpis(request: KPIRequest):
 
 
 @app.post("/api/kpi/forecast")
+@_off_event_loop
 async def forecast_kpi(request: KPIRequest):
     """Generates a 24-hour forecast of KPI-1 by evaluating multiple timestamps."""
     if app_data["db_full"] is None:
@@ -7339,7 +7900,7 @@ async def forecast_kpi(request: KPIRequest):
         net_base.trafo['tap_pos'] = net_base.trafo['tap_neutral']
 
         if disabled_gens:
-            net_base.sgen = net_base.sgen[~net_base.sgen['substation_name'].isin(disabled_gens)].reset_index(drop=True)
+            _drop_disabled_sgens(net_base, disabled_gens)
             
         try:
             pp.runpp(net_base)
@@ -7508,6 +8069,7 @@ def _eddk_preflight(token: str, probe_ids: list[int], start: str, end: str) -> d
 
 
 @app.post("/api/eddk/fetch")
+@_off_event_loop
 async def fetch_eddk_data(request: FetchDataRequest):
     """Pull transformer time-series from the EDDK data space.
 
@@ -7592,14 +8154,15 @@ async def fetch_eddk_data(request: FetchDataRequest):
 
 
 @app.post("/api/eddk/push")
+@_off_event_loop
 async def push_eddk_data():
     """Placeholder for publishing simulation results back to EDDK.
 
-    Currently returns success unconditionally — the real MQTT / REST
-    upload is not wired up yet. The button is left in the UI so the
-    end-to-end happy path can be demoed without a live upload.
+    The real MQTT / REST upload is not wired up. It used to answer "successfully
+    pushed" unconditionally — a report of something that did not happen.
     """
-    return {"status": "success", "message": "Simulation results successfully pushed to EDDK Data Space."}
+    return {"status": "not_implemented",
+            "message": "Publishing to the EDDK Data Space is not implemented yet; nothing was sent."}
 
 
 class AttributionRequest(GridRequest):
@@ -7622,6 +8185,7 @@ class AttributionRequest(GridRequest):
 
 
 @app.post("/api/rsa/attribution")
+@_off_event_loop
 async def violation_attribution(request: AttributionRequest):
     """Rank the injections driving each violated element at one operating point.
 
@@ -7642,7 +8206,7 @@ async def violation_attribution(request: AttributionRequest):
      request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
     ts = _resolve_tick(request.data_source, request.timestamp)
 
-    meas = prepare_measurement_df(_lookup_measurement_df(ts))
+    meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
     net_copy = copy.deepcopy(app_data["net"])
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
@@ -7664,7 +8228,7 @@ async def violation_attribution(request: AttributionRequest):
         top_n_sources=request.top_n_sources,
         top_n_drivers=request.top_n_drivers,
     )
-    result["data_source"] = request.data_source
+    result["data_source"] = _dataset_label(request)
     result["thresholds_used"] = {
         "vm_lower_pu": request.vm_lower_pu,
         "vm_upper_pu": request.vm_upper_pu,

@@ -101,6 +101,23 @@ class TestCheckLlmConfig:
         start.check_llm_config()
         assert capsys.readouterr().out.strip() == ""
 
+    @pytest.mark.parametrize("provider,key", [("openai", "OPENAI_API_KEY"),
+                                              ("anthropic", "ANTHROPIC_API_KEY")])
+    def test_hosted_providers_are_asked_for_their_own_key(
+        self, tmp_path, monkeypatch, capsys, provider, key
+    ):
+        (tmp_path / ".env").write_text(f"LLM_PROVIDER={provider}\n")
+        monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
+        start.check_llm_config()
+        out = capsys.readouterr().out
+        assert f"No {key}" in out and "GEMINI" not in out
+
+    def test_a_quoted_key_counts_as_present(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / ".env").write_text('LLM_PROVIDER=openai\nOPENAI_API_KEY="sk-x"\n')
+        monkeypatch.setattr(start, "AGENT_DIR", tmp_path)
+        start.check_llm_config()
+        assert capsys.readouterr().out.strip() == ""
+
     def test_warns_when_ollama_selected_without_a_model(
         self, tmp_path, monkeypatch, capsys
     ):

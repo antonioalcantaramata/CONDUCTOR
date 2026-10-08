@@ -2,9 +2,11 @@
 tool_schemas.py — Gemini FunctionDeclaration schemas for the digital twin tools.
 
 Every schema here is sent on every request, so description length is a running
-cost: these twenty-one tools are ~13.6k tokens of each prompt. This is the
-compacted form, kept after a trial against a longer version — descriptions were
-tightened and grid-specific facts removed, deferring to the system prompt,
+cost: these twenty-two tools are ~11.9k tokens of each prompt (~13.8k before
+the October 2026 trim of repeated OPF parameter advice, "Returns:" field lists
+and example-question lists). This is the compacted form, kept after a trial
+against a longer version — descriptions were tightened and grid-specific facts
+(substation names included) removed, deferring to the system prompt,
 which is rebuilt from live backend constants and therefore describes the
 network actually loaded. Schemas are built once at import and cannot follow an
 upload.
@@ -44,18 +46,13 @@ _LOAD_SCALING_DESC = (
 )
 
 _SLACK_MAX_MW_DESC = (
-    "External grid / cable capacity cap in MW. Omit (null/None) to use the "
-    "network's physical limit from the loaded network file (default). "
-    "0.0 = fully islanded. Positive values cap the bidirectional power exchange "
-    "to that level; use this when the user asks about islanding or derating "
-    "scenarios."
+    "External-grid exchange cap, MW, both directions. Omit for the network's "
+    "own limit; 0.0 = islanded. For islanding or derating questions."
 )
 
 _SLACK_Q_MAX_MVAR_DESC = (
-    "Independent reactive power limit on the external-grid interface in Mvar. Default None "
-    "(Q bound equals slack_max_mw). Set e.g. to 20 to cap reactive exchange "
-    "with the external grid to 20 Mvar regardless of the active power setting. "
-    "Forces local generators to supply more Q, shifting Pg_new in the dispatch chart."
+    "External-grid reactive exchange cap, Mvar. Omit to use slack_max_mw. "
+    "A cap makes local generators supply more Q."
 )
 
 _ELEMENT_TYPE_DESC = (
@@ -64,71 +61,54 @@ _ELEMENT_TYPE_DESC = (
 )
 
 _DISABLED_GEN_DESC = (
-    "List of substation names whose generators are forced offline. "
-    f"{_NAMES_FROM_PROMPT} "
-    "Use when user asks about generator loss or islanding of a substation."
+    "Substations whose generators are forced offline (generator loss, "
+    f"islanding). {_NAMES_FROM_PROMPT}"
 )
 
 _OPF_VM_UPPER_DESC = (
-    "Voltage upper bound enforced inside the AC OPF (p.u.). Default 1.05. "
-    "Use 1.04 to tighten the optimizer's voltage envelope and force more conservative dispatch. "
-    "A tighter bound will result in more redispatch visible in the dispatch chart."
+    "OPF voltage upper bound, p.u. Default: the network's own upper limit. "
+    "A tighter bound forces more redispatch."
 )
 
 _OPF_VM_LOWER_DESC = (
-    "Voltage lower bound enforced inside the AC OPF (p.u.). Default 0.95. "
-    "Use 0.93 to relax the lower bound and widen the feasible region when the "
-    "optimizer would otherwise be infeasible at low load."
+    "OPF voltage lower bound, p.u. Default: the network's own lower limit. "
+    "Lowering it widens the feasible region."
 )
 
 _OPF_LAMBDA_P_DESC = (
-    "Weight on active power deviation squared in the OPF objective. Default 0.01. "
-    "Increase (e.g. 0.1) to penalise active redispatch more heavily and keep Pg_new "
-    "close to Pg_base; decrease (e.g. 0.001) to allow larger P changes when needed."
+    "OPF weight on squared active-power deviation. Default 0.01; higher keeps "
+    "P closer to its base value."
 )
 
 _OPF_LAMBDA_Q_DESC = (
-    "Weight on reactive power deviation squared in the OPF objective. Default 0.001. "
-    "Increase to penalise reactive redispatch; the default is 10x smaller than "
-    "lambda_p because reactive power is typically cheaper to redispatch than active power."
+    "OPF weight on squared reactive-power deviation. Default 0.001; higher "
+    "keeps Q closer to its base value."
 )
 
 _FIXED_SETPOINTS_DESC = (
-    "Optional dict that pins specific generators or the external-grid slack to an exact MW value, "
-    "preventing the OPF from changing their output. "
-    f"Keys are substation names (generators) or {_SLACK_FROM_PROMPT}. "
-    f"{_NAMES_FROM_PROMPT} "
-    'Setting the slack entry to 5.0 keeps external-grid import fixed at 5 MW; '
-    'setting it to 0.0 fully isolates the external interface. '
-    "Unspecified elements are free to redispatch normally."
+    "Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are "
+    f"substation names or {_SLACK_FROM_PROMPT} (0.0 isolates the external "
+    f"interface). {_NAMES_FROM_PROMPT}"
 )
 
 _PG_MAX_OVERRIDES_DESC = (
-    "Optional dict overriding the maximum active power capacity (MW) for specific substations. "
-    'Example: {"Echo": 5.0, "\u00c5kirkeby": 3.0} caps those generators. '
-    "Keys are substation names; values are the new upper bound in MW. "
-    "Unspecified substations keep their default capacity."
+    "Per-substation maximum active power, MW: {name: MW}. Others keep their "
+    "capacity."
 )
 
 _PG_MIN_OVERRIDES_DESC = (
-    "Optional dict overriding the minimum active power (MW) for specific substations. "
-    "Use a positive value to set a must-run constraint (e.g. {\"Echo\": 1.0} forces "
-    "Echo to produce at least 1 MW). Use a less-negative value to reduce curtailment headroom. "
-    "Unspecified substations keep their default minimum."
+    "Per-substation minimum active power, MW: {name: MW}; positive = must-run. "
+    "Others keep their minimum."
 )
 
 _MIN_PF_DESC = (
-    "Minimum generator power factor enforced in the OPF. Default 0.95. "
-    "Relax to 0.90 to allow more reactive redispatch and increase feasibility; "
-    "tighten to 0.98 to keep generators near unity power factor. "
-    "Affects how much Q each generator can provide relative to its P output."
+    "Minimum generator power factor in the OPF. Default 0.95; lower allows "
+    "more reactive redispatch."
 )
 
 _CURRENT_SAFETY_MARGIN_DESC = (
-    "Safety factor on branch current limits inside the OPF (0–1). Default 0.9 (90% of rated). "
-    "Raise to 1.0 for a stress test that uses 100% of rated current; "
-    "lower to 0.85 to enforce a more conservative thermal margin. "
-    "Affects how much dispatch freedom the optimizer has before branch overloads are penalised."
+    "Fraction of rated branch current the OPF may use (0–1). Default 0.9; "
+    "1.0 = full rating."
 )
 
 _VM_UPPER_DESC = (
@@ -292,8 +272,8 @@ _simulate_contingency = genai.types.FunctionDeclaration(
             "element_index": genai.types.Schema(
                 type=genai.types.Type.INTEGER,
                 description=(
-                    "Zero-based index of the element to take out of service. "
-                    "Lines: 0–22. Transformers: 0–15."
+                    "Zero-based index of the element to take out of service."
+                    " Get it from locate_network_element; never guess it."
                 ),
             ),
             "load_scaling_factor": genai.types.Schema(
@@ -374,17 +354,13 @@ _optimize_contingency = genai.types.FunctionDeclaration(
             "element_index": genai.types.Schema(
                 type=genai.types.Type.INTEGER,
                 description=(
-                    "Zero-based index of the contingency element. "
-                    "Lines: 0–22. Transformers: 0–15."
+                    "Zero-based index of the contingency element."
+                    " Get it from locate_network_element; never guess it."
                 ),
             ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
-            ),
-            "slack_max_mw": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_SLACK_MAX_MW_DESC,
             ),
             "vm_upper_pu": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
@@ -710,7 +686,7 @@ _compare_results = genai.types.FunctionDeclaration(
         "Only supply label_a and label_b to name the two scenarios in the charts. "
         "Use when the user asks: 'what changed when...', 'compare X vs Y', "
         "'show the difference between the violation state and the fix', "
-        "'effect of disabling Echo', 'difference between cable derated to 20 MW vs 70 MW', etc."
+        "'effect of disabling a generator', 'difference between cable derated to 20 MW vs 70 MW', etc."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -721,7 +697,7 @@ _compare_results = genai.types.FunctionDeclaration(
             ),
             "label_b": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description="Human-readable label for the second (scenario) run, e.g. 'Cable 1 MW' or 'No Echo'. Default: 'Scenario'.",
+                description="Human-readable label for the second (scenario) run, e.g. 'Cable 1 MW'. Default: 'Scenario'.",
             ),
         },
     ),
@@ -750,6 +726,25 @@ _scan_rsa_over_time = genai.types.FunctionDeclaration(
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
+            ),
+            # Declared so a limit the operator set reaches the scan too — the
+            # wrapper always accepted them, but without a schema entry the
+            # model could not send them and the turn could not inherit them.
+            "vm_upper_pu": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=_VM_UPPER_DESC,
+            ),
+            "vm_lower_pu": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=_VM_LOWER_DESC,
+            ),
+            "max_line_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=_MAX_LINE_LOADING_DESC,
+            ),
+            "max_trafo_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=_MAX_TRAFO_LOADING_DESC,
             ),
         },
     ),
@@ -940,19 +935,8 @@ _run_probabilistic_rsa = genai.types.FunctionDeclaration(
         "Interpretation: current sgen values are treated as forecast estimates of renewable "
         "availability; uncertainty is on available resource around that estimate (with "
         "capacity clipping and setpoint ceiling), while load uncertainty remains multiplicative. "
-        "Use when the user asks: "
-        "'what is the probability of a voltage violation at this operating point?', "
-        "'how risky is the current state under uncertainty?', "
-        "'what is the chance Echo overvoltages with load uncertainty?', "
-        "'give me a probabilistic assessment', "
-        "'P5/P50/P95 voltage envelope', "
-        "'expected number of violations'. "
-        "Does NOT advance the clock. "
-        "Returns: p_any_violation (probability any element violates), "
-        "expected_violations (mean violation count), "
-        "bus_violation_probability (per-bus probability dict), "
-        "voltage_percentiles (P5/P50/P95 vm_pu per bus), "
-        "violation_count_histogram (distribution of total violations per sample)."
+        "Use for the probability or expected number of violations under "
+        "uncertainty, or P5/P50/P95 voltage envelopes. Does NOT advance the clock."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1014,19 +998,9 @@ _optimize_robust_flexibility = genai.types.FunctionDeclaration(
         "Step 3: solves OPF with tightened per-bus vm_upper and vm_lower bounds. "
         "Step 4: iterates tighten-and-solve using target_p_any, max_iter, and min_improvement. "
         "Step 5: reports independent validation risk after OPF. "
-        "Use when the user asks: "
-        "'apply a robust dispatch', "
-        "'secure the grid with 95% confidence under load uncertainty', "
-        "'guarantee security under uncertainty', "
-        "'apply back-off constraints for wind uncertainty', "
-        "'tighten voltage bounds to account for forecast error', "
-        "'robust OPF'. "
-        "Returns: activated_resources, bus_voltages_post_opf, upper/lower back-offs and tightened bounds, "
-        "p_any_violation_before, p_any_violation_after, "
-        "p_any_violation_after_validation, robust_loop_iterations, robust_loop_stop_reason, "
-        "sgen_sigma, risk_target, n_samples, validation_samples. "
-        "Scenario mode also returns guarantee diagnostics including guarantee_met, "
-        "effective_alpha_upper_bound, and guarantee_interpretation."
+        "Use for a dispatch that is secure with a stated confidence under "
+        "uncertainty (robust OPF, back-offs for forecast error). Scenario mode "
+        "also reports whether the guarantee was met (guarantee_met)."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1152,16 +1126,8 @@ _compute_flexibility_envelope = genai.types.FunctionDeclaration(
         "running a full AC power flow at each point in parallel. "
         "Returns a feasibility map (green = secure, red = constraint violated) and "
         "the safe reactive power range at the generator's current active output. "
-        "Use when the user asks: "
-        "'what is the safe dispatch range for [generator]?', "
-        "'how much Q can [generator] inject or absorb?', "
-        "'show the flexibility region for [generator]', "
-        "'show the secure operating region for [generator]', "
-        "'what Q is safe for [generator] right now?', "
-        "'explain why the OPF chose Q=[X] for [generator]', "
-        "'what is the flexibility envelope for [generator]?'. "
-        "Returns: gen_name, base_point, envelope (list of PQ points with feasibility), "
-        "safe_q_range_at_base_p, n_feasible, n_total, and capability_curve_pf metadata."
+        "Use for a generator's safe P/Q range or secure operating region, how "
+        "much Q it can inject or absorb, or why the OPF chose its Q."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1170,8 +1136,7 @@ _compute_flexibility_envelope = genai.types.FunctionDeclaration(
                 type=genai.types.Type.STRING,
                 description=(
                     "Substation name of the generator to sweep. "
-                    "Must match a 'substation_name' in the network sgen table "
-                    "(e.g. 'Echo', 'Alpha', 'Foxtrot'). Required."
+                    f"Required. {_NAMES_FROM_PROMPT}"
                 ),
             ),
             "p_min_mw": genai.types.Schema(

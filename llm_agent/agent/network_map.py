@@ -226,7 +226,13 @@ def apply_assessment(network: NetworkMap, rsa: dict) -> list[str]:
             if edge is None:
                 problems.append(f"loading reported for unknown element {name!r}")
                 continue
-            edge.loading_pct = float(entry.get("loading_percent") or 0.0)
+            # None stays None: an unsolved branch is "not measured" (grey),
+            # never 0 % loaded — which drew it as the healthiest green.
+            value = entry.get("loading_percent")
+            try:
+                edge.loading_pct = None if value is None else float(value)
+            except (TypeError, ValueError):
+                edge.loading_pct = None
 
     network.notes.append(f"{measured}/{len(network.nodes)} buses carry a measured voltage.")
     return problems

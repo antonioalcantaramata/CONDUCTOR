@@ -63,8 +63,19 @@ def _unsupported_kwargs_result(tool_name: str, kwargs: dict, supported_extra: se
     )
 
 
+# Security limits are sent only when someone chose them. The backend fills
+# every limit it is not sent with the loaded network's own, and honours every
+# one it is sent — so a default written here would be indistinguishable from
+# an operator asking for exactly that value.
+_LIMIT_KEYS = frozenset({
+    "vm_upper_pu", "vm_lower_pu", "max_line_loading_pct", "max_trafo_loading_pct",
+    "opf_vm_upper", "opf_vm_lower",
+})
+
+
 def _post(endpoint: str, body: dict) -> dict:
     """Execute a POST request and return parsed JSON or an error dict."""
+    body = {k: v for k, v in body.items() if not (k in _LIMIT_KEYS and v is None)}
     url = f"{BASE_URL}{endpoint}"
     try:
         with httpx.Client(timeout=HTTP_TIMEOUT) as client:
@@ -236,6 +247,7 @@ def advance_timestamp(steps: int = 1, target_timestamp: str | None = None, **kwa
 
     timestamps_traversed: list[str] = []
     current_timestamp: str = ""
+    reached_end = False
 
     for _ in range(steps):
         body: dict = {**kwargs}
@@ -243,13 +255,22 @@ def advance_timestamp(steps: int = 1, target_timestamp: str | None = None, **kwa
         if "error" in result:
             error_result = {**result, "timestamps_traversed": timestamps_traversed}
             return _record("advance_timestamp", error_result)
+        if result.get("status") == "finished":
+            # The clock is already on the last tick; it stays there. Reading a
+            # timestamp out of this reply recorded "" as the current time.
+            reached_end = True
+            break
         ts = result.get("current_timestamp", result.get("new_timestamp", result.get("timestamp", "")))
         timestamps_traversed.append(ts)
         current_timestamp = ts
 
+    if reached_end and not current_timestamp:
+        now = _get("/api/time/current")
+        current_timestamp = now.get("current_timestamp", now.get("timestamp", ""))
     final = {
         "timestamps_traversed": timestamps_traversed,
         "current_timestamp": current_timestamp,
+        "reached_end_of_data": reached_end,
     }
     return _record("advance_timestamp", final)
 
@@ -260,10 +281,10 @@ def advance_timestamp(steps: int = 1, target_timestamp: str | None = None, **kwa
 
 def run_rsa(
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -297,10 +318,10 @@ def simulate_contingency(
     element_type: str,
     element_index: int,
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -335,10 +356,10 @@ def simulate_contingency(
 
 def simulate_all_contingencies(
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -381,8 +402,8 @@ def optimize_contingency(
     element_index: int,
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -407,11 +428,16 @@ def optimize_contingency(
     # TODO: disabled_generators (list) — substation names forced offline
     # TODO: flexibility_bounds (dict) — per-substation {min, max} override
     """
+    if slack_max_mw is not None:
+        # The contingency endpoint has no external-grid cap. The value used to
+        # be sent and silently dropped by the backend, so "outage plus a cable
+        # derated to 20 MW" returned an uncapped dispatch presented as capped.
+        return _unsupported_kwargs_result(
+            "optimize_contingency", {"slack_max_mw": slack_max_mw}, supported_extra=set())
     body = {
         "element_type": element_type,
         "element_index": element_index,
         "load_scaling_factor": load_scaling_factor,
-        "slack_max_mw": slack_max_mw,
         # The engine spells these `opf_vm_*`; the tool layer does not, so one
         # ceiling has one name everywhere the model can see it. Translated
         # here rather than propagated: an alias the guards have to know about
@@ -440,8 +466,8 @@ def optimize_flexibility(
     disabled_generators: list[str] | None = None,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -500,8 +526,8 @@ def evaluate_kpis(
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -557,8 +583,8 @@ def forecast_kpis(
     load_scaling_factor: float = 1.0,
     slack_max_mw: float | None = None,
     slack_q_max_mvar: float | None = None,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
     opf_lambda_p: float = 0.01,
     opf_lambda_q: float = 0.001,
     pg_max_overrides: dict | None = None,
@@ -620,10 +646,10 @@ def get_element_timeseries(
     n_steps: int | None = None,
     step_size: int = 1,
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -815,6 +841,33 @@ def _normalize_to_comparable(result: dict) -> dict:
     return out
 
 
+def _first_number(*values) -> float:
+    """The first value that is a number — 0.0 included — else 0.0.
+
+    `a or b` treated a real 0.0 as missing: a unit curtailed from 4 MW to 0 MW
+    was compared as 4 → 4 (its base), and with the base falling through to
+    another field the reported change even flipped sign.
+    """
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
+
+
+def _unusable_for_comparison(result: dict) -> str | None:
+    """Why a result cannot be one side of a comparison, or None if it can."""
+    if not isinstance(result, dict):
+        return "it is not a result"
+    if "error" in result:
+        return "it is an error"
+    if result.get("feasible") is False:
+        return "it is infeasible"
+    status = str(result.get("status", "")).lower()
+    if status in {"infeasible", "failed", "error", "not_converged"}:
+        return f"its status is {status!r}"
+    return None
+
+
 def compare_results(
     label_a: str = "Baseline",
     label_b: str = "Scenario",
@@ -837,8 +890,12 @@ def compare_results(
     """
     # Auto-populate from the current turn's tool history if not supplied.
     if result_a is None or result_b is None:
+        # Infeasible or failed results are not states to compare against: an
+        # infeasible OPF lists no resources, and diffing it against an RSA
+        # reported every generator dropping to 0 MW.
         comparable = [
-            r for name, r in _last_tool_results if name in _ALL_COMPARABLE_NAMES
+            r for name, r in _last_tool_results
+            if name in _ALL_COMPARABLE_NAMES and _unusable_for_comparison(r) is None
         ]
         if len(comparable) < 2:
             return _record("compare_results", {
@@ -848,6 +905,12 @@ def compare_results(
             })
         result_a = comparable[-2]
         result_b = comparable[-1]
+    for label, res in ((label_a, result_a), (label_b, result_b)):
+        reason = _unusable_for_comparison(res)
+        if reason is not None:
+            return _record("compare_results", {
+                "error": f"Cannot compare {label!r}: {reason}. Compare only results "
+                         "that completed and are feasible."})
     result_a = _normalize_to_comparable(result_a)
     result_b = _normalize_to_comparable(result_b)
     diff: dict = {
@@ -875,10 +938,10 @@ def compare_results(
     if rows_b and a_is_rsa:
         for r in sorted(rows_b, key=lambda x: x.get("element") or x.get("name") or ""):
             name = r.get("element") or r.get("name")
-            pg_a = float(r.get("Pg_base") or 0.0)
-            pg_b = float(r.get("Pg_new") or 0.0)
-            qg_a = float(r.get("Qg_base") or 0.0)
-            qg_b = float(r.get("Qg_new") or 0.0)
+            pg_a = _first_number(r.get("Pg_base"))
+            pg_b = _first_number(r.get("Pg_new"))
+            qg_a = _first_number(r.get("Qg_base"))
+            qg_b = _first_number(r.get("Qg_new"))
             diff["dispatch_diff"].append({
                 "name": name,
                 "Pg_new_a": round(pg_a, 4),
@@ -894,10 +957,13 @@ def compare_results(
         for name in sorted(set(map_a) | set(map_b)):
             ra = map_a.get(name, {})
             rb = map_b.get(name, {})
-            pg_a = float(ra.get("Pg_new") or ra.get("Pg_base") or 0.0)
-            pg_b = float(rb.get("Pg_new") or rb.get("Pg_base") or 0.0)
-            qg_a = float(ra.get("Qg_new") or ra.get("Qg_base") or 0.0)
-            qg_b = float(rb.get("Qg_new") or rb.get("Qg_base") or 0.0)
+            # A unit missing from one side did not move there (contingency
+            # results list only the units that did), so it sits at its base —
+            # taken from the other side, not assumed to be 0 MW.
+            pg_a = _first_number(ra.get("Pg_new"), ra.get("Pg_base"), rb.get("Pg_base"))
+            pg_b = _first_number(rb.get("Pg_new"), rb.get("Pg_base"), ra.get("Pg_base"))
+            qg_a = _first_number(ra.get("Qg_new"), ra.get("Qg_base"), rb.get("Qg_base"))
+            qg_b = _first_number(rb.get("Qg_new"), rb.get("Qg_base"), ra.get("Qg_base"))
             diff["dispatch_diff"].append({
                 "name": name,
                 "Pg_new_a": round(pg_a, 4),
@@ -982,6 +1048,14 @@ def scan_rsa_over_time(
     max_voltage: list[float] = []
     max_line_loading: list[float] = []
     max_trafo_loading: list[float] = []
+    thresholds_used = None
+    reached_end = False
+
+    def _peak(rows: list, default: float) -> float:
+        # Out-of-service elements report no loading (None), not 0 %.
+        values = [r.get("loading_percent") for r in rows]
+        values = [v for v in values if isinstance(v, (int, float))]
+        return max(values) if values else default
 
     for _ in range(n_steps):
         # Advance clock one tick
@@ -989,6 +1063,11 @@ def scan_rsa_over_time(
         if "error" in adv:
             error_result = {**adv, "partial_timestamps": timestamps}
             return _record("scan_rsa_over_time", error_result)
+        if adv.get("status") == "finished":
+            # Past the last tick the backend no longer advances. Carrying on
+            # re-assessed the final tick under an empty timestamp, n times.
+            reached_end = True
+            break
         ts = adv.get("new_timestamp", adv.get("current_timestamp", adv.get("timestamp", "")))
         timestamps.append(ts)
 
@@ -1000,23 +1079,20 @@ def scan_rsa_over_time(
             return _record("scan_rsa_over_time", error_result)
 
         violation_counts.append(rsa.get("total_violations", 0))
+        thresholds_used = thresholds_used or rsa.get("thresholds_used")
 
-        voltages = [v.get("vm_pu", 1.0) for v in rsa.get("all_voltages", [])]
+        voltages = [v.get("vm_pu") for v in rsa.get("all_voltages", [])]
+        voltages = [v for v in voltages if isinstance(v, (int, float))]
         min_voltage.append(min(voltages) if voltages else 1.0)
         max_voltage.append(max(voltages) if voltages else 1.0)
 
-        line_loadings = [
-            l.get("loading_percent", 0.0) for l in rsa.get("all_line_loading", [])
-        ]
-        max_line_loading.append(max(line_loadings) if line_loadings else 0.0)
-
-        trafo_loadings = [
-            t.get("loading_percent", 0.0) for t in rsa.get("all_trafo_loading", [])
-        ]
-        max_trafo_loading.append(max(trafo_loadings) if trafo_loadings else 0.0)
+        max_line_loading.append(_peak(rsa.get("all_line_loading", []), 0.0))
+        max_trafo_loading.append(_peak(rsa.get("all_trafo_loading", []), 0.0))
 
     result = {
         "timestamps": timestamps,
+        "reached_end_of_data": reached_end,
+        "thresholds_used": thresholds_used,
         "violation_counts": violation_counts,
         "min_voltage": min_voltage,
         "max_voltage": max_voltage,
@@ -1065,10 +1141,10 @@ def scan_scenarios(
     n_steps: int | None = None,
     step_size: int = 1,
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -1110,10 +1186,10 @@ def run_probabilistic_rsa(
     n_samples: int = 200,
     sgen_sigma: float = 0.0,
     load_sigma: float = 0.05,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -1158,8 +1234,8 @@ def optimize_robust_flexibility(
     confidence: float | None = None,
     n_samples: int = 200,
     validation_samples: int | None = None,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
     slack_max_mw: float | None = None,
     load_scaling_factor: float = 1.0,
     target_p_any: float | None = None,
@@ -1170,8 +1246,8 @@ def optimize_robust_flexibility(
     n_scenarios: int | None = None,
     scenario_k_cap: int = 120,
     allowed_violation_fraction: float = 0.0,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -1242,11 +1318,11 @@ def compute_flexibility_envelope(
     p_max_mw: float | None = None,
     q_min_mvar: float | None = None,
     q_max_mvar: float | None = None,
-    resolution: int = 10,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 100.0,
-    max_trafo_loading_pct: float = 100.0,
+    resolution: int = 20,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     load_scaling_factor: float = 1.0,
     reference_state: str = "scada",
     dispatch_overrides: dict | None = None,
@@ -1308,10 +1384,10 @@ def compute_hosting_capacity(
     timestamp: str | None = None,
     p_max_search_mw: float | None = None,
     tolerance_mw: float = 0.1,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -1354,13 +1430,13 @@ def compute_historical_risk(
     window_end: str | None = None,
     condition: str | None = None,
     n_bins: int = 4,
-    near_miss_band: float = 0.01,
+    near_miss_band: float = 0.005,
     worst_n: int = 5,
     load_scaling_factor: float = 1.0,
-    vm_upper_pu: float = 1.05,
-    vm_lower_pu: float = 0.95,
-    max_line_loading_pct: float = 90.0,
-    max_trafo_loading_pct: float = 90.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
     parallel: bool = False,
     max_workers: int | None = None,
     **kwargs,

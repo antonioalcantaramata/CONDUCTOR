@@ -411,6 +411,20 @@ def _normalise_timestamp(value: str) -> str:
 _REQUESTED_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?")
 
 
+_FORECAST_WORD_RE = re.compile(r"\bforecast", re.IGNORECASE)
+_ACTUALS_WORD_RE = re.compile(r"\b(?:measur|actual|recorded|observed|histor)", re.IGNORECASE)
+
+
+def compares_datasets(text: str) -> bool:
+    """Whether the question asks about both the forecast and the actuals.
+
+    The dataset counterpart of `requested_timestamps`: comparing a forecast
+    with what was measured is a normal request, and must not be reported as
+    the turn drifting between datasets.
+    """
+    return bool(_FORECAST_WORD_RE.search(text or "") and _ACTUALS_WORD_RE.search(text or ""))
+
+
 def requested_timestamps(text: str) -> frozenset:
     """Operating points the user named, normalised to the minute.
 
@@ -427,18 +441,46 @@ def requested_timestamps(text: str) -> frozenset:
 # A voltage limit the user states in words. Deliberately narrow: a bare "1.045"
 # somewhere in a sentence is not a limit, and reading it as one would silently
 # re-run every study against a number the operator never meant as a ceiling.
-_REQUESTED_LIMIT_RES = (
-    ("vm_upper_pu", re.compile(
-        r"(?:max(?:imum)?|upper|no (?:more|higher) than|below|under|ceiling|cap(?:ped)?)"
-        r"[^.\n]{0,40}?\b(0?\.\d+|1\.\d+)\b", re.IGNORECASE)),
-    ("vm_lower_pu", re.compile(
-        r"(?:min(?:imum)?|lower|no (?:less|lower) than|above|at least|floor)"
-        r"[^.\n]{0,40}?\b(0?\.\d+|1\.\d+)\b", re.IGNORECASE)),
-)
+#
+# The first version matched any limit-ish word followed by a p.u.-sized number,
+# with a fixed direction per word. It read "voltage if load is scaled by 1.15"
+# as a 1.15 floor, and "buses below 0.96 p.u." as a 0.96 *ceiling* — the
+# operator asking which buses are under 0.96 is setting a floor. Both were then
+# injected into every call of the turn. So a number now counts only when:
+#   - it is not a scaling factor, power factor or margin;
+#   - an explicit direction word stands before it (upper/max/cap… or
+#     lower/min/floor…), which decides the direction even when the value
+#     contradicts it — an inverted band is the operator's to state and the
+#     validator's to refuse; or
+#   - a neutral limit word (above, below, limit, threshold…) stands before it
+#     *and* the sentence is about voltage, in which case the value decides:
+#     above 1.0 is a ceiling, below 1.0 a floor.
+_LIMIT_NUMBER_RE = re.compile(r"(?<![\d.])(0?\.\d+|1\.\d+)(?![\d.]*\d)")
+_UPPER_WORD_RE = re.compile(
+    r"\b(?:upper|max(?:imum)?|ceiling|cap(?:ped)?|at most|no (?:more|higher) than)\b",
+    re.IGNORECASE)
+_LOWER_WORD_RE = re.compile(
+    r"\b(?:lower|min(?:imum)?|floor|at least|no (?:less|lower) than)\b", re.IGNORECASE)
+_NEUTRAL_WORD_RE = re.compile(
+    r"\b(?:above|below|under|over|exceed\w*|limits?|threshold|band|bounds?|between|and)\b",
+    re.IGNORECASE)
+_VOLTAGE_CUE_RE = re.compile(r"volt|\bp\.?\s?u\b|\bv_?(?:max|min)\b|\bvm\b|\bbus", re.IGNORECASE)
+# Words that make a nearby number something other than a voltage limit.
+_NOT_A_LIMIT_RE = re.compile(
+    r"scal|factor|multipl|times|×|\bx\b|power factor|\bpf\b|cos|margin|lambda|safety",
+    re.IGNORECASE)
+_LIMIT_WINDOW = 45       # characters before the number that can carry its cue
+_NOT_A_LIMIT_WINDOW = 25  # how close a disqualifying word must be
 
 # Plausible p.u. voltages. A "maximum of 100" is a loading percentage, and a
 # limit parser that accepted it would propagate nonsense into every study.
 _PU_RANGE = (0.80, 1.20)
+
+
+def _last(pattern: re.Pattern, text: str) -> int:
+    """Position of the last match of `pattern` in `text`, or -1."""
+    matches = list(pattern.finditer(text))
+    return matches[-1].start() if matches else -1
 
 
 def requested_limits(text: str) -> dict:
@@ -454,16 +496,31 @@ def requested_limits(text: str) -> dict:
     The ceiling is in the prompt. Reading it there means the first call is
     covered too, on the same rule the timestamps already use.
     """
+    text = text or ""
     found: dict[str, float] = {}
-    for field, pattern in _REQUESTED_LIMIT_RES:
-        for match in pattern.finditer(text or ""):
-            try:
-                value = float(match.group(1))
-            except ValueError:  # pragma: no cover
+    for match in _LIMIT_NUMBER_RE.finditer(text):
+        value = float(match.group(1))
+        if not _PU_RANGE[0] <= value <= _PU_RANGE[1]:
+            continue
+        # The clause before the number: no further back than the previous
+        # line break, question mark or semicolon.
+        before = text[max(0, match.start() - _LIMIT_WINDOW):match.start()]
+        before = re.split(r"[\n?;]", before)[-1]
+        after = text[match.end():match.end() + _NOT_A_LIMIT_WINDOW]
+        if (_NOT_A_LIMIT_RE.search(before[-_NOT_A_LIMIT_WINDOW:])
+                or _NOT_A_LIMIT_RE.search(after)):
+            continue
+
+        upper_at, lower_at = _last(_UPPER_WORD_RE, before), _last(_LOWER_WORD_RE, before)
+        if upper_at >= 0 or lower_at >= 0:
+            field = "vm_upper_pu" if upper_at > lower_at else "vm_lower_pu"
+        elif _NEUTRAL_WORD_RE.search(before) and _VOLTAGE_CUE_RE.search(before + after):
+            if value == 1.0:
                 continue
-            if _PU_RANGE[0] <= value <= _PU_RANGE[1]:
-                found.setdefault(field, value)
-                break
+            field = "vm_upper_pu" if value > 1.0 else "vm_lower_pu"
+        else:
+            continue
+        found.setdefault(field, value)
     return found
 
 
@@ -504,9 +561,11 @@ class TurnConsistency:
     nobody asked for still is.
     """
 
-    def __init__(self, expected: frozenset | None = None) -> None:
+    def __init__(self, expected: frozenset | None = None,
+                 datasets_compared: bool = False) -> None:
         self._seen: dict[str, tuple[Any, str]] = {}
         self._expected = frozenset(expected or ())
+        self._datasets_compared = datasets_compared
 
     def observe(self, tool_name: str, result: Any) -> list[Issue]:
         context = operating_context(result)
@@ -524,6 +583,8 @@ class TurnConsistency:
             if (field == "timestamp"
                     and value in self._expected and established in self._expected):
                 # Both were asked for; this is a comparison, not a slip.
+                continue
+            if field == "data_source" and self._datasets_compared:
                 continue
 
             if field == "thresholds":
@@ -622,6 +683,9 @@ class TurnOperatingPoint:
 
     def __init__(self, requested: dict | None = None) -> None:
         self._established: dict[str, tuple[Any, str]] = {}
+        # Fields the most recent `resolve` established, so a call that is then
+        # refused or fails can take them back (see `rollback`).
+        self._last_established: list[str] = []
         # Limits the user stated in the prompt establish the turn's reference
         # before any tool runs, so the first call is covered like the rest.
         for field, value in (requested or {}).items():
@@ -640,6 +704,12 @@ class TurnOperatingPoint:
         """
         resolved = dict(kwargs)
         inherited: dict[str, Any] = {}
+        self._last_established = []
+
+        def establish(field: str, value: Any) -> None:
+            if field not in self._established:
+                self._established[field] = (value, tool_name)
+                self._last_established.append(field)
 
         # An alias carries the same quantity under a different name, so an
         # explicit `opf_vm_upper` establishes the turn's `vm_upper_pu` and vice
@@ -648,13 +718,13 @@ class TurnOperatingPoint:
         for alias, canonical in _ALIASES.items():
             explicit = resolved.get(alias)
             if explicit not in (None, ""):
-                self._established.setdefault(canonical, (explicit, tool_name))
+                establish(canonical, explicit)
 
         for field in _INHERITED_ARGS:
             explicit = resolved.get(field)
             if explicit not in (None, ""):
                 # First explicit value in the turn defines the operating point.
-                self._established.setdefault(field, (explicit, tool_name))
+                establish(field, explicit)
                 continue
 
             if accepts is None or field not in accepts:
@@ -680,3 +750,16 @@ class TurnOperatingPoint:
             inherited[alias] = {"value": value, "from": source}
 
         return resolved, inherited
+
+    def rollback(self) -> None:
+        """Withdraw what the last `resolve` established.
+
+        For a call that was refused by the validator or failed in the backend:
+        its explicit values never produced a result, so they must not become
+        the turn's reference. Observed: `vm_upper_pu=1.6` was rejected, and the
+        corrected retry — which omitted the field — inherited 1.6 and was
+        rejected again.
+        """
+        for field in self._last_established:
+            self._established.pop(field, None)
+        self._last_established = []

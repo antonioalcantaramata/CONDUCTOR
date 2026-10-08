@@ -11,6 +11,9 @@ These tests pin the properties that keep it honest:
     dropped, never repaired;
   - a figure in a suggestion's `why` that no result contains is flagged;
   - an answer with no record is never described with an earlier turn's results;
+  - every earlier turn reaches it as a one-line digest, so a long session is
+    not forgotten past the last few messages;
+  - its comment is parsed, and its figures are checked like a `why`;
   - the "this result has issues" highlight is decided in code, from verdicts;
   - its log records never reach the graders as turns.
 """
@@ -64,8 +67,8 @@ class FakeProvider:
         return ModelResponse(text=self.text)
 
 
-def _reply(*suggestions, note=""):
-    return json.dumps({"suggestions": list(suggestions), "note": note})
+def _reply(*suggestions, note="", comment=""):
+    return json.dumps({"comment": comment, "suggestions": list(suggestions), "note": note})
 
 
 def _s(angle="deeper", title="Look closer", prompt="Run X at 2000-01-03 02:15.", why=""):
@@ -94,7 +97,7 @@ class TestCapabilities:
         for name, _ in recommender.capability_list():
             assert f"- {name}:" in prompt
         # The format braces survive `.format`, the JSON example does not break it.
-        assert '{"suggestions": [{"angle"' in prompt
+        assert '{"comment": "...", "suggestions": [{"angle"' in prompt
 
     def test_prompt_is_small_compared_with_the_orchestrator(self):
         # One click is meant to be cheap; the orchestrator prompt is ~25k tokens.
@@ -267,6 +270,62 @@ class TestSuggest:
         result = recommender.suggest([], RSA_SECURE, [RSA_VIOLATED, RSA_SECURE], {},
                                      provider=provider)
         assert [s.unverified for s in result.suggestions] == [(), ("0.85 p.u.",)]
+
+
+class TestComment:
+    def test_parsed_with_the_suggestions(self):
+        result = recommender.parse_response(_reply(_s(), comment="The fix did not hold."))
+        assert result.comment == "The fix did not hold." and len(result.suggestions) == 1
+
+    def test_kept_when_there_is_nothing_to_suggest(self):
+        result = recommender.parse_response(_reply(comment="All clear.", note="Nothing new."))
+        assert result.comment == "All clear." and not result.suggestions
+
+    def test_its_figures_are_checked(self):
+        provider = FakeProvider(_reply(_s(), comment="Bus_3 sits at 0.9366 p.u., maybe 0.85 p.u. later."))
+        result = recommender.suggest([], RSA_VIOLATED, [RSA_VIOLATED], {}, provider=provider)
+        assert result.comment_unverified == ("0.85 p.u.",)
+
+    def test_the_prompt_asks_for_it_first(self):
+        prompt = recommender.build_system_prompt()
+        assert prompt.index('"comment"') < prompt.index('"suggestions"')
+
+
+class TestSessionDigest:
+    N1 = _record([("simulate_all_contingencies", {
+        "system_n1_secure": False, "total_outages_tested": 20,
+        "total_outages_causing_violations": 19, "violations": [{"element": "x"}] * 48})],
+        user="Which N-1 outages matter at 02:15?",
+        calls=[{"name": "simulate_all_contingencies", "args": {"timestamp": "2000-01-03 02:15:00"}}])
+
+    def test_a_turn_is_one_line_with_arguments_and_verdicts(self):
+        line = recommender.turn_digest(self.N1, 2)
+        assert line.startswith("T2 · Q: Which N-1 outages matter at 02:15?")
+        assert "simulate_all_contingencies(timestamp=2000-01-03 02:15:00)" in line
+        assert "system_n1_secure=False" in line and "total_outages_causing_violations=19" in line
+        assert "element" not in line  # lists stay in the full record
+
+    def test_the_latest_turn_is_left_to_its_full_record(self):
+        digest = recommender.session_digest([RSA_VIOLATED, self.N1], self.N1)
+        assert "run_rsa" in digest and "simulate_all_contingencies" not in digest
+
+    def test_a_long_session_keeps_its_newest_turns(self):
+        records = [_record([("run_rsa", {"secure": True})], user=f"question {i} " + "x" * 200)
+                   for i in range(60)]
+        digest = recommender.session_digest(records, None)
+        assert len(digest) <= recommender._MAX_DIGEST_CHARS + 60
+        assert "question 59" in digest and "question 0 " not in digest
+        assert digest.startswith("(") and "earlier turn(s) omitted" in digest.splitlines()[0]
+
+    def test_errors_are_named(self):
+        line = recommender.turn_digest(_record([("run_rsa", {"error": "timeout"})]), 1)
+        assert "→ error" in line
+
+    def test_it_is_in_the_request(self):
+        provider = FakeProvider(_reply(_s()))
+        recommender.suggest([], RSA_SECURE, [self.N1, RSA_SECURE], {}, provider=provider)
+        request = provider.calls[0]["messages"][0]["content"]
+        assert "## Earlier turns (digest)" in request and "T1 · Q: Which N-1" in request
 
 
 class TestConversationText:

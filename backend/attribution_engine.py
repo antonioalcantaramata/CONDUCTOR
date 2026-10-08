@@ -198,6 +198,25 @@ def _relief_feasible(relief: float | None, current: float) -> bool | None:
     return True if relief <= 0 else None
 
 
+def _relief_feasible_q(relief: float | None, current: float) -> bool | None:
+    """
+    Whether a source can make this *reactive* movement.
+
+    The "cannot go below zero" rule of `_relief_feasible` is about active
+    power. Reactive power is signed by nature — absorbing is as ordinary as
+    injecting — so applying that rule to Q marked a −5 Mvar absorption against
+    an overvoltage as impossible, withdrew it, and recommended a 13 MW
+    curtailment instead.
+
+    A movement that keeps |Q| within the magnitude the unit is already
+    producing is within capability it has demonstrated: True. Anything larger
+    depends on a capability not known here: None. Never provably impossible.
+    """
+    if relief is None:
+        return None
+    return True if abs(current + relief) <= abs(current) + 1e-9 else None
+
+
 def _relief(value: float, limit: float, sensitivity: float) -> float | None:
     """
     Signed movement of this source that would bring the quantity to its limit,
@@ -347,16 +366,39 @@ def _recommended_action(violation: dict, drivers: list[dict]) -> dict:
             ),
         }
 
-    # Nothing is deliverable: report the smallest shortfall so the operator can
-    # see how far short a single source falls.
-    shortfalls = []
+    # Nothing is *certainly* deliverable. Two different situations, which used
+    # to share one sentence: a movement whose headroom is simply not known here
+    # (an increase), and one the source provably cannot make. The shared text
+    # said the movement "exceeds its available 0.00 MVAr" in the first case
+    # too — a claim about capacity nobody had measured.
+    unknown, impossible = [], []
     for d in controllable:
-        for relief, unit, current in ((d["relief_mw"], "MW", d["current_p_mw"]),
-                                      (d["relief_mvar"], "MVAr", d["current_q_mvar"])):
-            if relief is not None:
-                shortfalls.append((abs(relief), d["source"], relief, unit, current))
-    shortfalls.sort()
-    _, source, relief, unit, current = shortfalls[0]
+        for relief, feasible, unit, current in (
+            (d["relief_mw"], d["relief_mw_feasible"], "MW", d["current_p_mw"]),
+            (d["relief_mvar"], d["relief_mvar_feasible"], "MVAr", d["current_q_mvar"]),
+        ):
+            if relief is None:
+                continue
+            bucket = unknown if feasible is None else impossible
+            bucket.append((abs(relief), d["source"], relief, unit, current))
+    if unknown:
+        unknown.sort()
+        _, source, relief, unit, _ = unknown[0]
+        verb = "reduction" if relief < 0 else "increase"
+        return {
+            "kind": "headroom_unknown",
+            "source": source,
+            "movement": round(relief, 4),
+            "unit": unit,
+            "text": (
+                f"No movement is certain to clear {violation['element']}. The "
+                f"smallest single-source option is a {_fmt(relief, unit)} {verb} "
+                f"of {source}, which works only if {source} has that headroom — "
+                "not known here. Check its capability, or use several sources."
+            ),
+        }
+    impossible.sort()
+    _, source, relief, unit, current = impossible[0]
     return {
         "kind": "none_sufficient",
         "text": (
@@ -458,7 +500,7 @@ def attribute_violations(
             })
             drivers[-1]["relief_mw_feasible"] = _relief_feasible(
                 drivers[-1]["relief_mw"], source["current_p_mw"])
-            drivers[-1]["relief_mvar_feasible"] = _relief_feasible(
+            drivers[-1]["relief_mvar_feasible"] = _relief_feasible_q(
                 drivers[-1]["relief_mvar"], source["current_q_mvar"])
 
         drivers.sort(key=lambda d: d["_influence"], reverse=True)
