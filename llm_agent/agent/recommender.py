@@ -167,6 +167,8 @@ then say what changed.
 7. Keep "title" under 12 words and "why" to one sentence that points to what \
 in the conversation motivates the suggestion.
 8. Match the operator's language.
+8b. A bus in `voltage_controlled_buses` is held at its setpoint by a unit: its \
+voltage is not a weak spot. Its margin is that unit's `q_headroom_up_mvar`.
 9. If there is nothing useful to suggest, return an empty list and a one-line \
 "note" explaining why; still write the comment.
 

@@ -56,6 +56,15 @@ def _fix_slack_voltage(var, vm: float) -> None:
     var.fix(vm)
 
 
+def _best_sentence(overload: dict) -> str:
+    """'At best, ...': the least the worst branch can be brought to."""
+    best = overload.get("best_achievable_pct_of_rating")
+    if best is None:
+        return ""
+    return (f" At best, local flexibility brings {overload['branch']} to {best:.0f} % of its "
+            f"rating (allowed {overload['allowed_pct_of_rating']:.0f} %).")
+
+
 def diagnose_infeasible(model, branch_label=None) -> dict | None:
     """Why a flexibility OPF has no solution, in an operator's terms.
 
@@ -154,6 +163,7 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
             f"exists only if branch limits are lifted, and then {listed} "
             f"{'carries' if len(overloads) == 1 else 'carry'} more than allowed — redispatch of "
             f"local units cannot move enough power off {'it' if len(overloads) == 1 else 'them'}."
+            + _best_sentence(overloads[0])
         )
     elif combined_solvable and overloads:
         listed = ", ".join(f"{o['branch']} ({o['loading_pct_of_rating']:.0f} % of its rating; "
@@ -162,6 +172,7 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
             f"local flexibility cannot clear the violations by raising the grid-connection "
             f"voltage within {band_text} or by lifting branch limits alone; only both together "
             f"give a dispatch, with {listed} overloaded."
+            + _best_sentence(overloads[0])
         )
     else:
         explanation = (
@@ -212,6 +223,29 @@ def _restart(model) -> None:
             model.Qg_new[g].value = start["Qg"][g]
 
 
+def _lowest_current(model, constraint, rating_sq) -> float | None:
+    """The lowest current one branch can be brought to (% of rating), with the
+    model as it stands — the dispatch objective swapped for that current, then
+    restored. None if that solve fails."""
+    from pyomo.environ import SolverFactory
+
+    original = next(iter(model.component_objects(Objective, active=True)))
+    original.deactivate()
+    model._lowest_current_obj = Objective(expr=constraint.body, sense=minimize)
+    _restart(model)
+    try:
+        res = SolverFactory("ipopt").solve(model, tee=False, load_solutions=False)
+        if res.solver.termination_condition != TerminationCondition.optimal:
+            return None
+        model.solutions.load_from(res)
+        return 100.0 * math.sqrt(max(float(value(constraint.body)), 0.0) / rating_sq)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        model.del_component("_lowest_current_obj")
+        original.activate()
+
+
 def _thermal_check(model, branch_label=None, slack=None) -> tuple[list[dict], bool]:
     """Re-solve with the branch-current limits lifted.
 
@@ -256,20 +290,164 @@ def _thermal_check(model, branch_label=None, slack=None) -> tuple[list[dict], bo
                     continue
                 key = tuple(sorted((int(i), int(j))))
                 pct = 100.0 * math.sqrt(current_sq / rating_sq)
-                if pct > worst.get(key, (0.0, 0.0))[0]:
-                    worst[key] = (pct, 100.0 * math.sqrt(allowed_sq / rating_sq))
+                if pct > worst.get(key, (0.0,))[0]:
+                    worst[key] = (pct, 100.0 * math.sqrt(allowed_sq / rating_sq), c[i, j], rating_sq)
+        ranked = sorted(worst.items(), key=lambda kv: -kv[1][0])
         overloads = [
             {"branch": (branch_label(*key) if branch_label else f"Bus_{key[0]}–Bus_{key[1]}"),
              "loading_pct_of_rating": round(pct, 1),
              "allowed_pct_of_rating": round(allowed, 1)}
-            for key, (pct, allowed) in sorted(worst.items(), key=lambda kv: -kv[1][0])
+            for key, (pct, allowed, _c, _r) in ranked
         ]
+        if ranked:
+            # The loading above is where the least-redispatch solution lands,
+            # not the least local flexibility can reach: minimise the worst
+            # branch's current, the other limits still lifted.
+            _, (_, _, worst_con, worst_rating_sq) = ranked[0]
+            best = _lowest_current(model, worst_con, worst_rating_sq)
+            if best is not None:
+                overloads[0]["best_achievable_pct_of_rating"] = round(best, 1)
         return overloads, True
     finally:
         for c in limits:
             c.activate()
         if slack is not None:
             slack.fix(fixed_at)
+
+
+def _in_service(row) -> bool:
+    v = row.get("in_service", True)
+    return True if v is None or v != v else bool(v)
+
+
+def _branch_current_data(net) -> dict:
+    """Current base and limit, kA, per directed branch (from bus, to bus).
+
+    Keyed by bus pair, so parallel branches between two buses are one entry
+    whose limits add — identical circuits share current by rating — matching
+    the admittance builder, which sums their admittances. Before, the last
+    branch read overwrote the others: two parallel circuits were modelled as
+    one, at half the capacity. A line's limit is ``max_i_ka × df × parallel``
+    and a transformer's rating is ``sn_mva × parallel``; out-of-service
+    branches, and branches touching an out-of-service bus, are left out.
+    (Code review 2.9 and sandbox hazard A.3 (2).)
+    """
+    sbase = float(net.sn_mva)
+    root3 = np.sqrt(3)
+    bus_on = {int(b): _in_service(r) for b, r in net.bus.iterrows()}
+    out: dict = {}
+
+    def add(i: int, j: int, ibase: float, imax: float) -> None:
+        entry = out.setdefault((i, j), {"Ibase_from_kA": ibase, "I_from_max": 0.0})
+        entry["I_from_max"] += imax
+
+    def factor(row, column: str) -> float:
+        v = row.get(column, 1.0)
+        return 1.0 if v is None or v != v else float(v)
+
+    for _, t in net.trafo.iterrows():
+        i, j = int(t["hv_bus"]), int(t["lv_bus"])
+        if not (_in_service(t) and bus_on.get(i, True) and bus_on.get(j, True)):
+            continue
+        sn = float(t["sn_mva"]) * factor(t, "parallel")
+        v_hv, v_lv = float(net.bus.at[i, "vn_kv"]), float(net.bus.at[j, "vn_kv"])
+        add(i, j, sbase / (root3 * v_hv), sn / (root3 * v_hv))
+        add(j, i, sbase / (root3 * v_lv), sn / (root3 * v_lv))
+
+    for _, line in net.line.iterrows():
+        i, j = int(line["from_bus"]), int(line["to_bus"])
+        if not (_in_service(line) and bus_on.get(i, True) and bus_on.get(j, True)):
+            continue
+        imax = float(line["max_i_ka"]) * factor(line, "df") * factor(line, "parallel")
+        add(i, j, sbase / (root3 * float(net.bus.at[i, "vn_kv"])), imax)
+        add(j, i, sbase / (root3 * float(net.bus.at[j, "vn_kv"])), imax)
+    return out
+
+
+def _is_condenser(row) -> bool:
+    """A `net.gen` unit with no active-power capacity: its declared
+    `max_p_mw` — or, with none declared, its output — under 1 MW."""
+    cap = row.get("max_p_mw", None)
+    if cap is None or cap != cap:
+        cap = row.get("p_mw", 0.0)
+    try:
+        return float(cap or 0.0) < 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _bus_label(net, bus_idx: int) -> str:
+    """A bus's name, or `Bus_<index>` when it has none.
+
+    `str()` of a missing name is the text "None", which then passed as a real
+    name: every bus of an unnamed network (PGLib) was labelled "None" in the
+    post-OPF voltage lists, and the voltage chart drew all of them at one x.
+    """
+    raw = net.bus.at[bus_idx, "name"] if "name" in net.bus.columns else None
+    if raw is None or raw != raw:
+        return f"Bus_{bus_idx}"
+    text = str(raw).strip()
+    return text if text and text.lower() not in ("none", "nan") else f"Bus_{bus_idx}"
+
+
+def _unit_in_service(net, row) -> bool:
+    """A generating unit the OPF may dispatch: in service, on a bus in service.
+
+    Out-of-service units — and units left on a bus an outage islanded — used
+    to enter the model with their power-flow results, NaN on an islanded bus.
+    """
+    if not _in_service(row):
+        return False
+    bus = int(row["bus"])
+    return bus not in net.bus.index or _in_service(net.bus.loc[bus])
+
+
+def _shunt_data(net) -> tuple[list, dict, dict, dict]:
+    """(keys, bus, P MW, Q Mvar at 1 p.u.) for every in-service shunt.
+
+    Keyed by index: keyed by `name` — empty on most networks — several shunts
+    collapsed into one entry. `step` multiplies the nominal values, as in
+    pandapower; out-of-service shunts are left out (code review 2.9).
+    """
+    bus_on = {int(b): _in_service(r) for b, r in net.bus.iterrows()}
+    keys, bus, p, q = [], {}, {}, {}
+    for idx, row in net.shunt.iterrows():
+        b = int(row["bus"])
+        if not (_in_service(row) and bus_on.get(b, True)):
+            continue
+        step = row.get("step", 1)
+        step = 1.0 if step is None or step != step else float(step)
+        k = int(idx)
+        keys.append(k)
+        bus[k] = b
+        p[k] = (0.0 if row.get("p_mw") != row.get("p_mw") else float(row.get("p_mw") or 0.0)) * step
+        q[k] = (0.0 if row.get("q_mvar") != row.get("q_mvar") else float(row.get("q_mvar") or 0.0)) * step
+    return keys, bus, p, q
+
+
+def _load_data(net) -> tuple[list, dict, dict, dict]:
+    """(keys, P MW, Q Mvar, bus) for every load the OPF must supply.
+
+    Keyed by the load's pandapower index. Keyed by substation name, two loads
+    on one substation — which a measurement split across them produces —
+    became one entry holding only the last load's demand (sandbox hazard
+    A.3 (3)). Out-of-service loads, and loads on out-of-service buses, are
+    left out; `scaling` applies, as in the power flow (code review 2.9).
+    """
+    bus_on = {int(b): _in_service(r) for b, r in net.bus.iterrows()}
+    keys, p, q, bus = [], {}, {}, {}
+    for idx, row in net.load.iterrows():
+        b = int(row["bus"])
+        if not (_in_service(row) and bus_on.get(b, True)):
+            continue
+        scale = row.get("scaling", 1.0)
+        scale = 1.0 if scale is None or scale != scale else float(scale)
+        k = int(idx)
+        keys.append(k)
+        p[k] = float(row["p_mw"]) * scale
+        q[k] = float(row["q_mvar"]) * scale
+        bus[k] = b
+    return keys, p, q, bus
 
 
 def _extract_pg_max(net) -> dict:
@@ -311,7 +489,7 @@ def active_power_balance_rule(m, bus_idx):
     P_inj = sum(m.Pg_new[g] for g in m.G if m.gen_bus[g] == bus_idx) \
           + sum(m.Pext[e] for e in m.Ext if m.ext_bus[e] == bus_idx) \
           - sum(m.Pl[l] for l in m.L if m.load_bus[l] == bus_idx) \
-          - sum(m.Ps_nom[s] for s in m.S if m.shunt_bus[s] == bus_idx)
+          - sum(m.Ps_nom[s] * m.V[bus_idx] ** 2 for s in m.S if m.shunt_bus[s] == bus_idx)
 
     # --- Branch outflows ---
     P_flow = sum(
@@ -323,9 +501,9 @@ def active_power_balance_rule(m, bus_idx):
         for (i, j) in m.Branches if i == bus_idx
     )
 
-    # Convert per-unit flows to MW. For buses with no connected model terms,
+    # Convert per-unit flows to MW (× base power). For buses with no connected model terms,
     # Pyomo can simplify to a plain bool (e.g. 0 == 0), which is invalid.
-    expr = P_inj == P_flow * 100
+    expr = P_inj == P_flow * m.Sbase
     if isinstance(expr, (bool, np.bool_)):
         return Constraint.Feasible if expr else Constraint.Infeasible
     return expr
@@ -355,8 +533,8 @@ def reactive_power_balance_rule(m, bus_idx):
         for (i, j) in m.Branches if i == bus_idx
     )
 
-    # Convert per-unit flows to MVAr. Guard against trivial bool expressions.
-    expr = Q_inj == Q_flow * 100
+    # Convert per-unit flows to MVAr (× base power). Guard against trivial bool expressions.
+    expr = Q_inj == Q_flow * m.Sbase
     if isinstance(expr, (bool, np.bool_)):
         return Constraint.Feasible if expr else Constraint.Infeasible
     return expr
@@ -418,6 +596,9 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # Step 1: Create Pyomo model
     # -------------------------
     model = ConcreteModel()
+    # The admittances are per-unit on the network's own base, so flows convert
+    # to MW / Mvar by it — not by a hard-coded 100 MVA (code review 2.10).
+    model.Sbase = Param(initialize=float(net.sn_mva))
     
     # -------------------------
     # Step 2: Define bus set
@@ -511,22 +692,14 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # Step 6: Prepare load data
     # -------------------------
     
-    # Extract all load names from the network (substation names)
-    load_name_list = net.load['substation_name'].tolist()
-    # Active power demand (MW) per load
-    load_data_p = dict(zip(net.load['substation_name'], net.load['p_mw']))
-    
-    # Reactive power demand (Mvar) per load
-    load_data_q = dict(zip(net.load['substation_name'], net.load['q_mvar']))
-    
-    # Map each load to its bus number
-    load_bus_map = dict(zip(net.load['substation_name'], net.load['bus']))
+    # One entry per load, keyed by its index (see _load_data)
+    load_name_list, load_data_p, load_data_q, load_bus_map = _load_data(net)
     
     # -------------------------
     # Step 7: Define load set and parameters in Pyomo
     # -------------------------
     
-    # Set of loads (indexed by load names)
+    # Set of loads (indexed by pandapower load index)
     model.L = Set(initialize=load_name_list)
     
     # Parameters for load data
@@ -558,6 +731,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # --- Static generators (measured renewables / IEEE sgen) ---
     if not net.sgen.empty:
         for idx, row in net.sgen.iterrows():
+            if not _unit_in_service(net, row):
+                continue  # out of service, or on an out-of-service bus (review 2.9)
             name = _sgen_name(row, idx)
             gen_name_list.append(name)
             res_p = net.res_sgen.at[idx, "p_mw"]   if not net.res_sgen.empty and idx in net.res_sgen.index else float(row.get("p_mw",   0.0))
@@ -568,9 +743,12 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
 
     # --- Controllable generators (IEEE net.gen; absent in measured substation profiles) ---
     condenser_q_max: dict = {}
+    true_condensers: set = set()
     condenser_q_min: dict = {}
     if not net.gen.empty:
         for idx, row in net.gen.iterrows():
+            if not _unit_in_service(net, row):
+                continue  # out of service, or on an out-of-service bus (review 2.9)
             name = _gen_name(row, idx)
             if name in gen_name_list:
                 continue  # avoid double-counting
@@ -593,6 +771,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                 mnq = -50.0
             condenser_q_max[name] = mxq
             condenser_q_min[name] = mnq
+            if _is_condenser(row):
+                true_condensers.add(name)
             # Clip base Q to declared limits.
             res_q = max(mnq, min(mxq, float(res_q)))
             P_base_data[name] = float(res_p)
@@ -604,8 +784,11 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     Pg_max_data = {g: _pg_max_all.get(g, 0.001) for g in gen_name_list}
     Pg_min_data = {g: 0.0 for g in gen_name_list}
 
-    # Synchronous condensers produce zero active power — fix Pg at 0
-    for g in condenser_q_max:
+    # Synchronous condensers produce zero active power — fix Pg at 0. Only
+    # units without active-power capacity: every `net.gen` row used to be
+    # pinned to 0 MW, so a real generator kept as `gen` (an upload with
+    # convert_gen_to_sgen off) could never move (code review 2.7).
+    for g in true_condensers:
         Pg_max_data[g] = 0.0
 
     if missing_substation:
@@ -670,8 +853,11 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # because their P is fixed at 0, removing all reactive voltage support.
     # Instead they get explicit Q-limit constraints from their net.gen data.
     # -------------------------
-    pf_gens   = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) >= 1.0]
+    # Every unit gets a reactive limit: condensers their own Q range, every
+    # other unit the power-factor cone. A unit under 1 MW that is not a
+    # condenser used to get neither, and could supply unlimited Q (review 2.8).
     cond_gens = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) <  1.0 and g in condenser_q_max]
+    pf_gens   = [g for g in gen_name_list if g not in set(cond_gens)]
 
     model.PF_set = Set(initialize=pf_gens)
     def pf_cone(m, g):
@@ -688,14 +874,9 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     
 
     
-    shunt_name_list = net.shunt['name'].tolist()
-    shunt_bus_map = dict(zip(net.shunt['name'], net.shunt['bus']))
-    
-    # NOMINAL reactive power (Mvar) at nominal voltage (this is NOT the actual Q at solved V)
-    shunt_Q_nom = dict(zip(net.shunt['name'], net.shunt['q_mvar'].fillna(0.0)))
-    
-    # If you also need P (rare), collect it similarly
-    shunt_P_nom = dict(zip(net.shunt['name'], net.shunt['p_mw'].fillna(0.0)))
+    # Nominal shunt P and Q at 1 p.u. (the solved values scale with V², as in
+    # pandapower); one entry per shunt index (see _shunt_data).
+    shunt_name_list, shunt_bus_map, shunt_P_nom, shunt_Q_nom = _shunt_data(net)
     
     model.S = Set(initialize=shunt_name_list)
     model.shunt_bus = Param(model.S, initialize=shunt_bus_map)
@@ -759,64 +940,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     #model.Qext = Param(model.Ext, initialize=ext_grid_data_q)
 
         
-    # ---------------------------
-    # Prepare branch current info (unchanged)
-    # ---------------------------
-    Sbase_MVA = net.sn_mva  # system base power
-    trafo_current_data = {}
-    
-    for trafo_idx, trafo_data in net.trafo.iterrows():
-        i = trafo_data['hv_bus']
-        j = trafo_data['lv_bus']
-    
-        sn_mva = trafo_data['sn_mva']
-        Vbase_hv_kV = net.bus.at[i, 'vn_kv']
-        Vbase_lv_kV = net.bus.at[j, 'vn_kv']
-    
-        # Rated currents
-        Irated_hv_kA = sn_mva / (np.sqrt(3) * Vbase_hv_kV)
-        Irated_lv_kA = sn_mva / (np.sqrt(3) * Vbase_lv_kV)
-    
-        # Base currents
-        Ibase_hv_kA = Sbase_MVA / (np.sqrt(3) * Vbase_hv_kV)
-        Ibase_lv_kA = Sbase_MVA / (np.sqrt(3) * Vbase_lv_kV)
-    
-        trafo_current_data[(i, j)] = {
-            'Ibase_from_kA': Ibase_hv_kA,
-            'I_from_max': Irated_hv_kA
-        }
-        trafo_current_data[(j, i)] = {
-            'Ibase_from_kA': Ibase_lv_kA,
-            'I_from_max': Irated_lv_kA
-        }
-    
-    line_current_data = {}
-    for line_idx, line_data in net.line.iterrows():
-        i = line_data['from_bus']
-        j = line_data['to_bus']
-    
-        Vbase_from_kV = net.bus.at[i, 'vn_kv']
-        Vbase_to_kV = net.bus.at[j, 'vn_kv']
-    
-        Ibase_from_kA = Sbase_MVA / (np.sqrt(3) * Vbase_from_kV)
-        Ibase_to_kA = Sbase_MVA / (np.sqrt(3) * Vbase_to_kV)
-    
-        I_from_max = line_data['max_i_ka']
-        I_to_max = line_data['max_i_ka']
-    
-        line_current_data[(i, j)] = {
-            'Ibase_from_kA': Ibase_from_kA,
-            'I_from_max': I_from_max
-        }
-        line_current_data[(j, i)] = {
-            'Ibase_from_kA': Ibase_to_kA,
-            'I_from_max': I_to_max
-        }
-    
-    # merge
-    branch_data = {}
-    branch_data.update(line_current_data)
-    branch_data.update(trafo_current_data)
+    # Branch current base and limits (lines + transformers)
+    branch_data = _branch_current_data(net)
         
     
     # ============================================================
@@ -885,7 +1010,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                  + m.Yft_real_used[i,j]*m.V[j]*sin(m.theta[j]) + m.Yft_imag_used[i,j]*m.V[j]*cos(m.theta[j])
         current_pu_sq = I_real**2 + I_imag**2
         max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j])**2
-        return current_pu_sq <= _csm * max_current_pu_sq
+        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
 
     def branch_current_to_rule(m, i, j):
         I_real = m.Yff_real_used[j,i]*m.V[j]*cos(m.theta[j]) - m.Yff_imag_used[j,i]*m.V[j]*sin(m.theta[j]) \
@@ -894,7 +1019,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                  + m.Yft_real_used[j,i]*m.V[i]*sin(m.theta[i]) + m.Yft_imag_used[j,i]*m.V[i]*cos(m.theta[i])
         current_pu_sq = I_real**2 + I_imag**2
         max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i])**2
-        return current_pu_sq <= _csm * max_current_pu_sq
+        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
 
     model.branch_current_from_limit = Constraint(model.Branches, rule=branch_current_from_rule)
 
@@ -1153,8 +1278,7 @@ def extract_post_opf_voltages(model, net) -> dict:
         - ``opf_vm_upper_used``: upper voltage bound applied inside the OPF (p.u.).
     """
     def _bus_name(bus_idx: int) -> str:
-        _raw = str(net.bus.at[bus_idx, 'name']).strip() if 'name' in net.bus.columns else ""
-        return _raw if _raw else f"Bus_{bus_idx}"
+        return _bus_label(net, bus_idx)
 
     bus_voltages = []
     excluded_buses = []
@@ -1213,8 +1337,7 @@ def extract_post_opf_voltages_scenario(
     internal box.
     """
     def _bus_name(bus_idx: int) -> str:
-        _raw = str(net.bus.at[bus_idx, 'name']).strip() if 'name' in net.bus.columns else ""
-        return _raw if _raw else f"Bus_{bus_idx}"
+        return _bus_label(net, bus_idx)
 
     bus_voltages = []
     excluded_buses = []
@@ -1250,6 +1373,46 @@ def extract_post_opf_voltages_scenario(
         "excluded_bus_count_post_opf": len(excluded_buses),
         "opf_vm_lower_used": float(vm_lower) if vm_lower is not None else 0.95,
         "opf_vm_upper_used": float(vm_upper) if vm_upper is not None else 1.05,
+    }
+
+
+def scenario_curtailment(model, tol: float = 0.01) -> dict:
+    """Renewable output the scenario plan curtails, per unit and scenario.
+
+    In scenario k a unit injects ``Pinj[g, k] ≤ min(Pg_new[g], xi[g, k])``;
+    unaided it would inject that minimum. The difference is curtailment the
+    plan relies on — free in the objective and absent from the dispatch, which
+    reports setpoints (code review 2.5). Reported, not priced: what curtailment
+    costs differs by operator and system.
+
+    ``tol`` (10 kW) sits above solver noise: injection is rewarded only at
+    1e-6 per MW, so the interior-point solution stops ~1 kW below the limit in
+    most scenarios, which is not curtailment anyone decided.
+    """
+    scenarios = list(model.K)
+    per_unit: dict = {}
+    worst_total = 0.0
+    with_curtailment = 0
+    for k in scenarios:
+        total = 0.0
+        for g in model.G:
+            available = min(float(value(model.Pg_new[g])), float(value(model.xi[g, k])))
+            cut = max(available - float(value(model.Pinj[g, k])), 0.0)
+            if cut > tol:
+                per_unit.setdefault(str(g), []).append(cut)
+                total += cut
+        if total > tol:
+            with_curtailment += 1
+        worst_total = max(worst_total, total)
+    return {
+        "n_scenarios": len(scenarios),
+        "scenarios_with_curtailment": with_curtailment,
+        "share_of_scenarios": round(with_curtailment / len(scenarios), 4) if scenarios else 0.0,
+        "max_total_mw": round(worst_total, 4),
+        "by_unit": [
+            {"unit": g, "scenarios": len(v), "max_mw": round(max(v), 4), "mean_mw": round(sum(v) / len(v), 4)}
+            for g, v in sorted(per_unit.items(), key=lambda kv: -max(kv[1]))
+        ],
     }
 
 
@@ -1290,6 +1453,9 @@ def scenario_optimization_model_base(
       a scenario budget (sum z <= frac*K) to stay compatible with IPOPT.
     """
     model = ConcreteModel()
+    # The admittances are per-unit on the network's own base, so flows convert
+    # to MW / Mvar by it — not by a hard-coded 100 MVA (code review 2.10).
+    model.Sbase = Param(initialize=float(net.sn_mva))
 
     # Core index sets.
     if "in_service" in net.bus.columns:
@@ -1312,11 +1478,8 @@ def scenario_optimization_model_base(
         vm_pu_map[b] = float(net.res_bus.at[idx, 'vm_pu'])
         va_rad_map[b] = math.radians(float(net.res_bus.at[idx, 'va_degree']))
 
-    # Loads.
-    load_name_list = net.load['substation_name'].tolist()
-    load_data_p = dict(zip(net.load['substation_name'], net.load['p_mw']))
-    load_data_q = dict(zip(net.load['substation_name'], net.load['q_mvar']))
-    load_bus_map = dict(zip(net.load['substation_name'], net.load['bus']))
+    # Loads, one entry per load index (see _load_data).
+    load_name_list, load_data_p, load_data_q, load_bus_map = _load_data(net)
     model.L = Set(initialize=load_name_list)
     model.Pl0 = Param(model.L, initialize=load_data_p)
     model.Ql0 = Param(model.L, initialize=load_data_q)
@@ -1339,10 +1502,13 @@ def scenario_optimization_model_base(
     Q_base_data = {}
     gen_bus_map = {}
     condenser_q_max = {}
+    true_condensers: set = set()
     condenser_q_min = {}
 
     if not net.sgen.empty:
         for idx, row in net.sgen.iterrows():
+            if not _unit_in_service(net, row):
+                continue  # out of service, or on an out-of-service bus (review 2.9)
             name = _sgen_name(row, idx)
             gen_name_list.append(name)
             res_p = net.res_sgen.at[idx, "p_mw"] if (not net.res_sgen.empty and idx in net.res_sgen.index) else float(row.get("p_mw", 0.0))
@@ -1353,6 +1519,8 @@ def scenario_optimization_model_base(
 
     if not net.gen.empty:
         for idx, row in net.gen.iterrows():
+            if not _unit_in_service(net, row):
+                continue  # out of service, or on an out-of-service bus (review 2.9)
             name = _gen_name(row, idx)
             if name in gen_name_list:
                 continue
@@ -1371,6 +1539,8 @@ def scenario_optimization_model_base(
                 mnq = -50.0
             condenser_q_max[name] = mxq
             condenser_q_min[name] = mnq
+            if _is_condenser(row):
+                true_condensers.add(name)
             res_q = max(mnq, min(mxq, float(res_q)))
             P_base_data[name] = float(res_p)
             Q_base_data[name] = float(res_q)
@@ -1380,7 +1550,7 @@ def scenario_optimization_model_base(
     Pg_max_data = {g: _pg_max_all.get(g, 0.001) for g in gen_name_list}
     Pg_min_data = {g: 0.0 for g in gen_name_list}
 
-    for g in condenser_q_max:
+    for g in true_condensers:
         Pg_max_data[g] = 0.0
 
     if pg_max_overrides:
@@ -1404,8 +1574,8 @@ def scenario_optimization_model_base(
     PF_min = min_power_factor
     tan_phi = math.tan(math.acos(PF_min))
     model.tan_phi_sq = Param(initialize=tan_phi ** 2)
-    pf_gens = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) >= 1.0]
     cond_gens = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) < 1.0 and g in condenser_q_max]
+    pf_gens = [g for g in gen_name_list if g not in set(cond_gens)]  # review 2.8
     model.PF_set = Set(initialize=pf_gens)
     model.PF_cone = Constraint(model.PF_set, rule=lambda m, g: m.Qg_new[g] ** 2 <= m.tan_phi_sq * m.Pg_new[g] ** 2)
     if cond_gens:
@@ -1416,10 +1586,7 @@ def scenario_optimization_model_base(
         model.QgCondLower = Constraint(model.CondSet, rule=lambda m, g: m.Qg_new[g] >= m.Qg_cond_min[g])
 
     # Shunts.
-    shunt_name_list = net.shunt['name'].tolist()
-    shunt_bus_map = dict(zip(net.shunt['name'], net.shunt['bus']))
-    shunt_Q_nom = dict(zip(net.shunt['name'], net.shunt['q_mvar'].fillna(0.0)))
-    shunt_P_nom = dict(zip(net.shunt['name'], net.shunt['p_mw'].fillna(0.0)))
+    shunt_name_list, shunt_bus_map, shunt_P_nom, shunt_Q_nom = _shunt_data(net)
     model.S = Set(initialize=shunt_name_list)
     model.shunt_bus = Param(model.S, initialize=shunt_bus_map)
     model.Qs_nom = Param(model.S, initialize=shunt_Q_nom)
@@ -1453,37 +1620,7 @@ def scenario_optimization_model_base(
     model.Qext = Var(model.Ext, model.K, bounds=lambda m, e, k: (-200.0, 200.0))
 
     # Branch and admittance data.
-    Sbase_MVA = net.sn_mva
-    trafo_current_data = {}
-    for trafo_idx, trafo_data in net.trafo.iterrows():
-        i = int(trafo_data['hv_bus'])
-        j = int(trafo_data['lv_bus'])
-        sn_mva = float(trafo_data['sn_mva'])
-        Vbase_hv_kV = float(net.bus.at[i, 'vn_kv'])
-        Vbase_lv_kV = float(net.bus.at[j, 'vn_kv'])
-        Irated_hv_kA = sn_mva / (np.sqrt(3) * Vbase_hv_kV)
-        Irated_lv_kA = sn_mva / (np.sqrt(3) * Vbase_lv_kV)
-        Ibase_hv_kA = Sbase_MVA / (np.sqrt(3) * Vbase_hv_kV)
-        Ibase_lv_kA = Sbase_MVA / (np.sqrt(3) * Vbase_lv_kV)
-        trafo_current_data[(i, j)] = {'Ibase_from_kA': Ibase_hv_kA, 'I_from_max': Irated_hv_kA}
-        trafo_current_data[(j, i)] = {'Ibase_from_kA': Ibase_lv_kA, 'I_from_max': Irated_lv_kA}
-
-    line_current_data = {}
-    for line_idx, line_data in net.line.iterrows():
-        i = int(line_data['from_bus'])
-        j = int(line_data['to_bus'])
-        Vbase_from_kV = float(net.bus.at[i, 'vn_kv'])
-        Vbase_to_kV = float(net.bus.at[j, 'vn_kv'])
-        Ibase_from_kA = Sbase_MVA / (np.sqrt(3) * Vbase_from_kV)
-        Ibase_to_kA = Sbase_MVA / (np.sqrt(3) * Vbase_to_kV)
-        I_from_max = float(line_data['max_i_ka'])
-        I_to_max = float(line_data['max_i_ka'])
-        line_current_data[(i, j)] = {'Ibase_from_kA': Ibase_from_kA, 'I_from_max': I_from_max}
-        line_current_data[(j, i)] = {'Ibase_from_kA': Ibase_to_kA, 'I_from_max': I_to_max}
-
-    branch_data = {}
-    branch_data.update(line_current_data)
-    branch_data.update(trafo_current_data)
+    branch_data = _branch_current_data(net)
     branches_list = list(branch_data.keys())
     model.Branches = Set(initialize=branches_list, dimen=2)
 
@@ -1552,7 +1689,7 @@ def scenario_optimization_model_base(
         p_gen = sum(m.Pinj[g, k] for g in m.G if m.gen_bus[g] == b)
         p_ext = sum(m.Pext[e, k] for e in m.Ext if m.ext_bus[e] == b)
         p_load = sum(m.Pl0[l] * m.load_mult[k] for l in m.L if m.load_bus[l] == b)
-        p_sh = sum(m.Ps_nom[s] for s in m.S if m.shunt_bus[s] == b)
+        p_sh = sum(m.Ps_nom[s] * (m.V[b, k] ** 2) for s in m.S if m.shunt_bus[s] == b)
         p_inj = p_gen + p_ext - p_load - p_sh
         p_flow = sum(
             m.V[i, k] ** 2 * m.Yff_real_used[i, j]
@@ -1562,7 +1699,7 @@ def scenario_optimization_model_base(
             )
             for (i, j) in m.Branches if i == b
         )
-        expr = p_inj == p_flow * 100
+        expr = p_inj == p_flow * m.Sbase
         if isinstance(expr, (bool, np.bool_)):
             return Constraint.Feasible if expr else Constraint.Infeasible
         return expr
@@ -1581,7 +1718,7 @@ def scenario_optimization_model_base(
             )
             for (i, j) in m.Branches if i == b
         )
-        expr = q_inj == q_flow * 100
+        expr = q_inj == q_flow * m.Sbase
         if isinstance(expr, (bool, np.bool_)):
             return Constraint.Feasible if expr else Constraint.Infeasible
         return expr
@@ -1606,7 +1743,7 @@ def scenario_optimization_model_base(
         )
         current_pu_sq = I_real ** 2 + I_imag ** 2
         max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j]) ** 2
-        return current_pu_sq <= _csm * max_current_pu_sq
+        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
 
     def branch_current_to_rule(m, i, j, k):
         I_real = (
@@ -1623,7 +1760,7 @@ def scenario_optimization_model_base(
         )
         current_pu_sq = I_real ** 2 + I_imag ** 2
         max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i]) ** 2
-        return current_pu_sq <= _csm * max_current_pu_sq
+        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
 
     model.branch_current_from_limit = Constraint(model.Branches, model.K, rule=branch_current_from_rule)
     model.branch_current_to_limit = Constraint(model.Branches, model.K, rule=branch_current_to_rule)

@@ -177,7 +177,11 @@ change" → `{{"{_slack_name}": <current_import_MW>}}`; "freeze the cable at zer
 `{{"{_slack_name}": 0.0}}`.
 
 6. **"What if load is X%"** → `run_rsa(load_scaling_factor=X/100)`. If the result has violations, \
-follow with `optimize_flexibility(load_scaling_factor=X/100)` for corrective dispatch.
+follow with `optimize_flexibility(load_scaling_factor=X/100)` for corrective dispatch. \
+**Voltage-controlled buses:** a bus listed in `voltage_controlled_buses` is held at its \
+`setpoint_pu` by its unit, so its voltage is not a margin — never call it "close to the limit". \
+Its margin is the unit's `q_headroom_up_mvar`: the reactive power left before it stops holding \
+that voltage.
 
 7. **Single contingency** → `simulate_contingency` first (fast). For "what loses supply / what \
 goes dark", read `unsupplied_buses` and `supply_analysis` from its result — do NOT try to work \
@@ -305,10 +309,14 @@ reduction. Key fields: `p_any_violation_before` and `p_any_violation_after`, `ba
 "use K=30" → `n_scenarios=30`; "allow 10% scenario violations" → \
 `allowed_violation_fraction=0.10`; "stressed" → add `load_scaling_factor=1.2`. \
 `risk_target` takes precedence over the deprecated aliases `alpha` / `confidence`. For \
-`robust_method="scenario"`, `effective_alpha_upper_bound` is a certified upper bound at fixed \
-`beta`, not an achieved equality — `guarantee_interpretation` says so explicitly. If K was clamped \
-by `scenario_k_cap`, `guarantee_met` can be `false` with `reason_code="k_required_exceeds_cap"` \
-even when the solve is feasible.
+`robust_method="scenario"`, `effective_alpha_upper_bound` comes from scenario theory for convex \
+problems; the AC OPF is not convex, so it is a nominal figure, not a certificate — never call it \
+certified or guaranteed. Lead with `p_any_violation_after_validation` (out of sample) as the \
+evidence of the risk that remains. `guarantee_met` means only that the scenario count reached the \
+nominal bound; if K was clamped by `scenario_k_cap` it is `false` with \
+`reason_code="k_required_exceeds_cap"` even when the solve is feasible. If \
+`scenario_curtailment` reports curtailed scenarios, say so: the plan relies on holding back \
+renewable output there, and the dispatch shown is the setpoint, not what is injected.
 
 23. **"Safe dispatch range for [gen]" / "how much Q can [gen] inject/absorb" / "flexibility \
 region" / "secure operating region" / "PQ map"** → `compute_flexibility_envelope(gen_name="…")`. \

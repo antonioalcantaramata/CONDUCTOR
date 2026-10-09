@@ -18,7 +18,6 @@ backend/
 ├── ca_engine.py             ← Contingency assessment (single outage)
 ├── flex_engine.py           ← Pyomo + IPOPT optimizer, Ybus helpers
 ├── element_names.py         ← One spelling of every bus/line/trafo name
-├── modify_network.py        ← Topology surgery (islanded buses, dead trafos)
 ├── load_gen_assignment.py   ← Maps measurement rows → pandapower loads/sgens
 ├── network_loader.py        ← Load networks, gen→sgen conversion, build Ybus
 ├── synthetic_timeseries.py  ← Generate synthetic measurement + forecast series
@@ -97,7 +96,8 @@ stay fast:
 2. Load the network (MATPOWER `.m`, pandapower JSON/Excel, or UCTE).
 3. Generate (or restore) the **measurement** and **forecast** time-series.
 4. Apply the first operating point and run a seed power flow.
-5. Build the Ybus / admittance databases used by the optimizer (intact + N-1).
+5. Build the Ybus / admittance database used by the optimizer (one power flow; an
+   outage is that database without the outaged branch).
 
 ## In-memory state (`app_data`)
 
@@ -115,8 +115,6 @@ app_data = {
     "forecasts_source": "synthetic",     # or "uploaded"
     "net": None,                 # pandapower network
     "db_full": None,             # intact-grid Ybus
-    "db_n1_line": None,          # per-line N-1 Ybus database
-    "db_n1_trafo": None,         # per-trafo N-1 Ybus database
     "grid_profile": {},          # metadata exposed via /api/grid_constants
 }
 ```
