@@ -177,6 +177,19 @@ def aggregated_measurements_substation(timestamp_input):
 # In[5]:
 
 
+def _proposed_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows a network proposal added (`proposed` is true).
+
+    They follow their own profile, not the measurements: a 50 MW data centre
+    added on a measured bus used to receive a share of that bus's measured
+    consumption — or all of it — at every tick, and vanish (sandbox hazard
+    A.3 (1)). Every assignment below leaves these rows alone.
+    """
+    if "proposed" not in df.columns or not len(df):
+        return pd.Series(False, index=df.index)
+    return df["proposed"].map(lambda v: bool(v) if pd.notna(v) else False).astype(bool)
+
+
 def assign_load_values_from_measurements(net, measurement_prod_cons, substations):
     """
     Assigns active (p_mw) and reactive (q_mvar) power values to loads in a pandapower network
@@ -263,6 +276,13 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
         net.load.loc[unmatched, '_meas_key'] = net.load.loc[unmatched, 'bus_name'].where(
             net.load.loc[unmatched, 'consumption'].notna())
 
+    # Proposed loads are not measured: no share of a measured total, and their
+    # own p_mw / q_mvar stay as the proposal set them.
+    own = _proposed_mask(net.load)
+    if own.any():
+        net.load.loc[own, 'consumption'] = np.nan
+        net.load.loc[own, '_meas_key'] = np.nan
+
     # A measurement is the total of its substation (or bus). Every load matched
     # to it used to receive that whole total, so two loads on one bus doubled
     # the measured demand (309 MW against 223 measured in a reproduction).
@@ -281,14 +301,14 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
         net.load.loc[keyed, 'consumption'] = net.load.loc[keyed, 'consumption'] * share
 
     # Identify buses that are still unmatched after both attempts.
-    still_unmatched = net.load['consumption'].isna()
+    still_unmatched = net.load['consumption'].isna() & ~own
     unmatched_bus_names = (
         net.load.loc[still_unmatched, 'bus_name'].dropna().unique().tolist()
     )
 
     # Only overwrite p_mw / q_mvar for matched rows — unmatched rows keep their
     # original base-case values so the power flow doesn't receive NaN injections.
-    matched = ~still_unmatched
+    matched = ~still_unmatched & ~own
     power_factor = 0.95
     net.load.loc[matched, 'p_mw'] = net.load.loc[matched, 'consumption']
     net.load.loc[matched, 'q_mvar'] = (
@@ -319,8 +339,9 @@ def _update_gen_table_inplace(gen_df: pd.DataFrame, bus_id_to_prod: dict, scale_
         stays constant.  Should be True for PQ elements (sgen) and False for
         PV elements (gen) where the solver determines Q.
     """
+    own = _proposed_mask(gen_df)
     for bus_id, total_prod in bus_id_to_prod.items():
-        indices = gen_df.index[gen_df['bus'] == bus_id].tolist()
+        indices = gen_df.index[(gen_df['bus'] == bus_id) & ~own].tolist()
         if not indices:
             continue
         max_vals = []
@@ -419,7 +440,8 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
         }
         # A bus with both a `gen` and an `sgen` used to receive its full
         # production in each table. Split it once across both, by capacity.
-        gen_share, sgen_share = _split_between_tables(net.gen, net.sgen, bus_id_to_prod)
+        gen_share, sgen_share = _split_between_tables(
+            net.gen[~_proposed_mask(net.gen)], net.sgen[~_proposed_mask(net.sgen)], bus_id_to_prod)
         _update_gen_table_inplace(net.gen, gen_share, scale_q=False)
         if len(net.sgen) > 0:
             _update_gen_table_inplace(net.sgen, sgen_share, scale_q=True)
@@ -434,6 +456,8 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
         return net, unmatched_gen_bus_names
 
     # --- Measured-substation path (original code): rebuild net.sgen from net.load structure ---
+    # Proposed units are set aside and appended again after the rebuild.
+    kept = net.sgen[_proposed_mask(net.sgen)].copy() if len(net.sgen) else None
 
     # --- Step 0: Initialize empty net.sgen DataFrame with appropriate structure
     net.sgen = pd.DataFrame(columns=[
@@ -495,6 +519,9 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
 
     # --- Step 9: Clean up
     net.sgen.drop(columns=['production'], inplace=True)
+    if kept is not None and len(kept):
+        kept.index = range(len(net.sgen), len(net.sgen) + len(kept))
+        net.sgen = pd.concat([net.sgen, kept])
 
     return net, []  # measured-substation path rebuilds sgen fully — no frozen buses
 

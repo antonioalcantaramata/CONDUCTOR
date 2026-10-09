@@ -9,7 +9,7 @@ load_profile(profile_name)     -> dict
 load_network(profile)          -> pp.pandapowerNet
     Load a pandapower network from a profile dict.
 
-build_ybus(net)                -> (db_full, db_n1_line, db_n1_trafo)
+build_ybus_full(net)           -> db_full (an outage leaves its branch out)
     Compute the three admittance databases on-the-fly using pandapower's
     internal pypower representation.  Format is identical to the legacy
     pre-computed pickle files so all existing flex_engine / main_backend code works
@@ -24,7 +24,6 @@ _build_ybus_entry(net)         -> dict
 from __future__ import annotations
 
 import copy
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -210,7 +209,7 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
     For lines  : tap_key = 1  (matching flex_engine's ``base_t = 1`` convention)
     For trafos : tap_key = tap_neutral  (matching flex_engine's ``t_default`` lookup)
     """
-    from pandapower.pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT
+    from pandapower.pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
 
     ppc = net._ppc
 
@@ -240,6 +239,8 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
 
         if fb_ppc not in ppc2pp or tb_ppc not in ppc2pp:
             continue  # disconnected / out-of-service bus
+        if float(ppc["branch"][k, BR_STATUS]) == 0.0:
+            continue  # out-of-service branch: no admittance (code review 2.9)
 
         r        = float(ppc["branch"][k, BR_R])
         x        = float(ppc["branch"][k, BR_X])
@@ -288,16 +289,17 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
         else:
             tap_key = 1  # lines always use tap=1 key
 
-        # Store both directions
-        Yff_r[(i, j), tap_key] = float(Yff.real)
-        Yff_i[(i, j), tap_key] = float(Yff.imag)
-        Yft_r[(i, j), tap_key] = float(Yft.real)
-        Yft_i[(i, j), tap_key] = float(Yft.imag)
-
-        Yff_r[(j, i), tap_key] = float(Ytt.real)
-        Yff_i[(j, i), tap_key] = float(Ytt.imag)
-        Yft_r[(j, i), tap_key] = float(Ytf.real)
-        Yft_i[(j, i), tap_key] = float(Ytf.imag)
+        # Store both directions. Added, not assigned: parallel branches between
+        # the same buses are one bus pair here, and in a pi-model their
+        # admittances sum — assigning kept only the last circuit read
+        # (sandbox hazard A.3 (2)).
+        for table, key, val in (
+            (Yff_r, (i, j), Yff.real), (Yff_i, (i, j), Yff.imag),
+            (Yft_r, (i, j), Yft.real), (Yft_i, (i, j), Yft.imag),
+            (Yff_r, (j, i), Ytt.real), (Yff_i, (j, i), Ytt.imag),
+            (Yft_r, (j, i), Ytf.real), (Yft_i, (j, i), Ytf.imag),
+        ):
+            table[key, tap_key] = table.get((key, tap_key), 0.0) + float(val)
 
     return {
         "Yff_r":         Yff_r,
@@ -322,74 +324,21 @@ def _try_runpp(net: pp.pandapowerNet) -> bool:
         return False
 
 
-def build_ybus(net: pp.pandapowerNet) -> tuple[dict, dict, dict]:
-    """Compute ``(db_full, db_n1_line, db_n1_trafo)`` on-the-fly.
+def build_ybus_full(net: pp.pandapowerNet) -> dict:
+    """The admittance database of the network as loaded (one power flow).
 
-    Parameters
-    ----------
-    net : pp.pandapowerNet
-        The base network (not modified — all solves use deep copies).
+    It used to come with one database per line and transformer outage, built
+    by a power flow per branch at startup. The OPF models the network branch
+    by branch and leaves out-of-service branches out, so an outage is exactly
+    this database without the outaged branch; the per-outage copies were
+    identical to it and are no longer built.
 
-    Returns
-    -------
-    db_full : dict
-        Admittance dict for the intact network.
-    db_n1_line : dict
-        ``{line_idx: admittance_dict}`` for each in-service line.
-        Lines that cause islanding/divergence are omitted (→ KeyError → 404).
-    db_n1_trafo : dict
-        ``{trafo_idx: admittance_dict}`` for each in-service trafo.
-        Non-converging contingencies are omitted.
-
-    Raises
-    ------
-    RuntimeError
-        If the full-network power flow fails (base case must converge).
+    Raises RuntimeError if the base-case power flow does not converge.
     """
-    # --- Full network (base case) ---
     net_base = copy.deepcopy(net)
     if not _try_runpp(net_base):
         raise RuntimeError(
-            "build_ybus: base-case power flow did not converge. "
+            "build_ybus_full: base-case power flow did not converge. "
             "Check network data (connectivity, voltage setpoints)."
         )
-    db_full = _build_ybus_entry(net_base)
-
-    n_lines  = len(net.line[net.line["in_service"] == True])
-    n_trafos = len(net.trafo[net.trafo["in_service"] == True])
-    print(f"[build_ybus] Base case OK. Computing N-1 for {n_lines} lines + {n_trafos} trafos...")
-    t0 = time.perf_counter()
-
-    # --- N-1 lines ---
-    db_n1_line: dict = {}
-    skipped_lines = 0
-    for line_idx in net.line.index:
-        if not net.line.at[line_idx, "in_service"]:
-            continue
-        net_n1 = copy.deepcopy(net)
-        net_n1.line.at[line_idx, "in_service"] = False
-        if _try_runpp(net_n1):
-            db_n1_line[line_idx] = _build_ybus_entry(net_n1)
-        else:
-            skipped_lines += 1  # islanded/non-converging — omit (→ 404 on request)
-
-    # --- N-1 trafos ---
-    db_n1_trafo: dict = {}
-    skipped_trafos = 0
-    for trafo_idx in net.trafo.index:
-        if not net.trafo.at[trafo_idx, "in_service"]:
-            continue
-        net_n1 = copy.deepcopy(net)
-        net_n1.trafo.at[trafo_idx, "in_service"] = False
-        if _try_runpp(net_n1):
-            db_n1_trafo[trafo_idx] = _build_ybus_entry(net_n1)
-        else:
-            skipped_trafos += 1
-
-    elapsed = time.perf_counter() - t0
-    print(
-        f"[build_ybus] Done in {elapsed:.1f}s — "
-        f"lines: {len(db_n1_line)} OK / {skipped_lines} islanded; "
-        f"trafos: {len(db_n1_trafo)} OK / {skipped_trafos} islanded"
-    )
-    return db_full, db_n1_line, db_n1_trafo
+    return _build_ybus_entry(net_base)

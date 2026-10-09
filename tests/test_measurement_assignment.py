@@ -103,3 +103,48 @@ class TestGeneration:
         assert gen_share[1] + sgen_share[1] == pytest.approx(40.0)
         assert gen_share[1] == pytest.approx(30.0)  # 60 of 80 MW installed
         assert sgen_share[3] == pytest.approx(10.0)  # only sgens there
+
+
+class TestProposedElements:
+    """Rows a network proposal added follow their own profile, never the
+    measurements (sandbox hazard A.3 (1)): a 50 MW data centre on a measured
+    bus used to receive that bus's measured consumption and vanish."""
+
+    def test_a_proposed_load_keeps_its_own_value(self, net):
+        meas = _measurements(net)
+        idx = pp.create_load(net, bus=2, p_mw=50.0, q_mvar=10.0, name="Data centre")
+        net.load["proposed"] = False
+        net.load.at[idx, "proposed"] = True
+        net, unmatched = lg.assign_load_values_from_measurements(net, meas, [])
+        assert net.load.at[idx, "p_mw"] == pytest.approx(50.0)
+        assert net.load.at[idx, "q_mvar"] == pytest.approx(10.0)
+        # The measured loads on that bus still carry the whole measurement.
+        measured = meas.set_index("substation_name").at["Bus_2", "consumption"]
+        others = net.load[(net.load.bus == 2) & ~net.load.proposed]["p_mw"].sum()
+        assert others == pytest.approx(measured)
+        assert not unmatched
+
+    def test_a_proposed_unit_keeps_its_output_on_a_generic_network(self):
+        n = pn.case14()
+        n.bus["name"] = None
+        bus = int(n.gen.bus.iloc[0])
+        idx = pp.create_sgen(n, bus=bus, p_mw=7.0, max_p_mw=100.0, name="New wind")
+        n.sgen["proposed"] = False
+        n.sgen.at[idx, "proposed"] = True
+        meas = pd.DataFrame({"substation_name": [f"Bus_{bus}"], "consumption": [0.0],
+                             "production": [30.0]})
+        n, _ = lg.assign_generators_values_from_measurements(n, meas, [])
+        assert n.sgen.at[idx, "p_mw"] == pytest.approx(7.0)
+        # The measured unit gets the whole measurement, not a share diluted by
+        # the proposal's 100 MW of capacity.
+        assert n.gen.loc[n.gen.bus == bus, "p_mw"].sum() == pytest.approx(30.0)
+
+    def test_a_proposed_unit_survives_the_measured_path_rebuild(self, net):
+        net.gen = net.gen.iloc[0:0]          # measured-substation path
+        net.load["substation_name"] = [f"Bus_{b}" for b in net.load.bus]
+        pp.create_sgen(net, bus=3, p_mw=12.0, name="New PV")
+        net.sgen["proposed"] = True
+        meas = _measurements(net)
+        net, _ = lg.assign_generators_values_from_measurements(net, meas, [])
+        kept = net.sgen[lg._proposed_mask(net.sgen)]
+        assert len(kept) == 1 and kept["p_mw"].iloc[0] == pytest.approx(12.0)

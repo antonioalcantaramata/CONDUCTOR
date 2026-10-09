@@ -1021,7 +1021,9 @@ def render_kpi_forecast(result: dict) -> go.Figure:
         return _empty_figure("No forecast data — run forecast_kpis first")
 
     timestamps = [f.get("timestamp", str(i)) for i, f in enumerate(forecast)]
-    kpi1_vals = [f.get("kpi_1_target_demand_flex_pct", 0.0) for f in forecast]
+    # A failed tick carries None — drawn as a gap, never as 0 % (review 2.11).
+    kpi1_vals = [_float_or_none(f.get("kpi_1_target_demand_flex_pct")) for f in forecast]
+    n_failed = sum(v is None for v in kpi1_vals)
 
     fig = go.Figure(
         go.Scatter(
@@ -1033,8 +1035,10 @@ def render_kpi_forecast(result: dict) -> go.Figure:
             name="KPI-1 (%)",
         )
     )
+    note = (f"<br><sup>{n_failed} of {len(forecast)} tick(s) without a solution — shown as gaps</sup>"
+            if n_failed else "")
     fig.update_layout(
-        title="24-Hour KPI-1 Forecast — Target Demand Flexibility (%)",
+        title="24-Hour KPI-1 Forecast — Target Demand Flexibility (%)" + note,
         xaxis={"title": "Timestamp", "tickangle": 45},
         yaxis={"title": "KPI-1 (%)", "range": [0, 100]},
         **CHART_THEME,

@@ -1000,7 +1000,8 @@ _optimize_robust_flexibility = genai.types.FunctionDeclaration(
         "Step 5: reports independent validation risk after OPF. "
         "Use for a dispatch that is secure with a stated confidence under "
         "uncertainty (robust OPF, back-offs for forecast error). Scenario mode "
-        "also reports whether the guarantee was met (guarantee_met)."
+        "also reports whether its scenario count met the nominal bound (guarantee_met; "
+        "not a certificate for AC OPF) — the out-of-sample validation risk is the evidence."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,

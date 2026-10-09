@@ -53,7 +53,6 @@ import time
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-import modify_network as mn
 import load_gen_assignment as lg
 import rsa_engine as rs
 # Never ship a number that would be wrong to state. See backend/withdrawal.py.
@@ -279,7 +278,9 @@ def extract_flexibility_results(model, net_base, ts):
 
     Walks the optimized model's generator set (``model.G``) and external
     grid set (``model.Ext``) and returns a list of dispatch records for
-    elements whose setpoint actually moved (|Pg_new - Pg_base| > 1 kW).
+    elements whose active or reactive output moved (by more than 1 kW / 1 kvar).
+    Reactive output is reported too: without it a unit that only changed Q
+    was missing, and a dispatch could not be checked against a power flow.
 
     This is the lean view consumed by the Flexibility / Contingency
     activation tables in the UI. It is deliberately different from the
@@ -304,45 +305,63 @@ def extract_flexibility_results(model, net_base, ts):
     list[dict]
         One record per generator / external-grid element whose setpoint
         changed. Each record has keys: ``element``, ``type``, ``Pg_base``,
-        ``Pg_new``, ``Pg_up``, ``Pg_down``.
+        ``Pg_new``, ``Pg_up``, ``Pg_down`` and the same four for ``Qg``.
     """
     records = []
     # Local generators
+    def q_fields(q_base: float, q_new: float) -> dict:
+        return {"Qg_base": round(q_base, 4), "Qg_new": round(q_new, 4),
+                "Qg_up": round(max(q_new - q_base, 0), 4),
+                "Qg_down": round(max(q_base - q_new, 0), 4)}
+
     for g in model.G:
         Pg_new_val = value(model.Pg_new[g])
         Pg_base_val = value(model.Pg_base[g])
+        Qg_new_val = value(model.Qg_new[g])
+        Qg_base_val = value(model.Qg_base[g])
 
-        if abs(Pg_new_val - Pg_base_val) > 0.001:
+        if abs(Pg_new_val - Pg_base_val) > 0.001 or abs(Qg_new_val - Qg_base_val) > 0.001:
             records.append({
                 "element": str(g),
                 "type": "Generator",
+                # The bus, stated: unit names ("Gen_bus7") and substation names
+                # ("Bus 8") use different numberings, and an answer guessed one
+                # from the other.
+                "bus": _bus_display_name(net_base, int(value(model.gen_bus[g]))),
                 "Pg_base": round(Pg_base_val, 4),
                 "Pg_new": round(Pg_new_val, 4),
                 "Pg_up": round(max(Pg_new_val - Pg_base_val, 0), 4),
-                "Pg_down": round(max(Pg_base_val - Pg_new_val, 0), 4)
+                "Pg_down": round(max(Pg_base_val - Pg_new_val, 0), 4),
+                **q_fields(Qg_base_val, Qg_new_val),
             })
 
     # Check for external grid in the model Pymo does not store its baseline: Slack bus check necessary
     for e in model.Ext:
         try:
             Pext_new_val = value(model.Pext[e])
+            Qext_new_val = value(model.Qext[e])
+            Pext_base_val, Qext_base_val = Pext_new_val, Qext_new_val
             if hasattr(net_base, 'res_ext_grid') and not net_base.res_ext_grid.empty:
                 ext_idx = net_base.ext_grid[net_base.ext_grid['name'] == e].index
                 if not ext_idx.empty:
                     Pext_base_val = net_base.res_ext_grid.at[ext_idx[0], 'p_mw']
-                else:
-                    Pext_base_val = Pext_new_val
-            else:
-                Pext_base_val = Pext_new_val
+                    Qext_base_val = net_base.res_ext_grid.at[ext_idx[0], 'q_mvar']
+                    # No converged base power flow: no "before", so no change claimed.
+                    if Pext_base_val != Pext_base_val:
+                        Pext_base_val = Pext_new_val
+                    if Qext_base_val != Qext_base_val:
+                        Qext_base_val = Qext_new_val
 
-            if abs(Pext_new_val - Pext_base_val) > 0.001:
+            if abs(Pext_new_val - Pext_base_val) > 0.001 or abs(Qext_new_val - Qext_base_val) > 0.001:
                 records.append({
                     "element": str(e),
                     "type": "External Grid",
+                    "bus": _bus_display_name(net_base, int(value(model.ext_bus[e]))),
                     "Pg_base": round(Pext_base_val, 4),
                     "Pg_new": round(Pext_new_val, 4),
                     "Pg_up": round(max(Pext_new_val - Pext_base_val, 0), 4),
-                    "Pg_down": round(max(Pext_base_val - Pext_new_val, 0), 4)
+                    "Pg_down": round(max(Pext_base_val - Pext_new_val, 0), 4),
+                    **q_fields(float(Qext_base_val), Qext_new_val),
                 })
         except Exception:
             pass
@@ -647,9 +666,8 @@ def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max
 #   measurements   : dict[timestamp_str -> DataFrame] of smart-meter rows
 #   current_index  : int — points to ``timestamps`` shows how many 15min steps have been made
 #   net            : pandapowerNet — base grid
-#   db_full        : dict — pre-computed Ybus for the intact grid
-#   db_n1_line     : dict[line_idx -> Ybus dict] is for 24 single-line outages
-#   db_n1_trafo    : dict[trafo_idx -> Ybus dict] is for 16 single-trafo outages.
+#   db_full        : dict — pre-computed Ybus for the network as loaded; an
+#                    outage is this database without the outaged branch
 app_data = {
     "timestamps": [],
     "measurements": {},
@@ -666,8 +684,6 @@ app_data = {
     "forecasts_source": "synthetic",
     "net": None,
     "db_full": None,
-    "db_n1_line": None,
-    "db_n1_trafo": None,
     "admittance_source": "generated",  # generated | uploaded_csv
     "ipopt_available": None,  # probed once at startup; None = not yet checked
     "grid_profile": {},   # metadata exposed via GET /api/grid_constants
@@ -676,6 +692,53 @@ app_data = {
     "default_vm_lower": 0.95,  # network-specific defaults, overwritten at load time
     "default_vm_upper": 1.05,
 }
+
+
+# ---------------------------------------------------------------------------
+# Network access
+#
+# Every analysis endpoint reads the network it studies, and that network's
+# admittance databases, through `_net_for` / `_db_for`. Today there is one
+# network: the base the operator loaded. The sandbox will add proposals — the
+# base plus a list of edits — chosen by a `network` field on the request, and
+# these two functions are where that choice is made, so no endpoint has to
+# change again. Startup, uploads, resets and the topology view act on the base
+# directly; they are not studies of a network but the loading of one.
+# ---------------------------------------------------------------------------
+BASE_NETWORK = "base"
+_DB_KEYS = {"full": "db_full"}
+
+
+def _network_name(request=None) -> str:
+    """The network a request names; only the base exists so far."""
+    raw = getattr(request, "network", None) if request is not None else None
+    name = (str(raw).strip() if raw else "") or BASE_NETWORK
+    if name != BASE_NETWORK:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown network {name!r}: only the base network exists "
+                   "(network proposals are not available yet).",
+        )
+    return name
+
+
+def _net_for(request=None):
+    """The network a request studies.
+
+    The shared object: deep-copy it before changing anything.
+    """
+    _network_name(request)
+    net = app_data.get("net")
+    if net is None:
+        raise HTTPException(status_code=503, detail="No network loaded yet.")
+    return net
+
+
+def _db_for(kind: str = "full", request=None):
+    """That network's admittance database ("full"), or None while it has not
+    been built. Outages need no database of their own (see build_ybus_full)."""
+    _network_name(request)
+    return app_data.get(_DB_KEYS[kind])
 
 
 def _resolve_dataset(data_source: str = "measurements"):
@@ -1354,15 +1417,9 @@ def _build_and_store_ybus(net) -> None:
     print("[lifespan] Building Ybus databases on-the-fly...")
     t0 = time.time()
     try:
-        db_full, db_n1_line, db_n1_trafo = nl.build_ybus(net)
-        app_data["db_full"] = db_full
-        app_data["db_n1_line"] = db_n1_line
-        app_data["db_n1_trafo"] = db_n1_trafo
+        app_data["db_full"] = nl.build_ybus_full(net)
         app_data["admittance_source"] = "generated"
-        print(
-            f"[lifespan] Ybus ready in {round(time.time() - t0, 2)}s: "
-            f"{len(db_n1_line)} line contingencies, {len(db_n1_trafo)} trafo contingencies."
-        )
+        print(f"[lifespan] Ybus ready in {round(time.time() - t0, 2)}s.")
     except Exception as exc:
         print(f"[lifespan] Ybus build failed (flex/OPF will be unavailable): {exc}")
 
@@ -1417,10 +1474,11 @@ def _apply_tap_policy(net, tap_policy: str, context: str = "upload") -> None:
             print(f"[{context}] Tap policy=neutral applied to {changed} trafo(s): tap_pos <- tap_neutral")
         return
 
-    # policy == "current": keep current imported positions as the neutral reference.
-    net.trafo["tap_neutral"] = net.trafo["tap_pos"]
+    # policy == "current": the taps as imported, untouched. It used to set
+    # tap_neutral = tap_pos, which made every imported off-nominal ratio 1.0 —
+    # the opposite of keeping the current taps (review 2.3).
     if changed:
-        print(f"[{context}] Tap policy=current applied to {changed} trafo(s): tap_neutral <- tap_pos")
+        print(f"[{context}] Tap policy=current: {changed} trafo(s) keep their imported tap positions")
 
 
 def _write_upload_sentinel(
@@ -1957,8 +2015,6 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     app_data["default_vm_lower"] = _vm_lower
     app_data["default_vm_upper"] = _vm_upper
     app_data["db_full"]        = None
-    app_data["db_n1_line"]     = None
-    app_data["db_n1_trafo"]    = None
 
     PG_MAX_DATA.update(get_pg_max_data(net))
     print(f"[lifespan] PG_MAX_DATA: {len(PG_MAX_DATA)} generators.")
@@ -2624,10 +2680,9 @@ async def upload_network(
     load/generation so that subsequent calls to ``/api/grid/rsa`` (power-flow
     only) and the LLM network-info tools work immediately.
 
-    Admittance databases (``db_full``, ``db_n1_line``, ``db_n1_trafo``) are
-    reset to ``None`` after upload — RSA optimisation, OPF, and N-1
-    contingency tools will return 503 until Phase 2 on-the-fly Ybus
-    computation is implemented.
+    The admittance database (``db_full``) is rebuilt from the uploaded network;
+    contingency optimisation needs no per-outage database (the outaged branch
+    is left out of it).
 
     Returns
     -------
@@ -2747,8 +2802,6 @@ async def upload_network(
     app_data["measurements_source"] = "synthetic"
     app_data["forecasts_source"] = "synthetic"
     app_data["db_full"] = None
-    app_data["db_n1_line"] = None
-    app_data["db_n1_trafo"] = None
     app_data["admittance_source"] = "generated"
     # Derive the ext_grid active power cap from the .m file (Pmax of the slack-bus
     # generator).  Fall back to 999 (effectively uncapped) if the column is absent.
@@ -2798,18 +2851,13 @@ async def upload_network(
     t0 = time.perf_counter()
     ybus_note = ""
     try:
-        db_full, db_n1_line, db_n1_trafo = nl.build_ybus(net)
-        app_data["db_full"]    = db_full
-        app_data["db_n1_line"] = db_n1_line
-        app_data["db_n1_trafo"] = db_n1_trafo
+        app_data["db_full"] = nl.build_ybus_full(net)
         app_data["admittance_source"] = "generated"
-        print(f"[upload] Admittance databases built in {time.perf_counter() - t0:.1f}s.")
+        print(f"[upload] Admittance database built in {time.perf_counter() - t0:.1f}s.")
     except Exception as _ybus_exc:
-        print(f"[upload] WARNING: Ybus build failed: {_ybus_exc} — OPF/N-1 disabled.")
-        app_data["db_n1_line"]  = {}   # empty dict, not None — 503 guard uses is None
-        app_data["db_n1_trafo"] = {}
+        print(f"[upload] WARNING: Ybus build failed: {_ybus_exc} — OPF disabled.")
         app_data["admittance_source"] = "generated"
-        ybus_note = f" Admittance build failed ({_ybus_exc}); OPF/N-1 unavailable."
+        ybus_note = f" Admittance build failed ({_ybus_exc}); OPF unavailable."
 
     bus_names = [bus_name_map[i] for i in sorted(bus_name_map.keys())]
     # Separate buses that have loads/gens from pure transit buses so the guide
@@ -2849,11 +2897,7 @@ async def upload_network(
         "bus_names": bus_names,
         "active_bus_names": active_bus_names,
         "stored_path": stored_path,
-        "note": (
-            f"Network loaded. {len(db_n1_line) if app_data['db_full'] is not None else 0} "
-            f"line contingencies and {len(db_n1_trafo) if app_data['db_full'] is not None else 0} "
-            f"trafo contingencies computed.{gen_conversion_note}{ybus_note}"
-        ),
+        "note": f"Network loaded.{gen_conversion_note}{ybus_note}",
         "n_sgens": len(net.sgen),
         "n_gens_remaining": len(net.gen),
         "gen_conversion_applied": convert_gen_to_sgen and bool(gen_conversion_note),
@@ -2913,9 +2957,9 @@ async def upload_advanced_admittance(
     core_path = _persist_uploaded_bytes(DATA_FILES_DIR, core_file.filename, core_content, "uploaded_admittance_core", ".csv")
     meta_path = _persist_uploaded_bytes(DATA_FILES_DIR, meta_file.filename, meta_content, "uploaded_admittance_meta", ".csv")
 
+    # Per-outage entries are accepted for compatibility but not used: an
+    # outage is the full database without the outaged branch.
     app_data["db_full"] = db_full
-    app_data["db_n1_line"] = db_n1_line
-    app_data["db_n1_trafo"] = db_n1_trafo
     app_data["admittance_source"] = "uploaded_csv"
 
     return {
@@ -2928,7 +2972,10 @@ async def upload_advanced_admittance(
         },
         "note": (
             "Advanced admittance uploaded. This only affects OPF-related endpoints; "
-            "RSA and contingency simulation continue to use power-flow calculations from the loaded network."
+            "RSA and contingency simulation continue to use power-flow calculations from the loaded network. "
+            + (f"The {len(db_n1_line) + len(db_n1_trafo)} per-outage entries are not needed and not "
+               "used: contingency optimisation leaves the outaged branch out of the full database."
+               if (db_n1_line or db_n1_trafo) else "")
         ),
     }
 
@@ -2997,7 +3044,7 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     meas_df = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas_df, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas_df, substations)
     try:
@@ -3167,7 +3214,7 @@ def _with_infeasibility_diagnosis(failed: dict, model, net=None) -> dict:
     return failed
 
 
-def _check_outage_element(element_type: str, element_index: int) -> None:
+def _check_outage_element(element_type: str, element_index: int, net=None) -> None:
     """Refuse an outage of something that is not a line or transformer of
     this network, before any copy of it is touched.
 
@@ -3180,7 +3227,8 @@ def _check_outage_element(element_type: str, element_index: int) -> None:
             status_code=400,
             detail=f"element_type must be 'line' or 'trafo' for an outage; got {element_type!r}.",
         )
-    table = app_data["net"].line if element_type == "line" else app_data["net"].trafo
+    net = _net_for() if net is None else net
+    table = net.line if element_type == "line" else net.trafo
     if element_index not in table.index:
         valid = [int(i) for i in table.index]
         raise HTTPException(
@@ -3222,9 +3270,51 @@ def _effective_thresholds(request) -> tuple[float, float, float, float]:
             request.max_line_loading_pct, request.max_trafo_loading_pct)
 
 
+def _voltage_controlled_buses(net) -> list[dict]:
+    """Buses whose voltage a unit holds at a setpoint, and that unit's margin.
+
+    In a power flow such a bus sits exactly at its setpoint whatever the load,
+    so its distance to a voltage limit is not a margin: 0.942 p.u. on a
+    0.94 floor read as "close to the limit" at every hour of the week. The
+    margin is the unit's reactive headroom — how much more it can supply
+    before it stops holding the voltage. The external grid holds its bus too,
+    with no reactive limit in the model.
+    """
+    out = []
+    if len(net.gen) and len(net.res_gen):
+        for idx, row in net.gen.iterrows():
+            if not bool(row.get("in_service", True)) or idx not in net.res_gen.index:
+                continue
+            q = _safe_float(net.res_gen.at[idx, "q_mvar"])
+            q_max = _safe_float(row.get("max_q_mvar"))
+            q_min = _safe_float(row.get("min_q_mvar"))
+            bus = int(row["bus"])
+            raw = row.get("name")
+            out.append({
+                "bus": _bus_display_name(net, bus), "bus_index": bus,
+                "unit": str(raw).strip() if raw and str(raw).strip() else f"Gen_bus{bus}",
+                "setpoint_pu": _safe_float(row.get("vm_pu")),
+                "q_mvar": q, "q_max_mvar": q_max, "q_min_mvar": q_min,
+                "q_headroom_up_mvar": round(q_max - q, 3) if q is not None and q_max is not None else None,
+                "q_headroom_down_mvar": round(q - q_min, 3) if q is not None and q_min is not None else None,
+            })
+    for idx, row in net.ext_grid.iterrows():
+        if not bool(row.get("in_service", True)):
+            continue
+        bus = int(row["bus"])
+        out.append({
+            "bus": _bus_display_name(net, bus), "bus_index": bus, "unit": "external grid",
+            "setpoint_pu": _safe_float(row.get("vm_pu")),
+            "q_mvar": _safe_float(net.res_ext_grid.at[idx, "q_mvar"]) if idx in net.res_ext_grid.index else None,
+            "q_max_mvar": None, "q_min_mvar": None,
+            "q_headroom_up_mvar": None, "q_headroom_down_mvar": None,
+        })
+    return out
+
+
 def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     """Run the existing RSA pipeline for one explicit timestamp."""
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(timestamp, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
@@ -3342,6 +3432,7 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
 
     return {
         "timestamp": timestamp, "total_violations": len(violations_json),
+        "voltage_controlled_buses": _voltage_controlled_buses(net_calculated),
         # The engine's own verdict, stated rather than implied. An answer that
         # calls this operating point secure can then be checked against it
         # instead of against a violation count the prose may never mention.
@@ -3653,16 +3744,12 @@ async def run_security_assessment(request: GridRequest):
 
     Note on transformer taps
     ------------------------
-    This endpoint runs on a **neutral-tap** grid. ``lifespan`` sets
-    ``raw_net.trafo['tap_pos'] = tap_neutral`` once at startup, and
-    each request here deep-copies that net without touching taps —
-    so RSA voltages reflect neutral-tap physics, not the actual
-    mechanical tap positions that would exist in the field.
-    If the real-world tap positions become the desired baseline,
-    drop the neutralization in ``lifespan`` and neutralize only
-    inside the optimization endpoints that still require it
-    (``/api/contingency/optimize``, ``/api/flexibility/optimize``,
-    ``/api/kpi/evaluate``).
+    Every endpoint — assessments and optimisations alike — uses the taps of
+    the network as loaded. The OPF's equations always did (its admittance
+    database is built from them), but its endpoints reset taps to neutral for
+    the power flow that sets the starting point, so the base dispatch and base
+    voltages they reported came from a grid the assessments never showed
+    (review 2.2).
     """
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     return _run_rsa_snapshot(current_ts, request)
@@ -3985,7 +4072,7 @@ async def worst_case_scan(request: WorstCaseRequest):
     for idx in indices:
         ts = timestamps[idx]
         try:
-            net_copy = copy.deepcopy(app_data["net"])
+            net_copy = copy.deepcopy(_net_for(request))
             meas = prepare_measurement_df(dataset[ts])
             net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
             net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
@@ -4239,7 +4326,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
             pool.submit(
                 _scan_one_scenario,
                 scale, indices, all_timestamps,
-                app_data["net"], scenario_measurements, substations,
+                _net_for(request), scenario_measurements, substations,
                 request.load_scaling_factor,
                 request.vm_upper_pu, request.vm_lower_pu,
                 request.max_line_loading_pct, request.max_trafo_loading_pct,
@@ -4372,8 +4459,21 @@ def _run_envelope_point(
 
     viol_upper   = max_vm > vm_upper
     viol_lower   = min_vm < vm_lower
-    viol_thermal = max_loading > max(max_line, max_trafo)
+    # Lines against the line limit and transformers against the transformer
+    # limit. Both against the larger of the two let a line at 90 % pass an
+    # 80 % line limit whenever transformers were allowed 100 % (review 2.12).
+    line_over  = max_line_load > max_line
+    trafo_over = max_trafo_load > max_trafo
+    viol_thermal = line_over or trafo_over
     feasible = not (viol_upper or viol_lower or viol_thermal)
+    thermal = None
+    if viol_thermal:
+        r_line = max_line_load / max_line if max_line else 0.0
+        r_trafo = max_trafo_load / max_trafo if max_trafo else 0.0
+        kind = "line" if (line_over and (not trafo_over or r_line >= r_trafo)) else "trafo"
+        thermal = {"branch_type": kind,
+                   "value": round(max_line_load if kind == "line" else max_trafo_load, 2),
+                   "limit": float(max_line if kind == "line" else max_trafo)}
 
     if viol_upper:
         binding = "upper_voltage"
@@ -4391,6 +4491,7 @@ def _run_envelope_point(
         "max_loading_pct": round(max_loading, 2),
         "violations": int(viol_upper) + int(viol_lower) + int(viol_thermal),
         "binding_constraint": binding,
+        "thermal": thermal,
     }
 
 
@@ -4414,7 +4515,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     from scipy.stats.qmc import LatinHypercube
     from scipy.stats import norm as sp_norm
 
-    net = app_data["net"]
+    net = _net_for(request)
     (request.vm_lower_pu, request.vm_upper_pu,
      request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
     ts = _resolve_tick(request.data_source, request.timestamp)
@@ -4692,7 +4793,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
 
     # ---- locate the element ------------------------------------------------
     etype = request.element_type.lower().strip()
-    net_ref = app_data["net"]
+    net_ref = _net_for(request)
 
     if etype == "bus":
         tbl = net_ref.bus
@@ -4726,7 +4827,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
     for idx in indices:
         ts = all_timestamps[idx]
         try:
-            net_copy = copy.deepcopy(app_data["net"])
+            net_copy = copy.deepcopy(_net_for(request))
             meas = prepare_measurement_df(ets_measurements[ts])
             net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
             net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
@@ -4841,17 +4942,16 @@ async def simulate_contingency(request: ContingencyRequest):
     No optimization is performed — see ``/api/contingency/optimize`` for
     the cure-the-blackout variant.
     """
-    _check_outage_element(request.element_type, request.element_index)
+    _check_outage_element(request.element_type, request.element_index, _net_for(request))
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
-    #  net_copy.trafo['tap_pos'] = net_copy.trafo['tap_neutral'] ----added in lifespan function
 
     if request.element_type == "line":
         net_copy.line.at[request.element_index, "in_service"] = False
@@ -4962,7 +5062,7 @@ async def simulate_all_contingencies(request: GridRequest):
       iterations; the failed indices simply contribute zero violations.
     """
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
@@ -5083,48 +5183,58 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     HTTPException 500
         If the Ipopt solver itself raises during the solve.
     """
-    if app_data["db_n1_line"] is None or app_data["db_n1_trafo"] is None:
-        raise HTTPException(status_code=503, detail="N-1 Admittance databases not loaded.")
-    _check_outage_element(request.element_type, request.element_index)
+    _check_outage_element(request.element_type, request.element_index, _net_for(request))
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
-    net_copy.trafo['tap_pos'] = net_copy.trafo['tap_neutral']
+    # Transformers stay at the taps of the network as loaded — the ones the
+    # assessments use and the admittance database was built at; the starting
+    # point used to come from a neutral-tap power flow (review 2.2).
     net_base = copy.deepcopy(net_copy)
 
-    # Topological Surgery
-    if request.element_type == "trafo":
-        modified_net, _, _ = mn.remove_trafo_and_connected_elements(net_copy, request.element_index)
-        db = app_data["db_n1_trafo"]
-    elif request.element_type == "line":
-        modified_net, _, _, _ = mn.remove_isolated_line_buses_with_trafo(net_copy, request.element_index)
-        db = app_data["db_n1_line"]
+    # The outage, as the N-1 power flows apply it: the element switched out of
+    # service, and any bus left without a path to a source switched out with
+    # it (its loads unsupplied, its units unavailable). It used to be cut out
+    # of the tables and the remaining buses renumbered: a still-meshed bus and
+    # its loads could be deleted, lines re-attached to the wrong bus, and the
+    # OPF crashed for line 10 and every transformer (code review 5.2).
+    modified_net = copy.deepcopy(net_copy)
+    outaged = modified_net.line if request.element_type == "line" else modified_net.trafo
+    outaged.at[request.element_index, "in_service"] = False
+    islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(modified_net))
+    if islanded:
+        modified_net.bus.loc[islanded, "in_service"] = False
+    lost_load = round(float(net_copy.load.loc[net_copy.load.bus.isin(islanded), "p_mw"].sum()), 4)
 
     try:
         pp.runpp(modified_net)
     except pp.powerflow.LoadflowNotConverged:
         pass
 
-    # Find Islanded Generators
-    missing_list = list(set(_sgen_names(net_base)) - set(_sgen_names(modified_net)))
-    missing_sub = missing_list[0] if missing_list else None
-
-    try:
-        Yff_r, Yff_i, Yft_r, Yft_i, TAPS, trafo_ranges, trafo_defaults, branch_to_trafo = fe.get_admittance_parameters(
-            db, request.element_index)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Matrix for this index not found.")
+    # Admittances: the network's full database, as before (the N-1 databases
+    # built at startup are identical to it). The OPF only reads the branches
+    # still in service, so the outaged one drops out. Building them from the
+    # outaged network instead changes results through the transformer taps the
+    # database was built at — review 2.2, a separate decision.
+    adm = _db_for("full", request)
+    if adm is None:
+        raise HTTPException(status_code=503, detail="Admittance database not loaded.")
+    Yff_r, Yff_i, Yft_r, Yft_i = adm["Yff_r"], adm["Yff_i"], adm["Yft_r"], adm["Yft_i"]
+    TAPS, trafo_ranges = adm["TAPS"], adm["trafo_ranges"]
+    trafo_defaults, branch_to_trafo = adm["trafo_defaults"], adm["branch_to_trafo"]
+    islanding = {"islanded_buses": [_bus_display_name(net_copy, b) for b in islanded],
+                 "load_not_supplied_mw": lost_load}
 
     try:
         results_opt, model_opt = fe.optimization_model_base(
             modified_net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, trafo_ranges, trafo_defaults,
-            branch_to_trafo, missing_substation=missing_sub,
+            branch_to_trafo,
             opf_vm_lower=request.opf_vm_lower, opf_vm_upper=request.opf_vm_upper,
             lambda_p=request.opf_lambda_p, lambda_q=request.opf_lambda_q,
             pg_max_overrides=request.pg_max_overrides or None,
@@ -5140,7 +5250,12 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
 
     tc = getattr(results_opt.solver, "termination_condition", None)
     if tc == TerminationCondition.optimal:
-        regulation_data = extract_flexibility_results(model_opt, net_base, current_ts)
+        # Base values from the post-outage power flow (before redispatch), the
+        # state the OPF starts from. `net_base` carries no results of its own
+        # for this hour: its tables were the stored network's startup power
+        # flow, so the external grid read 245 MW "before" at an hour importing
+        # 186 MW, and a 0.13 MW change was reported as −59 MW.
+        regulation_data = extract_flexibility_results(model_opt, modified_net, current_ts)
         # Issue 1: extract post-OPF bus voltages
         voltage_data = fe.extract_post_opf_voltages(model_opt, modified_net)
         # Phase 3 Placeholder: publish_flex_ca_results(df, current_ts, topic="topic6919"...)
@@ -5150,14 +5265,14 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         # termination strings count as success.
         result = {"timestamp": current_ts, "status": "optimal", "message": "Optimization successful.",
                   "feasible": True, "converged": True,
-                  "activated_resources": regulation_data}
+                  "activated_resources": regulation_data, **islanding}
         result.update(voltage_data)
         app_data["last_dispatch_result"] = regulation_data
         app_data["last_dispatch_timestamp"] = current_ts
         return result
     else:
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
-                  "feasible": False, "converged": False, "activated_resources": []}
+                  "feasible": False, "converged": False, "activated_resources": [], **islanding}
         return _with_infeasibility_diagnosis(failed, model_opt, modified_net)
 
 
@@ -5236,15 +5351,14 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
     import scipy.stats as sp_norm_mod
     import numpy as np
 
-    if app_data["db_full"] is None:
+    if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Data not loaded.")
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_base = copy.deepcopy(app_data["net"])
+    net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base.trafo["tap_pos"] = net_base.trafo["tap_neutral"]
 
     bus_idx_to_name = {int(idx): _bus_display_name(net_base, int(idx))
                        for idx in net_base.bus.index}
@@ -5582,7 +5696,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             raise HTTPException(status_code=500, detail="Scenario mode baseline risk evaluation failed.")
 
         # Build deterministic warm-start dispatch on base forecast.
-        db = app_data["db_full"]
+        db = _db_for("full", request)
         net_warm = copy.deepcopy(net_base)
         net_warm.load["p_mw"] *= request.load_scaling_factor
         net_warm.load["q_mvar"] *= request.load_scaling_factor
@@ -5647,12 +5761,27 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         k_effective = min(k_requested, k_cap)
         k_capped = bool(k_effective < k_requested)
         effective_alpha_upper_bound = min(1.0, max(1e-6, 2.0 * (math.log(1.0 / beta) + d) / max(1, k_effective)))
-        guarantee_interpretation = "alpha_is_certified_upper_bound_beta_fixed"
+        # The bound is scenario theory for *convex* programs (Calafiore-Campi);
+        # the AC OPF is not convex, so it is a nominal figure, not a
+        # certificate. The out-of-sample validation risk is the evidence
+        # (code review 2.6).
+        guarantee_interpretation = "nominal_bound_convex_scenario_theory_not_certified_for_ac_opf"
+        guarantee_note = (
+            "effective_alpha_upper_bound comes from scenario theory for convex problems; the AC OPF is "
+            "not convex, so it is a nominal figure, not a certificate. guarantee_met means only that the "
+            "scenario count reached that nominal bound. p_any_violation_after_validation (out of sample) "
+            "is the evidence of the risk that remains."
+        )
         guarantee_met = not k_capped
 
-        # Use the existing LHS draws (seeded) and uncertainty machinery.
-        sm_train = sgen_mults_cal[:k_effective]
-        lm_train = load_mults_cal[:k_effective]
+        # Training scenarios: K draws. Sliced from the calibration pool when it
+        # is large enough (as before); drawn on their own when it is not — the
+        # slice silently trained on n_samples scenarios while reporting K.
+        if len(sgen_mults_cal) >= k_effective:
+            sm_train = sgen_mults_cal[:k_effective]
+            lm_train = load_mults_cal[:k_effective]
+        else:
+            sm_train, lm_train = _draw_multipliers(k_effective, seed=42)
 
         # Build scenario xi[g,k] for uncertain sgens; non-uncertain entries
         # default to Pg_max in the engine.
@@ -5738,6 +5867,8 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
                 "effective_alpha_upper_bound": round(float(effective_alpha_upper_bound), 6),
                 "effective_beta_fixed": round(float(beta), 12),
                 "guarantee_interpretation": guarantee_interpretation,
+                "guarantee_note": guarantee_note,
+                "K_trained": int(len(sm_train)),
                 "implied_alpha": round(float(effective_alpha_upper_bound), 6),
                 "allowed_violation_fraction": max(0.0, min(float(request.allowed_violation_fraction), 0.5)),
                 "scenario_discard_indicator_relaxation": bool(sc_meta.get("discard_indicator_relaxation", False)),
@@ -5847,8 +5978,24 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             display_vm_upper=request.vm_upper_pu,
         )
 
+        # Curtailment the plan relies on in its scenarios: reported so the
+        # operator sees it — the dispatch above is setpoints, not injections.
+        try:
+            curtailment = fe.scenario_curtailment(sc_model)
+        except Exception:  # noqa: BLE001
+            curtailment = None
+
         # Shared response structure with heuristic path.
         sc_msg = "Scenario robust OPF solved successfully."
+        if curtailment and curtailment["scenarios_with_curtailment"]:
+            top = curtailment["by_unit"][0]
+            sc_msg += (
+                f" In {curtailment['scenarios_with_curtailment']} of {curtailment['n_scenarios']} "
+                f"scenarios the plan relies on curtailing renewable output (up to "
+                f"{curtailment['max_total_mw']:.2f} MW in total; most at {top['unit']}, up to "
+                f"{top['max_mw']:.2f} MW). The dispatch shown is the setpoint, not what is "
+                "injected in those scenarios."
+            )
         _excluded_sc = int(voltage_data.get("excluded_bus_count_post_opf") or 0)
         if _excluded_sc > 0:
             sc_msg += f" Excluded {_excluded_sc} bus(es) from post-OPF voltage output; see excluded_buses_post_opf for details."
@@ -5859,7 +6006,9 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             "message": sc_msg,
             "feasible": True,
             "guarantee_met": guarantee_met,
+            "nominal_bound_met": guarantee_met,
             "activated_resources": activated_resources,
+            "scenario_curtailment": curtailment,
             **voltage_data,
             "back_off_per_bus": {},
             "tightened_bounds": {},
@@ -5938,6 +6087,8 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             "effective_alpha_upper_bound": round(float(effective_alpha_upper_bound), 6),
             "effective_beta_fixed": round(float(beta), 12),
             "guarantee_interpretation": guarantee_interpretation,
+            "guarantee_note": guarantee_note,
+            "K_trained": int(len(sm_train)),
             "implied_alpha": round(float(effective_alpha_upper_bound), 6),
             "scenario_discard_indicator_relaxation": bool(sc_meta.get("discard_indicator_relaxation", False)),
             "scenario_warnings": ([f"Computed K={k_requested} exceeded cap {k_cap}; clamped to {k_effective}."] if k_capped else []),
@@ -6361,7 +6512,7 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     import math
     import numpy as np
 
-    net = app_data["net"]
+    net = _net_for(request)
     ts = _resolve_tick(request.data_source, request.timestamp)
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
 
@@ -6641,13 +6792,19 @@ def _build_hosting_binding(
             "units": "p.u.",
         }
     if binding == "thermal":
-        return {
+        # The branch type that binds, against its own limit (review 2.12);
+        # `thermal_limit` remains the fallback for results without it.
+        own = point_result.get("thermal") or {}
+        out = {
             "type": "thermal",
             "element": "max_branch_loading",
-            "value": float(point_result.get("max_loading_pct") or 0.0),
-            "limit": float(thermal_limit),
+            "value": float(own.get("value", point_result.get("max_loading_pct") or 0.0)),
+            "limit": float(own.get("limit", thermal_limit)),
             "units": "%",
         }
+        if own.get("branch_type"):
+            out["branch_type"] = own["branch_type"]
+        return out
     if binding == "no_convergence":
         return {
             "type": "no_convergence",
@@ -7194,7 +7351,7 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
 
     target_ts = _resolve_tick(request.data_source, request.timestamp)
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(target_ts, request.data_source))
-    net_base = copy.deepcopy(app_data["net"])
+    net_base = copy.deepcopy(_net_for(request))
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
 
@@ -7437,15 +7594,14 @@ async def optimise_flexibility(request: FlexibilityRequest):
       * Fold 1 checks if the grid is naturally secure with generators fixed.
       * Fold 2 unfixes them and minimizes ``|Pg_new - Pg_base|``.
     """
-    if app_data["db_full"] is None: raise HTTPException(status_code=503)
+    if _db_for("full", request) is None: raise HTTPException(status_code=503)
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_base = copy.deepcopy(app_data["net"])
+    net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base.trafo['tap_pos'] = net_base.trafo['tap_neutral']
 
     disabled_gens = request.disabled_generators
 
@@ -7484,7 +7640,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
     except Exception:
         pass
 
-    db = app_data["db_full"]
+    db = _db_for("full", request)
 
     try:
         results_opt, model_opt = fe.optimization_model_base(
@@ -7680,16 +7836,15 @@ async def evaluate_kpis(request: KPIRequest):
     * ``slack_max_mw == 0``   -> fully islanded; if infeasible, that's
             the headline answer "The active system cannot self-sustain right now".
     """
-    if app_data["db_full"] is None:
+    if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_base = copy.deepcopy(app_data["net"])
+    net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
     net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base.trafo['tap_pos'] = net_base.trafo['tap_neutral']
 
     disabled_gens = request.disabled_generators
     if disabled_gens:
@@ -7715,7 +7870,7 @@ async def evaluate_kpis(request: KPIRequest):
 
     # --- Solve the Pyomo optimization model ---
     start_time = time.perf_counter()
-    db = app_data["db_full"]
+    db = _db_for("full", request)
 
     try:
         results_opt, model_opt = fe.optimization_model_base(
@@ -7875,7 +8030,7 @@ async def evaluate_kpis(request: KPIRequest):
 @_off_event_loop
 async def forecast_kpi(request: KPIRequest):
     """Generates a 24-hour forecast of KPI-1 by evaluating multiple timestamps."""
-    if app_data["db_full"] is None:
+    if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
 
     fk_timestamps, fk_measurements, fk_source = _resolve_dataset(request.data_source)
@@ -7887,17 +8042,16 @@ async def forecast_kpi(request: KPIRequest):
     end_idx = min(start_idx + 96, len(fk_timestamps))
     forecast_data = []
 
-    db = app_data["db_full"]
+    db = _db_for("full", request)
     disabled_gens = request.disabled_generators
 
     for i in range(start_idx, end_idx):
         ts = fk_timestamps[i]
-        net_base = copy.deepcopy(app_data["net"])
+        net_base = copy.deepcopy(_net_for(request))
         measurement_prod_cons = prepare_measurement_df(fk_measurements[ts])
 
         net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
         net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
-        net_base.trafo['tap_pos'] = net_base.trafo['tap_neutral']
 
         if disabled_gens:
             _drop_disabled_sgens(net_base, disabled_gens)
@@ -7927,33 +8081,52 @@ async def forecast_kpi(request: KPIRequest):
                 pg_min_overrides=request.pg_min_overrides or None,
                 min_power_factor=request.opf_min_power_factor,
                 current_safety_margin=request.opf_current_safety_margin,
+                fixed_setpoints=request.fixed_setpoints or None,
             )
         except Exception:
+            # Kept as a failed tick: dropping it made the series silently
+            # shorter than the 24 hours it claims to cover.
+            forecast_data.append({"timestamp": ts, "kpi_1_target_demand_flex_pct": None,
+                                  "status": "error"})
             continue
 
         tc = getattr(results_opt.solver, "termination_condition", None) if results_opt else None
-        
+
         _phys_cap = app_data.get("slack_max_mw", 70.0)
         slack_cap = float(max(0.0, _phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap)))
-        kpi1_pct = 0.0
+        # None, not 0 %, when there is no solution: a failed tick read as "no
+        # flexibility available" (code review 2.11).
+        kpi1_pct = None
+        status = str(tc) if tc is not None else "error"
 
         if tc == TerminationCondition.optimal:
             try:
-                cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar)
+                cscen_results, cscen_model = solve_constrained_slack_scenario(
+                    model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar,
+                    fixed_setpoints=request.fixed_setpoints or None)
                 cscen_tc = getattr(cscen_results.solver, "termination_condition", None) if cscen_results else None
                 if cscen_tc == TerminationCondition.optimal:
                     df_cs = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, ts)
-                    kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**PG_MAX_DATA, **request.pg_max_overrides})
+                    kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**PG_MAX_DATA, **(request.pg_max_overrides or {})})
                     kpi1_pct = round(kpi1_cs['target_demand_flexibility_pct'], 2)
+                    status = "optimal"
+                else:
+                    status = "cap_infeasible"
             except Exception:
-                pass
-                
+                status = "error"
+
         forecast_data.append({
             "timestamp": ts,
-            "kpi_1_target_demand_flex_pct": kpi1_pct
+            "kpi_1_target_demand_flex_pct": kpi1_pct,
+            "status": status,
         })
 
-    return {"forecast": forecast_data}
+    n_failed = sum(1 for f in forecast_data if f["kpi_1_target_demand_flex_pct"] is None)
+    result = {"forecast": forecast_data, "n_ticks": len(forecast_data), "n_failed": n_failed}
+    if n_failed:
+        result["note"] = (f"{n_failed} of {len(forecast_data)} tick(s) have no KPI: the optimisation "
+                          "found no solution there (see each tick's status). They are not 0 %.")
+    return result
 
 EDDK_VALUES_URL = "https://admin.energydata.dk/api/v1/datastreams/values"
 
@@ -8207,7 +8380,7 @@ async def violation_attribution(request: AttributionRequest):
     ts = _resolve_tick(request.data_source, request.timestamp)
 
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
-    net_copy = copy.deepcopy(app_data["net"])
+    net_copy = copy.deepcopy(_net_for(request))
     net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
     net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
     net_copy.load["p_mw"] *= request.load_scaling_factor
