@@ -17,7 +17,10 @@ from __future__ import annotations
 
 from llm_agent.agent.tool_schemas import _POINT_IN_TIME_TOOLS
 from llm_agent.agent.validators import (
+    PROPOSAL_NOTE_PREFIX,
     TurnConsistency,
+    compares_datasets,
+    compares_networks,
     operating_context,
     requested_timestamps,
 )
@@ -60,7 +63,14 @@ def grade_composition(record: dict) -> list[Finding]:
     #    live guard, so a log written before the guard existed is graded by the
     #    same rule as one written after it.
     requested = requested_timestamps(record.get("user", ""))
-    consistency = TurnConsistency(expected=requested)
+    # The same exceptions as the live guard: a question that compares the
+    # forecast with the measurements, or a proposal with the base, asks for
+    # both, and grading it as drift would fail the turn for doing so.
+    consistency = TurnConsistency(
+        expected=requested,
+        datasets_compared=compares_datasets(record.get("user", "")),
+        networks_compared=compares_networks(record.get("user", "")),
+    )
     for entry in results:
         for issue in consistency.observe(entry.get("name", "tool"), entry.get("result")):
             findings.append(Finding(
@@ -108,6 +118,17 @@ def grade_composition(record: dict) -> list[Finding]:
                 turn, PARAMETERISATION, WARN, code,
                 f"{entry.get('name')}: {warning.get('message', '')}",
             ))
+
+    # 4b. An answer built on a network proposal that did not name it: the
+    #     loop appended the note. Not a wrong answer — the mechanism worked —
+    #     but how often the model would have presented a proposal's figures
+    #     as the loaded network's.
+    if PROPOSAL_NOTE_PREFIX in (record.get("assistant") or ""):
+        findings.append(Finding(
+            turn, INTERPRETATION, WARN, "proposal_unnamed",
+            "The answer used results from a network proposal without naming it; "
+            "the loop added the note.",
+        ))
 
     # 5. Calls that did not produce a result at all.
     for entry in results:

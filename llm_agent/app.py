@@ -58,6 +58,7 @@ from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent import loop as _loop_module
 from agent import model_check as _model_check
 from agent import recommender as _recommender
+from agent import update_check as _update_check
 from agent import timeline as _tl
 from agent import data_view as _dv
 from agent import trace as _trace
@@ -73,7 +74,7 @@ from agent.providers.ollama import probe as ollama_probe
 from agent.providers.openai import OpenAIProvider as _OpenAIProvider
 from agent.providers.openai import probe as openai_probe
 from agent import network_map as _network_map
-from agent.renderers import RENDERER_MAP, render_network_map
+from agent.renderers import RENDERER_MAP, render_network_diff, render_network_map
 from agent import tools as _tools_module
 from agent.tools import get_current_timestamp
 
@@ -2856,7 +2857,91 @@ def _render_operating_point() -> None:
     ss.op_view = {"mode": mode, "ts": value}
 
 
+# ---------------------------------------------------------------------------
+# Network proposals (sandbox)
+#
+# The agent builds proposals; the operator always sees what it has built and
+# can take any edit back. The base network cannot be touched, so no edit needs
+# a confirmation — but which grid a picture shows is always stated.
+# ---------------------------------------------------------------------------
+def _list_proposals() -> list[dict] | None:
+    """Every proposal, or None when the backend cannot be read."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.get(f"{BASE_URL}/api/proposals")
+            r.raise_for_status()
+            return r.json().get("proposals") or []
+    except Exception:  # noqa: BLE001 — the card says so
+        return None
+
+
+def _proposal_action(path: str) -> None:
+    """DELETE a proposal or one of its edits; errors are shown, not raised."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.delete(f"{BASE_URL}{path}")
+        if r.status_code >= 400:
+            st.session_state._proposal_error = r.json().get("detail", r.text)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._proposal_error = str(exc)
+
+
+def _render_proposals() -> None:
+    proposals = _list_proposals()
+    if proposals is None:
+        st.caption("Proposals could not be read from the backend.")
+        return
+    error = st.session_state.pop("_proposal_error", None)
+    if error:
+        st.warning(error)
+    if not proposals:
+        st.caption("None yet. Ask, for example: *What if we connect a 50 MW data centre at "
+                   "Bus 9?* The loaded network is never modified.")
+        return
+    for prop in proposals:
+        pid = prop["id"]
+        summary = prop.get("summary") or {}
+        with st.expander(f"{pid} · {summary.get('n_edits', len(prop.get('edits', [])))} edit(s)",
+                         icon=":material/edit_note:", key=f"prop_{pid}"):
+            for n, text in enumerate(summary.get("edits") or [], start=1):
+                c_text, c_del = st.columns([0.86, 0.14], vertical_alignment="center")
+                c_text.caption(f"{n}. {text}")
+                c_del.button("", icon=":material/close:", type="tertiary", key=f"prop_{pid}_rm{n}",
+                             help="Remove this edit", on_click=_proposal_action,
+                             args=(f"/api/proposals/{pid}/edits/{n}",))
+            st.button("Discard proposal", icon=":material/delete:", width="stretch",
+                      key=f"prop_{pid}_discard", on_click=_proposal_action,
+                      args=(f"/api/proposals/{pid}",))
+
+
+def _env_reflection() -> str:
+    """CONDUCTOR_REFLECTION, as the loop reads it: off, warn or inform."""
+    return _loop_module.normalise_mode(_loop_module.REFLECTION_MODE)
+
+
+def _reflection_mode() -> str:
+    """The answer-check mode for this turn: the operator's switch, or the
+    research setting from the environment when the switch is off."""
+    if st.session_state.get("answer_review"):
+        return "inform"
+    return "warn" if _env_reflection() == "warn" else "off"
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _update_status() -> dict | None:
+    """Whether GitHub has a newer version: the launcher's answer when it gave
+    one, else asked once here (read-only, never blocks for long, None when
+    it cannot tell)."""
+    checked, status = _update_check.from_env()
+    if checked:
+        return status
+    return _update_check.check(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 with st.sidebar:
+    _update_notice = _update_check.message(_update_status())
+    if _update_notice:
+        st.info(_update_notice, icon=":material/system_update:")
     # The brand is already in the page header and the hero; a third copy here
     # pushed the controls an operator uses — the clock first — below the fold.
     # The most used action first.
@@ -2868,6 +2953,9 @@ with st.sidebar:
     st.markdown("<div class='conductor-sidebar-label'>Operating point</div>", unsafe_allow_html=True)
     with st.container(border=True, key="op_card"):
         _render_operating_point()
+
+    st.markdown("<div class='conductor-sidebar-label'>Proposals</div>", unsafe_allow_html=True)
+    _render_proposals()
 
     st.divider()
     st.markdown("<div class='conductor-sidebar-label'>Settings</div>", unsafe_allow_html=True)
@@ -2896,40 +2984,36 @@ with st.sidebar:
             st.success("Saved — applies to your next message.")
             st.rerun()
 
-    # Answer checks. One control, not one per check: an operator choosing how
-    # much the agent second-guesses itself is making a single decision, and a
-    # switch per check would turn that into a configuration exercise. Which
-    # checks run is ours to decide; the session log still records which one
-    # produced each finding.
-    #
-    # Off by default — it is the configuration every reported result was
-    # produced under, and the other two levels are experiments.
-    _REFLECT_LABELS = {
-        "off": "Off",
-        "warn": "Check silently",
-        "inform": "Show the agent",
-    }
-    _reflect_now = _REFLECT_LABELS.get(st.session_state.get("reflection_mode", "off"), "Off")
-    with st.expander(f"Answer checks · {_reflect_now}", icon=":material/fact_check:",
-                     key="sb_checks"):
-        st.radio(
-            "Before answering",
-            list(_REFLECT_LABELS),
-            format_func=lambda m: _REFLECT_LABELS[m],
-            key="reflection_mode",
+    # Answer checks. Every answer is checked by deterministic rules — each
+    # figure traced to the tool result that produced it, described as its own
+    # record describes it, and the question's quantity present — and the audit
+    # panel under the answer always shows what they found. The one choice an
+    # operator makes is whether the agent sees the findings before answering
+    # and may revise once. ("Recorded silently", which measures what would
+    # have fired without changing any answer, is a research setting:
+    # CONDUCTOR_REFLECTION=warn.) Off by default — the configuration every
+    # reported result was produced under.
+    _research_mode = _env_reflection() == "warn"
+    _review_on = bool(st.session_state.get("answer_review", _env_reflection() == "inform"))
+    with st.expander(f"Answer checks · {'Agent reviews' if _review_on else 'Report only'}",
+                     icon=":material/fact_check:", key="sb_checks"):
+        st.toggle(
+            "Let the agent review its answer",
+            value=_review_on, key="answer_review",
             help=(
-                "Two checks run over the draft answer: every figure is traced "
-                "back to the tool result that produced it, and each figure is "
-                "compared against the fields beside it in that result — so a "
-                "movement the payload marks undeliverable is not reported as an "
-                "action. A third checks the answer still contains what the "
-                "question asked for.\n\n"
-                "**Off** grades afterwards only. **Check silently** records what "
-                "the checks found without changing the answer. **Show the agent** "
-                "hands the findings back before the answer is delivered — the "
-                "agent may keep it, revise it, or call another tool."
+                "Every answer is checked: each figure is traced back to the tool result "
+                "that produced it, compared against the fields beside it (so an "
+                "undeliverable movement is not reported as an action), and the answer is "
+                "checked for the kind of quantity the question asked for. What they find "
+                "is always shown under the answer.\n\n"
+                "**On:** the agent sees the findings before the answer is delivered and may "
+                "keep it, revise it, or call another tool. It costs one more model call "
+                "when the checks find something."
             ),
         )
+        if _research_mode and not st.session_state.get("answer_review"):
+            st.caption("Research setting active: findings are recorded silently "
+                       "(CONDUCTOR_REFLECTION=warn).")
 
     # AI Agent Suggestion. On demand by default: suggestions nobody asked for
     # are more to read, which is the opposite of what they are for.
@@ -3019,10 +3103,16 @@ with st.sidebar:
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def _fetch_topology(_fingerprint: str) -> dict | None:
-    """The live network's shape. Keyed on the fingerprint, so an upload refetches."""
+def _fetch_topology(fingerprint: str, network: str = "base", edits_hash: str = "") -> dict | None:
+    """The network's shape — the base, or a proposal with what its edits added.
+
+    Keyed on the fingerprint (and the proposal's edits), so an upload or an
+    edit refetches. The parameter used to be `_fingerprint`, which Streamlit
+    leaves out of the cache key: the old topology was served after an upload.
+    """
     try:
-        response = httpx.get(f"{BASE_URL}/api/network/topology", timeout=HTTP_TIMEOUT)
+        params = {} if network == "base" else {"network": network}
+        response = httpx.get(f"{BASE_URL}/api/network/topology", params=params, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         return response.json()
     except Exception:  # noqa: BLE001
@@ -3039,21 +3129,24 @@ def _layout_for(_fingerprint: str, payload: dict):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_state(timestamp: str, vm_lower: float, vm_upper: float,
-                 fingerprint: str = "") -> tuple[dict, dict]:
+                 fingerprint: str = "", network: str = "base",
+                 edits_hash: str = "") -> tuple[dict, dict]:
     """RSA and snapshot at one moment, cached per (moment, limits, network).
 
     Uncached, every rerun — any click anywhere in the app, every suggestion,
     every finished turn — ran a full assessment because Streamlit tabs are not
     lazy. `fingerprint` is part of the key only so a network swap is never
-    answered from the previous network's cache.
+    answered from the previous network's cache; `edits_hash` likewise for a
+    proposal whose edits changed.
     """
     body = {"data_source": "measurements", "timestamp": timestamp,
-            "vm_lower_pu": vm_lower, "vm_upper_pu": vm_upper}
+            "vm_lower_pu": vm_lower, "vm_upper_pu": vm_upper, "network": network}
     with httpx.Client(timeout=HTTP_TIMEOUT) as client:
         rsa = client.post(f"{BASE_URL}/api/grid/rsa", json=body)
         rsa.raise_for_status()
         snapshot = client.post(f"{BASE_URL}/api/network/snapshot",
-                               json={"data_source": "measurements", "timestamp": timestamp})
+                               json={"data_source": "measurements", "timestamp": timestamp,
+                                     "network": network})
         snapshot.raise_for_status()
     return rsa.json(), snapshot.json()
 
@@ -3068,6 +3161,34 @@ def _system_operating_point() -> str:
     return st.session_state.get("system_ts") or st.session_state.current_ts
 
 
+def _diff_figure(fingerprint, payload, positions, proposal_map, proposal_rsa, timestamp,
+                 limits, chosen, problems):
+    """The proposal against the base at the same moment and limits, drawn as
+    a difference; None (with the reason in `problems`) if the base cannot be
+    read, so the caller falls back to the proposal's own map."""
+    # The base as the base: its own topology, drawn at the proposal's
+    # positions (indices are shared), so what the proposal added shows as added.
+    base_payload = _fetch_topology(fingerprint)
+    if not base_payload:
+        problems.append("The base topology could not be read for the difference view.")
+        return None
+    base_map = _network_map.from_payload(base_payload)
+    try:
+        base_rsa, base_snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper,
+                                               st.session_state.get("_network_fingerprint") or "")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"The base could not be assessed for the difference view: {exc}")
+        return None
+    problems += _network_map.apply_assessment(base_map, base_rsa)
+    problems += _network_map.apply_conditions(base_map, base_snapshot)
+    new = _network_map.violated_elements(proposal_rsa) - _network_map.violated_elements(base_rsa)
+    gone = _network_map.violated_elements(base_rsa) - _network_map.violated_elements(proposal_rsa)
+    subtitle = (f"Proposal {chosen} − base · {proposal_rsa.get('timestamp', timestamp)} · "
+                f"{len(new)} new violation(s), {len(gone)} resolved")
+    return render_network_diff(base_map, proposal_map, positions, new_violations=new,
+                               subtitle=subtitle)
+
+
 def _render_system_view() -> None:
     status = last_grid_constants_status()
     if status is not None and not status.live:
@@ -3080,7 +3201,16 @@ def _render_system_view() -> None:
         return
 
     fingerprint = st.session_state.get("_network_fingerprint") or "unknown"
-    payload = _fetch_topology(fingerprint)
+
+    # Which grid the picture is of: the base, or one of the proposals.
+    proposals = {p["id"]: p for p in (_list_proposals() or [])}
+    if st.session_state.get("system_network") not in proposals:
+        st.session_state.system_network = "base"
+    chosen = st.session_state.get("system_network") or "base"
+    proposal = proposals.get(chosen)
+    edits_hash = (proposal or {}).get("edits_hash", "")
+
+    payload = _fetch_topology(fingerprint, chosen, edits_hash)
     if not payload:
         st.error(f"Could not read the network topology from `{BASE_URL}`.")
         return
@@ -3099,7 +3229,22 @@ def _render_system_view() -> None:
     levels = ", ".join(f"{v:g} kV" for v in payload.get("voltage_levels") or [])
     st.caption(f"**{payload.get('name', 'network')}** · {levels or 'unknown voltage levels'}")
 
-    network, positions = _layout_for(fingerprint, payload)
+    if proposals:
+        st.segmented_control(
+            "Network", ["base", *proposals], key="system_network",
+            format_func=lambda n: "Base (loaded)" if n == "base" else f"Proposal · {n}",
+            selection_mode="single")
+    diff = False
+    if proposal:
+        diff = st.segmented_control(
+            "View", ["proposal", "diff"], key="system_view", default="proposal",
+            format_func={"proposal": "Proposal", "diff": "Difference from the base"}.get,
+            selection_mode="single") == "diff"
+        st.info("**Proposal " + chosen + "** — the loaded network plus: "
+                + "; ".join((proposal.get("summary") or {}).get("edits") or []) + ".",
+                icon=":material/edit_note:")
+
+    network, positions = _layout_for(f"{fingerprint}|{chosen}|{edits_hash}", payload)
     # The cached objects are shared between reruns, so state is joined onto a
     # copy: mutating the cache would leave last hour's voltages on the map.
     network = copy.deepcopy(network)
@@ -3109,24 +3254,31 @@ def _render_system_view() -> None:
     limits = grid_limits()
     problems: list[str] = []
     violations: set[str] = set()
+    rsa = None
 
     try:
         rsa, snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper,
-                                     st.session_state.get("_network_fingerprint") or "")
+                                     st.session_state.get("_network_fingerprint") or "",
+                                     chosen, (proposal or {}).get("edits_hash", ""))
         problems += _network_map.apply_assessment(network, rsa)
         problems += _network_map.apply_conditions(network, snapshot)
         violations = _network_map.violated_elements(rsa)
-        subtitle = (f"{rsa.get('timestamp', timestamp)} · "
+        subtitle = ((f"Proposal {chosen} · " if proposal else "")
+                    + f"{rsa.get('timestamp', timestamp)} · "
                     f"{rsa.get('total_violations', 0)} violation(s) · "
                     f"band {limits.vm_lower}–{limits.vm_upper} pu")
     except Exception as exc:  # noqa: BLE001
         subtitle = "topology only — the operating point could not be read"
         problems.append(str(exc))
 
+    figure = None
+    if diff and rsa is not None:
+        figure = _diff_figure(fingerprint, payload, positions, network, rsa, timestamp, limits,
+                              chosen, problems)
     st.plotly_chart(
-        render_network_map(network, positions, vm_lower=limits.vm_lower,
-                           vm_upper=limits.vm_upper, highlight=violations,
-                           subtitle=subtitle, max_loading=limits.max_loading),
+        figure or render_network_map(network, positions, vm_lower=limits.vm_lower,
+                                     vm_upper=limits.vm_upper, highlight=violations,
+                                     subtitle=subtitle, max_loading=limits.max_loading),
         width="stretch", theme=None,
     )
 
@@ -3176,6 +3328,8 @@ _TOOL_LABELS = {
     "scan_rsa_over_time": "Security scan over time",
     "compute_violation_attribution": "Violation attribution",
     "compare_results": "Result comparison",
+    "edit_proposal": "Network proposal",
+    "compare_networks": "Base vs proposal",
     "run_probabilistic_rsa": "Probabilistic security assessment",
     "scan_scenarios": "Renewable scenario scan",
     "compute_historical_risk": "Historical risk",
@@ -3310,6 +3464,10 @@ def _suggestion_context() -> dict:
         "default_voltage_band_pu": [gc.get("vm_lower"), gc.get("vm_upper")],
         "max_loading_pct": gc.get("max_loading_pct"),
         "substations": names[:40] + ([f"… and {len(names) - 40} more"] if len(names) > 40 else []),
+        # Network proposals that exist now — read fresh: the grid constants
+        # were fetched before the turn that may have created one.
+        "proposals": [{"id": p["id"], "edits": (p.get("summary") or {}).get("edits") or []}
+                      for p in (_list_proposals() or [])] or None,
     }
     return {k: v for k, v in ctx.items() if v not in (None, [], [None, None])}
 
@@ -3487,7 +3645,10 @@ def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
             if attention:
                 # Decided in code from the result's own verdict fields — costs
                 # nothing until clicked.
-                first = attention[0].split(": ", 1)[-1]
+                # A proposal's gap keeps its name: "judged at a single moment"
+                # alone would not say which grid was judged.
+                first = (attention[0] if attention[0].startswith(("proposal ", "answer check:"))
+                         else attention[0].split(": ", 1)[-1])
                 st.caption(f"⚠️ This result has issues ({first}) — an AI Agent "
                            "Suggestion can help decide what to check next.")
             if st.button("✨ AI Agent Suggestion", key=f"ais_{idx}",
@@ -3806,7 +3967,7 @@ def _chat_input_fragment():
                     # without it every turn got a fresh `id(history)`.
                     conversation_id=st.session_state.ui_conversation_id,
                     on_event=_on_event,
-                    reflection=st.session_state.get("reflection_mode", "off"),
+                    reflection=_reflection_mode(),
                 )
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
                 # The turn just refetched grid constants; if that failed, the

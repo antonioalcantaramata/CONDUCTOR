@@ -103,13 +103,17 @@ class SuggestionResult(NamedTuple):
 # System prompt
 # ---------------------------------------------------------------------------
 
-# The "change" angle describes the levers that exist today. When network
-# proposals (the sandbox) land, this text grows to include them.
+# The "change" angle describes the levers that exist: operating changes, and
+# network proposals (the sandbox) — the base network plus edits.
 _CHANGE_ANGLE = (
     "a what-if worth studying with the levers CONDUCTOR has: scaling load, "
     "scaling renewable output, disabling or derating generators, capping the "
-    "external-grid import, adding injection at a bus (hosting capacity), or "
-    "re-dispatching flexibility"
+    "external-grid import, adding injection at a bus (hosting capacity), "
+    "re-dispatching flexibility, or a network proposal — the loaded network "
+    "plus edits: add a load (flat; follow_bus — the demand shape of its own bus or, with "
+    "`follow`, of another bus, since a new bus has no measured demand; or shift), add a "
+    "generator (dispatchable, pv or wind), reinforce a line, upgrade a transformer, "
+    "add a new bus joined by a line, or switch a branch or unit in or out of service"
 )
 
 _BASE_PROMPT = """\
@@ -169,6 +173,25 @@ in the conversation motivates the suggestion.
 8. Match the operator's language.
 8b. A bus in `voltage_controlled_buses` is held at its setpoint by a unit: its \
 voltage is not a weak spot. Its margin is that unit's `q_headroom_up_mvar`.
+8b2. Concerns that start with "answer check:" are about how the answer was \
+written, found by deterministic checks — not about the grid. In the comment, \
+say plainly what each means for the operator (e.g. a figure the tools never \
+produced). Where a study would settle it, suggest that study; never restate \
+an unverified figure as if it were confirmed.
+8c. Network proposals. A result carrying a `network` block was computed on a \
+proposal, not on the loaded network; name the proposal whenever you refer to \
+it. When the latest turn studied a proposal:
+   - "stress" should cover what a planner would check before trusting it: other \
+hours (compare_networks with study "scan" over the dataset, the forecast), and \
+an N-1 screen on the proposal at its worst moment, if the session has not done them;
+   - "change" should offer an ALTERNATIVE to the proposal, written as a request \
+to create a new proposal with a new id and compare it with the base using the \
+same study, timestamp and limits. Ground it in what the session showed — the \
+elements that violated, the drivers attribution ranked, a bus with more \
+hosting capacity — e.g. the same load at another bus, a different profile or \
+size, reinforcing the branch that overloaded, a dispatchable unit near the bus \
+that dropped, or opening/closing a branch. Say what motivates it; never claim \
+the alternative is better — that is for the study to show.
 9. If there is nothing useful to suggest, return an empty list and a one-line \
 "note" explaining why; still write the comment.
 
@@ -258,10 +281,90 @@ def compact_turn(record: dict, max_chars_per_tool: int = 3000) -> dict:
         if len(text) > max_chars_per_tool:
             # Still bounded on a large network; keep the top-level scalars,
             # which carry the verdicts (secure, feasible, totals).
-            view = {k: v for k, v in view.items() if not isinstance(v, (dict, list))} \
+            # The `network` block stays: without it a proposal's result would
+            # read as the loaded network's.
+            view = {k: v for k, v in view.items()
+                    if not isinstance(v, (dict, list)) or k == "network"} \
                 if isinstance(view, dict) else text[:max_chars_per_tool]
         tools.append({"name": call.get("name"), "args": call.get("args") or {}, "result": view})
     return {"question": record.get("user") or "", "tools": tools}
+
+
+# Studies that look at more than one moment.
+_OVER_TIME = frozenset({"find_worst_case_timestamp", "scan_rsa_over_time", "scan_scenarios",
+                        "get_element_timeseries", "compute_historical_risk", "run_probabilistic_rsa",
+                        "forecast_kpis"})
+
+
+def proposal_gaps(record: dict | None) -> list[str]:
+    """Why a turn's study of a network proposal is thinner than a planner
+    would accept: new violations against the base, a verdict resting on one
+    moment, or no N-1 screen of the proposal. Decided in code, like the rest
+    of the attention check."""
+    if not record:
+        return []
+    studied: dict[str, dict] = {}
+    for call, entry in zip(record.get("tool_calls") or [], record.get("tool_results") or []):
+        result = entry.get("result") if isinstance(entry, dict) else None
+        net = result.get("network") if isinstance(result, dict) else None
+        if not isinstance(net, dict) or not net.get("id") or result.get("error"):
+            continue
+        seen = studied.setdefault(str(net["id"]), {"over_time": False, "n1": False, "new": 0})
+        name = call.get("name") or entry.get("name")
+        seen["over_time"] |= name in _OVER_TIME or (
+            name == "compare_networks" and result.get("study") == "scan")
+        seen["n1"] |= name == "simulate_all_contingencies" or (
+            name == "compare_networks" and result.get("study") == "n1")
+        seen["new"] += len(result.get("new_violations") or [])
+    reasons = []
+    for pid, seen in studied.items():
+        if seen["new"]:
+            reasons.append(f"proposal {pid}: {seen['new']} violation(s) the base does not have")
+        if not seen["over_time"]:
+            reasons.append(f"proposal {pid}: judged at a single moment — no study over time")
+        if not seen["n1"]:
+            reasons.append(f"proposal {pid}: no N-1 screen of the proposal in this turn")
+    return reasons
+
+
+def answer_concerns(record: dict | None) -> list[str]:
+    """What the deterministic answer checks found in the delivered answer, in
+    plain words: a figure that traces to no tool result, a figure written about
+    the wrong element, a figure described against its own record, or a kind of
+    quantity the question asked for and the answer does not contain.
+
+    The same checks as the audit panel and the reflection setting
+    (`reflection.check_all`) — no model is involved. The suggestion agent is
+    given them so it can say what they mean and propose what would settle
+    them; it does not judge the answer itself.
+    """
+    answer = (record or {}).get("assistant") or ""
+    if not answer.strip() or not record.get("tool_results"):
+        return []
+    from .reflection import check_all
+    try:
+        findings, _report, conflicts, gaps = check_all(answer, record)
+    except Exception:  # noqa: BLE001 — a check that cannot run says nothing
+        logger.debug("Answer checks could not run for the suggestion agent.", exc_info=True)
+        return []
+
+    def shown(value, unit):
+        return f"{value:g}" + (f" {unit}" if unit else "")
+
+    out = []
+    for v in findings:
+        if v.status == MISATTRIBUTED:
+            out.append(f"answer check: {shown(v.claim.value, v.claim.unit)} is written about "
+                       f"{v.subject or 'one element'} but comes from {v.source}, which belongs to "
+                       f"{v.belongs_to or 'another element'}")
+        else:
+            out.append(f"answer check: {shown(v.claim.value, v.claim.unit)} appears in no tool result "
+                       "(the agent may have computed or estimated it)")
+    for c in conflicts:
+        lead = "" if c.value == 0 and c.unit is None else f"{shown(c.value, c.unit)}: "
+        out.append(f"answer check: {lead}{c.detail}")
+    out.extend(f"answer check: {g.render()}" for g in gaps)
+    return list(dict.fromkeys(out))
 
 
 def needs_attention(record: dict | None) -> list[str]:
@@ -273,6 +376,7 @@ def needs_attention(record: dict | None) -> list[str]:
     if not record:
         return []
     reasons: list[str] = []
+    reasons.extend(answer_concerns(record))
 
     def scan(node: dict, tool: str) -> None:
         for key in ("secure", "system_secure", "system_n1_secure",
@@ -284,9 +388,20 @@ def needs_attention(record: dict | None) -> list[str]:
             reasons.append(f"{tool}: {int(total)} violation(s)")
         if node.get("any_violations") is True:
             reasons.append(f"{tool}: violations in the scanned window")
-        if node.get("error"):
+        if node.get("error") and tool not in retried:
             reasons.append(f"{tool}: returned an error")
 
+    reasons.extend(proposal_gaps(record))
+    # A call that failed and was then repeated successfully in the same turn
+    # is a retry (a lookup of "Bus 8" before "Bus_8"), not a concern.
+    retried = set()
+    for n, entry in enumerate(record.get("tool_results") or []):
+        res = entry.get("result")
+        if isinstance(res, dict) and res.get("error") and any(
+                later.get("name") == entry.get("name") and isinstance(later.get("result"), dict)
+                and not later["result"].get("error")
+                for later in (record.get("tool_results") or [])[n + 1:]):
+            retried.add(entry.get("name"))
     for entry in record.get("tool_results") or []:
         result = entry.get("result")
         if not isinstance(result, dict):
@@ -325,6 +440,7 @@ _VERDICT_KEYS = (
     "p_any_violation", "worst_timestamp", "worst_value", "guarantee_met",
 )
 _ARG_KEYS = (
+    "network", "proposal", "study",
     "timestamp", "data_source", "element_type", "element_index", "gen_name", "bus",
     "metric", "load_scaling_factor", "slack_max_mw", "disabled_generators",
 )

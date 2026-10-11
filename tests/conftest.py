@@ -33,7 +33,8 @@ def backend_client(tmp_path_factory):
     scratch = tmp_path_factory.mktemp("uploads")
     patch = pytest.MonkeyPatch()
     patch.setenv("GRID_PROFILE", "pglib_case14")
-    for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL"):
+    for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
+                 "_PROPOSALS_FILE"):
         patch.setattr(mb, name, str(scratch / f"{name}.json"))
     saved = dict(mb.app_data)
     with TestClient(mb.app) as client:

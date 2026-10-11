@@ -115,6 +115,18 @@ Every analysis tool accepts a `data_source` parameter — `"measurements"`
 (read-only look-ahead). Point-in-time tools also accept an optional `timestamp`.
 The agent picks the source from the user's intent and reports it in its answer.
 
+## Network proposals (sandbox)
+
+`edit_proposal` builds a proposal — the loaded network plus edits (add a load or
+a generator, reinforce a line, switch an element in or out of service); the base
+is never modified. Every analysis tool accepts `network` (`"base"` or a proposal
+id), and `compare_networks` runs one study on the base and a proposal at the
+same operating point — or, with `study="scan"`, at every tick of a window. The guards carry `network` through a turn like
+`timestamp`, flag a turn that mixes base and proposal unless the question
+compares them, and append a note to any answer that uses a proposal without
+naming it. The AI Agent Suggestion flags a proposal judged at one moment or
+without N-1 and may propose an alternative proposal.
+
 ## Extending the agent
 
 Tool functions use a `**kwargs` catch-all and spread it into the request body,

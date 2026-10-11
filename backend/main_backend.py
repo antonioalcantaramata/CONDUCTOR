@@ -70,6 +70,7 @@ import ca_engine as ca
 
 import flex_engine as fe
 import network_loader as nl
+import sandbox as sb
 
 from dotenv import load_dotenv
 
@@ -87,6 +88,8 @@ DEFAULT_GRID_PROFILE = "pglib_case14"
 _LAST_UPLOAD_SENTINEL      = os.path.join(SYSTEMS_DIR,    "last_uploaded.json")
 _LAST_TIMESERIES_SENTINEL  = os.path.join(DATA_FILES_DIR, "last_uploaded_timeseries.json")
 _LAST_FORECAST_SENTINEL    = os.path.join(DATA_FILES_DIR, "last_uploaded_forecast.json")
+# Network proposals, kept across restarts for the network they were built on.
+_PROPOSALS_FILE            = os.path.join(SYSTEMS_DIR,    "proposals.json")
 
 
 def _ensure_storage_dirs() -> None:
@@ -691,6 +694,11 @@ app_data = {
     "last_dispatch_timestamp": None,
     "default_vm_lower": 0.95,  # network-specific defaults, overwritten at load time
     "default_vm_upper": 1.05,
+    # Network proposals (sandbox): {id -> {"id", "edits", "hash", ...}} and
+    # their materialisations; emptied whenever the base network is replaced.
+    "proposals": {},
+    "_proposal_cache": {},
+    "_peaks_cache": {},
 }
 
 
@@ -698,28 +706,134 @@ app_data = {
 # Network access
 #
 # Every analysis endpoint reads the network it studies, and that network's
-# admittance databases, through `_net_for` / `_db_for`. Today there is one
-# network: the base the operator loaded. The sandbox will add proposals — the
-# base plus a list of edits — chosen by a `network` field on the request, and
-# these two functions are where that choice is made, so no endpoint has to
-# change again. Startup, uploads, resets and the topology view act on the base
-# directly; they are not studies of a network but the loading of one.
+# admittance database, through `_net_for` / `_db_for`. The network is the base
+# the operator loaded, or a proposal — the base plus a list of edits
+# (`sandbox.py`) — named by the request's `network` field. Startup, uploads,
+# resets and the topology view act on the base directly; they are not studies
+# of a network but the loading of one.
+#
+# Proposals are kept in memory, shared by every browser tab like the
+# simulation clock, until they are discarded or the base network is replaced.
+# A proposal is materialised (deep copy of the base, edits applied) the first
+# time a study asks for it and cached with its own admittance database.
 # ---------------------------------------------------------------------------
 BASE_NETWORK = "base"
 _DB_KEYS = {"full": "db_full"}
+_PROPOSAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,47}$")
+
+
+def _proposals() -> dict:
+    return app_data.setdefault("proposals", {})
+
+
+def _discard_proposals() -> None:
+    """The base changed: every proposal was built on the old one."""
+    app_data["proposals"] = {}
+    app_data["_proposal_cache"] = {}
+    app_data["_peaks_cache"] = {}
+
+
+def _save_proposals() -> None:
+    """Write the proposals to disk with the base network's fingerprint.
+
+    Called after every change to them. A failure to write is reported, not
+    raised: the proposal itself was stored and works until the next restart.
+    """
+    base = app_data.get("net")
+    if base is None:
+        return
+    payload = {"version": 1, "base_fingerprint": sb.network_fingerprint(base),
+               "proposals": app_data.get("proposals") or {}}
+    try:
+        os.makedirs(os.path.dirname(_PROPOSALS_FILE), exist_ok=True)
+        tmp = _PROPOSALS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=1, default=str)
+        os.replace(tmp, _PROPOSALS_FILE)
+    except OSError as exc:
+        print(f"[proposals] Could not save proposals: {exc}")
+
+
+def _forget_saved_proposals() -> None:
+    """The operator replaced the base network: its proposals are not kept."""
+    try:
+        os.remove(_PROPOSALS_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[proposals] Could not remove {_PROPOSALS_FILE}: {exc}")
+
+
+def _restore_proposals() -> list[str]:
+    """At startup, bring back the proposals saved for this network.
+
+    Only when the loaded network is structurally the one they were built on
+    (same fingerprint), and only those whose edits still apply. Returns the
+    ids restored.
+    """
+    base = app_data.get("net")
+    if base is None or not os.path.isfile(_PROPOSALS_FILE):
+        return []
+    try:
+        with open(_PROPOSALS_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"[proposals] Could not read saved proposals: {exc}")
+        return []
+    if saved.get("base_fingerprint") != sb.network_fingerprint(base):
+        print("[proposals] Saved proposals belong to a different network — not restored.")
+        return []
+    restored = []
+    for pid, prop in (saved.get("proposals") or {}).items():
+        try:
+            net, canonical = sb.materialise(base, prop["edits"])
+        except (sb.EditError, KeyError, TypeError) as exc:
+            print(f"[proposals] {pid!r} no longer applies ({exc}) — dropped.")
+            continue
+        _proposals()[pid] = {**prop, "edits": canonical, "hash": sb.edits_hash(canonical),
+                             "summary": sb.summary(net, canonical)}
+        restored.append(pid)
+    if restored:
+        print(f"[proposals] Restored {len(restored)}: {', '.join(restored)}")
+    return restored
 
 
 def _network_name(request=None) -> str:
-    """The network a request names; only the base exists so far."""
+    """The network a request names: the base, or an existing proposal."""
     raw = getattr(request, "network", None) if request is not None else None
     name = (str(raw).strip() if raw else "") or BASE_NETWORK
-    if name != BASE_NETWORK:
+    if name != BASE_NETWORK and name not in _proposals():
+        known = sorted(_proposals())
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown network {name!r}: only the base network exists "
-                   "(network proposals are not available yet).",
+            detail=f"Unknown network {name!r}. Use 'base'"
+                   + (f" or one of the proposals {known}." if known else
+                      " — there are no proposals; create one with edit_proposal."),
         )
     return name
+
+
+def _materialised(name: str) -> dict:
+    """The cached materialisation of proposal `name`, built on first use."""
+    base = app_data.get("net")
+    if base is None:
+        raise HTTPException(status_code=503, detail="No network loaded yet.")
+    proposal = _proposals().get(name)
+    if proposal is None:
+        # Discarding is not serialised with the studies (the sidebar must not
+        # wait behind a long optimisation), so a proposal can go mid-study.
+        raise HTTPException(status_code=409, detail=f"Proposal {name!r} was discarded during the study.")
+    cache = app_data.setdefault("_proposal_cache", {})
+    key = (id(base), proposal["hash"])
+    entry = cache.get(name)
+    if entry is None or entry["key"] != key:
+        try:
+            net, _ = sb.materialise(base, proposal["edits"])
+        except sb.EditError as exc:
+            raise HTTPException(status_code=409, detail=f"Proposal {name!r} no longer applies: {exc}")
+        entry = {"key": key, "net": net, "db_full": None, "db_error": None}
+        cache[name] = entry
+    return entry
 
 
 def _net_for(request=None):
@@ -727,7 +841,9 @@ def _net_for(request=None):
 
     The shared object: deep-copy it before changing anything.
     """
-    _network_name(request)
+    name = _network_name(request)
+    if name != BASE_NETWORK:
+        return _materialised(name)["net"]
     net = app_data.get("net")
     if net is None:
         raise HTTPException(status_code=503, detail="No network loaded yet.")
@@ -737,8 +853,102 @@ def _net_for(request=None):
 def _db_for(kind: str = "full", request=None):
     """That network's admittance database ("full"), or None while it has not
     been built. Outages need no database of their own (see build_ybus_full)."""
-    _network_name(request)
-    return app_data.get(_DB_KEYS[kind])
+    key = _DB_KEYS[kind]
+    name = _network_name(request)
+    if name == BASE_NETWORK:
+        return app_data.get(key)
+    if app_data.get("admittance_source") == "uploaded_csv":
+        # The base's admittances came from the operator's files; a proposal's
+        # would come from pandapower — the comparison would mix two models.
+        raise HTTPException(
+            status_code=409,
+            detail="The base network's admittances were uploaded as CSV files, so a "
+                   "proposal cannot be optimised on a consistent model. Assessments "
+                   "(power flows) of proposals still work.",
+        )
+    entry = _materialised(name)
+    if entry["db_full"] is None and entry["db_error"] is None:
+        try:
+            entry["db_full"] = nl.build_ybus_full(entry["net"])
+        except Exception as exc:
+            entry["db_error"] = str(exc)
+    if entry["db_error"]:
+        raise HTTPException(status_code=422, detail=f"Proposal {name!r}: {entry['db_error']}")
+    return entry["db_full"]
+
+
+def _pg_max_for(request=None, net=None) -> dict:
+    """{generator name -> Pmax} of the request's network.
+
+    PG_MAX_DATA on the base. A proposal adds its own units, read from `net`
+    (the network at the tick, where a pv or wind unit's maximum is what the
+    resource gives) or, without one, from the proposal as built.
+    """
+    if _network_name(request) == BASE_NETWORK:
+        return PG_MAX_DATA
+    out = dict(PG_MAX_DATA)
+    src = _net_for(request) if net is None else net
+    named = "substation_name" if "substation_name" in src.sgen.columns else "name"
+    for idx in src.sgen.index[lg._proposed_mask(src.sgen)]:
+        name = src.sgen.at[idx, named]
+        if not isinstance(name, str):
+            name = src.sgen.at[idx, "name"]
+        out[str(name)] = float(src.sgen.at[idx, "max_p_mw"])
+    return out
+
+
+def _dataset_peaks(dataset: dict) -> dict:
+    """`sandbox.dataset_peaks` of a dataset, computed once per dataset."""
+    cache = app_data.setdefault("_peaks_cache", {})
+    ts = list(dataset)
+    key = (id(dataset), len(ts), ts[0] if ts else None, ts[-1] if ts else None)
+    if key not in cache:
+        cache.clear()  # one dataset at a time is enough; uploads replace it
+        cache[key] = sb.dataset_peaks(dataset)
+    return cache[key]
+
+
+def _dataset_of(request) -> dict:
+    """The dataset a request reads (measurements or forecasts)."""
+    return _resolve_dataset(getattr(request, "data_source", None) or "measurements")[1]
+
+
+def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | None = None):
+    """Give `net` the values of one tick: measured loads and generation, then
+    every element a proposal added at its own profile.
+
+    `dataset` is the series the tick comes from (its peaks scale the
+    `follow_bus`, `pv` and `wind` profiles); only needed when `net` has added
+    elements. Returns (net, report) — the report lists each added element and
+    what it injects at this tick, empty on the base.
+    """
+    subs = substations if subs is None else subs
+    net, _ = lg.assign_load_values_from_measurements(net, meas, subs)
+    net, _ = lg.assign_generators_values_from_measurements(net, meas, subs)
+    if not (lg._proposed_mask(net.load).any() or lg._proposed_mask(net.sgen).any()):
+        return net, []
+    if dataset is None:
+        raise HTTPException(status_code=500, detail="Internal: a proposal tick needs its dataset.")
+    try:
+        report = sb.apply_profiles(net, ts, meas, _dataset_peaks(dataset))
+    except sb.EditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    wrong = sb.check_profiles(net, report)
+    if wrong:
+        raise HTTPException(status_code=500, detail="Added elements were overwritten: " + "; ".join(wrong))
+    if getattr(_tick_report, "first", "unset") is None:
+        _tick_report.first = {"timestamp": ts, "elements": report}
+    return net, report
+
+
+def _proposal_card(name: str) -> dict:
+    """What a result on proposal `name` carries about it."""
+    proposal = _proposals().get(name)
+    if proposal is None:
+        raise HTTPException(status_code=409, detail=f"Proposal {name!r} was discarded during the study.")
+    return {"id": name, "edits_hash": proposal["hash"],
+            "base": "the loaded network, unchanged",
+            "edits": list(proposal["summary"]["edits"])}
 
 
 def _resolve_dataset(data_source: str = "measurements"):
@@ -985,9 +1195,11 @@ class _TimeseriesRequest(_NetworkLimitsMixin):
     ``timestamp`` optionally targets one tick within the chosen source (ISO
     prefix matching, e.g. ``'2000-01-09 18'``). When omitted the default above
     applies. The two series may share timestamps (a forecast of measured days).
+    ``network`` names the grid studied: ``"base"`` (default) or a proposal id.
     """
     data_source: str = "measurements"
     timestamp: str | None = None
+    network: str | None = None
 
 
 class GridRequest(_TimeseriesRequest):
@@ -1037,6 +1249,7 @@ class WorstCaseRequest(_NetworkLimitsMixin):
     n_steps: int | None = None
     step_size: int = 1
     data_source: str = "measurements"  # "measurements" (live actuals) or "forecasts"
+    network: str | None = None         # "base" or a proposal id
     vm_upper_pu: float = 1.05
     vm_lower_pu: float = 0.95
     max_line_loading_pct: float = 90.0
@@ -1926,6 +2139,7 @@ def _prepare_runtime_reload() -> None:
     app_data["measurements_source"] = "synthetic"
     app_data["last_dispatch_result"] = []
     app_data["last_dispatch_timestamp"] = None
+    _discard_proposals()
 
 
 def _lifespan_from_uploaded(sentinel: dict) -> bool:
@@ -2178,6 +2392,7 @@ async def lifespan(app: FastAPI):
             with open(_LAST_UPLOAD_SENTINEL, encoding="utf-8") as fh:
                 sentinel = json.load(fh)
             if _lifespan_from_uploaded(sentinel):
+                _restore_proposals()
                 yield
                 print("Shutting down backend")
                 return
@@ -2189,6 +2404,7 @@ async def lifespan(app: FastAPI):
     print(f"[lifespan] GRID_PROFILE={profile_name!r}")
 
     _lifespan_generic(profile_name, BACKEND_DIR)
+    _restore_proposals()
 
     yield
     print("Shutting down backend")
@@ -2205,6 +2421,26 @@ app = FastAPI(lifespan=lifespan)
 # cheap reads below stay answerable.
 _STATE_LOCK = threading.Lock()
 _holds_state = threading.local()
+# What the elements a proposal added inject at the first tick a request
+# studied (set by `_assign_tick`, read by `_echo_network`).
+_tick_report = threading.local()
+
+
+def _echo_network(result, args, kwargs):
+    """A result computed on a proposal says so, with the proposal's edits and
+    what its added elements inject at the tick — so no figure from a proposal
+    can be read as the base's. Results on the base are returned unchanged."""
+    request = next((a for a in (*args, *kwargs.values()) if hasattr(a, "network")), None)
+    if request is None or not isinstance(result, dict):
+        return result
+    name = _network_name(request)
+    if name == BASE_NETWORK or "network" in result:
+        return result
+    result["network"] = _proposal_card(name)
+    first = getattr(_tick_report, "first", None)
+    if first:
+        result["network"]["added_elements_at_tick"] = first
+    return result
 
 
 def _off_event_loop(endpoint):
@@ -2218,8 +2454,10 @@ def _off_event_loop(endpoint):
         def locked():
             with _STATE_LOCK:
                 _holds_state.active = True
+                _tick_report.first = None
                 try:
-                    return asyncio.run(endpoint(*args, **kwargs))
+                    result = asyncio.run(endpoint(*args, **kwargs))
+                    return _echo_network(result, args, kwargs)
                 finally:
                     _holds_state.active = False
 
@@ -2258,8 +2496,10 @@ async def health():
 
 @app.get("/api/network/topology")
 @_off_event_loop
-async def network_topology():
-    """Buses and branches of the network currently loaded.
+async def network_topology(network: str | None = None):
+    """Buses and branches of the network currently loaded — or of a proposal
+    (`?network=<id>`), whose buses and branches added by its edits carry
+    `"added": true`.
 
     The shape of the system, so a caller can draw it or reason about how it is
     connected. `/api/grid_constants` reports counts and names; this reports
@@ -2269,7 +2509,15 @@ async def network_topology():
     an upload the two differ, and a picture drawn from the file would show a
     system nobody is analysing.
     """
-    net = app_data["net"]
+    import types
+    request = types.SimpleNamespace(network=network)
+    net = _net_for(request)
+    proposed = _network_name(request) != BASE_NETWORK
+
+    def added(table, idx) -> dict:
+        if not proposed or "proposed" not in net[table].columns:
+            return {}
+        return {"added": True} if net[table].at[idx, "proposed"] is True else {}
 
     buses = [
         {
@@ -2278,6 +2526,7 @@ async def network_topology():
             "vn_kv": _safe_float(net.bus.at[idx, "vn_kv"]) or 0.0,
             "in_service": bool(net.bus.at[idx, "in_service"])
             if "in_service" in net.bus.columns else True,
+            **added("bus", idx),
         }
         for idx in net.bus.index
     ]
@@ -2292,6 +2541,7 @@ async def network_topology():
             "kind": "line",
             "in_service": bool(net.line.at[idx, "in_service"])
             if "in_service" in net.line.columns else True,
+            **added("line", idx),
         })
     for idx in net.trafo.index:
         hv, lv = int(net.trafo.at[idx, "hv_bus"]), int(net.trafo.at[idx, "lv_bus"])
@@ -2318,6 +2568,7 @@ async def network_topology():
     profile = app_data.get("grid_profile", {}) or {}
     return {
         "name": str(profile.get("name") or getattr(net, "name", "") or "network"),
+        **({"network": _proposal_card(_network_name(request))} if proposed else {}),
         "buses": buses,
         "branches": branches,
         "external_grids": external_grids,
@@ -2385,6 +2636,9 @@ async def get_grid_constants_endpoint():
         "description": profile.get("description", ""),
         "voltage_level_kv": profile.get("voltage_level_kv", 0.0),
         "load_scaling_max": profile.get("load_scaling_max", 4.0),
+        # Network proposals, so the agent knows what it can study.
+        "proposals": [{"id": pid, "edits": list(p["summary"]["edits"])}
+                      for pid, p in (app_data.get("proposals") or {}).items()],
     }
 
 
@@ -2803,6 +3057,8 @@ async def upload_network(
     app_data["forecasts_source"] = "synthetic"
     app_data["db_full"] = None
     app_data["admittance_source"] = "generated"
+    _discard_proposals()
+    _forget_saved_proposals()
     # Derive the ext_grid active power cap from the .m file (Pmax of the slack-bus
     # generator).  Fall back to 999 (effectively uncapped) if the column is absent.
     _ext_pmax = None
@@ -2960,6 +3216,7 @@ async def upload_advanced_admittance(
     # Per-outage entries are accepted for compatibility but not used: an
     # outage is the full database without the outaged branch.
     app_data["db_full"] = db_full
+    app_data["_proposal_cache"] = {}
     app_data["admittance_source"] = "uploaded_csv"
 
     return {
@@ -3003,6 +3260,7 @@ async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveN
         _lifespan_generic(profile_name, BACKEND_DIR)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to reset active network: {exc}")
+    _forget_saved_proposals()
 
     net = app_data.get("net")
     if net is None:
@@ -3045,8 +3303,8 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
     meas_df = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy = copy.deepcopy(_net_for(request))
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas_df, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas_df, substations)
+    net_copy, _ = _assign_tick(net_copy, meas_df, current_ts, _dataset_of(request))
+    pg_max = _pg_max_for(request, net_copy)
     try:
         pp.runpp(net_copy)
         solved = bool(net_copy.converged)
@@ -3073,27 +3331,32 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
         for _, row in net_copy.sgen.iterrows():
             bus_id = int(row["bus"])
             name = str(row.get(key_col) or "").strip() or f"Bus_{bus_id}"
+            on = bool(row.get("in_service", True))
             generators.append({
                 "name": name,
                 "bus": _bus_display_name(net_copy, bus_id),
                 "bus_index": bus_id,
-                "Pg_mw": _safe_float(row["p_mw"]) or 0.0,
-                "Qg_mvar": _safe_float(row.get("q_mvar") or 0.0) or 0.0,
-                "Pg_max_mw": _safe_float(PG_MAX_DATA[name]) if name in PG_MAX_DATA else None,
+                # A unit switched off injects nothing, whatever its measured share.
+                "Pg_mw": (_safe_float(row["p_mw"]) or 0.0) if on else 0.0,
+                "Qg_mvar": (_safe_float(row.get("q_mvar") or 0.0) or 0.0) if on else 0.0,
+                "Pg_max_mw": _safe_float(pg_max[name]) if name in pg_max else None,
                 "Pg_min_mw": 0.0,
+                **({} if on else {"in_service": False}),
             })
     if not net_copy.gen.empty:
         for gen_idx, row in net_copy.gen.iterrows():
             bus_id = int(row.get("bus", 0))
             raw_name = row.get("name", None)
             name = str(raw_name).strip() if (raw_name and str(raw_name).strip()) else f"Gen_bus{bus_id}"
+            on = bool(row.get("in_service", True))
             generators.append({
                 "name": name,
                 "bus": _bus_display_name(net_copy, bus_id),
                 "bus_index": bus_id,
-                "Pg_mw": _safe_float(row["p_mw"]) or 0.0,
+                "Pg_mw": (_safe_float(row["p_mw"]) or 0.0) if on else 0.0,
+                **({} if on else {"in_service": False}),
                 # Voltage-controlled: its Q is whatever holds the bus voltage.
-                "Qg_mvar": _safe_float(net_copy.res_gen.at[gen_idx, "q_mvar"]) if solved else None,
+                "Qg_mvar": (_safe_float(net_copy.res_gen.at[gen_idx, "q_mvar"]) if solved else None) if on else 0.0,
                 "vm_setpoint_pu": _safe_float(row.get("vm_pu")),
                 "Pg_max_mw": _safe_float(row.get("max_p_mw") or 0.0) or 0.0,
                 "Pg_min_mw": _safe_float(row.get("min_p_mw") or 0.0) or 0.0,
@@ -3105,13 +3368,15 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
         bus_id = int(row["bus"])
         bus_name = net_copy.bus.at[bus_id, "name"] if "name" in net_copy.bus.columns else ""
         label = str(bus_name).strip() if (bus_name and str(bus_name).strip()) else f"Bus_{bus_id}"
+        on = bool(row.get("in_service", True))
         loads.append({
             "bus": label,
             # Bus names are not unique on every network — this one has four
             # buses sharing a name — so the index is reported alongside it.
             "bus_index": bus_id,
-            "P_mw": _safe_float(row["p_mw"]) or 0.0,
-            "Q_mvar": _safe_float(row.get("q_mvar") or 0.0) or 0.0,
+            "P_mw": (_safe_float(row["p_mw"]) or 0.0) if on else 0.0,
+            "Q_mvar": (_safe_float(row.get("q_mvar") or 0.0) or 0.0) if on else 0.0,
+            **({} if on else {"in_service": False}),
         })
 
     # --- External grid: from the power flow; without one, only the balance ---
@@ -3317,8 +3582,8 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(timestamp, request.data_source))
 
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
+    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, timestamp, _dataset_of(request))
+    pg_max = _pg_max_for(request, net_copy)
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
     if request.sgen_scaling_factor != 1.0:
@@ -3386,25 +3651,35 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
 
     df_line = net_calculated.res_line.reset_index()
     df_line["line_name"] = [_line_display_name(net_calculated, int(i)) for i in df_line["index"]]
+    # An open branch carries nothing; it is marked so a 0 % is never read as
+    # a lightly loaded line (only out-of-service rows carry the field).
+    def _off(table, idx) -> dict:
+        return {} if bool(table.at[idx, "in_service"]) else {"in_service": False}
+
     all_line_loading = [
-        {"line_name": row["line_name"], "loading_percent": _safe_float(row["loading_percent"])}
+        {"line_name": row["line_name"], "loading_percent": _safe_float(row["loading_percent"]),
+         **_off(net_calculated.line, int(row["index"]))}
         for _, row in df_line.iterrows()
     ]
 
     df_trafo = net_calculated.res_trafo.reset_index()
     df_trafo["trafo_name"] = [_trafo_display_name(net_calculated, int(i)) for i in df_trafo["index"]]
     all_trafo_loading = [
-        {"trafo_name": row["trafo_name"], "loading_percent": _safe_float(row["loading_percent"])}
+        {"trafo_name": row["trafo_name"], "loading_percent": _safe_float(row["loading_percent"]),
+         **_off(net_calculated.trafo, int(row["index"]))}
         for _, row in df_trafo.iterrows()
     ]
 
     df_sgen = net_calculated.res_sgen.reset_index()
-    df_sgen["gen_name"] = net_calculated.sgen.loc[
-        df_sgen["index"], "substation_name"].values if "substation_name" in net_calculated.sgen.columns else df_sgen[
-        "index"].astype(str)
+    # Named as the OPF and the snapshot name them. Without `substation_name`
+    # (every PGLib case) units used to be called "0", "1" here — so no name
+    # matched the Pmax table and the headroom below was always 0.
+    df_sgen["gen_name"] = _sgen_names(net_calculated).reindex(df_sgen["index"]).values
+    in_service = net_calculated.sgen["in_service"].astype(bool).reindex(df_sgen["index"]).values
+    df_sgen = df_sgen[in_service]
 
     total_available_flex_mw = sum(
-        max(0, PG_MAX_DATA.get(row["gen_name"], row["p_mw"]) - row["p_mw"]) for _, row in df_sgen.iterrows())
+        max(0, pg_max.get(row["gen_name"], row["p_mw"]) - row["p_mw"]) for _, row in df_sgen.iterrows())
 
     gen_dispatch = [
         {"name": row["gen_name"], "Pg_mw": _safe_float(row["p_mw"]), "Qg_mvar": _safe_float(row["q_mvar"])}
@@ -3823,6 +4098,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
     target_kind, target_name = _parse_historical_target(request.target)
     rsa_request = GridRequest(
         data_source=request.data_source,
+        network=request.network,
         load_scaling_factor=request.load_scaling_factor,
         vm_upper_pu=request.vm_upper_pu,
         vm_lower_pu=request.vm_lower_pu,
@@ -4074,9 +4350,10 @@ async def worst_case_scan(request: WorstCaseRequest):
         try:
             net_copy = copy.deepcopy(_net_for(request))
             meas = prepare_measurement_df(dataset[ts])
-            net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
-            net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
+            net_copy, _ = _assign_tick(net_copy, meas, ts, dataset)
             pp.runpp(net_copy, algorithm="nr", numba=False)
+        except HTTPException:
+            raise  # a request error (unknown network, profile) is not a non-converged tick
         except Exception:
             non_converged.append(ts)
             continue
@@ -4183,8 +4460,7 @@ def _scan_one_scenario(
         try:
             net_copy = copy.deepcopy(net)
             meas = prepare_measurement_df(measurements[ts])
-            net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations_list)
-            net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations_list)
+            net_copy, _ = _assign_tick(net_copy, meas, ts, measurements, subs=substations_list)
             if load_scaling_factor != 1.0:
                 net_copy.load["p_mw"] *= load_scaling_factor
                 net_copy.load["q_mvar"] *= load_scaling_factor
@@ -4192,6 +4468,8 @@ def _scan_one_scenario(
                 net_copy.sgen["p_mw"] *= sgen_scale
                 net_copy.sgen["q_mvar"] *= sgen_scale
             pp.runpp(net_copy, algorithm="nr", numba=False)
+        except HTTPException:
+            raise  # a request error (unknown network, profile) is not a non-converged tick
         except Exception:
             non_converged.append(ts)
             continue
@@ -4523,8 +4801,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
     # Assign measurements once; net_base is read-only after this
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
     net_base = copy.deepcopy(net)
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, meas, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, meas, substations)
+    net_base, _ = _assign_tick(net_base, meas, ts, _dataset_of(request))
 
     out_of_service_names = {
         _bus_display_name(net_base, int(idx))
@@ -4829,12 +5106,13 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
         try:
             net_copy = copy.deepcopy(_net_for(request))
             meas = prepare_measurement_df(ets_measurements[ts])
-            net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
-            net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
+            net_copy, _ = _assign_tick(net_copy, meas, ts, ets_measurements)
             if request.load_scaling_factor != 1.0:
                 net_copy.load["p_mw"] *= request.load_scaling_factor
                 net_copy.load["q_mvar"] *= request.load_scaling_factor
             pp.runpp(net_copy, algorithm="nr", numba=False)
+        except HTTPException:
+            raise  # a request error (unknown network, profile) is not a non-converged tick
         except Exception:
             non_converged.append(ts)
             continue
@@ -4948,8 +5226,7 @@ async def simulate_contingency(request: ContingencyRequest):
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
+    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
 
@@ -5065,8 +5342,7 @@ async def simulate_all_contingencies(request: GridRequest):
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
+    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
     # Accepted by the request and the agent's wrapper, but never applied: the
@@ -5083,7 +5359,9 @@ async def simulate_all_contingencies(request: GridRequest):
     non_converged_outages: list[str] = []
 
     for el_type, table in (("line", net_copy.line), ("trafo", net_copy.trafo)):
-        for idx in table.index:
+        # A branch already out of service is not a contingency. It used to be
+        # "tested" and then put back *in* service for the rest of the sweep.
+        for idx in table.index[table["in_service"].astype(bool)]:
             total_tested += 1
             table.at[idx, "in_service"] = False
             try:
@@ -5189,8 +5467,7 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, measurement_prod_cons, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, measurement_prod_cons, substations)
+    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
     net_copy.load['p_mw'] *= request.load_scaling_factor
     net_copy.load['q_mvar'] *= request.load_scaling_factor
     # Transformers stay at the taps of the network as loaded — the ones the
@@ -5357,8 +5634,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
+    net_base, _ = _assign_tick(net_base, measurement_prod_cons, current_ts, _dataset_of(request))
 
     bus_idx_to_name = {int(idx): _bus_display_name(net_base, int(idx))
                        for idx in net_base.bus.index}
@@ -6192,6 +6468,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             # above, then stamped the whole robust result with that day.
             timestamp=request.timestamp,
             data_source=request.data_source,
+            network=request.network,
             load_scaling_factor=request.load_scaling_factor,
             slack_max_mw=request.slack_max_mw,
             opf_vm_upper=request.vm_upper_pu,
@@ -6517,8 +6794,7 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
 
     net_base = copy.deepcopy(net)
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, meas, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, meas, substations)
+    net_base, _ = _assign_tick(net_base, meas, ts, _dataset_of(request))
     net_base.load["p_mw"] *= request.load_scaling_factor
     net_base.load["q_mvar"] *= request.load_scaling_factor
 
@@ -6626,9 +6902,10 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     qg_base = round(float(net_base.res_sgen.at[sgen_idx, "q_mvar"]), 5)
 
     # Build sweep ranges
-    pg_max = PG_MAX_DATA.get(
+    pg_max_data = _pg_max_for(request, net_base)
+    pg_max = pg_max_data.get(
         resolved_gen_name,
-        PG_MAX_DATA.get(request.gen_name, max(1.0, pg_base * 1.5)),
+        pg_max_data.get(request.gen_name, max(1.0, pg_base * 1.5)),
     )
     p_min = request.p_min_mw if request.p_min_mw is not None else 0.0
     p_max = request.p_max_mw if request.p_max_mw is not None else pg_max
@@ -7352,8 +7629,7 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
     target_ts = _resolve_tick(request.data_source, request.timestamp)
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(target_ts, request.data_source))
     net_base = copy.deepcopy(_net_for(request))
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
+    net_base, _ = _assign_tick(net_base, measurement_prod_cons, target_ts, _dataset_of(request))
 
     bus_input_text = str(request.bus).strip().lower()
     scan_all_buses = bool(requested_run_mode == "deterministic" and bus_input_text == "all")
@@ -7600,8 +7876,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
     net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
+    net_base, _ = _assign_tick(net_base, measurement_prod_cons, current_ts, _dataset_of(request))
 
     disabled_gens = request.disabled_generators
 
@@ -7843,8 +8118,7 @@ async def evaluate_kpis(request: KPIRequest):
     net_base = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
-    net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
-    net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
+    net_base, _ = _assign_tick(net_base, measurement_prod_cons, current_ts, _dataset_of(request))
 
     disabled_gens = request.disabled_generators
     if disabled_gens:
@@ -7926,7 +8200,7 @@ async def evaluate_kpis(request: KPIRequest):
         raise HTTPException(status_code=500, detail=f"Regulation frame build failed: {str(e)}")
 
     try:
-        kpi1 = calculate_kpi_target_demand_flexibility(df_reg_flex_rsa, {**PG_MAX_DATA, **request.pg_max_overrides})
+        kpi1 = calculate_kpi_target_demand_flexibility(df_reg_flex_rsa, {**_pg_max_for(request, net_base), **request.pg_max_overrides})
     except ValueError as e:
         # Typically: generator absent from PG_MAX_DATA, or zero system demand.
         raise HTTPException(status_code=500, detail=f"KPI-1 failed: {str(e)}")
@@ -7980,7 +8254,7 @@ async def evaluate_kpis(request: KPIRequest):
         else:
             try:
                 df_cs = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, current_ts)
-                kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**PG_MAX_DATA, **request.pg_max_overrides})
+                kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**_pg_max_for(request, net_base), **request.pg_max_overrides})
                 kpi2_cs = calculate_kpi_flexibility_utilization(df_cs)
                 kpi3_cs = calculate_kpi_prevented_violation_ratio(df_cs)
                 constrained_metrics = {
@@ -8050,8 +8324,7 @@ async def forecast_kpi(request: KPIRequest):
         net_base = copy.deepcopy(_net_for(request))
         measurement_prod_cons = prepare_measurement_df(fk_measurements[ts])
 
-        net_base, _ = lg.assign_load_values_from_measurements(net_base, measurement_prod_cons, substations)
-        net_base, _ = lg.assign_generators_values_from_measurements(net_base, measurement_prod_cons, substations)
+        net_base, _ = _assign_tick(net_base, measurement_prod_cons, ts, fk_measurements)
 
         if disabled_gens:
             _drop_disabled_sgens(net_base, disabled_gens)
@@ -8107,7 +8380,7 @@ async def forecast_kpi(request: KPIRequest):
                 cscen_tc = getattr(cscen_results.solver, "termination_condition", None) if cscen_results else None
                 if cscen_tc == TerminationCondition.optimal:
                     df_cs = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, ts)
-                    kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**PG_MAX_DATA, **(request.pg_max_overrides or {})})
+                    kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**_pg_max_for(request, net_base), **(request.pg_max_overrides or {})})
                     kpi1_pct = round(kpi1_cs['target_demand_flexibility_pct'], 2)
                     status = "optimal"
                 else:
@@ -8381,8 +8654,7 @@ async def violation_attribution(request: AttributionRequest):
 
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
     net_copy = copy.deepcopy(_net_for(request))
-    net_copy, _ = lg.assign_load_values_from_measurements(net_copy, meas, substations)
-    net_copy, _ = lg.assign_generators_values_from_measurements(net_copy, meas, substations)
+    net_copy, _ = _assign_tick(net_copy, meas, ts, _dataset_of(request))
     net_copy.load["p_mw"] *= request.load_scaling_factor
     net_copy.load["q_mvar"] *= request.load_scaling_factor
     if request.sgen_scaling_factor != 1.0:
@@ -8409,3 +8681,397 @@ async def violation_attribution(request: AttributionRequest):
         "max_trafo_loading_pct": request.max_trafo_loading_pct,
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# Network proposals (sandbox)
+#
+# A proposal is the base network plus an ordered list of edits (`sandbox.py`).
+# These endpoints create, edit, list and discard proposals and compare one
+# with the base. Every analysis endpoint studies a proposal when its request
+# names it in `network`; the base itself is never modified.
+# ---------------------------------------------------------------------------
+
+class ProposalEditRequest(BaseModel):
+    """Create a proposal or append edits to it.
+
+    proposal : str
+        Its id — letters, digits, `_` and `-`, e.g. "dc_bus9". Created when
+        it does not exist yet.
+    edits : list[dict]
+        Edits in order, each with an `op` (see `sandbox.OPS`).
+    replace : bool
+        True replaces the proposal's edits instead of appending to them.
+    """
+    proposal: str
+    edits: list[dict] = []
+    replace: bool = False
+
+
+class CompareNetworksRequest(GridRequest):
+    """Run one study on the base and on a proposal at the same operating point.
+
+    proposal : str
+        The proposal compared with the base.
+    study : str
+        "rsa" (security assessment), "n1" (all single outages) or "scan" (the
+        security assessment at every tick of a window, on both networks).
+    start_timestamp / end_timestamp : str | None
+        scan: the window (prefix match); the whole dataset by default.
+    step_size : int | None
+        scan: every Nth tick. By default every tick, thinned only when the
+        window holds more than `_SCAN_MAX_TICKS`, and the result says so.
+    """
+    proposal: str
+    study: str = "rsa"
+    start_timestamp: str | None = None
+    end_timestamp: str | None = None
+    step_size: int | None = None
+
+
+# A comparison over time runs the full assessment twice per tick (~20 ms each
+# on the 14-bus case); above this many ticks the window is thinned and the
+# result says so, rather than running for minutes on a year of data.
+_SCAN_MAX_TICKS = 700
+
+
+def _proposal_view(name: str) -> dict:
+    p = _proposals()[name]
+    return {"id": name, "edits": p["edits"], "edits_hash": p["hash"],
+            "summary": p["summary"], "created": p["created"], "updated": p["updated"]}
+
+
+def _check_profiles_now(net, name: str) -> list[str]:
+    """Run every added element's profile at the current measurement tick and
+    the first forecast tick, so a profile that cannot be followed (a load
+    following a bus with no measured demand, a pv unit on a dataset without
+    production) is refused when it is created, not at the first study."""
+    checked = []
+    for source in ("measurements", "forecasts"):
+        try:
+            ts = _resolve_tick(source, None)
+        except HTTPException:
+            continue  # that dataset is not loaded
+        meas = prepare_measurement_df(_lookup_measurement_df(ts, source))
+        _assign_tick(copy.deepcopy(net), meas, ts, _resolve_dataset(source)[1])
+        checked.append(f"{source} at {ts}")
+    return checked
+
+
+@app.get("/api/proposals")
+async def list_proposals():
+    """Every proposal, oldest first."""
+    return {"proposals": [_proposal_view(n) for n in list(_proposals())]}
+
+
+@app.post("/api/proposals/edit")
+@_off_event_loop
+async def edit_proposal(request: ProposalEditRequest):
+    """Create a proposal or add edits to it; nothing is stored unless the
+    whole edit list applies to the base and every profile can be followed."""
+    name = request.proposal.strip()
+    if not _PROPOSAL_ID.match(name) or name == BASE_NETWORK:
+        raise HTTPException(status_code=400, detail=(
+            f"Invalid proposal id {request.proposal!r}: use up to 48 letters, digits, "
+            "'_' or '-', starting with a letter or digit (and not 'base')."))
+    base = app_data.get("net")
+    if base is None:
+        raise HTTPException(status_code=503, detail="No network loaded yet.")
+    existing = _proposals().get(name)
+    previous = [] if (existing is None or request.replace) else list(existing["edits"])
+    if not request.edits and not previous:
+        raise HTTPException(status_code=400, detail="A proposal needs at least one edit.")
+    try:
+        net, canonical = sb.materialise(base, previous + list(request.edits))
+    except sb.EditError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    checked = _check_profiles_now(net, name)
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    _proposals()[name] = {
+        "id": name, "edits": canonical, "hash": sb.edits_hash(canonical),
+        "summary": sb.summary(net, canonical),
+        "created": existing["created"] if existing else now, "updated": now,
+    }
+    app_data.setdefault("_proposal_cache", {}).pop(name, None)
+    _save_proposals()
+    return {**_proposal_view(name), "status": "created" if existing is None else "updated",
+            "profiles_checked": checked}
+
+
+@app.delete("/api/proposals/{name}")
+async def discard_proposal(name: str):
+    """Discard a proposal. The base is unaffected."""
+    if name not in _proposals():
+        raise HTTPException(status_code=404, detail=f"No proposal {name!r}.")
+    del _proposals()[name]
+    app_data.setdefault("_proposal_cache", {}).pop(name, None)
+    _save_proposals()
+    return {"status": "discarded", "id": name, "remaining": list(_proposals())}
+
+
+@app.delete("/api/proposals/{name}/edits/{position}")
+@_off_event_loop
+async def remove_proposal_edit(name: str, position: int):
+    """Remove one edit (1-based). The rest must still apply; the last edit's
+    removal discards the proposal."""
+    if name not in _proposals():
+        raise HTTPException(status_code=404, detail=f"No proposal {name!r}.")
+    edits = list(_proposals()[name]["edits"])
+    if not 1 <= position <= len(edits):
+        raise HTTPException(status_code=400, detail=f"{name!r} has edits 1–{len(edits)}.")
+    del edits[position - 1]
+    if not edits:
+        return await discard_proposal(name)
+    return await edit_proposal(ProposalEditRequest(proposal=name, edits=edits, replace=True))
+
+
+def _rsa_digest(r: dict) -> dict:
+    volts = [v["vm_pu"] for v in r.get("all_voltages", []) if v.get("vm_pu") is not None]
+    lines = [x["loading_percent"] for x in r.get("all_line_loading", []) if x.get("loading_percent") is not None]
+    trafos = [x["loading_percent"] for x in r.get("all_trafo_loading", []) if x.get("loading_percent") is not None]
+    return {
+        "secure": r.get("secure"), "total_violations": r.get("total_violations"),
+        "min_vm_pu": min(volts) if volts else None, "max_vm_pu": max(volts) if volts else None,
+        "max_line_loading_pct": max(lines) if lines else None,
+        "max_trafo_loading_pct": max(trafos) if trafos else None,
+        "total_load_mw": r.get("total_load_mw"), "slack_import_mw": r.get("slack_import_mw"),
+    }
+
+
+def _violation_keys(rows: list[dict], with_cause: bool = False) -> set:
+    def name(v):
+        # The RSA names the element in `element`, the N-1 sweep in
+        # `element_name`; a missing name used to come out as "None".
+        for key in ("element", "element_name", "bus_name", "line_name", "trafo_name"):
+            if v.get(key) not in (None, ""):
+                return str(v[key])
+        index = v.get("element_index", v.get("violation_element_index"))
+        return f"{v.get('violation_type', 'element')} {index}"
+    return {((v.get("outage_cause"),) if with_cause else ()) + (v.get("violation_type"), name(v))
+            for v in rows}
+
+
+def _largest_changes(base_rows, prop_rows, key, value, n=5):
+    b = {x[key]: x[value] for x in base_rows if x.get(value) is not None}
+    p = {x[key]: x[value] for x in prop_rows if x.get(value) is not None}
+    deltas = [(k, b[k], p[k], p[k] - b[k]) for k in b.keys() & p.keys()]
+    deltas.sort(key=lambda t: abs(t[3]), reverse=True)
+    return [{"element": k, "base": round(vb, 4), "proposal": round(vp, 4), "change": round(d, 4)}
+            for k, vb, vp, d in deltas[:n] if abs(d) > 1e-6]
+
+
+@app.post("/api/proposals/compare")
+@_off_event_loop
+async def compare_networks(request: CompareNetworksRequest):
+    """The same study on the base and on a proposal, at the same operating
+    point (one timestamp, one dataset, the same limits and stress factors),
+    and the difference. Two separate calls could land on two different ticks;
+    one call cannot."""
+    study = (request.study or "rsa").strip().lower()
+    if study not in ("rsa", "n1", "scan"):
+        raise HTTPException(status_code=400, detail="study must be 'rsa', 'n1' or 'scan'.")
+    name = (request.proposal or "").strip()
+    if name in ("", BASE_NETWORK):
+        raise HTTPException(status_code=400, detail="Name a proposal to compare with the base.")
+    if name not in _proposals():
+        raise HTTPException(status_code=400, detail=f"No proposal {name!r}. Existing: {sorted(_proposals())}.")
+    if study == "scan":
+        return _compare_over_time(request, name)
+    ts = _resolve_tick(request.data_source, request.timestamp)
+    runner = run_security_assessment if study == "rsa" else simulate_all_contingencies
+
+    results = {}
+    for label, network in (("base", BASE_NETWORK), ("proposal", name)):
+        req = GridRequest(**request.model_dump(exclude={"proposal", "study", "network",
+                                                        "timestamp", "data_source"}),
+                          network=network, timestamp=ts, data_source=request.data_source)
+        _tick_report.first = None
+        results[label] = await runner(req)
+        results[label + "_added"] = getattr(_tick_report, "first", None)
+    base, prop = results["base"], results["proposal"]
+
+    out = {"study": study, "timestamp": ts, "data_source": _dataset_label(request),
+           "thresholds_used": _thresholds_used(request),
+           "load_scaling_factor": request.load_scaling_factor,
+           "network": {**_proposal_card(name), "compared_with": BASE_NETWORK}}
+    if results["proposal_added"]:
+        out["network"]["added_elements_at_tick"] = results["proposal_added"]
+    if study == "rsa":
+        kb, kp = _violation_keys(base.get("violations", [])), _violation_keys(prop.get("violations", []))
+        digest_b, digest_p = _rsa_digest(base), _rsa_digest(prop)
+        out.update({
+            "base": digest_b, "proposal": digest_p,
+            # Stated, so the answer quotes them rather than subtracting two
+            # rounded figures (16.96 written over a computed 16.97).
+            "changes": {k: round(digest_p[k] - digest_b[k], 4)
+                        for k in ("total_load_mw", "slack_import_mw", "min_vm_pu", "max_vm_pu",
+                                  "max_line_loading_pct", "max_trafo_loading_pct")
+                        if isinstance(digest_b.get(k), (int, float)) and isinstance(digest_p.get(k), (int, float))},
+            "new_violations": [{"type": t, "element": e} for t, e in sorted(kp - kb)],
+            "resolved_violations": [{"type": t, "element": e} for t, e in sorted(kb - kp)],
+            "largest_voltage_changes": _largest_changes(
+                base.get("all_voltages", []), prop.get("all_voltages", []), "bus_name", "vm_pu"),
+            "largest_line_loading_changes": _largest_changes(
+                base.get("all_line_loading", []), prop.get("all_line_loading", []),
+                "line_name", "loading_percent"),
+            "largest_trafo_loading_changes": _largest_changes(
+                base.get("all_trafo_loading", []), prop.get("all_trafo_loading", []),
+                "trafo_name", "loading_percent"),
+            # Buses the proposal built have no base value to subtract; their
+            # voltage is reported as it is.
+            "added_buses": [
+                {"bus": v["bus_name"], "vm_pu": v["vm_pu"]}
+                for v in prop.get("all_voltages", [])
+                if v["bus_name"] not in {b["bus_name"] for b in base.get("all_voltages", [])}],
+        })
+    else:
+        keys = ("system_n1_secure", "total_outages_tested", "total_outages_causing_violations",
+                "total_violations", "n_non_converged_outages", "non_converged_outages")
+        kb = _violation_keys(base.get("violations", []), with_cause=True)
+        kp = _violation_keys(prop.get("violations", []), with_cause=True)
+        out.update({
+            "base": {k: base.get(k) for k in keys}, "proposal": {k: prop.get(k) for k in keys},
+            "new_violations": [{"outage": c, "type": t, "element": e} for c, t, e in sorted(kp - kb, key=str)],
+            "resolved_violations": [{"outage": c, "type": t, "element": e} for c, t, e in sorted(kb - kp, key=str)],
+        })
+    return out
+
+
+def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
+    """The security assessment on the base and on proposal `name` at every
+    tick of one window, with the same dataset, limits and stress factors.
+
+    What a single moment cannot show: at how many ticks the proposal violates
+    where the base does not (and the reverse), which elements, for how long,
+    and its worst moments — the hour to take an N-1 screen to next.
+    """
+    timestamps, _dataset, label = _resolve_dataset(request.data_source)
+    if not timestamps:
+        raise HTTPException(status_code=400, detail=f"No {label} loaded.")
+    start = _window_index(timestamps, request.start_timestamp, "start_timestamp", label,
+                          last=False, default=0)
+    end = _window_index(timestamps, request.end_timestamp, "end_timestamp", label,
+                        last=True, default=len(timestamps) - 1) + 1
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end_timestamp is before start_timestamp.")
+    if request.step_size is not None and request.step_size < 1:
+        raise HTTPException(status_code=400, detail="step_size must be at least 1.")
+    span = end - start
+    step = request.step_size or max(1, math.ceil(span / _SCAN_MAX_TICKS))
+    ticks = [timestamps[i] for i in range(start, end, step)]
+
+    common = request.model_dump(exclude={"proposal", "study", "network", "timestamp", "data_source",
+                                         "start_timestamp", "end_timestamp", "step_size"})
+    requests = {label_: GridRequest(**common, network=network, timestamp=None,
+                                    data_source=request.data_source)
+                for label_, network in (("base", BASE_NETWORK), ("proposal", name))}
+
+    def keys(rows):
+        return {(v.get("violation_type"), str(v.get("element"))): v.get("value") for v in rows}
+
+    per = {"base": [], "proposal": []}
+    for ts in ticks:
+        for side, req in requests.items():
+            try:
+                r = _run_rsa_snapshot(ts, req)
+            except HTTPException as exc:
+                if exc.status_code != 503:      # 503 = power flow did not converge here
+                    raise
+                per[side].append(None)
+                continue
+            volts = [v["vm_pu"] for v in r.get("all_voltages", []) if v.get("vm_pu") is not None]
+            lines = [x["loading_percent"] for x in r.get("all_line_loading", [])
+                     if x.get("loading_percent") is not None]
+            trafos = [x["loading_percent"] for x in r.get("all_trafo_loading", [])
+                      if x.get("loading_percent") is not None]
+            per[side].append({"violations": keys(r.get("violations", [])),
+                              "min_vm": min(volts) if volts else None,
+                              "max_vm": max(volts) if volts else None,
+                              "max_line": max(lines) if lines else None,
+                              "max_trafo": max(trafos) if trafos else None,
+                              "slack": r.get("slack_import_mw")})
+
+    def worst(side, field, highest=True):
+        pairs = [(row[field], ts) for row, ts in zip(per[side], ticks)
+                 if row is not None and row[field] is not None]
+        if not pairs:
+            return None
+        best, at = (max if highest else min)(pairs)
+        return {"timestamp": at, "value": round(best, 4)}
+
+    def digest(side):
+        rows = per[side]
+        return {
+            "ticks_with_violations": sum(1 for r in rows if r and r["violations"]),
+            "non_converged_ticks": sum(1 for r in rows if r is None),
+            "worst_min_vm": worst(side, "min_vm", highest=False),
+            "worst_max_vm": worst(side, "max_vm"),
+            "worst_line_loading": worst(side, "max_line"),
+            "worst_trafo_loading": worst(side, "max_trafo"),
+            "max_slack_import": worst(side, "slack"),
+        }
+
+    def differences(a, b):
+        """Elements violating on `b` at ticks where they do not on `a`."""
+        found: dict = {}
+        for ts, ra, rb in zip(ticks, per[a], per[b]):
+            if rb is None:
+                continue
+            before = ra["violations"] if ra else {}
+            for key, val in rb["violations"].items():
+                if key in before:
+                    continue
+                entry = found.setdefault(key, {"type": key[0], "element": key[1], "ticks": 0,
+                                               "first": ts, "worst_value": val})
+                entry["ticks"] += 1
+                if val is not None and entry["worst_value"] is not None:
+                    low = key[0] == "bus_vm_pu" and val < 1.0
+                    entry["worst_value"] = min(entry["worst_value"], val) if low else \
+                        max(entry["worst_value"], val)
+        out = sorted(found.values(), key=lambda e: -e["ticks"])
+        for e in out:
+            if isinstance(e["worst_value"], float):
+                e["worst_value"] = round(e["worst_value"], 4)
+        return out[:15]
+
+    def only(a, b):
+        hits = [ts for ts, ra, rb in zip(ticks, per[a], per[b])
+                if rb and rb["violations"] and not (ra and ra["violations"])]
+        return {"count": len(hits), "first": hits[:10]}
+
+    def column(side, field):
+        return [None if r is None or r[field] is None else round(r[field], 4) for r in per[side]]
+
+    proposal_digest = digest("proposal")
+    next_hour = (proposal_digest["worst_min_vm"] or proposal_digest["worst_line_loading"] or {}).get("timestamp")
+    out = {
+        "study": "scan", "data_source": _dataset_label(request),
+        "thresholds_used": _thresholds_used(request),
+        "load_scaling_factor": request.load_scaling_factor,
+        "window": {"start": ticks[0], "end": ticks[-1], "ticks_scanned": len(ticks),
+                   "step": step, "ticks_in_window": span,
+                   **({"note": f"every {step}th tick: the window holds {span} ticks; narrow it or "
+                               "set step_size to scan every tick"} if step > 1 and not request.step_size
+                      else {})},
+        "network": {**_proposal_card(name), "compared_with": BASE_NETWORK},
+        "base": digest("base"), "proposal": proposal_digest,
+        "ticks_violating_only_on_proposal": only("base", "proposal"),
+        "ticks_violating_only_on_base": only("proposal", "base"),
+        "new_violations": differences("base", "proposal"),
+        "resolved_violations": differences("proposal", "base"),
+        "suggested_next": (f"An N-1 screen of the proposal at {next_hour} (its worst moment in the window)."
+                           if next_hour else None),
+        # For the chart; the model is sent the summary above, not these.
+        "series": {"timestamps": ticks,
+                   "base_min_vm": column("base", "min_vm"), "proposal_min_vm": column("proposal", "min_vm"),
+                   "base_max_line_loading": column("base", "max_line"),
+                   "proposal_max_line_loading": column("proposal", "max_line"),
+                   "base_violations": [None if r is None else len(r["violations"]) for r in per["base"]],
+                   "proposal_violations": [None if r is None else len(r["violations"])
+                                           for r in per["proposal"]]},
+    }
+    first = getattr(_tick_report, "first", None)
+    if first:
+        out["network"]["added_elements_at_tick"] = first
+    return out

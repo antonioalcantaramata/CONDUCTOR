@@ -458,6 +458,10 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
     # --- Measured-substation path (original code): rebuild net.sgen from net.load structure ---
     # Proposed units are set aside and appended again after the rebuild.
     kept = net.sgen[_proposed_mask(net.sgen)].copy() if len(net.sgen) else None
+    # A unit a proposal switched off stays off: the rebuild used to create
+    # every unit in service again at each tick.
+    switched_off = (set(net.sgen.loc[~net.sgen["in_service"].astype(bool), "name"].astype(str))
+                    if len(net.sgen) and "in_service" in net.sgen.columns else set())
 
     # --- Step 0: Initialize empty net.sgen DataFrame with appropriate structure
     net.sgen = pd.DataFrame(columns=[
@@ -519,6 +523,8 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
 
     # --- Step 9: Clean up
     net.sgen.drop(columns=['production'], inplace=True)
+    if switched_off:
+        net.sgen.loc[net.sgen['name'].astype(str).isin(switched_off), 'in_service'] = False
     if kept is not None and len(kept):
         kept.index = range(len(net.sgen), len(net.sgen) + len(kept))
         net.sgen = pd.concat([net.sgen, kept])

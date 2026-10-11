@@ -398,6 +398,7 @@ def annotate(result: Any, issues: list[Issue]) -> Any:
 _CONTEXT_LABELS = {
     "timestamp": "operating point",
     "data_source": "dataset",
+    "network": "network",
 }
 _THRESHOLD_FIELDS = ("vm_lower_pu", "vm_upper_pu",
                      "max_line_loading_pct", "max_trafo_loading_pct")
@@ -413,6 +414,60 @@ _REQUESTED_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?
 
 _FORECAST_WORD_RE = re.compile(r"\bforecast", re.IGNORECASE)
 _ACTUALS_WORD_RE = re.compile(r"\b(?:measur|actual|recorded|observed|histor)", re.IGNORECASE)
+
+
+_PROPOSAL_WORD_RE = re.compile(r"\bpropos|\bwhat if\b|\bwith (?:the|a|an|this)\b", re.IGNORECASE)
+_BASE_WORD_RE = re.compile(
+    r"\b(?:base|current|existing|today|now|without|before|compar|versus|vs\.?|differen)",
+    re.IGNORECASE)
+
+
+def compares_networks(text: str) -> bool:
+    """Whether the question sets a proposal against the base network.
+
+    The network counterpart of `compares_datasets`: "would the data centre
+    overload anything compared with today?" asks for both grids, and results
+    from both in one answer are then the point, not drift.
+    """
+    return bool(_PROPOSAL_WORD_RE.search(text or "") and _BASE_WORD_RE.search(text or ""))
+
+
+def proposals_used(results: list[dict]) -> dict[str, list[str]]:
+    """{proposal id -> its edits} for every proposal a turn's results came from."""
+    used: dict[str, list[str]] = {}
+    for entry in results or []:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        net = result.get("network") if isinstance(result, dict) else None
+        if isinstance(net, dict) and net.get("id") and "error" not in result:
+            used.setdefault(str(net["id"]), list(net.get("edits") or []))
+    return used
+
+
+# How the note begins; the integrity grader counts answers that needed it.
+PROPOSAL_NOTE_PREFIX = "_Results above are for proposal "
+
+
+def proposal_note(answer: str, results: list[dict]) -> str | None:
+    """A line naming each proposal the answer's figures came from, when the
+    answer itself does not name it.
+
+    Every answer about a proposal must say so — a figure from a grid with a
+    50 MW data centre read as today's grid is a silent wrong answer. The
+    prompt asks for it; this makes it hold when the prompt is not followed.
+    Attached to the answer, never substituted for any of it.
+
+    With a single proposal in the turn, "the proposal" names it: there is no
+    other it could mean. With two or more, each must be named by its id.
+    """
+    used = proposals_used(results)
+    text = (answer or "").casefold()
+    if len(used) == 1 and re.search(r"\bproposal\b", text):
+        return None
+    missing = {pid: edits for pid, edits in used.items() if pid.casefold() not in text}
+    if not missing:
+        return None
+    parts = [f"**{pid}** (base network + {'; '.join(edits) or 'edits'})" for pid, edits in missing.items()]
+    return PROPOSAL_NOTE_PREFIX + ", ".join(parts) + ", not the loaded network._"
 
 
 def compares_datasets(text: str) -> bool:
@@ -530,7 +585,14 @@ def operating_context(result: Any) -> dict:
         return {}
 
     context: dict[str, Any] = {}
-    for field in _CONTEXT_LABELS:
+    # A result computed on a proposal carries a `network` block; a study of
+    # the base carries none. A comparison carries both and is not one network.
+    net = result.get("network")
+    if isinstance(net, dict) and net.get("id") and "compared_with" not in net:
+        context["network"] = str(net["id"])
+    elif net is None and "data_source" in result and "thresholds_used" in result:
+        context["network"] = "base"
+    for field in ("timestamp", "data_source"):
         value = result.get(field)
         if isinstance(value, str) and value.strip():
             context[field] = (
@@ -562,10 +624,11 @@ class TurnConsistency:
     """
 
     def __init__(self, expected: frozenset | None = None,
-                 datasets_compared: bool = False) -> None:
+                 datasets_compared: bool = False, networks_compared: bool = False) -> None:
         self._seen: dict[str, tuple[Any, str]] = {}
         self._expected = frozenset(expected or ())
         self._datasets_compared = datasets_compared
+        self._networks_compared = networks_compared
 
     def observe(self, tool_name: str, result: Any) -> list[Issue]:
         context = operating_context(result)
@@ -585,6 +648,8 @@ class TurnConsistency:
                 # Both were asked for; this is a comparison, not a slip.
                 continue
             if field == "data_source" and self._datasets_compared:
+                continue
+            if field == "network" and self._networks_compared:
                 continue
 
             if field == "thresholds":
@@ -634,7 +699,7 @@ class TurnConsistency:
 # ---------------------------------------------------------------------------
 
 # Arguments that identify *which* operating point a call runs against.
-_OPERATING_POINT_ARGS = ("timestamp", "data_source")
+_OPERATING_POINT_ARGS = ("timestamp", "data_source", "network")
 
 # Limits the user set for this turn. A request like "would it still be secure
 # with a maximum voltage of 1.045, and if contingencies happen?" decomposes

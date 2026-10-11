@@ -42,6 +42,8 @@ from .validators import (
     TurnOperatingPoint,
     annotate,
     compares_datasets,
+    compares_networks,
+    proposal_note,
     requested_limits,
     requested_timestamps,
     validate_call,
@@ -271,6 +273,7 @@ def run_agent_turn(
     turn_consistency = TurnConsistency(
         expected=requested_timestamps(user_message),
         datasets_compared=compares_datasets(user_message),
+        networks_compared=compares_networks(user_message),
     )
     # Carries an explicitly stated operating point, and the limits the user
     # set, across the turn's calls — so a later tool cannot silently fall back
@@ -486,6 +489,11 @@ def run_agent_turn(
     # Calculate execution duration
     duration_s = round(time.perf_counter() - turn_start_time, 3)
 
+    # An answer built on a network proposal names it (sandbox).
+    note = proposal_note(final_text, turn_tool_results)
+    if note:
+        final_text = f"{final_text.rstrip()}\n\n{note}"
+
     # Close the reflection record now the answer is settled. Both the draft and
     # the delivered answer are kept: the difference between them is the only
     # way to tell a revision from a rationalisation after the fact.
@@ -579,7 +587,8 @@ def _without_long_series(tool_name: str, result: dict) -> dict:
     return out
 
 
-_SERIES_TOOLS = frozenset({"find_worst_case_timestamp", "get_element_timeseries", "scan_scenarios"})
+_SERIES_TOOLS = frozenset({"find_worst_case_timestamp", "get_element_timeseries", "scan_scenarios",
+                           "compare_networks"})  # its scan carries per-tick series for the chart
 
 
 def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001

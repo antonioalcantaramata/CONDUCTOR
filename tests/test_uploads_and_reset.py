@@ -30,6 +30,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(mb, "_LAST_UPLOAD_SENTINEL", str(systems / "last_uploaded.json"))
     monkeypatch.setattr(mb, "_LAST_TIMESERIES_SENTINEL", str(data / "last_uploaded_timeseries.json"))
     monkeypatch.setattr(mb, "_LAST_FORECAST_SENTINEL", str(data / "last_uploaded_forecast.json"))
+    monkeypatch.setattr(mb, "_PROPOSALS_FILE", str(systems / "proposals.json"))
     saved = dict(mb.app_data)
     with TestClient(mb.app) as c:
         c.storage = (systems, data)

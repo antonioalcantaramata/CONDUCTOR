@@ -55,3 +55,6 @@ docs/
 
 # Real datastream map — operational metadata, never committed.
 backend/datastream_map.local.json
+
+# What-if evaluation runs (python -m evaluation.whatif run)
+evaluation_runs/
