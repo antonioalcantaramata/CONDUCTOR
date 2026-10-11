@@ -484,3 +484,40 @@ class TestRobustness:
         monkeypatch.setattr(recommender, "ground", broken)
         result = recommender.suggest([], None, [], {}, provider=FakeProvider(_reply(_s())))
         assert result.ok and len(result.suggestions) == 1
+
+
+class TestAnswerChecksForTheSuggestionAgent:
+    """The deterministic answer checks feed the suggestion agent: it explains
+    what they found and proposes what would settle it; it does not judge."""
+
+    def _record(self, answer, question="How much does the import change?"):
+        return {"user": question, "grid": {},
+                "tool_calls": [{"name": "run_rsa", "args": {}}],
+                "tool_results": [{"name": "run_rsa", "result": {
+                    "timestamp": "2000-01-01 00:00:00", "secure": True, "total_violations": 0,
+                    "slack_import_mw": 153.3629, "total_load_mw": 189.2339}}],
+                "assistant": answer}
+
+    def test_a_figure_no_tool_produced(self):
+        from llm_agent.agent.recommender import answer_concerns, needs_attention
+        rec = self._record("Import is 153.36 MW and rises by 16.96 MW with the change.")
+        concerns = answer_concerns(rec)
+        assert concerns == ["answer check: 16.96 MW appears in no tool result "
+                            "(the agent may have computed or estimated it)"]
+        assert concerns[0] in needs_attention(rec)
+
+    def test_a_clean_answer_raises_nothing(self):
+        from llm_agent.agent.recommender import answer_concerns
+        assert answer_concerns(self._record("Import is 153.36 MW for 189.23 MW of load.")) == []
+        assert answer_concerns({"assistant": "Hello", "tool_results": []}) == []
+        assert answer_concerns(None) == []
+
+    def test_a_missing_percentage(self):
+        from llm_agent.agent.recommender import answer_concerns
+        rec = self._record("Import is 153.36 MW for 189.23 MW of load.",
+                           question="What percentage of the load does the external grid cover?")
+        assert any(c.startswith("answer check: the question asked for") for c in answer_concerns(rec))
+
+    def test_the_prompt_says_what_answer_checks_are(self):
+        from llm_agent.agent.recommender import build_system_prompt
+        assert '"answer check:"' in build_system_prompt([])

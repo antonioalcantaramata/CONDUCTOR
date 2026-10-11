@@ -20,6 +20,7 @@ backend/
 ├── element_names.py         ← One spelling of every bus/line/trafo name
 ├── load_gen_assignment.py   ← Maps measurement rows → pandapower loads/sgens
 ├── network_loader.py        ← Load networks, gen→sgen conversion, build Ybus
+├── sandbox.py               ← Network proposals: edits, validation, profiles
 ├── synthetic_timeseries.py  ← Generate synthetic measurement + forecast series
 ├── pipeline_functions.py    ← Optional external time-series data client
 └── network_profiles/        ← Bundled grid profiles (YAML): pglib_case14, ieee14
@@ -116,8 +117,37 @@ app_data = {
     "net": None,                 # pandapower network
     "db_full": None,             # intact-grid Ybus
     "grid_profile": {},          # metadata exposed via /api/grid_constants
+    "proposals": {},             # network proposals {id -> edits, hash, summary}
 }
 ```
+
+## Network proposals (sandbox)
+
+A proposal is the loaded network plus an ordered list of edits — `add_load`,
+`add_generator`, `reinforce_line`, `upgrade_trafo` (a larger unit of the same
+design: impedance falls in proportion, like units in parallel),
+`add_bus_with_connection` (a new site joined to an existing bus by a line
+copied from an existing line or a pandapower type), `set_in_service`
+(`sandbox.py`). Edits only
+append rows or change existing ones, so base indices are the same in every
+proposal, and the base itself is never modified. Every analysis endpoint takes
+`network` (`"base"`, the default, or a proposal id); `_net_for` / `_db_for`
+materialise the proposal on first use and cache it with its own admittance
+database. Proposals are shared by every browser tab and saved to
+`systems/proposals.json` with a fingerprint of the base network's structure;
+after a restart they are restored if the same network is loaded (and their
+edits still apply). Uploading or resetting a network discards them.
+
+Added elements are tagged `proposed` and follow their own profile, never the
+measurements: loads `flat`, `follow_bus` (the bus's measured demand shape,
+peaking at the load's size) or `shift` (on between two hours); generators
+`dispatchable` (a set-point, redispatchable up to capacity) or `pv` / `wind`
+(the dataset's measured production shape; the optimiser may curtail them but
+not exceed it). `_assign_tick` applies the profiles after the measurements and
+checks each added element injects what its edit says. A result computed on a
+proposal carries a `network` block — its edits, and what each added element
+injects at the tick. `GET /api/network/topology?network=<id>` returns a
+proposal's topology, with the buses and lines its edits added marked `added`.
 
 ## Measurements vs forecasts
 
@@ -139,6 +169,7 @@ own CSV via `/api/data/upload`.
 | **Contingency (N-1)** | `POST /api/contingency/simulate`, `POST /api/contingency/simulate_all`, `POST /api/contingency/optimize` |
 | **Flexibility / OPF** | `POST /api/flexibility/optimize`, `POST /api/flexibility/robust`, `POST /api/flexibility/envelope`, `POST /api/flexibility/hosting_capacity` |
 | **KPIs** | `POST /api/kpi/evaluate`, `POST /api/kpi/forecast` |
+| **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|scan` — `scan` assesses both networks at every tick of a window) |
 | **External data** *(optional)* | `POST /api/eddk/fetch`, `POST /api/eddk/push` |
 
 Full request/response schemas are browsable at `/docs` while the server runs.

@@ -22,7 +22,8 @@ so a grade is exactly reproducible and can be recomputed on old logs.
 *The input is the session log, not a bespoke run format.* Anything the agent
 has ever done can be graded after the fact, including a real operator session.
 The batch runner and prompt catalog build on top of this; they are not
-prerequisites for it.
+prerequisites for it. `evaluation.whatif` is one for network proposals: a
+fixed set of what-if questions run through the real agent and graded here.
 """
 
 from .graders.integrity import grade_composition

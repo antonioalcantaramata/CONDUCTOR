@@ -103,9 +103,17 @@ git pull
 
 **Tips**
 
+- At start the launcher asks GitHub (read-only, a few seconds at most) whether
+  a newer version exists, and says so in the console and in the app's sidebar.
+  Turn it off with `CONDUCTOR_UPDATE_CHECK=0`.
 - Ports taken? Override them: `BACKEND_PORT=8010 STREAMLIT_PORT=8502 python start.py`.
-- The services bind to `127.0.0.1` by default. Set `BACKEND_HOST=0.0.0.0` only
-  if you need LAN access (expect an OS firewall prompt).
+- The services bind to the local machine by default. Set `BACKEND_HOST=0.0.0.0`
+  and `STREAMLIT_HOST=0.0.0.0` only if you need LAN access (expect an OS
+  firewall prompt).
+- Running on a remote machine over SSH (e.g. VS Code Remote-SSH)? The browser
+  is on your own computer, so forward ports **8501** and **8000** to it — in
+  VS Code: Ports panel → Forward a Port — then open http://localhost:8501. The
+  launcher prints these steps when it detects an SSH session.
 - Slow env solve on an older conda? Enable the fast solver once:
   `conda config --set solver libmamba`.
 - If the first env build was interrupted, remove the broken env before

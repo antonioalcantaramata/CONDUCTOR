@@ -15,6 +15,17 @@ Environment overrides:
     BACKEND_HOST=0.0.0.0       # bind address   (default: 127.0.0.1 — keep it
                                # local unless you need LAN access; 0.0.0.0
                                # triggers OS firewall prompts)
+    CONDUCTOR_UPDATE_CHECK=0   # skip the check for a newer version on GitHub
+    STREAMLIT_HOST=0.0.0.0     # chat app bind address (default: localhost;
+                               # Streamlit itself would listen on every
+                               # interface, LAN and public addresses included).
+                               # A specific address — e.g. the machine's
+                               # Tailscale IP — serves the app on that network
+                               # only, without any port forwarding.
+
+Over SSH (e.g. VS Code Remote-SSH), forward ports STREAMLIT_PORT and
+BACKEND_PORT to your own machine and open http://localhost:<STREAMLIT_PORT>;
+the launcher prints the exact steps when it detects an SSH session.
 
 Press Ctrl+C once to stop both services cleanly.
 """
@@ -29,6 +40,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -36,6 +48,9 @@ import webbrowser
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from llm_agent.agent import update_check  # noqa: E402 — standard library only
+
 BACKEND_DIR = SCRIPT_DIR / "backend"
 AGENT_DIR = SCRIPT_DIR / "llm_agent"
 ENV_NAME = "conductor_env"
@@ -45,6 +60,14 @@ HASH_FILE = SCRIPT_DIR / ".conductor_env_hash"
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "127.0.0.1")
 BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "8000"))
 STREAMLIT_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
+STREAMLIT_HOST = os.environ.get("STREAMLIT_HOST", "localhost")
+_WILDCARD_OR_LOCAL = {"localhost", "127.0.0.1", "0.0.0.0", "::", "::1", ""}
+
+
+def streamlit_url_host(host: str = STREAMLIT_HOST) -> str:
+    """Where the chat app is reached: localhost, unless it is bound to one
+    specific address — then only that address answers."""
+    return "localhost" if host in _WILDCARD_OR_LOCAL else host
 GRID_PROFILE = os.environ.get("GRID_PROFILE", "pglib_case14")
 
 # Enable ANSI colours (the empty os.system call switches on VT processing in
@@ -245,6 +268,61 @@ def launch(conda: str, args: list[str], cwd: Path, log_path: Path,
     )
 
 
+def wait_for_streamlit(proc: subprocess.Popen, log_path: Path, timeout_s: int = 60) -> None:
+    """Until the chat app answers its health check. The browser used to be
+    opened after a fixed two seconds — a page that cannot load if the app is
+    slower than that (and, over SSH, a forwarded port with nothing behind it)."""
+    probe = streamlit_url_host()
+    url = f"http://{'127.0.0.1' if probe == 'localhost' else probe}:{STREAMLIT_PORT}/_stcore/health"
+    for _ in range(timeout_s * 4):
+        if proc.poll() is not None:
+            warn("Streamlit exited unexpectedly. Last lines of streamlit.log:")
+            print(tail(log_path), file=sys.stderr)
+            die("Streamlit failed to start.")
+        try:
+            with urllib.request.urlopen(url, timeout=1) as resp:
+                if resp.status == 200:
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.25)
+    warn(f"Streamlit did not answer within {timeout_s} s; opening the browser anyway.")
+
+
+def ssh_session() -> bool:
+    """Whether this launcher runs on a machine reached over SSH — where the
+    browser that opens is on another computer, and `localhost` there is not
+    this machine unless the ports are forwarded."""
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"))
+
+
+def access_instructions(streamlit_port: int, backend_port: int, remote: bool,
+                        host: str = "localhost") -> list[str]:
+    """What to open, and over SSH how to reach it. The URL is printed bare —
+    no colour codes — so terminals (and VS Code's port detection) recognise it."""
+    if host != "localhost":
+        return [
+            f"URL: http://{host}:{streamlit_port}",
+            f"Served on {host} only: open it from any computer that can reach that "
+            "address (e.g. on the same Tailscale network) — no port forwarding needed.",
+            f"Uploading a network from the browser also needs port {backend_port} "
+            "forwarded; everything else works without it.",
+        ]
+    lines = [f"Local URL: http://localhost:{streamlit_port}"]
+    if remote:
+        lines += [
+            "",
+            "This is an SSH session: the browser runs on your own computer, so both ports",
+            f"must be forwarded to it — {streamlit_port} (chat app) and {backend_port} (backend;",
+            "network uploads go from the browser straight to it).",
+            f"  VS Code Remote-SSH: Ports panel -> Forward a Port -> {streamlit_port}, then {backend_port}.",
+            f"  Plain ssh: ssh -L {streamlit_port}:localhost:{streamlit_port} "
+            f"-L {backend_port}:localhost:{backend_port} <user>@<this machine>",
+            f"Then open http://localhost:{streamlit_port} on your own computer.",
+        ]
+    return lines
+
+
 def wait_for_backend(proc: subprocess.Popen, log_path: Path, timeout_s: int = 120) -> None:
     log("Waiting for backend to be ready (this can take 60–120 s on first load)…")
     url = f"http://{'127.0.0.1' if BACKEND_HOST == '0.0.0.0' else BACKEND_HOST}:{BACKEND_PORT}/health"
@@ -299,10 +377,32 @@ def terminate(proc: subprocess.Popen | None, name: str) -> None:
     log(f"{name} stopped (PID {proc.pid})")
 
 
+class UpdateCheck:
+    """The GitHub version check, run in the background while the services
+    start so it never delays them."""
+
+    def __init__(self) -> None:
+        self.status: dict | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        if update_check.enabled():
+            self._thread.start()
+
+    def _run(self) -> None:
+        self.status = update_check.check(SCRIPT_DIR)
+
+    def result(self, wait_s: float = 0.0) -> tuple[bool, dict | None]:
+        """(finished, status) — waits at most `wait_s`."""
+        if not self._thread.is_alive() and self._thread.ident is None:
+            return False, None                       # disabled: never started
+        self._thread.join(timeout=wait_s)
+        return (not self._thread.is_alive()), self.status
+
+
 def main() -> None:
     # Ensure the cleanup in `finally` also runs when the launcher is killed
     # (SIGTERM), not just on Ctrl+C.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    updates = UpdateCheck()
 
     conda = find_conda()
     ensure_env(conda)
@@ -328,24 +428,37 @@ def main() -> None:
         log(f"Backend PID: {backend_proc.pid}  (logs → backend.log)")
         wait_for_backend(backend_proc, backend_log)
 
+        # The app shows the same notice; it is handed the result rather than
+        # asking GitHub again. Not finished yet → the app checks on its own.
+        checked, status = updates.result(wait_s=1.0)
+        app_env = {"DT_BACKEND_URL": backend_url}
+        if checked:
+            app_env[update_check.ENV_RESULT] = update_check.to_env(status)
+
         log(f"Starting Streamlit chat app on http://localhost:{STREAMLIT_PORT} …")
         streamlit_proc = launch(
             conda,
             ["streamlit", "run", "app.py",
-             "--server.port", str(STREAMLIT_PORT), "--server.headless", "true"],
+             "--server.port", str(STREAMLIT_PORT), "--server.headless", "true",
+             "--server.address", STREAMLIT_HOST],
             cwd=AGENT_DIR, log_path=streamlit_log,
-            extra_env={"DT_BACKEND_URL": backend_url},
+            extra_env=app_env,
         )
         log(f"Streamlit PID: {streamlit_proc.pid}  (logs → streamlit.log)")
-
-        time.sleep(2)
-        webbrowser.open(f"http://localhost:{STREAMLIT_PORT}")
+        wait_for_streamlit(streamlit_proc, streamlit_log)
 
         print()
         log("Both services running. Press Ctrl+C to stop.")
         print(f"  Backend:   {GREEN}{backend_url}/docs{NC}")
-        print(f"  Chat app:  {GREEN}http://localhost:{STREAMLIT_PORT}{NC}")
-        print()
+        url_host = streamlit_url_host()
+        for line in access_instructions(STREAMLIT_PORT, BACKEND_PORT, ssh_session(), url_host):
+            print(f"  {line}" if line else "")
+        notice = update_check.message(updates.result(wait_s=2.0)[1])
+        if notice:
+            warn(notice)
+        print(flush=True)  # shown at once even when the output is not a terminal
+        # Over VS Code Remote-SSH this opens the browser on your own computer.
+        webbrowser.open(f"http://{url_host}:{STREAMLIT_PORT}")
 
         while True:
             time.sleep(1)

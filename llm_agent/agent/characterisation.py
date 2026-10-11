@@ -353,6 +353,33 @@ def _study_verdicts(record: dict) -> list[tuple[str, Qualifier]]:
     return out
 
 
+def _network_of(result: dict) -> str:
+    net = result.get("network")
+    return str(net["id"]) if isinstance(net, dict) and net.get("id") and "compared_with" not in net \
+        else "base"
+
+
+def _verdicts_by_network(record: dict) -> dict[str, set]:
+    """{verdict field: {(network, value), ...}} — including the base and
+    proposal digests a comparison carries."""
+    seen: dict[str, set] = {}
+    for entry in record.get("tool_results") or []:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if not isinstance(result, dict):
+            continue
+        parts = [(_network_of(result), result)]
+        net = result.get("network")
+        if isinstance(net, dict) and "compared_with" in net:
+            parts = [("base", result.get("base") or {}), (str(net.get("id")), result.get("proposal") or {})]
+        for network, payload in parts:
+            if not isinstance(payload, dict):
+                continue
+            for verdict in _STUDY_VERDICTS:
+                if isinstance(payload.get(verdict.field), bool):
+                    seen.setdefault(verdict.field, set()).add((network, payload[verdict.field]))
+    return seen
+
+
 def check_study_claims(answer: str, record: dict) -> list[Conflict]:
     """Sentences that call a study fine when the study says otherwise.
 
@@ -370,8 +397,17 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
 
     conflicts: list[Conflict] = []
     seen: set[str] = set()
+    # A turn that compares the base with a proposal can find one secure and
+    # the other not; "secure" in the answer may then describe either, and a
+    # whole-answer check cannot tell which. Such verdicts are not judged here
+    # (a stated limit, not a pass): the answer names the network each figure
+    # is from, and the network guards check that.
+    by_network = _verdicts_by_network(record)
+    split = {field for field, pairs in by_network.items()
+             if {value for _, value in pairs} == {True, False}
+             and len({network for network, _ in pairs}) > 1}
     for name, verdict in _study_verdicts(record):
-        if verdict.field in seen:
+        if verdict.field in seen or verdict.field in split:
             continue
         # Judged over the whole answer rather than a sentence: the claim may be
         # a standalone "All clear." with the detail in a neighbouring sentence.

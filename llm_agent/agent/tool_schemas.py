@@ -1394,6 +1394,126 @@ _compute_violation_attribution = genai.types.FunctionDeclaration(
 )
 
 
+_S = genai.types.Schema
+_T = genai.types.Type
+
+_edit_proposal = genai.types.FunctionDeclaration(
+    name="edit_proposal",
+    description=(
+        "Create a network proposal — the loaded (base) network plus edits — or add edits "
+        "to one. Use it for what-if questions about changing the grid: a new load (data "
+        "centre, factory, electrolyser), a new generator, a reinforced line, or a branch or "
+        "unit switched in or out, a larger transformer, or a new bus (site) joined by a line. "
+        "The base is never modified. Then study the proposal by "
+        "passing its id as `network` to any analysis tool, or call compare_networks. "
+        "Returns the edits as stored and a summary. Edits are validated; an invalid one "
+        "stores nothing and the error says why. Give each edit only the fields its op uses."
+    ),
+    parameters=_S(
+        type=_T.OBJECT,
+        properties={
+            "proposal": _S(type=_T.STRING, description=(
+                "Proposal id: letters, digits, '_' or '-', e.g. 'dc_bus9'. Created if new.")),
+            "edits": _S(
+                type=_T.ARRAY,
+                description="Edits applied in order after any the proposal already has.",
+                items=_S(
+                    type=_T.OBJECT,
+                    properties={
+                        "op": _S(type=_T.STRING, enum=[
+                            "add_load", "add_generator", "reinforce_line", "upgrade_trafo",
+                            "add_bus_with_connection", "set_in_service"]),
+                        "name": _S(type=_T.STRING, description=(
+                            "add_load / add_generator: a unique name, e.g. 'Data centre'. "
+                            "add_bus_with_connection: the new bus's name, usable as `bus` in later "
+                            "edits of the same proposal.")),
+                        "bus": _S(type=_T.STRING, description=(
+                            "add_load / add_generator: bus name as results show it, or index.")),
+                        "p_mw": _S(type=_T.NUMBER, description=(
+                            "add_load: size in MW (its peak). add_generator (dispatchable): "
+                            "set-point, default 0.")),
+                        "pf": _S(type=_T.NUMBER, description="add_load: power factor, default 0.95."),
+                        "profile": _S(type=_T.STRING, enum=["flat", "follow_bus", "shift"], description=(
+                            "add_load: 'flat' (constant, default), 'follow_bus' (a bus's measured "
+                            "demand shape, peaking at p_mw — its own bus, or `follow`), 'shift' (p_mw "
+                            "from start_hour to end_hour, else 0).")),
+                        "follow": _S(type=_T.STRING, description=(
+                            "follow_bus: the bus whose demand shape to follow, if not the load's own "
+                            "(a new bus has no measured demand).")),
+                        "start_hour": _S(type=_T.INTEGER, description="shift: first hour on (0–23)."),
+                        "end_hour": _S(type=_T.INTEGER, description="shift: hour it stops (1–24)."),
+                        "p_max_mw": _S(type=_T.NUMBER, description="add_generator: capacity in MW."),
+                        "kind": _S(type=_T.STRING, enum=["dispatchable", "pv", "wind"], description=(
+                            "add_generator: pv and wind follow the dataset's measured production "
+                            "shape (curtailable, never above it); dispatchable holds p_mw and may "
+                            "be redispatched up to p_max_mw.")),
+                        "line": _S(type=_T.STRING, description="reinforce_line: line name or index."),
+                        "factor": _S(type=_T.NUMBER, description=(
+                            "reinforce_line: capacity multiplier, e.g. 2 = a second identical circuit.")),
+                        "trafo": _S(type=_T.STRING, description="upgrade_trafo: transformer name or index."),
+                        "new_sn_mva": _S(type=_T.NUMBER, description=(
+                            "upgrade_trafo: new rating in MVA, above the present one (same design: "
+                            "impedance falls in proportion).")),
+                        "connect_to": _S(type=_T.STRING, description=(
+                            "add_bus_with_connection: existing bus the new line starts from (same voltage).")),
+                        "length_km": _S(type=_T.NUMBER, description="add_bus_with_connection: line length in km."),
+                        "line_like": _S(type=_T.STRING, description=(
+                            "add_bus_with_connection: existing line whose conductor to copy "
+                            "(or give std_type).")),
+                        "std_type": _S(type=_T.STRING, description=(
+                            "add_bus_with_connection: pandapower line type, e.g. "
+                            "'NA2XS2Y 1x240 RM/25 12/20 kV' (or give line_like).")),
+                        "element_type": _S(type=_T.STRING, enum=["line", "trafo", "load", "sgen", "gen"],
+                                           description="set_in_service: element type."),
+                        "element": _S(type=_T.STRING, description="set_in_service: element name or index."),
+                        "in_service": _S(type=_T.BOOLEAN, description="set_in_service: true or false."),
+                    },
+                    required=["op"],
+                ),
+            ),
+            "replace": _S(type=_T.BOOLEAN, description=(
+                "True replaces the proposal's edits instead of appending. Default false.")),
+        },
+        required=["proposal", "edits"],
+    ),
+)
+
+_compare_networks = genai.types.FunctionDeclaration(
+    name="compare_networks",
+    description=(
+        "Run one study on the base network and on a proposal at the SAME operating point "
+        "(one timestamp, dataset, limits and load scaling) and return both results and the "
+        "difference: new and resolved violations, the largest voltage and loading changes, and "
+        "`changes` (proposal minus base) — quote those rather than subtracting. study='scan' compares them at every tick of a window instead — how often "
+        "and where the proposal violates when the base does not, and its worst moments. "
+        "Prefer this to separate calls whenever the question compares a proposal with "
+        "today's grid."
+    ),
+    parameters=_S(
+        type=_T.OBJECT,
+        properties={
+            "proposal": _S(type=_T.STRING, description="The proposal id to compare with the base."),
+            "study": _S(type=_T.STRING, enum=["rsa", "n1", "scan"], description=(
+                "'rsa' (security assessment at one moment, default), 'n1' (every single line "
+                "and transformer outage at one moment), or 'scan' (the security assessment at "
+                "every tick of a window).")),
+            "start_timestamp": _S(type=_T.STRING, description=(
+                "scan: window start (timestamp prefix); default the first tick.")),
+            "end_timestamp": _S(type=_T.STRING, description=(
+                "scan: window end (timestamp prefix); default the last tick.")),
+            "step_size": _S(type=_T.INTEGER, description=(
+                "scan: every Nth tick; default every tick (long windows are thinned and say so).")),
+            "load_scaling_factor": _S(type=_T.NUMBER, description=_LOAD_SCALING_DESC),
+            "vm_lower_pu": _S(type=_T.NUMBER, description=_VM_LOWER_DESC),
+            "vm_upper_pu": _S(type=_T.NUMBER, description=_VM_UPPER_DESC),
+            "max_line_loading_pct": _S(type=_T.NUMBER, description=_MAX_LINE_LOADING_DESC),
+            "max_trafo_loading_pct": _S(type=_T.NUMBER, description=_MAX_TRAFO_LOADING_DESC),
+        },
+        required=["proposal"],
+    ),
+)
+
+
 TOOLS: list = [
     genai.types.Tool(
         function_declarations=[
@@ -1419,6 +1539,8 @@ TOOLS: list = [
             _compute_hosting_capacity,
             _compute_historical_risk,
             _compute_violation_attribution,
+            _edit_proposal,
+            _compare_networks,
         ]
     )
 ]
@@ -1437,8 +1559,15 @@ _TIMESTAMP_SCHEMA_DESC = (
     "current clock. See 'Data sources' in the system prompt."
 )
 
+_NETWORK_SCHEMA_DESC = (
+    "'base' (default: the loaded network) or a proposal id from edit_proposal. "
+    "See 'Network proposals' in the system prompt."
+)
+
 # Clock-control and pure post-processing tools never read a selectable dataset.
 _NO_DATA_SOURCE_TOOLS = {
+    "edit_proposal",       # edits a proposal; studies nothing
+
     "locate_network_element",  # topology, not a time series
     "get_current_timestamp",
     "advance_timestamp",
@@ -1460,17 +1589,28 @@ _POINT_IN_TIME_TOOLS = {
     "optimize_robust_flexibility",
     "compute_flexibility_envelope",
     "compute_hosting_capacity",
+    "compare_networks",
 }
+# Every tool that studies a network takes `network`, except the comparison
+# (which names its proposal) and the tools that study none.
+_NO_NETWORK_TOOLS = (_NO_DATA_SOURCE_TOOLS - {"scan_rsa_over_time", "locate_network_element"}
+                     | {"compare_networks"})
 
 for _tool in TOOLS:
     for _fd in _tool.function_declarations or []:
-        if _fd.name in _NO_DATA_SOURCE_TOOLS:
+        if _fd.name in _NO_DATA_SOURCE_TOOLS and _fd.name in _NO_NETWORK_TOOLS:
             continue
         if _fd.parameters is None:
             _fd.parameters = genai.types.Schema(type=genai.types.Type.OBJECT, properties={})
         if _fd.parameters.properties is None:
             _fd.parameters.properties = {}
         props = _fd.parameters.properties
+        if _fd.name not in _NO_NETWORK_TOOLS and "network" not in props:
+            props["network"] = genai.types.Schema(
+                type=genai.types.Type.STRING, description=_NETWORK_SCHEMA_DESC
+            )
+        if _fd.name in _NO_DATA_SOURCE_TOOLS:
+            continue
         if "data_source" not in props:
             props["data_source"] = genai.types.Schema(
                 type=genai.types.Type.STRING, description=_DATA_SOURCE_SCHEMA_DESC
@@ -1504,4 +1644,6 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "compute_hosting_capacity": tools.compute_hosting_capacity,
     "compute_historical_risk": tools.compute_historical_risk,
     "compute_violation_attribution": tools.compute_violation_attribution,
+    "edit_proposal": tools.edit_proposal,
+    "compare_networks": tools.compare_networks,
 }

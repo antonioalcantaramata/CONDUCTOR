@@ -33,6 +33,7 @@ DATA_SOURCE = "forecasts"
 # request never leaves the process.
 REQUIRED_ARGS = {
     "compute_flexibility_envelope": {"gen_name": "Alpha"},
+    "compare_networks": {"proposal": "dc_bus9"},
     "compute_hosting_capacity": {"bus": 23},
     "optimize_contingency": {"element_type": "line", "element_index": 0},
     "simulate_contingency": {"element_type": "line", "element_index": 0},
@@ -75,6 +76,32 @@ class TestOperatingPointReachesTheBackend:
             f"{tool_name} declares `data_source` but never sends it — measurements "
             f"would be read where forecasts were asked for."
         )
+
+
+def _network_tools() -> list[str]:
+    from llm_agent.agent.providers.schema import to_json_schema_tools
+    from llm_agent.agent.tool_schemas import TOOLS
+    return sorted(t["function"]["name"] for t in to_json_schema_tools(TOOLS)
+                  if "network" in t["function"]["parameters"].get("properties", {}))
+
+
+@pytest.mark.parametrize("tool_name", _network_tools())
+def test_network_is_forwarded(tool_name, captured, monkeypatch):
+    """A tool that takes `network` and drops it studies the base while the
+    answer describes a proposal (sandbox)."""
+    required = {**REQUIRED_ARGS,
+                "get_element_timeseries": {"element_type": "line", "element_name": "L1"},
+                "compute_historical_risk": {"target": "line:L1"}}.get(tool_name, {})
+    sent = []
+    monkeypatch.setattr(tools, "_post", lambda endpoint, body: sent.append((endpoint, body)) or {"ok": True})
+    # Reads go as a query parameter (the topology, for the element lookup).
+    monkeypatch.setattr(tools, "_get", lambda endpoint: sent.append(
+        (endpoint, {"network": endpoint.split("network=", 1)[1]} if "network=" in endpoint else {}))
+        or {"ok": True})
+    getattr(tools, tool_name)(network="dc_bus9", **{"locate_network_element": {"element": "Bus_9"}}
+                              .get(tool_name, required))
+    studies = [body for endpoint, body in sent if not endpoint.startswith("/api/time")]
+    assert studies and all(b.get("network") == "dc_bus9" for b in studies), sent
 
 
 class TestTheHarnessItself:
@@ -158,7 +185,9 @@ class TestBackendSubCalls:
                     continue
                 if (holder.name, node.func.id) in self.SANCTIONED:
                     continue
-                missing = {"timestamp", "data_source"} - {kw.arg for kw in node.keywords}
+                # `network` too: a sub-call without it studies the base
+                # while the caller reports a proposal (sandbox).
+                missing = {"timestamp", "data_source", "network"} - {kw.arg for kw in node.keywords}
                 if missing:
                     offenders.append(
                         f"{holder.name}() builds {node.func.id} at line {node.lineno} "

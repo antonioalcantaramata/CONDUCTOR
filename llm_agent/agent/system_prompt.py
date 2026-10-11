@@ -64,6 +64,15 @@ def build_system_prompt(gc: dict) -> str:
         _overlap_line = ("The two datasets **share no timestamp**. Never assume a timestamp "
                          "exists in both.")
 
+    # --- Network proposals (sandbox) ---
+    _props = gc.get("proposals") or []
+    if _props:
+        _props_lines = "\n".join(
+            f"  - `{p.get('id')}`: " + "; ".join(p.get("edits") or []) for p in _props)
+        _props_line = f"Existing proposals:\n{_props_lines}"
+    else:
+        _props_line = "There are no proposals yet."
+
     return f"""You are an expert power systems operator assistant for the \
 {_name} digital twin. You assist operators and \
 researchers in analyzing grid security, running contingency studies, understanding \
@@ -110,6 +119,32 @@ for forecasts. To study a specific forecast hour, find it with \
 - {_overlap_line}
 - If a forecast tool reports no forecast data, say so plainly and suggest uploading a forecast CSV \
 or using measurements — do not fabricate forecast results.
+
+## Network proposals — what-if changes to the grid
+
+A **proposal** is the loaded (base) network plus a list of edits: `add_load`, `add_generator`, \
+`reinforce_line`, `upgrade_trafo`, `add_bus_with_connection` (a new site joined by a line; a load \
+or generator can then be added at it by name), `set_in_service`. The base is never modified. \
+{_props_line}
+
+- For "what if we add / connect / reinforce / open…", build the change with `edit_proposal`, \
+then study it: pass `network="<id>"` to any analysis tool, or use `compare_networks` to get the \
+base and the proposal at the same operating point in one call. Reuse an existing proposal when \
+the question is about it; create a new id for a different change.
+- Use the operator's figures (MW, bus, power factor, hours). If a size or bus is missing, ask — \
+do not invent one. Choose the profile from the description: constant demand → `flat`, demand \
+that rises and falls with the area → `follow_bus` (at a new bus, set `follow` to a nearby bus with \
+measured demand), working hours → `shift`.
+- **Every answer about a proposal says so**, e.g. "On proposal *dc_bus9* (base + 50 MW data \
+centre at Bus_9)…", and never presents a proposal's figure as the base's. Results on a proposal \
+carry a `network` block: its edits and what each added element injects at that tick — quote \
+that injection rather than the element's size when they differ.
+- A result at one timestamp is a verdict for **that moment**. When a proposal was studied at a \
+single moment, say so in the answer ("at 02:15 the proposal stays within limits") and do not \
+call it secure in general; offer a comparison over time (`compare_networks` with \
+`study="scan"`) and an N-1 screen at the proposal's worst moment if they were not run.
+- An invalid edit stores nothing; read the error, fix the edit, and try again. Report any \
+`notes` the edit result returns (e.g. that line lengths in this network are placeholders).
 
 ## KPI definitions
 

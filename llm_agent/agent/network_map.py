@@ -226,6 +226,10 @@ def apply_assessment(network: NetworkMap, rsa: dict) -> list[str]:
             if edge is None:
                 problems.append(f"loading reported for unknown element {name!r}")
                 continue
+            # A branch the studied network has open (a proposal can open one
+            # the base drawing shows closed) is drawn out of service.
+            if entry.get("in_service") is False:
+                edge.in_service = False
             # None stays None: an unsolved branch is "not measured" (grey),
             # never 0 % loaded — which drew it as the healthiest green.
             value = entry.get("loading_percent")

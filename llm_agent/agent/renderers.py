@@ -3053,6 +3053,91 @@ def render_violation_attribution(result: dict) -> list[go.Figure]:
     return figures
 
 
+def render_network_comparison(result: dict) -> list[go.Figure]:
+    """compare_networks: what a proposal changes against the base.
+
+    Security assessment — the largest voltage changes and the largest loading
+    changes (proposal − base), one chart each. N-1 screen — outages that cause
+    violations on one network and not the other. Increases are teal, decreases
+    purple; the title names the proposal and the timestamp, so a chart can
+    never be read as the base on its own.
+    """
+    net = result.get("network") or {}
+    where = f"{net.get('id', 'proposal')} − base at {str(result.get('timestamp', '?'))[:16]}"
+    figures: list[go.Figure] = []
+
+    def bars(rows, title, unit, fmt):
+        rows = [r for r in rows or [] if _float_or_none(r.get("change")) is not None]
+        if not rows:
+            return
+        rows = sorted(rows, key=lambda r: abs(r["change"]))
+        fig = go.Figure(go.Bar(
+            x=[r["change"] for r in rows], y=_safe_labels([r["element"] for r in rows], "Element"),
+            orientation="h",
+            marker_color=[_C.TEAL if r["change"] > 0 else _C.PURPLE for r in rows],
+            customdata=[[r.get("base"), r.get("proposal")] for r in rows],
+            hovertemplate="%{y}: %{customdata[0]:" + fmt + "} → %{customdata[1]:" + fmt
+                          + "} " + unit + "<extra></extra>",
+        ))
+        fig.update_layout(**CHART_THEME, title=f"{title} ({where})",
+                          xaxis_title=f"Change ({unit})", yaxis_title="",
+                          height=max(220, 40 * len(rows) + 120))
+        figures.append(fig)
+
+    if result.get("study") == "scan":
+        series = result.get("series") or {}
+        stamps = series.get("timestamps") or []
+        if not stamps:
+            return [_empty_figure(f"No ticks scanned ({where})")]
+        limits = result.get("thresholds_used") or {}
+        window = result.get("window") or {}
+        span = f"{net.get('id', 'proposal')} vs base · {window.get('start', '?')[:16]} → {window.get('end', '?')[:16]}"
+        for key, title, unit, limit_key in (
+                ("min_vm", "Lowest bus voltage", "p.u.", "vm_lower_pu"),
+                ("max_line_loading", "Highest line loading", "%", "max_line_loading_pct")):
+            fig = go.Figure([
+                go.Scatter(x=stamps, y=series.get(f"base_{key}"), name="base", mode="lines",
+                           line=dict(color=_C.NEUTRAL, width=1.5)),
+                go.Scatter(x=stamps, y=series.get(f"proposal_{key}"), name=net.get("id", "proposal"),
+                           mode="lines", line=dict(color=_C.PRIMARY, width=2)),
+            ])
+            limit = _float_or_none(limits.get(limit_key))
+            if limit is not None:
+                fig.add_hline(y=limit, line=dict(color=_C.VIOLATION, dash="dash", width=1),
+                              annotation_text="limit", annotation_position="top left")
+            fig.update_layout(**CHART_THEME, title=f"{title} over time ({span})",
+                              yaxis_title=unit, xaxis_title="", hovermode="x unified")
+            figures.append(fig)
+        return figures
+
+    if result.get("study") == "n1":
+        def per_outage(rows):
+            counts: dict[str, int] = {}
+            for r in rows or []:
+                counts[str(r.get("outage"))] = counts.get(str(r.get("outage")), 0) + 1
+            return counts
+        new, gone = per_outage(result.get("new_violations")), per_outage(result.get("resolved_violations"))
+        outages = sorted(set(new) | set(gone), key=lambda o: new.get(o, 0) - gone.get(o, 0))
+        if not outages:
+            return [_empty_figure(f"Same N-1 violations on both networks ({where})", _C.OK)]
+        fig = go.Figure([
+            go.Bar(name="New on the proposal", y=outages, x=[new.get(o, 0) for o in outages],
+                   orientation="h", marker_color=_C.VIOLATION),
+            go.Bar(name="Resolved by the proposal", y=outages, x=[-gone.get(o, 0) for o in outages],
+                   orientation="h", marker_color=_C.OK),
+        ])
+        fig.update_layout(**CHART_THEME, barmode="relative",
+                          title=f"N-1 violations by outage ({where})",
+                          xaxis_title="Violations (new → right, resolved ← left)", yaxis_title="",
+                          height=max(240, 40 * len(outages) + 140))
+        return [fig]
+
+    bars(result.get("largest_voltage_changes"), "Largest voltage changes", "p.u.", ".4f")
+    bars((result.get("largest_line_loading_changes") or []) + (result.get("largest_trafo_loading_changes") or []),
+         "Largest loading changes", "%", ".1f")
+    return figures or [_empty_figure(f"No measurable change ({where})")]
+
+
 RENDERER_MAP: dict[str, Callable] = {
     "run_rsa": render_rsa,                              # returns list of 3 figs
     "simulate_contingency": render_contingency_violations,
@@ -3073,6 +3158,7 @@ RENDERER_MAP: dict[str, Callable] = {
     "compute_flexibility_envelope": render_flexibility_envelope,
     "compute_hosting_capacity": render_hosting_capacity,
     "compute_historical_risk": render_historical_risk,
+    "compare_networks": render_network_comparison,
 }
 
 
@@ -3411,6 +3497,190 @@ def render_network_map(network: NetworkMap, positions: dict, *,
             # is not one.
             text="schematic connectivity, not geography"
                  + (f" · {dropped} name(s) hidden, hover for them" if dropped else ""),
+            xref="paper", yref="paper", x=0.0, y=-0.045, showarrow=False,
+            font=dict(size=10, color="#888"), xanchor="left")],
+    )
+    return fig
+
+
+# A change, not a level: purple for a decrease, teal for an increase, white
+# for none — the palette's own meanings, so a drop never reads as a violation.
+_DIFF_SCALE = [[0.0, _C.PURPLE], [0.5, "#f4f5f7"], [1.0, _C.TEAL]]
+
+
+def _diff_colour(delta: float, span: float) -> str:
+    from plotly.colors import sample_colorscale
+    t = 0.5 + 0.5 * max(-1.0, min(1.0, delta / span))
+    return sample_colorscale(_DIFF_SCALE, [t])[0]
+
+
+def render_network_diff(base: NetworkMap, proposal: NetworkMap, positions: dict, *,
+                        new_violations: set | None = None, subtitle: str = "") -> go.Figure:
+    """What a proposal changes, drawn on the network: proposal − base.
+
+    Buses are filled by the change in voltage and branches coloured and sized
+    by the change in loading, on one symmetric scale each so the largest
+    change sets the range. Branches the proposal opens are dashed grey;
+    elements violating on the proposal and not on the base are ringed; added
+    demand and generation sit beside the bus they were added to. Hover gives
+    both values.
+    """
+    new_violations = new_violations or set()
+    drawn = [n for n in proposal.nodes.values() if n.index in positions]
+    if not drawn:
+        return _empty_figure("No network to draw")
+    xs = [positions[n.index][0] for n in drawn]
+    ys = [positions[n.index][1] for n in drawn]
+    span = max(max(ys) - min(ys), max(xs) - min(xs)) or 1.0
+    per_px = span / _PLOT_PX
+    offset = 0.022 * span
+
+    def dv(node):
+        b = base.nodes.get(node.index)
+        return (None if b is None or b.vm_pu is None or node.vm_pu is None
+                else node.vm_pu - b.vm_pu)
+
+    base_edges = {(e.kind, e.index): e for e in base.edges}
+
+    def dl(edge):
+        b = base_edges.get((edge.kind, edge.index))
+        if b is None or b.loading_pct is None or edge.loading_pct is None:
+            return None
+        return edge.loading_pct - b.loading_pct
+
+    v_span = max([abs(d) for d in map(dv, drawn) if d is not None] + [0.005])
+    l_span = max([abs(d) for d in map(dl, proposal.edges) if d is not None] + [1.0])
+
+    traces: list[go.Scatter] = []
+    hx, hy, ht = [], [], []
+    for edge in proposal.edges:
+        if edge.from_bus not in positions or edge.to_bus not in positions:
+            continue
+        (x0, y0), (x1, y1) = positions[edge.from_bus], positions[edge.to_bus]
+        b = base_edges.get((edge.kind, edge.index))
+        opened = b is not None and b.in_service and not edge.in_service
+        d = dl(edge)
+        if edge.kind == "ext_grid":
+            colour, width, dash, detail = _EXTERNAL, 3.0, "solid", "external connection"
+        elif b is None:
+            # Built by the proposal: there is nothing to subtract.
+            load = "" if edge.loading_pct is None else f" · {edge.loading_pct:.1f}% loaded"
+            colour, width, dash, detail = _C.PRIMARY, 3.0, "solid", "added by the proposal" + load
+        elif opened:
+            colour, width, dash, detail = _OUT_OF_SERVICE, 2.0, "dash", "opened by the proposal"
+        elif d is None:
+            colour, width, dash, detail = _UNMEASURED_EDGE, 1.4, "solid", "not measured"
+        else:
+            colour = _diff_colour(d, l_span)
+            width = 1.4 + 4.6 * min(abs(d) / l_span, 1.0)
+            dash = "dot" if edge.kind == "trafo" else "solid"
+            detail = f"{b.loading_pct:.1f}% → {edge.loading_pct:.1f}% ({d:+.1f} pts)"
+        if edge.name in new_violations:
+            colour, width = _OVER_LIMIT_EDGE, max(width, 5.5)
+            detail += " — newly over its limit"
+        traces.append(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines", hoverinfo="skip",
+                                 showlegend=False, line=dict(color=colour, width=width, dash=dash)))
+        for f in (0.2, 0.35, 0.5, 0.65, 0.8):
+            hx.append(x0 + (x1 - x0) * f)
+            hy.append(y0 + (y1 - y0) * f)
+            ht.append(f"<b>{edge.name}</b><br>{edge.kind} · {detail}")
+    if hx:
+        traces.append(go.Scatter(x=hx, y=hy, mode="markers", showlegend=False,
+                                 marker=dict(size=14, color="rgba(0,0,0,0)"),
+                                 hoverinfo="text", hovertext=ht))
+
+    fills, outlines, widths, sizes, hovers, symbols = [], [], [], [], [], []
+    for node in drawn:
+        d = dv(node)
+        flagged = node.name in new_violations
+        b = base.nodes.get(node.index)
+        new_bus = b is None and node.kind != "external"
+        if node.kind == "external":
+            symbols.append("square")
+            fills.append(_EXTERNAL)
+        elif new_bus:
+            symbols.append("diamond")
+            fills.append("white")
+        elif d is None:
+            symbols.append("circle-open")
+            fills.append(_UNMEASURED_EDGE)
+        else:
+            symbols.append("circle")
+            fills.append(_diff_colour(d, v_span))
+        outlines.append("#111111" if flagged else _C.PRIMARY if new_bus else "#5b5b5b")
+        widths.append(3.0 if flagged or new_bus else 1.0)
+        sizes.append(MARKER_PX.get(node.kind, 10) * proposal.marker_scale + (3 if flagged else 0))
+        if new_bus:
+            voltage = "added by the proposal · " + (
+                "not measured" if node.vm_pu is None else f"{node.vm_pu:.4f} pu")
+        else:
+            voltage = ("not measured" if d is None
+                       else f"{b.vm_pu:.4f} → {node.vm_pu:.4f} pu ({d:+.4f})")
+        hovers.append(f"<b>{node.name}</b><br>bus {node.index} · {node.vn_kv:g} kV<br>V {voltage}"
+                      + ("<br><b>newly violating</b>" if flagged else ""))
+    names = [n.name for n in drawn]
+    ranked = [(0 if n.name in new_violations else 1 if n.kind == "substation" else 2,
+               -abs(dv(n) or 0.0), i) for i, n in enumerate(drawn)]
+    obstacles = [(xs[i] - (sizes[i] / 2 + 3) * per_px, ys[i] - (sizes[i] / 2 + 3) * per_px,
+                  xs[i] + (sizes[i] / 2 + 3) * per_px, ys[i] + (sizes[i] / 2 + 3) * per_px)
+                 for i in range(len(drawn))]
+    labels, placements, dropped = _place_labels(xs, ys, names, sizes, ranked, obstacles, per_px)
+    traces.append(go.Scatter(
+        x=xs, y=ys, mode="markers+text", showlegend=False,
+        marker=dict(size=sizes, color=fills, symbol=symbols,
+                    line=dict(color=outlines, width=widths)),
+        text=labels, textposition=placements, textfont=dict(size=_FONT_PX, color="#333"),
+        hoverinfo="text", hovertext=hovers))
+
+    # Added demand and generation, beside the bus they were added to; sized by
+    # the square root of the change, as the power marks on the map are.
+    def change_of(node, attr):
+        b = base.nodes.get(node.index)
+        return getattr(node, attr) - (getattr(b, attr) if b else 0.0)
+
+    peak = max([abs(change_of(n, a)) for n in drawn for a in ("gen_mw", "load_mw")] + [1e-9])
+    for attr, symbol, colour, label, sign in (("gen_mw", "triangle-up", _GENERATION, "added generation", 1),
+                                              ("load_mw", "triangle-down", _DEMAND, "added demand", -1)):
+        px, py, ps, ph = [], [], [], []
+        for node in drawn:
+            change = change_of(node, attr)
+            if abs(change) < 0.01 or node.kind == "external":
+                continue
+            x, y = positions[node.index]
+            px.append(x)
+            py.append(y + sign * offset)
+            ps.append(7 + 13 * (abs(change) / peak) ** 0.5)
+            ph.append(f"<b>{node.name}</b><br>{label}: {change:+.2f} MW")
+        if px:
+            traces.append(go.Scatter(x=px, y=py, mode="markers", name=label, showlegend=True,
+                                     marker=dict(size=ps, color=colour, symbol=symbol),
+                                     hoverinfo="text", hovertext=ph))
+
+    traces.append(go.Scatter(
+        x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+        marker=dict(size=0.1, color=[-v_span, v_span], colorscale=_DIFF_SCALE,
+                    cmin=-v_span, cmax=v_span, showscale=True,
+                    colorbar=dict(title=dict(text="ΔV (pu)", side="right"), thickness=12,
+                                  len=0.38, x=1.02, y=0.0, yanchor="bottom",
+                                  tickformat="+.3f"))))
+
+    title = f"<b>{proposal.name}</b> — difference from the base"
+    if subtitle:
+        title += f"<br><span style='font-size:12px;color:#666'>{subtitle}</span>"
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left"),
+        hovermode="closest", plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(l=20, r=20, t=74, b=44), height=720,
+        legend=dict(orientation="v", x=1.0, y=1.0, xanchor="left",
+                    bgcolor="rgba(255,255,255,0.8)", borderwidth=0, font=dict(size=10)),
+        xaxis=dict(visible=False, showgrid=False, zeroline=False),
+        yaxis=dict(visible=False, showgrid=False, zeroline=False, scaleanchor="x", scaleratio=1),
+        annotations=[dict(
+            text=(f"buses: voltage change (±{v_span:.3f} pu) · branches: loading change "
+                  f"(±{l_span:.1f} pts, width = size) · purple decrease, teal increase · "
+                  "dashed = opened · blue = added · dark ring/line = newly violating"
+                  + (f" · {dropped} name(s) hidden" if dropped else "")),
             xref="paper", yref="paper", x=0.0, y=-0.045, showarrow=False,
             font=dict(size=10, color="#888"), xanchor="left")],
     )

@@ -223,3 +223,55 @@ class TestTerminateKillsProcessTree:
                         os.kill(grandchild_pid, 9)
             except (NameError, ProcessLookupError):
                 pass
+
+
+class TestRemoteAccess:
+    """Over SSH the browser is on another computer: the launcher says how to
+    reach the app, waits until it answers, and keeps it off the network."""
+
+    def test_ssh_is_detected(self, monkeypatch):
+        for var in ("SSH_CONNECTION", "SSH_CLIENT"):
+            monkeypatch.delenv(var, raising=False)
+        assert not start.ssh_session()
+        monkeypatch.setenv("SSH_CONNECTION", "10.0.0.2 52063 10.0.0.1 22")
+        assert start.ssh_session()
+
+    def test_instructions(self):
+        local = start.access_instructions(8501, 8000, remote=False)
+        assert local == ["Local URL: http://localhost:8501"]   # bare, no colour codes
+        remote = "\n".join(start.access_instructions(8502, 8010, remote=True))
+        assert "Forward a Port -> 8502, then 8010" in remote
+        assert "ssh -L 8502:localhost:8502 -L 8010:localhost:8010" in remote
+
+    def test_waiting_for_the_app_returns_once_it_answers(self, monkeypatch):
+        import http.server
+        import threading
+
+        class Health(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/_stcore/health" else 404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        monkeypatch.setattr(start, "STREAMLIT_PORT", server.server_address[1])
+        proc = types.SimpleNamespace(poll=lambda: None)
+        t0 = time.time()
+        start.wait_for_streamlit(proc, log_path=None, timeout_s=5)
+        assert time.time() - t0 < 2
+        server.shutdown()
+
+
+class TestServedOnOneAddress:
+    def test_a_specific_address_is_where_the_app_is_reached(self):
+        assert start.streamlit_url_host("localhost") == "localhost"
+        assert start.streamlit_url_host("0.0.0.0") == "localhost"
+        assert start.streamlit_url_host("100.110.91.32") == "100.110.91.32"
+
+    def test_instructions_for_an_address(self):
+        lines = start.access_instructions(8501, 8000, remote=True, host="100.110.91.32")
+        assert lines[0] == "URL: http://100.110.91.32:8501"
+        assert "no port forwarding needed" in lines[1]

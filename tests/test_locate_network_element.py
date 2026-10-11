@@ -146,5 +146,7 @@ class TestRegistration:
         declared = {t["function"]["name"]: t["function"] for t in to_json_schema_tools(TOOLS)}
         parameters = declared["locate_network_element"]["parameters"]
         assert parameters["required"] == ["element"]
-        # One argument, because every schema is sent on every request.
-        assert set(parameters["properties"]) == {"element"}
+        # Few arguments, because every schema is sent on every request: the
+        # element, and `network` — a proposal's topology holds the buses and
+        # lines its edits added, whose indices the contingency tools need.
+        assert set(parameters["properties"]) == {"element", "network"}

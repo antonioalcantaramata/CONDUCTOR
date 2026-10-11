@@ -10,6 +10,7 @@ from .graders.completeness import grade_completeness
 from .graders.integrity import grade_composition
 from .graders.provenance import grade_provenance
 from .graders.refusal import grade_refusal
+from .graders.sandbox import grade_sandbox
 from .session_log import FAIL, Finding, load_records
 
 
@@ -39,7 +40,7 @@ def grade_record(record: dict) -> TurnGrade:
     completeness_findings, gaps = grade_completeness(record)
     findings = (grade_composition(record) + provenance_findings
                 + characterisation_findings + grade_refusal(record)
-                + completeness_findings)
+                + completeness_findings + grade_sandbox(record))
 
     return TurnGrade(
         turn=record.get("turn", 0),

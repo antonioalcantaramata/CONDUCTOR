@@ -376,7 +376,7 @@ def simulate_all_contingencies(
     unsupported = _unsupported_kwargs_result(
         "simulate_all_contingencies",
         kwargs,
-        supported_extra={"sgen_scaling_factor", "data_source", "timestamp"},
+        supported_extra={"sgen_scaling_factor", "data_source", "timestamp", "network"},
     )
     if unsupported is not None:
         return unsupported
@@ -689,7 +689,7 @@ def get_element_timeseries(
 # 2.x — Current network conditions snapshot
 # ---------------------------------------------------------------------------
 
-def locate_network_element(element: str, **kwargs) -> dict:
+def locate_network_element(element: str, network: str | None = None, **kwargs) -> dict:
     """
     GET /api/network/topology, resolved locally to one element.
 
@@ -707,7 +707,9 @@ def locate_network_element(element: str, **kwargs) -> dict:
     small network and hundreds of thousands on a large one. Only the matched
     element and its immediate neighbours are returned.
     """
-    topology = _get("/api/network/topology")
+    # On a proposal the topology includes the buses and lines its edits added.
+    path = "/api/network/topology" + (f"?network={network}" if network and network != "base" else "")
+    topology = _get(path)
     if "error" in topology:
         return topology
 
@@ -717,9 +719,15 @@ def locate_network_element(element: str, **kwargs) -> dict:
 
     buses = {int(b["index"]): b for b in topology.get("buses") or []}
     branches = topology.get("branches") or []
-    folded = wanted.casefold()
+    # "Bus 8" and "Bus_8" are one bus: names are compared with spaces and
+    # underscores folded together (the agent asked for "Bus 8" first, got
+    # nothing, and had to retry).
+    def fold(text) -> str:
+        return re.sub(r"[\s_]+", " ", str(text)).strip().casefold()
 
-    matches = [b for b in buses.values() if str(b.get("name", "")).casefold() == folded]
+    folded = fold(wanted)
+
+    matches = [b for b in buses.values() if fold(b.get("name", "")) == folded]
     if len(matches) > 1:
         # Bus names repeat on real networks; guessing which one is meant is
         # exactly the error this tool exists to prevent.
@@ -757,10 +765,11 @@ def locate_network_element(element: str, **kwargs) -> dict:
             "connected_to": neighbours[:_MAX_NEIGHBOURS],
             "n_connections": len(neighbours),
             "truncated": len(neighbours) > _MAX_NEIGHBOURS,
+            **({"network": topology["network"]} if "network" in topology else {}),
         })
 
     branch_matches = [b for b in branches
-                      if folded in str(b.get("name", "")).casefold()]
+                      if folded in fold(b.get("name", ""))]
     if len(branch_matches) == 1:
         branch = branch_matches[0]
         return _record("locate_network_element", {
@@ -771,6 +780,7 @@ def locate_network_element(element: str, **kwargs) -> dict:
             "between": [buses.get(int(branch["from_bus"]), {}).get("name"),
                         buses.get(int(branch["to_bus"]), {}).get("name")],
             "in_service": branch.get("in_service", True),
+            **({"network": topology["network"]} if "network" in topology else {}),
         })
     if len(branch_matches) > 1:
         return {
@@ -1033,6 +1043,7 @@ def scan_rsa_over_time(
         kwargs,
         supported_extra={
             "sgen_scaling_factor",
+            "network",
             "vm_upper_pu",
             "vm_lower_pu",
             "max_line_loading_pct",
@@ -1549,7 +1560,7 @@ def compute_violation_attribution(
     """Rank the injections driving each violated element at one operating point."""
     unsupported = _unsupported_kwargs_result(
         "compute_violation_attribution", kwargs,
-        {"sgen_scaling_factor", "delta_mw", "delta_mvar"},
+        {"sgen_scaling_factor", "delta_mw", "delta_mvar", "network"},
     )
     if unsupported is not None:
         return unsupported
@@ -1573,3 +1584,53 @@ def compute_violation_attribution(
             body[key] = value
 
     return _record("compute_violation_attribution", _post("/api/rsa/attribution", body))
+
+
+# ---------------------------------------------------------------------------
+# Network proposals (sandbox)
+# ---------------------------------------------------------------------------
+
+def edit_proposal(proposal: str, edits: list | None = None, replace: bool = False, **kwargs) -> dict:
+    """
+    POST /api/proposals/edit
+
+    Create a proposal (the base network plus edits) or add edits to it. The
+    base is never modified; nothing is stored when an edit is invalid.
+    """
+    unsupported = _unsupported_kwargs_result("edit_proposal", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    body = {"proposal": proposal, "edits": list(edits or []), "replace": bool(replace)}
+    return _record("edit_proposal", _post("/api/proposals/edit", body))
+
+
+def compare_networks(
+    proposal: str,
+    study: str = "rsa",
+    load_scaling_factor: float = 1.0,
+    vm_upper_pu: float | None = None,
+    vm_lower_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
+    **kwargs,
+) -> dict:
+    """
+    POST /api/proposals/compare
+
+    The same study on the base and on a proposal at one operating point, and
+    the difference.
+    """
+    unsupported = _unsupported_kwargs_result(
+        "compare_networks", kwargs,
+        supported_extra={"data_source", "timestamp", "sgen_scaling_factor",
+                         "start_timestamp", "end_timestamp", "step_size"})
+    if unsupported is not None:
+        return unsupported
+    body = {
+        "proposal": proposal, "study": study, "load_scaling_factor": load_scaling_factor,
+        "vm_upper_pu": vm_upper_pu, "vm_lower_pu": vm_lower_pu,
+        "max_line_loading_pct": max_line_loading_pct,
+        "max_trafo_loading_pct": max_trafo_loading_pct,
+        **kwargs,
+    }
+    return _record("compare_networks", _post("/api/proposals/compare", body))
