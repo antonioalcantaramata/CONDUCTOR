@@ -29,7 +29,7 @@ llm_agent/
 │   ├── tool_schemas.py    ← function declarations (TOOLS) — single source of truth
 │   ├── renderers.py       ← Plotly renderers, keyed by tool name (RENDERER_MAP)
 │   ├── system_prompt.py   ← system instruction, built from live grid constants
-│   ├── recommender.py     ← AI Agent Suggestion: on-demand second agent, no tools
+│   ├── recommender.py     ← the advisor: suggestions and side discussions, no tools
 │   ├── timeline.py        ← operating point: measured / forecast / compare, and at what time
 │   ├── data_view.py       ← Data tab: the loaded series, forecast against measured
 │   └── errors.py          ← error classification / retry helpers
@@ -118,14 +118,58 @@ The agent picks the source from the user's intent and reports it in its answer.
 ## Network proposals (sandbox)
 
 `edit_proposal` builds a proposal — the loaded network plus edits (add a load or
-a generator, reinforce a line, switch an element in or out of service); the base
+a generator, reinforce a line, upgrade a transformer, add a new bus joined by a
+line or, at another voltage, by a new transformer, switch an element in or out of
+service); the base
 is never modified. Every analysis tool accepts `network` (`"base"` or a proposal
 id), and `compare_networks` runs one study on the base and a proposal at the
 same operating point — or, with `study="scan"`, at every tick of a window. The guards carry `network` through a turn like
 `timestamp`, flag a turn that mixes base and proposal unless the question
 compares them, and append a note to any answer that uses a proposal without
-naming it. The AI Agent Suggestion flags a proposal judged at one moment or
+naming it. The advisor's suggestions flag a proposal judged at one moment or
 without N-1 and may propose an alternative proposal.
+
+## The advisor — suggestions and discussion
+
+A second agent, run only when the operator asks (`recommender.py`). It never
+runs a tool and never produces a figure of its own: every number it writes is
+checked against the session's results and flagged when not found. It has two
+modes over the same view of the session and the same rules:
+
+The UI keeps the two roles apart: **CONDUCTOR** (the orchestrator, blue) runs
+the studies — its chat box is labelled ⚡ CONDUCTOR and sends with **Run**; the
+**advisor** (violet, a tinted panel) discusses and suggests and runs nothing. An
+answer leads to it ("💬 Discuss with the advisor"); its studies and suggestions
+lead back ("Run in CONDUCTOR →" fills CONDUCTOR's box, the operator sends it).
+The welcome message gives an example for each.
+
+Both modes live in the **advisor panel** to the right of the conversation, about
+the latest answer, switched with ✨ Suggestions / 💬 Discuss; the conversation
+on the left stays the record of questions, studies and answers (it shows only
+a one-line hint when the agent has something to flag, and decision notes).
+The panel starts closed: a slim strip on the right holds its ✨ button,
+highlighted when the latest answer has something to flag (the line under the
+answer then points to it). Once opened it stays open for the session until
+hidden again with its header button.
+
+- **Suggestions** — "Suggest next steps": a short comment and 3–4 next steps;
+  "Use" places one in the chat box.
+- **Discussion** — an open side thread to think a result through; it needs no
+  suggestions first and stays in the panel while studies it proposed are run. It separates evidence
+  from opinion, asks about the operator's criteria, argues the other side when
+  asked, and proposes studies as cards that go to the chat box like
+  suggestions — the operator sends them, and their answers become evidence in
+  the thread. "Close and record a decision" writes a decision note (decision,
+  evidence, open risks, studies run) into the session log.
+- **Before the first question** the panel is already there, for planning: a
+  discussion only, which helps frame the question and proposes the first
+  studies without saying anything about the grid's state (there are no results
+  yet). It carries on beside the first answer; a decision can be recorded once
+  there is one.
+
+The deterministic answer checks (provenance, characterisation, completeness)
+feed both modes as "answer check: …" concerns. One model call per suggestion
+round, per message in a discussion, and per decision note.
 
 ## Extending the agent
 

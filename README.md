@@ -7,11 +7,14 @@
 
 # CONDUCTOR
 
-An LLM-orchestrated digital twin for uncertainty-aware power-system operations.
+**Ask, test and decide: a solver-grounded AI assistant for distribution grids.**
 CONDUCTOR pairs a power-systems analysis backend (security assessment, N-1
 contingencies, probabilistic risk, robust corrective dispatch, flexibility and
 hosting-capacity studies, KPIs) with a natural-language agent that drives those
-tools from a chat interface.
+tools from a chat interface. Changes to the grid can be tested as proposals
+without touching the loaded network, every figure in an answer is traced to the
+solver that produced it, and an advisor — a second agent that runs no studies —
+suggests next steps and discusses results with the operator.
 
 The agent runs on a **hosted model** — Google Gemini, OpenAI, or Anthropic
 (Claude) — or a **local model via Ollama**. You pick which each time you start

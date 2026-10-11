@@ -127,7 +127,13 @@ A proposal is the loaded network plus an ordered list of edits — `add_load`,
 `add_generator`, `reinforce_line`, `upgrade_trafo` (a larger unit of the same
 design: impedance falls in proportion, like units in parallel),
 `add_bus_with_connection` (a new site joined to an existing bus by a line
-copied from an existing line or a pandapower type), `set_in_service`
+copied from an existing line or a pandapower type), `add_bus_with_transformer`
+(a new bus at another voltage behind a new transformer, step-down or step-up,
+optionally at the far end of a new line; the unit copied from an existing one —
+in per unit, resized with `sn_mva` — or a pandapower catalogue type, or given
+explicitly: rating, vk/vkr, no-load losses, magnetising current, vector-group
+shift, rated voltages, tap changer and position; up to 4 units in `parallel`,
+one branch in the model), `set_in_service`
 (`sandbox.py`). Edits only
 append rows or change existing ones, so base indices are the same in every
 proposal, and the base itself is never modified. Every analysis endpoint takes
@@ -143,7 +149,10 @@ measurements: loads `flat`, `follow_bus` (the bus's measured demand shape,
 peaking at the load's size) or `shift` (on between two hours); generators
 `dispatchable` (a set-point, redispatchable up to capacity) or `pv` / `wind`
 (the dataset's measured production shape; the optimiser may curtail them but
-not exceed it). `_assign_tick` applies the profiles after the measurements and
+not exceed it). A flat added load is a stated, fixed demand: load-stress factors and demand
+uncertainty draws (probabilistic RSA, robust OPF, hosting capacity) leave it
+unchanged (`_scale_loads`); a `follow_bus` load scales with the demand it
+follows. `_assign_tick` applies the profiles after the measurements and
 checks each added element injects what its edit says. A result computed on a
 proposal carries a `network` block — its edits, and what each added element
 injects at the tick. `GET /api/network/topology?network=<id>` returns a
@@ -169,7 +178,7 @@ own CSV via `/api/data/upload`.
 | **Contingency (N-1)** | `POST /api/contingency/simulate`, `POST /api/contingency/simulate_all`, `POST /api/contingency/optimize` |
 | **Flexibility / OPF** | `POST /api/flexibility/optimize`, `POST /api/flexibility/robust`, `POST /api/flexibility/envelope`, `POST /api/flexibility/hosting_capacity` |
 | **KPIs** | `POST /api/kpi/evaluate`, `POST /api/kpi/forecast` |
-| **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|scan` — `scan` assesses both networks at every tick of a window) |
+| **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|opf\|scan` — `opf`: corrective dispatch on both; `scan`: both networks at every tick of a window) |
 | **External data** *(optional)* | `POST /api/eddk/fetch`, `POST /api/eddk/push` |
 
 Full request/response schemas are browsable at `/docs` while the server runs.

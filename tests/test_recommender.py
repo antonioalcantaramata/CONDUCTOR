@@ -238,7 +238,8 @@ class TestSuggest:
                                      [RSA_VIOLATED], {"network": "n"}, provider=provider)
         (call,) = provider.calls
         assert call["tools"] == []
-        assert call["system"].startswith("You are the suggestion agent of CONDUCTOR")
+        assert call["system"].startswith("You are the advisor of CONDUCTOR")
+        assert "propose 3 or 4 next steps" in call["system"]          # the suggestion mode
         assert len(call["messages"]) == 1 and call["messages"][0]["role"] == "user"
         assert result.ok and len(result.suggestions) == 1
 
@@ -521,3 +522,87 @@ class TestAnswerChecksForTheSuggestionAgent:
     def test_the_prompt_says_what_answer_checks_are(self):
         from llm_agent.agent.recommender import build_system_prompt
         assert '"answer check:"' in build_system_prompt([])
+
+
+class TestDiscussion:
+    """The AI agent's discussion mode: a side thread with the operator. Same
+    session view and rules as the suggestions; it runs nothing, proposes
+    studies, and every figure it writes is checked."""
+
+    THREAD = [{"role": "operator", "text": "Is Bus_3 really a problem?"},
+              {"role": "advisor", "text": "At 02:15 it is at 0.9366 p.u.",
+               "studies": [{"title": "Scan the week", "prompt": "..."}]},
+              {"role": "sent", "text": "Scan the week", "prompt": "...", "answered_turn": 2}]
+
+    def _reply(self, **data):
+        return json.dumps({"reply": "Bus_3 is at 0.9366 p.u. at 02:15; in my view that is close "
+                                    "to the limit.",
+                           "studies": [{"title": "N-1 at 02:15", "prompt": "Run N-1 at 2000-01-03 02:15.",
+                                        "why": "Only the intact grid was studied."}], **data})
+
+    def test_one_reply_with_its_own_prompt_and_the_thread(self):
+        provider = FakeProvider(self._reply())
+        reply = recommender.discuss("So what should I check?", self.THREAD, [{"role": "user", "text": "hi"}],
+                                    RSA_VIOLATED, [RSA_VIOLATED], {"network": "n"}, provider=provider)
+        (call,) = provider.calls
+        assert call["tools"] == [] and "side discussion with the operator" in call["system"]
+        assert "Always:" in call["system"]                          # the shared rules
+        request = call["messages"][0]["content"]
+        assert "## Side discussion so far" in request and "Operator: Is Bus_3 really a problem?" in request
+        assert "it was answered in turn 2" in request and "So what should I check?" in request
+        assert reply.ok and reply.studies[0].title == "N-1 at 02:15" and reply.unverified == ()
+
+    def test_figures_not_in_the_session_are_flagged(self):
+        provider = FakeProvider(json.dumps({"reply": "It would drop to 0.91 p.u. under N-1.",
+                                            "studies": [{"title": "t", "prompt": "p", "why": "Loading 140 %."}]}))
+        reply = recommender.discuss("q", [], [], RSA_VIOLATED, [RSA_VIOLATED], {}, provider=provider)
+        assert reply.unverified == ("0.91 p.u.",) and reply.studies[0].unverified == ("140 %",)
+
+    def test_at_most_three_studies_and_errors_are_kept(self):
+        many = [{"title": f"t{i}", "prompt": f"p{i}"} for i in range(5)]
+        reply = recommender.parse_discussion(json.dumps({"reply": "x", "studies": many}))
+        assert len(reply.studies) == 3
+        assert not recommender.parse_discussion("not json").ok
+        assert not recommender.parse_discussion(json.dumps({"reply": "", "studies": []})).ok
+        failing = FakeProvider(raises=RuntimeError("timeout"))
+        assert "could not be reached" in recommender.discuss("q", [], [], None, [], {}, provider=failing).error
+
+    def test_the_decision_note(self):
+        provider = FakeProvider(json.dumps({
+            "decision": "Run N-1 before deciding.",
+            "evidence": ["RSA at 2000-01-03 02:15: Bus_3 at 0.9366 p.u. (turn 1)."],
+            "open_risks": ["One moment only."], "studies_run": ["run_rsa (turn 1)"]}))
+        note = recommender.decision_note(self.THREAD, [], RSA_VIOLATED, [RSA_VIOLATED], {}, provider=provider)
+        (call,) = provider.calls
+        assert "record what a side discussion" in call["system"]
+        assert note.ok and note.decision == "Run N-1 before deciding." and note.unverified == ()
+        assert note.as_record()["studies_run"] == ["run_rsa (turn 1)"]
+        empty = recommender.parse_note(json.dumps({"evidence": []}))
+        assert empty.decision == "No decision recorded"
+
+    def test_before_the_first_question_it_plans(self):
+        provider = FakeProvider(json.dumps({"reply": "First decide the moment and the limits.",
+                                            "studies": [{"title": "Worst hour", "prompt": "Find the worst hour."}]}))
+        reply = recommender.discuss("How should we assess a 30 MW data centre?", [], [], None, [],
+                                    {"network": "n"}, provider=provider)
+        (call,) = provider.calls
+        assert "Before any question has been asked" in call["system"]
+        assert "## Before the first question" in call["messages"][0]["content"]
+        assert reply.ok and reply.studies[0].title == "Worst hour"
+        later = FakeProvider(self._reply())
+        recommender.discuss("q", [], [{"role": "user", "text": "hi"}], RSA_VIOLATED, [RSA_VIOLATED], {},
+                            provider=later)
+        assert "## Before the first question" not in later.calls[0]["messages"][0]["content"]
+
+    def test_both_modes_share_the_rules(self):
+        suggest, discuss = recommender.build_system_prompt([]), recommender.build_discussion_prompt([])
+        shared = recommender._SHARED_RULES.strip()
+        assert shared in suggest and shared in discuss
+        assert "propose 3 or 4 next steps" in suggest and "propose 3 or 4 next steps" not in discuss
+
+
+def test_both_modes_know_the_comparison_over_time_needs_no_timestamp():
+    """Live sessions: a study was proposed as an RSA "from 14:45 through
+    00:00", and another was withheld for want of a timestamp."""
+    for prompt in (recommender.build_system_prompt([]), recommender.build_discussion_prompt([])):
+        assert 'study "scan"' in prompt and "needs no timestamp" in prompt

@@ -107,15 +107,11 @@ def _active_model_label() -> str:
 
 
 _BRAND_NAME = "CONDUCTOR"
-_BRAND_TAGLINE = "An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations"
+_BRAND_TAGLINE = "Ask, test and decide: a solver-grounded AI assistant for distribution grids"
 _BRAND_CAPTION = (
-    "Natural-language access to deterministic and uncertainty-aware grid studies, "
-    "including probabilistic security assessment, robust corrective dispatch, "
-    "flexibility envelopes, and hosting-capacity analysis."
-)
-_SIDEBAR_BRIEF = (
-    "Deterministic RSA, probabilistic risk, robust dispatch, flexibility envelopes, "
-    "and hosting-capacity studies."
+    "Grid studies in plain language — security, N-1, probabilistic risk, flexibility and "
+    "hosting capacity — changes to the grid tested as proposals, and every figure traced "
+    "to the solver that produced it."
 )
 
 
@@ -282,6 +278,7 @@ st.markdown(
     [data-testid="stExpander"] summary { font-weight: 600; }
     /* The question box as a raised card. */
     [data-testid="stForm"] {
+        padding: 0.5rem 0.7rem;
         background: var(--cd-surface);
         border: 1px solid var(--cd-border);
         border-radius: 14px;
@@ -304,22 +301,13 @@ st.markdown(
     [data-testid="stCaptionContainer"] { color: var(--cd-muted); }
     /* Once a conversation has started, the hero shrinks to a single line so
        the answers, not the branding, fill the screen. */
-    .conductor-hero-compact .conductor-brand img { width: 44px !important; }
-    .conductor-hero-compact .conductor-brand-title { font-size: 1.35rem; }
+    .conductor-hero-compact .conductor-brand img { width: 58px !important; }
+    .conductor-hero-compact .conductor-brand-title { font-size: 1.75rem; }
     .conductor-hero-compact .conductor-brand-tagline,
     .conductor-hero-compact .conductor-brand-support { display: none; }
     .conductor-hero-compact { padding: 0; margin-bottom: 0; }
-    /* AI Agent Suggestion: a different accent from tool output, because this
-       is model reasoning, not a solver result. */
-    .conductor-ai-comment {
-        background: rgba(107, 79, 216, 0.06);
-        border-left: 3px solid #8E5CD9;
-        border-radius: 6px;
-        padding: 0.55rem 0.85rem;
-        margin: 0.1rem 0 0.7rem 0;
-        color: var(--cd-ink);
-        line-height: 1.55;
-    }
+    /* The AI agent's label: a different accent from tool output, because its
+       text is model reasoning, not a solver result. */
     .conductor-ai-comment-label {
         font-size: 0.72rem;
         font-weight: 700;
@@ -328,8 +316,129 @@ st.markdown(
         color: #5b3fc4;
         margin-bottom: 0.2rem;
     }
+    /* The AI agent panel stays in view beside a long conversation. Both
+       columns stretch to the row's height, so the panel can stick inside its
+       own; without support it simply sits at the top of its column. */
+    .st-key-chat_layout [data-testid="stHorizontalBlock"] { align-items: stretch !important; }
+    [data-testid="stColumn"]:has(.st-key-ai_panel) > [data-testid="stVerticalBlock"],
+    [data-testid="stColumn"]:has(.st-key-ai_panel_closed) > [data-testid="stVerticalBlock"] { height: 100%; }
+    [data-testid="stLayoutWrapper"]:has(> .st-key-ai_panel), .st-key-ai_panel,
+    [data-testid="stLayoutWrapper"]:has(> .st-key-ai_panel_closed), .st-key-ai_panel_closed {
+        position: sticky; top: 4rem;
+    }
+    .st-key-ai_panel { max-height: calc(100vh - 7rem); overflow-y: auto; padding-right: 0.25rem; }
+    /* The collapsed panel's launcher: a round button in the AI agent's purple. */
+    .st-key-ai_panel_closed { align-items: center; }
+    .st-key-agent_open button, .st-key-agent_open_flag button {
+        position: relative;
+        width: 2.9rem; height: 2.9rem; min-height: 2.9rem;
+        padding: 0; border-radius: 50%;
+        border: 1.5px solid #8E5CD9;
+        background: rgba(107, 79, 216, 0.10);
+        box-shadow: 0 2px 8px rgba(91, 63, 196, 0.18);
+        transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .st-key-agent_open button p, .st-key-agent_open_flag button p { font-size: 1.35rem; line-height: 1; }
+    .st-key-agent_open button:hover, .st-key-agent_open_flag button:hover {
+        transform: scale(1.06); box-shadow: 0 4px 14px rgba(91, 63, 196, 0.30);
+    }
+    .st-key-agent_open_flag button { background: #6B4FD8; border-color: #5b3fc4; }
+    /* The panel's hide button, in the same style: smaller, outlined. */
+    .st-key-agent_hide button {
+        width: 2.2rem; height: 2.2rem; min-height: 2.2rem;
+        padding: 0; border-radius: 50%;
+        border: 1.5px solid #8E5CD9;
+        background: rgba(107, 79, 216, 0.08);
+        color: #5b3fc4;
+        box-shadow: 0 1px 5px rgba(91, 63, 196, 0.15);
+        transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .st-key-agent_hide button:hover {
+        transform: scale(1.06); color: #4a2fb0;
+        background: rgba(107, 79, 216, 0.16); box-shadow: 0 3px 10px rgba(91, 63, 196, 0.28);
+    }
+    .st-key-agent_open_flag button::after {
+        content: ""; position: absolute; top: 1px; right: 1px;
+        width: 0.7rem; height: 0.7rem; border-radius: 50%;
+        background: #E8A317; border: 2px solid #ffffff;
+    }
+    [class*="st-key-aibox_"] {
+        background: rgba(107, 79, 216, 0.06);
+        border-left: 3px solid #8E5CD9;
+        border-radius: 8px;
+        padding: 0.75rem 1rem 0.8rem 1rem;
+        margin: 0.25rem 0 0.85rem 0;
+        gap: 0.5rem;
+    }
+    /* The label keeps its own line: Streamlit tightens the space between the
+       two markdown elements, and the label sat on the first line of text. */
+    [class*="st-key-aibox_"] .conductor-ai-comment-label {
+        display: block; margin: 0; padding-bottom: 0.35rem; line-height: 1.2;
+    }
+    [class*="st-key-aibox_"] [data-testid="stMarkdownContainer"] p { line-height: 1.55; margin: 0 0 0.55rem 0; }
+    [class*="st-key-aibox_"] [data-testid="stMarkdownContainer"] > *:last-child,
+    [class*="st-key-aibox_"] [data-testid="stMarkdownContainer"] p:last-child { margin-bottom: 0; }
+    [class*="st-key-aibox_"] [data-testid="stMarkdownContainer"] ul,
+    [class*="st-key-aibox_"] [data-testid="stMarkdownContainer"] ol { margin: 0.1rem 0 0.55rem 0; padding-left: 1.2rem; }
+    /* The waiting line in the chat box's place: centred, with a spinner. */
+    .st-key-chat_busy { min-height: 2.9rem; justify-content: center; }
+    .st-key-chat_busy [data-testid="stMarkdownContainer"] p { margin: 0; }
+    .conductor-busy {
+        display: flex; align-items: center; gap: 0.75rem;
+        min-height: 2.9rem; padding: 0 0.35rem;
+        color: #5b6170; font-size: 0.98rem; line-height: 1.3;
+    }
+    .conductor-spin {
+        flex: none; width: 1.05rem; height: 1.05rem; border-radius: 50%;
+        border: 2.5px solid rgba(29, 111, 232, 0.18); border-top-color: #1D6FE8;
+        animation: conductor-spin 0.9s linear infinite;
+    }
+    .conductor-busy-agent .conductor-spin { border-color: rgba(107, 79, 216, 0.18); border-top-color: #6B4FD8; }
+    .conductor-busy-agent { color: #5b3fc4; }
+    @keyframes conductor-spin { to { transform: rotate(360deg); } }
+    /* Discussion as a chat: the operator's messages as right-aligned bubbles. */
+    .conductor-you-row { display: flex; justify-content: flex-end; margin: 0.25rem 0 0.5rem 0; }
+    .conductor-you {
+        max-width: 85%;
+        background: #EEF3FC; border: 1px solid #DCE6F7; border-radius: 14px 14px 4px 14px;
+        padding: 0.5rem 0.85rem; line-height: 1.45; color: var(--cd-ink);
+    }
+    .conductor-sent { color: var(--cd-muted); font-size: 0.85rem; margin: 0.1rem 0 0.4rem 0; }
+    .conductor-study-title { font-weight: 600; }
+    /* The question box stays at the bottom of the panel while the thread scrolls. */
+    .st-key-adv_input {
+        position: sticky; bottom: 0; z-index: 2;
+        background: #f1f2fa;     /* the page under the advisor panel's tint */
+        padding: 0.5rem 0 0.25rem 0; gap: 0.1rem;
+        box-shadow: 0 -8px 12px -10px rgba(30, 40, 60, 0.18);
+    }
+    /* Who each box belongs to: CONDUCTOR (blue) runs studies; the advisor
+       (violet, tinted panel) discusses and suggests. */
+    .conductor-who {
+        display: inline-block; white-space: nowrap;
+        background: var(--cd-brand-soft); color: var(--cd-brand);
+        border: 1px solid rgba(29, 111, 232, 0.25); border-radius: 0.7rem;
+        padding: 0.2rem 0.6rem; font-size: 0.8rem; font-weight: 700;
+    }
+    .st-key-ai_panel {
+        background: rgba(107, 79, 216, 0.035);
+        border: 1px solid rgba(107, 79, 216, 0.16); border-radius: 14px;
+        padding: 0.6rem 0.75rem 0.4rem 0.75rem;
+    }
+    /* An advisor card: title, why, and a small hand-off to CONDUCTOR — tight. */
+    [class*="st-key-card_"] { gap: 0.1rem; }
+    /* Its title row never wraps: the title shrinks (and wraps its text). */
+    [class*="st-key-row_"] { flex-wrap: nowrap !important; }
+    [class*="st-key-row_"] > div:first-child { flex: 1 1 0 !important; min-width: 0 !important; }
+    [class*="st-key-card_"] [data-testid="stCaptionContainer"] p { margin-bottom: 0; }
+    [class*="st-key-card_"] [data-testid="stButton"] button {
+        min-height: 1.6rem; padding: 0.05rem 0.65rem; border-radius: 0.8rem;
+        color: var(--cd-brand); border-color: rgba(29, 111, 232, 0.35); background: var(--cd-surface);
+    }
+    [class*="st-key-card_"] [data-testid="stButton"] button p { font-size: 0.78rem; white-space: nowrap; }
+    [class*="st-key-card_"] [data-testid="stButton"] button:hover { background: var(--cd-brand-soft); }
     .conductor-ai-badge {
-        display: inline-block;
+        display: inline-block; white-space: nowrap;
         background: rgba(107, 79, 216, 0.10);
         color: #5b3fc4;
         border-radius: 0.6rem;
@@ -387,8 +496,9 @@ def _render_main_hero(compact: bool = False) -> None:
                 </div>
             </div>
             <p class="conductor-brand-support">
-                Ask about deterministic security, N-1 contingencies, probabilistic risk, robust dispatch,
-                flexibility envelopes, hosting capacity, KPIs, and more. Charts appear automatically after each response.
+                Ask about security, contingencies, risk, flexibility or hosting capacity — or try a change to
+                the grid and compare it with today. CONDUCTOR runs the studies, and every figure comes from a solver
+                and is traced; the advisor beside the conversation helps you think results through.
             </p>
         </div>
         """,
@@ -440,7 +550,7 @@ def _render_main_hero(compact: bool = False) -> None:
                     white-space: nowrap;
                 }
                 #${brandId} img {
-                    width: 30px;
+                    width: 38px;
                     height: auto;
                     display: block;
                     filter: saturate(1.05);
@@ -449,7 +559,7 @@ def _render_main_hero(compact: bool = False) -> None:
                     display: block;
                     overflow: hidden;
                     text-overflow: ellipsis;
-                    font-size: 1rem;
+                    font-size: 1.2rem;
                     line-height: 1;
                     font-weight: 800;
                     letter-spacing: 0.025em;
@@ -463,7 +573,7 @@ def _render_main_hero(compact: bool = False) -> None:
                 }
                 .cb-sep {
                     width: 1px;
-                    height: 1.1rem;
+                    height: 1.3rem;
                     background: rgba(46,49,64,0.18);
                     margin: 0 0.2rem;
                     flex-shrink: 0;
@@ -472,7 +582,7 @@ def _render_main_hero(compact: bool = False) -> None:
                     background: none;
                     border: none;
                     cursor: pointer;
-                    font-size: 0.8rem;
+                    font-size: 0.92rem;
                     font-weight: 600;
                     color: #4a5270;
                     padding: 0.22rem 0.52rem;
@@ -2409,6 +2519,8 @@ def _reset_conversation_state() -> None:
     st.session_state._box_n = st.session_state.get("_box_n", 0) + 1
     st.session_state.pop("_box_pending", None)
     st.session_state.pop("_suggestion_used", None)
+    st.session_state.pop("discussions", None)
+    st.session_state.pop("_advisor_request", None)
     st.session_state.pop("system_ts", None)
     st.session_state.ui_conversation_id = uuid.uuid4().hex[:12]
     _tools_module._last_tool_results.clear()
@@ -3018,15 +3130,15 @@ with st.sidebar:
     # AI Agent Suggestion. On demand by default: suggestions nobody asked for
     # are more to read, which is the opposite of what they are for.
     _suggest_now = "Auto" if st.session_state.get("auto_suggest") else "On click"
-    with st.expander(f"AI Agent Suggestion · {_suggest_now}", icon=":material/auto_awesome:",
+    with st.expander(f"Advisor suggestions · {_suggest_now}", icon=":material/auto_awesome:",
                      key="sb_suggest"):
         st.toggle(
             "Suggest after every answer",
             key="auto_suggest",
             value=False,
             help=(
-                "Off: a ✨ AI Agent Suggestion button appears under the latest "
-                "answer, and nothing runs until you click it. On: suggestions "
+                "Off: the advisor suggests next steps only when you click ✨ Suggest "
+                "next steps in its panel. On: suggestions "
                 "are generated automatically after every answer, at the cost of "
                 "one extra model call each time."
             ),
@@ -3079,7 +3191,7 @@ with st.sidebar:
 
     # ── Example queries ──────────────────────────────────────────────────
     with st.expander("Example queries", expanded=True, icon=":material/lightbulb:"):
-        st.caption("Click to drop into the chat box — edit if you like, then send.")
+        st.caption("Click to drop into CONDUCTOR's chat box — edit if you like, then press Run.")
         examples = st.container(key="examples_list")
         for q_i, (query, q_icon) in enumerate(EXAMPLE_QUERIES):
             if examples.button(query, icon=q_icon, type="tertiary", width="stretch",
@@ -3442,10 +3554,8 @@ def _render_trace(trace, key: str) -> None:
 # operator's behalf: choosing one places its prompt in the chat box.
 # ---------------------------------------------------------------------------
 
-_AI_SUGGESTION_CAPTION = (
-    "Reasoning by an AI model — not a solver result. Choose one to place it in "
-    "the chat box, edit it if you like, then send."
-)
+_AI_SUGGESTION_CAPTION = ("Run in CONDUCTOR puts a suggestion in CONDUCTOR's chat box — edit it if "
+                          "you like, then press Run.")
 
 
 def _suggestion_context() -> dict:
@@ -3490,7 +3600,7 @@ def _run_ai_suggestion(idx: int, trigger: str) -> None:
     records = [m["record"] for m in upto if m.get("record")]
 
     started = time.perf_counter()
-    with st.spinner("The AI agent is considering how to continue…"):
+    with st.spinner("The advisor is considering how to continue…"):
         try:
             result = _recommender.suggest(
                 visible, msg.get("record"), records, _suggestion_context(),
@@ -3569,102 +3679,487 @@ def _log_suggestion_outcome(sent: str) -> None:
     _loop_module.log_event(record)
 
 
-def _render_suggestion_round(rnd: dict, idx: int, r_i: int, expanded: bool = True) -> None:
+def _ai_box(label: str, text: str, key: str) -> None:
+    """The AI agent's prose in its purple box, rendered as Markdown (bold,
+    lists, code). Drawn as a keyed container styled by CSS rather than an
+    HTML block: Markdown inside raw HTML is not rendered, and escaping it
+    showed the asterisks. Raw HTML from the model stays escaped."""
+    with st.container(key=f"aibox_{key}"):
+        st.markdown(f"<div class='conductor-ai-comment-label'>{html.escape(label)}</div>",
+                    unsafe_allow_html=True)
+        st.markdown((text or "").replace("$", "\\$"))
+
+
+def _render_suggestion_round(rnd: dict, idx: int, r_i: int, expanded: bool = True,
+                             framed: bool = True) -> None:
     # Collapsible, so suggestions the operator has read or does not want can
-    # be folded away; open under the latest answer, folded under older ones.
-    with st.expander(":violet[**✨ AI Agent Suggestion**]", expanded=expanded):
+    # be folded away. Unframed inside "Earlier in this conversation", where an
+    # expander of its own could not be nested.
+    frame = (st.expander(":violet[**✨ Suggestions**]", expanded=expanded) if framed
+             else st.container())
+    with frame:
         st.caption(_AI_SUGGESTION_CAPTION)
         if rnd.get("error"):
-            st.caption("The AI agent could not produce suggestions this time. "
+            st.caption("The advisor could not produce suggestions this time. "
                        "Try again in a moment.")
             return
         if rnd.get("comment"):
             # Its reading of what happened, above the ways to continue.
-            text = html.escape(rnd["comment"]).replace("$", "&#36;")
-            st.markdown(
-                "<div class='conductor-ai-comment'>"
-                "<div class='conductor-ai-comment-label'>AI Agent Comment</div>"
-                f"{text}</div>",
-                unsafe_allow_html=True,
-            )
+            _ai_box("Advisor · comment", rnd["comment"], key=f"c_{idx}_{r_i}")
             if rnd.get("comment_unverified"):
                 st.caption("⚠️ Not found in this conversation's results: "
                            + ", ".join(rnd["comment_unverified"]))
         if not rnd.get("suggestions"):
-            st.caption(rnd.get("note") or "The AI agent had nothing new to suggest.")
+            st.caption(rnd.get("note") or "The advisor had nothing new to suggest.")
             return
         for s_i, sug in enumerate(rnd["suggestions"]):
-            c_text, c_btn = st.columns([6, 2])
-            with c_text:
-                label = _recommender.ANGLE_LABELS.get(sug["angle"], sug["angle"])
-                st.markdown(
-                    f"<span class='conductor-ai-badge'>{html.escape(label)}</span>"
-                    f"<strong>{html.escape(sug['title'])}</strong>",
-                    unsafe_allow_html=True,
-                )
-                if sug.get("why"):
-                    # `$` would otherwise be read as LaTeX.
-                    st.caption(sug["why"].replace("$", "\\$"))
-                if sug.get("unverified"):
-                    st.caption("⚠️ Not found in this conversation's results: "
-                               + ", ".join(sug["unverified"]))
-            # The full prompt sits behind an ⓘ next to "Use" — a popover, not
-            # an expander, because expanders cannot be nested.
-            with c_btn, st.container(horizontal=True, horizontal_alignment="right",
-                                     vertical_alignment="center"):
-                with st.popover("", icon=":material/info:", type="tertiary",
-                                help="Show the full prompt"):
-                    st.caption(sug["prompt"].replace("$", "\\$"))
-                if st.button("Use", key=f"ais_use_{idx}_{r_i}_{s_i}",
-                             help="Place this prompt in the chat box"):
-                    # Same path as the example queries: into the box, not sent.
-                    st.session_state._box_pending = sug["prompt"]
-                    st.session_state._suggestion_used = {
-                        "round_id": rnd["id"], "index": s_i, "prompt": sug["prompt"],
-                    }
+            with st.container(key=f"card_s_{idx}_{r_i}_{s_i}", gap="small"):
+                _suggestion_card(rnd, sug, idx, r_i, s_i)
 
 
-def _render_ai_suggestion(msg: dict, idx: int) -> str | None:
-    """The suggestion button and panels under an assistant message.
+def _suggestion_card(rnd: dict, sug: dict, idx: int, r_i: int, s_i: int) -> None:
+    def _use(prompt=sug["prompt"], index=s_i) -> None:
+        # Same path as the example queries: into the box, not sent.
+        st.session_state._box_pending = prompt
+        st.session_state._suggestion_used = {
+            "round_id": rnd["id"], "index": index, "prompt": prompt,
+        }
 
-    The button appears only under the latest answer; earlier rounds stay
-    visible under the answer they followed. Returns how a new round was
-    requested ("button", "auto", "more"), or None — the caller runs it, outside
-    the error guard that protects the conversation view.
-    """
-    rounds = msg.get("suggestion_rounds") or []
-    is_last = idx == len(st.session_state.messages) - 1
-    trigger = None
+    # Title row sized by its content, like a study card; why below it.
+    with st.container(horizontal=True, vertical_alignment="center", gap="small",
+                      key=f"row_s_{idx}_{r_i}_{s_i}"):
+        label = _recommender.ANGLE_LABELS.get(sug["angle"], sug["angle"])
+        st.markdown(
+            f"<span class='conductor-ai-badge'>{html.escape(label)}</span>"
+            f"<strong>{html.escape(sug['title'])}</strong>",
+            unsafe_allow_html=True, width="stretch",
+        )
+        # The full request on hover: the row stays one line.
+        st.button(_RUN_IN_CONDUCTOR, key=f"ais_use_{idx}_{r_i}_{s_i}", disabled=_ui_busy(),
+                  help=_handoff_help(sug["prompt"]), on_click=_use, width="content")
+    if sug.get("why"):
+        # `$` would otherwise be read as LaTeX.
+        st.caption(sug["why"].replace("$", "\\$"))
+    if sug.get("unverified"):
+        st.caption("⚠️ Not found in this conversation's results: " + ", ".join(sug["unverified"]))
 
-    if is_last and not rounds:
-        if st.session_state.get("auto_suggest") and not msg.get("auto_suggested"):
-            msg["auto_suggested"] = True
-            trigger = "auto"
+
+# ---------------------------------------------------------------------------
+# Discussion with the AI agent — a side thread under an answer
+#
+# The same AI agent as the suggestions, in its discussion mode: the operator
+# thinks a result through with it. It runs nothing. Studies it proposes go
+# to the chat box through "Use", exactly like suggestions, and the operator
+# sends them; their answers then reach the thread as evidence. Closing the
+# thread records a decision note in the session log.
+# ---------------------------------------------------------------------------
+_DISCUSS_CAPTION = (
+    "Think a result through with the advisor — e.g. *is this result reliable?*, *what should I "
+    "check before deciding?* Studies it proposes go to CONDUCTOR with Run in CONDUCTOR, and you "
+    "decide whether to send them."
+)
+# Open questions, not fixed ones: the box takes anything, and its placeholder
+# shows the kind of thing worth asking when the discussion is empty.
+_DISCUSS_PLACEHOLDER = ("Ask anything about this result — e.g. why might it be wrong, what to "
+                        "check before deciding, what the concerns mean…")
+# Before the first question there is no result yet: the discussion helps plan.
+_PLAN_CAPTION = (
+    "Talk a question through before asking CONDUCTOR — what to study, at which moment, against "
+    "which limits. Studies the advisor proposes go to CONDUCTOR with Run in CONDUCTOR."
+)
+_PLAN_PLACEHOLDER = ("e.g. we are asked to connect a 30 MW data centre — how should we assess "
+                     "it?")
+
+
+def _discussions() -> list[dict]:
+    """This conversation's discussions with the AI agent, oldest first:
+    `{"thread", "note", "started_at", "closed_at"}` (message indices)."""
+    return st.session_state.setdefault("discussions", [])
+
+
+def _active_discussion() -> dict | None:
+    """The open discussion. There is at most one, and it follows the
+    conversation: it is drawn under the latest answer, so a study sent from
+    it is answered just above where the discussion continues."""
+    found = _discussions()
+    return found[-1] if found and found[-1].get("note") is None else None
+
+
+def _answered_turn(prompt: str, after: int) -> int | None:
+    """The turn (1-based, counting questions) that answered a study sent from
+    a discussion — the first question after `after` that matches it."""
+    turn = 0
+    for i, m in enumerate(st.session_state.messages):
+        if m.get("role") != "user":
+            continue
+        turn += 1
+        if i > after and difflib.SequenceMatcher(
+                None, (m.get("text") or "").strip(), prompt.strip()).ratio() > 0.9:
+            answered = i + 1 < len(st.session_state.messages) and \
+                st.session_state.messages[i + 1].get("role") == "assistant"
+            return turn if answered else None
+    return None
+
+
+_RUN_IN_CONDUCTOR = "Run in CONDUCTOR →"
+
+
+def _handoff_help(prompt: str, why: str | None = None) -> str:
+    """The hand-off's tooltip: why (for a study), the exact request, and what
+    the click does."""
+    parts = [f"**Why:** {why}"] if why else []
+    parts += [f"**Request:** {prompt}", "Puts it in CONDUCTOR's chat box — you send it with **Run**."]
+    return "\n\n".join(parts).replace("$", "\\$")
+
+
+def _render_study_card(study: dict, key: str, disc: dict | None) -> None:
+    """A study the advisor proposed; "Run in CONDUCTOR" only while its
+    discussion is open — only CONDUCTOR runs studies."""
+    with st.container(key=f"card_{key}", gap="small"):
+        _study_card_body(study, key, disc)
+
+
+def _study_card_body(study: dict, key: str, disc: dict | None) -> None:
+    # One row sized by its content: the title takes what is left (and wraps),
+    # the ⓘ and the hand-off only their own width.
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"row_{key}"):
+        st.markdown("<span class='conductor-ai-badge'>Study</span>"
+                    f"<span class='conductor-study-title'>{html.escape(study['title'])}</span>",
+                    unsafe_allow_html=True, width="stretch")
+        if disc is None:
+            # A closed discussion: the request stays readable, nothing to send.
+            with st.popover("", icon=":material/info:", type="tertiary", help="Why, and the full request"):
+                if study.get("why"):
+                    st.markdown(f"**Why:** {study['why']}".replace("$", "\\$"))
+                st.caption(study["prompt"].replace("$", "\\$"))
         else:
-            attention = msg.get("attention") or []
-            if attention:
-                # Decided in code from the result's own verdict fields — costs
-                # nothing until clicked.
-                # A proposal's gap keeps its name: "judged at a single moment"
-                # alone would not say which grid was judged.
-                first = (attention[0] if attention[0].startswith(("proposal ", "answer check:"))
-                         else attention[0].split(": ", 1)[-1])
-                st.caption(f"⚠️ This result has issues ({first}) — an AI Agent "
-                           "Suggestion can help decide what to check next.")
-            if st.button("✨ AI Agent Suggestion", key=f"ais_{idx}",
-                         type="primary" if attention else "secondary",
-                         help="Ask a second AI agent how to continue from here. "
-                              "It reasons over the conversation; it runs no analysis."):
-                trigger = "button"
+            def _use() -> None:
+                # A callback: it runs before the redraw, so the "sent" line
+                # shows at once (set while drawing, it appeared a click later).
+                st.session_state._box_pending = study["prompt"]
+                disc["thread"].append({"role": "sent", "text": study["title"], "prompt": study["prompt"]})
+                _loop_module.log_event({
+                    "kind": "advisor_study_sent",
+                    "conversation": st.session_state.ui_conversation_id,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "study": study,
+                })
 
+            # Why it is proposed and the exact request on hover: the row stays one line.
+            st.button(_RUN_IN_CONDUCTOR, key=key, disabled=_ui_busy(),
+                      help=_handoff_help(study["prompt"], study.get("why")), on_click=_use,
+                      width="content")
+    if study.get("unverified"):
+        st.caption("⚠️ Not found in this conversation's results: " + ", ".join(study["unverified"]))
+
+
+def _render_decision_note(note: dict) -> None:
+    with st.container(border=True):
+        st.markdown(":violet[**📝 Decision note**]")
+        st.markdown(f"**Decision:** {note['decision']}".replace("$", "\\$"))
+        for label, key in (("Evidence", "evidence"), ("Open risks", "open_risks"),
+                           ("Studies run", "studies_run")):
+            if note.get(key):
+                st.markdown(f"**{label}:**\n" + "\n".join(f"- {x}" for x in note[key]).replace("$", "\\$"))
+        if note.get("unverified"):
+            st.caption("⚠️ Not found in this conversation's results: " + ", ".join(note["unverified"]))
+        st.caption("Written by the advisor from the discussion; recorded in the session log.")
+
+
+def _render_operator_bubble(text: str, key: str) -> None:
+    """The operator's message: a small right-aligned bubble — one element, so
+    Streamlit's spacing between elements cannot push the text out of it."""
+    body = html.escape(text).replace("\n", "<br>")
+    st.markdown(f"<div class='conductor-you-row'><div class='conductor-you'>{body}</div></div>",
+                unsafe_allow_html=True)
+
+
+def _render_thread_item(disc: dict, k: int, t_i: int, item: dict, interactive: bool) -> None:
+    role = item.get("role")
+    if role == "operator":
+        _render_operator_bubble(item["text"], key=f"{k}_{t_i}")
+    elif role == "advisor":
+        if item.get("error"):
+            st.caption(f"The advisor could not reply: {item['error']}")
+            return
+        _ai_box("Advisor", item.get("text") or "", key=f"t_{k}_{t_i}")
+        if item.get("unverified"):
+            st.caption("⚠️ Not found in this conversation's results: " + ", ".join(item["unverified"]))
+        for s_i, study in enumerate(item.get("studies") or []):
+            _render_study_card(study, key=f"adv_use_{k}_{t_i}_{s_i}", disc=disc if interactive else None)
+    elif role == "sent":
+        turn = _answered_turn(item.get("prompt", ""), disc.get("started_at", -1))
+        state = f"answered in turn {turn}" if turn else "not sent yet"
+        st.markdown(f"<div class='conductor-sent'>↪ Sent: {html.escape(item['text'])} · {state}</div>",
+                    unsafe_allow_html=True)
+
+
+def _render_thread(disc: dict, k: int, interactive: bool) -> None:
+    """The discussion as a chat. In the open discussion only the latest
+    exchange — the operator's last message and what followed — is shown in
+    full; earlier ones fold away, so a long discussion stays readable."""
+    thread = disc.get("thread") or []
+    last_ask = max((i for i, it in enumerate(thread) if it.get("role") == "operator"), default=0)
+    if interactive and last_ask > 0:
+        n_q = sum(1 for it in thread[:last_ask] if it.get("role") == "operator")
+        with st.expander(f"{n_q} earlier question{'s' if n_q != 1 else ''} and the replies", expanded=False):
+            for t_i in range(last_ask):
+                _render_thread_item(disc, k, t_i, thread[t_i], interactive)
+        start = last_ask
+    else:
+        start = 0
+    for t_i in range(start, len(thread)):
+        _render_thread_item(disc, k, t_i, thread[t_i], interactive)
+
+
+def _render_discussion_input(disc: dict | None, k: int, idx: int) -> None:
+    """The question box and the close button — or, while the AI agent is
+    answering, the operator's message and the thinking indicator in their place."""
+    thread = (disc or {}).get("thread") or []
+    pending = st.session_state.get("_advisor_request")
+    if pending:
+        kind, text, _ = pending
+        if kind == "ask":
+            _render_operator_bubble(text, key=f"{k}_pending")
+        _AGENT_SLOT["slot"] = st.empty()      # the reply's place, while it is written
+        return
+    if _agent_busy():
+        return
+
+    def _ask() -> None:
+        question = (st.session_state.get(f"adv_q_{k}") or "").strip()
+        if question:
+            st.session_state._advisor_request = ("ask", question, idx)
+
+    with st.container(key="adv_input"):
+        with st.form(key=f"adv_form_{k}", clear_on_submit=True, border=False):
+            with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+                st.text_input("Discuss with the advisor", key=f"adv_q_{k}",
+                              placeholder=(_PLAN_PLACEHOLDER if idx < 0 else _DISCUSS_PLACEHOLDER)
+                              if not thread else "Ask a follow-up…", label_visibility="collapsed",
+                              width="stretch")
+                st.form_submit_button("Discuss", width="content", on_click=_ask)
+        # A decision needs evidence: not before the first answer.
+        if idx >= 0 and any(i.get("role") == "advisor" and not i.get("error") for i in thread):
+            st.button("📝 Close and record a decision", key=f"adv_close_{k}", type="tertiary",
+                      on_click=lambda: st.session_state.update(_advisor_request=("note", "", idx)))
+
+
+def _run_advisor(kind: str, text: str, idx: int) -> None:
+    """One call of the AI agent's discussion mode, on the open discussion
+    (started here when there is none)."""
+    disc = _active_discussion()
+    if disc is None:
+        disc = {"thread": [], "note": None, "started_at": idx, "closed_at": None}
+        _discussions().append(disc)
+    thread = disc["thread"]
+    for item in thread:
+        if item.get("role") == "sent":
+            item["answered_turn"] = _answered_turn(item.get("prompt", ""), disc["started_at"])
+    visible = [{"role": m["role"], "text": m.get("text", "")} for m in st.session_state.messages]
+    records = [m["record"] for m in st.session_state.messages if m.get("record")]
+    # The newest results are what the discussion is about now — including the
+    # answers to studies sent from the thread.
+    latest = records[-1] if records else None
+    started = time.perf_counter()
+    with st.spinner("The advisor is thinking…"):
+        try:
+            if kind == "note":
+                result = _recommender.decision_note(thread, visible, latest, records, _suggestion_context())
+            else:
+                result = _recommender.discuss(text, thread, visible, latest, records, _suggestion_context())
+        except Exception as exc:  # noqa: BLE001 — never takes the page down
+            logging.getLogger(__name__).warning("AI agent discussion failed.", exc_info=True)
+            result = (_recommender.DecisionNote("", error=str(exc)) if kind == "note"
+                      else _recommender.AdvisorReply("", error=str(exc)))
+    try:
+        provider_info = describe_provider(get_provider())
+    except Exception:  # noqa: BLE001
+        provider_info = {}
+    anchor = (st.session_state.messages[idx].get("record") or {}) if idx >= 0 else {}
+    base = {"conversation": st.session_state.ui_conversation_id,
+            "after_turn_key": anchor.get("turn_key"),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "duration_s": round(time.perf_counter() - started, 3), **provider_info}
+    if kind == "note":
+        if result.ok:
+            disc["note"] = result.as_record()
+            disc["closed_at"] = idx
+        else:
+            thread.append({"role": "advisor", "text": "", "error": result.error})
+        _loop_module.log_event({"kind": "decision_note", **base,
+                                **(result.as_record() if result.ok else {"error": result.error})})
+        return
+    thread.append({"role": "operator", "text": text})
+    thread.append({"role": "advisor", "text": result.text, "error": result.error,
+                   "studies": [s.as_record() for s in result.studies],
+                   "unverified": list(result.unverified)})
+    _loop_module.log_event({"kind": "advisor_message", **base, "question": text,
+                            "reply": result.text, "studies": [s.as_record() for s in result.studies],
+                            "unverified": list(result.unverified), "error": result.error})
+
+
+def _attention_hint(attention: list[str]) -> str:
+    # A proposal's gap and an answer check keep their subject; other reasons
+    # drop the tool prefix.
+    first = attention[0]
+    return first if first.startswith(("proposal ", "answer check:")) else first.split(": ", 1)[-1]
+
+
+def _turn_of(idx: int) -> int:
+    """The turn number (questions asked) a message index belongs to."""
+    return sum(1 for m in st.session_state.messages[: idx + 1] if m.get("role") == "user")
+
+
+def _turn_label(idx: int, width: int = 70) -> str:
+    """'turn 2: "What if we connect a 45 MW data centre…"' — the number alone
+    did not say which answer was meant."""
+    question = next((m.get("text") or "" for m in reversed(st.session_state.messages[: idx + 1])
+                     if m.get("role") == "user"), "")
+    question = " ".join(question.split())
+    if len(question) > width:
+        question = question[: width - 1].rstrip() + "…"
+    return f"turn {_turn_of(idx)}" + (f": “{question}”" if question else "")
+
+
+def _render_answer_footer(msg: dict, idx: int) -> None:
+    """Under an answer in the conversation: one line when the AI agent has
+    something to flag about the latest answer, and the decision notes
+    recorded here. Everything else of the AI agent lives in its panel."""
+    is_last = idx == len(st.session_state.messages) - 1
+    panel_open = st.session_state.get("agent_panel_open")
+    if is_last and msg.get("attention"):
+        where = "the advisor (right) can help" if panel_open else "open the advisor (✨ on the right) to"
+        st.caption(f"⚠️ {_attention_hint(msg['attention'])} — {where} decide what to check next.")
+    if is_last and not (panel_open and st.session_state.get("agent_mode") == "discuss"):
+        # The way from an answer to the advisor, about that answer.
+        st.button("💬 Discuss with the advisor", key=f"discuss_{idx}", type="tertiary",
+                  disabled=_ui_busy(),
+                  help="Open the advisor to think this answer through. It runs no studies.",
+                  on_click=lambda: st.session_state.update(agent_panel_open=True, agent_mode="discuss"))
+    for disc in _discussions():
+        if disc.get("note") is not None and disc.get("closed_at") == idx:
+            _render_decision_note(disc["note"])
+
+
+# Where a pending AI agent call draws its "thinking" indicator: a slot in the
+# panel, exactly where its result will appear. The call itself runs at the end
+# of the script, after the whole page — the chat box included — has been drawn
+# in its waiting state; a request is set by a button's callback, so the run
+# that handles it knows from the start that it is busy.
+_AGENT_SLOT: dict = {}
+
+
+def _agent_busy() -> bool:
+    """Whether an AI agent call is about to run in this script run."""
+    return bool(st.session_state.get("_suggestion_request") or st.session_state.get("_advisor_request"))
+
+
+def _ui_busy() -> bool:
+    """Whether anything is running — a turn or an AI agent call. The panel's
+    controls are disabled meanwhile: a click during a run stops it (Streamlit
+    interrupts the script), and the work it was doing was lost."""
+    return _agent_busy() or st.session_state.get("_pending_turn") is not None
+
+
+# A request interrupted all the same (a click elsewhere) is kept and resumed on
+# the next run, at most this many times, so it can never loop.
+_MAX_ATTEMPTS = 2
+
+
+def _attempt(key: str) -> bool:
+    """Count one more attempt at the pending work under `key`; False once it
+    has been tried too often (it is then dropped)."""
+    n = st.session_state.get(f"_attempts{key}", 0) + 1
+    st.session_state[f"_attempts{key}"] = n
+    return n <= _MAX_ATTEMPTS
+
+
+def _panel_suggestions(msg: dict, idx: int) -> None:
+    rounds = msg.get("suggestion_rounds") or []
+    attention = msg.get("attention") or []
+    if st.session_state.get("auto_suggest") and not rounds and not msg.get("auto_suggested"):
+        msg["auto_suggested"] = True
+        st.session_state._suggestion_request = (idx, "auto")
+    pending = st.session_state.get("_suggestion_request")
+    if attention and not rounds:
+        st.caption(f"⚠️ {_attention_hint(attention)}")
+    label = "✨ More ideas" if rounds else "✨ Suggest next steps"
+    st.button(label, key=f"ais_{idx}_{len(rounds)}", width="stretch",
+              type="primary" if attention and not rounds else "secondary",
+              disabled=_ui_busy(),
+              help="Ask the advisor how to continue from here. It reasons over the "
+                   "conversation; it runs no analysis.",
+              on_click=lambda: st.session_state.update(
+                  _suggestion_request=(idx, "more" if rounds else "button")))
+    if pending:
+        _AGENT_SLOT["slot"] = st.empty()      # the new round's place, while it is written
     for r_i, rnd in enumerate(rounds):
-        _render_suggestion_round(rnd, idx, r_i, expanded=is_last)
+        _render_suggestion_round(rnd, idx, r_i, expanded=r_i == len(rounds) - 1)
 
-    if is_last and rounds and trigger is None:
-        if st.button("✨ More ideas", key=f"ais_more_{idx}"):
-            trigger = "more"
 
-    return trigger
+def _panel_discussion(idx: int) -> None:
+    active = _active_discussion()
+    k = len(_discussions()) - 1 if active is not None else len(_discussions())
+    if active is None or not active.get("thread"):
+        st.caption(_PLAN_CAPTION if idx < 0 else _DISCUSS_CAPTION)
+    if active is not None:
+        _render_thread(active, k, interactive=True)
+    _render_discussion_input(active, k, idx)
+
+
+def _panel_history(last_idx: int) -> None:
+    """Suggestions under earlier answers and closed discussions, folded."""
+    messages = st.session_state.messages
+    earlier = [(i, m) for i, m in enumerate(messages) if i != last_idx and m.get("suggestion_rounds")]
+    closed = [(k, d) for k, d in enumerate(_discussions()) if d.get("note") is not None]
+    if not (earlier or closed):
+        return
+    with st.expander("Earlier in this conversation", expanded=False):
+        for i, m in earlier:
+            st.markdown(f"**Suggestions after {_turn_label(i, 50)}**".replace("$", "\\$"))
+            for r_i, rnd in enumerate(m["suggestion_rounds"]):
+                _render_suggestion_round(rnd, i, r_i, framed=False)
+        for k, d in closed:
+            st.markdown(f"**Discussion · decision recorded at {_turn_label(d['closed_at'], 50)}**"
+                        .replace("$", "\\$"))
+            _render_thread(d, k, interactive=False)
+            _render_decision_note(d["note"])
+
+
+def _render_agent_panel() -> None:
+    """The AI agent, beside the conversation: suggestions and discussion about
+    the latest answer, with earlier ones folded below. The conversation on the
+    left stays the record of questions, studies and answers."""
+    messages = st.session_state.messages
+    answers = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    c_title, c_hide = st.columns([6, 1], vertical_alignment="center")
+    c_title.markdown(":violet[**✨ Advisor**]")
+    with c_hide, st.container(horizontal=True, horizontal_alignment="right"):
+        st.button("", key="agent_hide", icon=":material/keyboard_double_arrow_right:",
+                  disabled=_ui_busy(),
+                  help="Hide the advisor — reopen it with ✨ in the same place.",
+                  on_click=lambda: st.session_state.update(agent_panel_open=False))
+    st.caption("Thinks results through with you and suggests what to run next. Reasoning by an "
+               "AI model, not a solver result — it runs no studies; CONDUCTOR does.")
+    if not answers:
+        # Before the first answer: a discussion only — there is no result to
+        # suggest next steps from. The same discussion carries on afterwards.
+        st.markdown("**Before you ask** — plan what to study")
+        _panel_discussion(-1)
+        return
+    idx = answers[-1]
+    st.markdown(f"**About the latest answer** — {_turn_label(idx)}".replace("$", "\\$"))
+    st.session_state.setdefault("agent_mode", "discuss" if _active_discussion() else "suggest")
+    mode = st.segmented_control(
+        "Advisor", ["suggest", "discuss"], key="agent_mode", label_visibility="collapsed",
+        format_func={"suggest": "✨ Suggestions", "discuss": "💬 Discuss"}.get,
+        selection_mode="single", disabled=_ui_busy()) or "suggest"
+    if mode == "discuss":
+        _panel_discussion(idx)
+    else:
+        _panel_suggestions(messages[idx], idx)
+    _panel_history(idx)
 
 
 # ---------------------------------------------------------------------------
@@ -3759,17 +4254,29 @@ def _render_data_view() -> None:
 _chat_tab, _system_tab, _data_tab = st.tabs(["Chat", "System", "Data"])
 
 with _chat_tab:
+    # The AI agent starts closed — the conversation is the main work, and the
+    # agent is something the operator opens (its launcher is flagged when an
+    # answer has concerns). Its column is there from the start, so it can be
+    # opened to plan before the first question.
+    _panel_open = st.session_state.get("agent_panel_open", False)
+    with st.container(key="chat_layout"):
+        _col_chat, _col_agent = st.columns([0.63, 0.37] if _panel_open else [0.955, 0.045],
+                                           gap="large" if _panel_open else "small")
     if not st.session_state.messages:
-        with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
+        with _col_chat, st.chat_message("assistant", avatar=_AVATARS["assistant"]):
             st.markdown(
-                f"Hello! I'm **{_BRAND_NAME}**, an LLM-orchestrated digital twin for uncertainty-aware distribution grid operations. "
-                "I can help you analyze deterministic security, run N-1 contingency studies, quantify probabilistic risk, "
-                "optimize robust corrective dispatch, and evaluate flexibility, hosting-capacity, and KPI studies.\n\n"
+                f"Hello! I'm **{_BRAND_NAME}**. I run validated power-system studies on the loaded network — "
+                "security, N-1, probabilistic risk, flexibility, hosting capacity, KPIs — and can test changes "
+                "to the grid as proposals without touching it.\n\n"
+                "- **Ask me** (the box below, **Run**) to run or explain a study — e.g. *Run an N-1 "
+                "screen at 14:45*, *What if we add 30 MW at Bus 9?*\n"
+                "- **Open the advisor** (✨ on the right) to think things through — e.g. *Is this result "
+                "reliable?*, *What should I check before deciding?* It runs nothing itself; studies "
+                "it proposes come to me.\n\n"
                 "Try one of the **Example queries** in the sidebar, or ask me anything about the active power-system model."
             )
-    _suggestion_request: tuple[int, str] | None = None
     for _msg_idx, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"], avatar=_AVATARS.get(msg["role"])):
+        with _col_chat, st.chat_message(msg["role"], avatar=_AVATARS.get(msg["role"])):
             st.markdown(msg["text"])
             if msg.get("charts"):
                 render_charts(msg["charts"])
@@ -3789,20 +4296,31 @@ with _chat_tab:
                 # Same rule as the audit panel: a failure here must not take
                 # the conversation view down with it.
                 try:
-                    _trigger = _render_ai_suggestion(msg, _msg_idx)
-                    if _trigger:
-                        _suggestion_request = (_msg_idx, _trigger)
+                    _render_answer_footer(msg, _msg_idx)
                 except Exception:  # noqa: BLE001
                     logging.getLogger(__name__).warning(
-                        "Could not render the AI Agent Suggestion for message %s.",
-                        _msg_idx, exc_info=True)
+                        "Could not render the AI agent notes for message %s.", _msg_idx, exc_info=True)
+    if not _panel_open:
+        # Collapsed: only the open button, where the hide button was, and in
+        # view while the conversation scrolls. Highlighted when the latest
+        # answer has something the AI agent would flag.
+        _flag = bool((st.session_state.messages or [{}])[-1].get("attention"))
+        with _col_agent, st.container(key="ai_panel_closed"):
+            # A round launcher in the agent's colour (styled in CSS by its
+            # key); filled, with a dot, when there is something to flag.
+            st.button("✨",
+                      key="agent_open_flag" if _flag else "agent_open", disabled=_ui_busy(),
+                      help="Open the advisor" + (" — it has something to flag about the latest answer"
+                                                  if _flag else ""),
+                      on_click=lambda: st.session_state.update(agent_panel_open=True))
+    else:
+        with _col_agent, st.container(key="ai_panel"):
+            try:
+                _render_agent_panel()
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning("Could not render the AI agent panel.", exc_info=True)
+                st.caption("⚠️ The advisor panel could not be rendered.")
 
-    # Run a requested suggestion round after the history is drawn, then rerun
-    # so it appears under its answer. Outside the guard above: `st.rerun`
-    # works by raising, and a broad `except` would swallow it.
-    if _suggestion_request is not None:
-        _run_ai_suggestion(*_suggestion_request)
-        st.rerun()
 
 with _system_tab:
     _render_system_view()
@@ -3816,6 +4334,34 @@ with _data_tab:
 
 
 
+def _safe_attention(record: dict | None) -> list[str]:
+    """`needs_attention`, never allowed to cost the answer it describes."""
+    try:
+        return _recommender.needs_attention(record)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Could not compute the attention reasons.", exc_info=True)
+        return []
+
+
+def _queue_turn() -> None:
+    """Send's callback: record the question. The fragment's rerun then draws a
+    waiting line instead of the box before the turn starts — a box that stays
+    on screen during a turn looks ready to take the next question, and is not."""
+    typed = (st.session_state.get(f"chat_box_{st.session_state.get('_box_n', 0)}") or "").strip()
+    if typed:
+        st.session_state._pending_turn = typed
+        st.session_state._turn_redraw = True
+        st.session_state.pop("_attempts_turn", None)
+
+
+def _busy_bar(text: str, who: str = "conductor") -> None:
+    """Where the chat box is, while CONDUCTOR (blue) or the AI agent (purple)
+    is working: a spinner and one line, centred in a box the chat box's size."""
+    with st.container(border=True, key="chat_busy"):
+        st.markdown(f"<div class='conductor-busy conductor-busy-{who}'><span class='conductor-spin'></span>"
+                    f"<span>{html.escape(text)}</span></div>", unsafe_allow_html=True)
+
+
 @st.fragment
 def _chat_input_fragment():
     """Input box + turn processing, isolated in a fragment.
@@ -3827,6 +4373,24 @@ def _chat_input_fragment():
     """
     # The in-progress turn renders here, just above the form.
     work = st.container()
+
+    pending_turn = st.session_state.get("_pending_turn")
+    if pending_turn is not None:
+        if st.session_state.pop("_turn_redraw", False):
+            # Sent from this fragment: redraw the whole page first, so the
+            # panel's controls are disabled before the turn starts.
+            st.rerun(scope="app")
+        if not _attempt("_turn"):
+            st.session_state.pop("_pending_turn", None)
+            st.session_state.pop("_attempts_turn", None)
+            st.warning("The question was interrupted twice and was not answered — please send it again.")
+        else:
+            _busy_bar("CONDUCTOR is working on your question — you can ask the next one when it finishes.")
+            _process_turn(pending_turn, work)
+            return
+    if _agent_busy():
+        _busy_bar("The advisor is thinking — CONDUCTOR's chat box is back in a moment.", who="agent")
+        return
 
     # Apply a pending prefill (example query, AI Agent Suggestion) BEFORE the
     # widget renders — as a new widget whose initial value is the text.
@@ -3845,22 +4409,27 @@ def _chat_input_fragment():
         st.session_state._box_n += 1
 
     with st.form("chat_form", clear_on_submit=True):
-        fc_in, fc_send = st.columns([8, 1])
-        with fc_in:
+        # Labelled as CONDUCTOR's: the advisor has its own box in its panel,
+        # and only this one runs studies.
+        # One row sized by its content: the label only as wide as itself.
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            st.markdown("<span class='conductor-who'>⚡ CONDUCTOR</span>", unsafe_allow_html=True,
+                        width="content")
             typed = st.text_input(
-                "Ask about the grid…",
+                "Ask CONDUCTOR",
                 key=f"chat_box_{st.session_state._box_n}",
                 value=st.session_state._box_value,
-                placeholder="Ask about the grid…",
+                placeholder="Ask CONDUCTOR to run, compare or explain a study…",
                 label_visibility="collapsed",
+                width="stretch",
             )
-        with fc_send:
-            send = st.form_submit_button("Send", width="stretch", type="primary")
+            st.form_submit_button("Run", width=96, type="primary", on_click=_queue_turn,
+                                  help="CONDUCTOR runs the studies and answers with solver results.")
+    del typed
 
-    if not (send and typed and typed.strip()):
-        return
 
-    effective_input = typed.strip()
+def _process_turn(effective_input: str, work) -> None:
+    """One orchestrator turn for a question the operator sent."""
     # Sent: the next render starts from a fresh, empty box rather than
     # `clear_on_submit` restoring the prefilled text as the widget's default.
     st.session_state._box_value = ""
@@ -3884,8 +4453,6 @@ def _chat_input_fragment():
         _log_suggestion_outcome(effective_input)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).warning("Could not log the suggestion outcome.", exc_info=True)
-
-    st.session_state.messages.append({"role": "user", "text": effective_input, "charts": None})
 
     with work:
         if _swapped:
@@ -3969,83 +4536,92 @@ def _chat_input_fragment():
                     on_event=_on_event,
                     reflection=_reflection_mode(),
                 )
+                # Persist history
+                st.session_state.history = updated_history
+
+                # Update sidebar timestamp if it changed
+                if _tools_module._last_tool_results:
+                    for tname, tres in _tools_module._last_tool_results:
+                        if tname in ("get_current_timestamp", "advance_timestamp"):
+                            new_ts = tres.get("current_timestamp", tres.get("timestamp"))
+                            if new_ts:
+                                st.session_state.current_ts = new_ts
+                                break
+
+                # Point the system view at whatever moment this turn analysed, so
+                # the picture describes the answer on screen. A turn that spanned
+                # two operating points names none, and the view is left alone.
+                turn_point = _network_map.operating_point_of(_tools_module._last_tool_results)
+                if turn_point:
+                    st.session_state.system_ts = turn_point
+
+                # Capture chart data and store message.
+                #
+                # A turn can call the same tool twice with the same arguments — the
+                # agent re-reads conditions to derive a figure, say — and the second
+                # call returns the identical payload. Rendering it again shows the
+                # operator the same table twice and reads as two measurements. Only
+                # byte-identical repeats are dropped: two calls that differ in
+                # arguments or results are genuinely different analyses and both
+                # belong on screen.
+                charts_this_turn = _dedupe_tool_results(_tools_module._last_tool_results)
+                assistant_text = final_text if final_text else "_No text response from agent._"
+
+                # The audit panel is built from the turn record the loop just
+                # wrote — the same input the offline graders read, so the panel and
+                # the evaluation cannot disagree about a turn. Never allowed to
+                # break the answer: a missing panel costs an audit, a raised
+                # exception costs the reply.
+                turn_trace = None
+                turn_record = None
+                try:
+                    record = _loop_module.session_log[-1] if _loop_module.session_log else None
+                    # Verify the record belongs to *this* question. A turn that
+                    # aborts before logging leaves the previous turn's record at
+                    # the end of the list, and attributing one answer's evidence to
+                    # a different question is the worst thing this panel could do —
+                    # it would assert provenance for numbers never produced. No
+                    # panel is strictly better than a wrong one.
+                    if record is not None and record.get("user") == llm_input:
+                        turn_record = record
+                        turn_trace = _trace.build(record)
+                    elif record is not None:
+                        logging.getLogger(__name__).warning(
+                            "Skipping the audit panel: the newest log record is for "
+                            "a different prompt.")
+                except Exception:  # noqa: BLE001
+                    logging.getLogger(__name__).warning(
+                        "Could not build the answer trace.", exc_info=True)
+
+                # The question and its answer are saved together, before
+                # anything is drawn: the answer used to be saved after the
+                # status box was updated, and a page interrupted at that
+                # instant kept the question and lost the answer — the
+                # operator saw nothing happen and sent it again.
+                st.session_state.messages.append({"role": "user", "text": effective_input, "charts": None})
+                st.session_state.pop("_pending_turn", None)
+                st.session_state.pop("_attempts_turn", None)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "text": assistant_text,
+                    "charts": charts_this_turn,
+                    "trace": turn_trace,
+                    # Kept for the AI Agent Suggestion: the record is what it reads
+                    # and what its figures are grounded against.
+                    "record": turn_record,
+                    "attention": _safe_attention(turn_record),
+                })
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
                 # The turn just refetched grid constants; if that failed, the
                 # answer above was produced without knowing the real network.
                 _warn_if_grid_identity_unverified()
             except RuntimeError as exc:
+                st.session_state.pop("_pending_turn", None)
+                st.session_state.pop("_attempts_turn", None)
                 status_box.update(label="Error", state="error", expanded=True)
                 with status_box:
                     st.error(str(exc))
                 st.stop()
-
-            # Persist history
-            st.session_state.history = updated_history
-
-            # Update sidebar timestamp if it changed
-            if _tools_module._last_tool_results:
-                for tname, tres in _tools_module._last_tool_results:
-                    if tname in ("get_current_timestamp", "advance_timestamp"):
-                        new_ts = tres.get("current_timestamp", tres.get("timestamp"))
-                        if new_ts:
-                            st.session_state.current_ts = new_ts
-                            break
-
-            # Point the system view at whatever moment this turn analysed, so
-            # the picture describes the answer on screen. A turn that spanned
-            # two operating points names none, and the view is left alone.
-            turn_point = _network_map.operating_point_of(_tools_module._last_tool_results)
-            if turn_point:
-                st.session_state.system_ts = turn_point
-
-            # Capture chart data and store message.
-            #
-            # A turn can call the same tool twice with the same arguments — the
-            # agent re-reads conditions to derive a figure, say — and the second
-            # call returns the identical payload. Rendering it again shows the
-            # operator the same table twice and reads as two measurements. Only
-            # byte-identical repeats are dropped: two calls that differ in
-            # arguments or results are genuinely different analyses and both
-            # belong on screen.
-            charts_this_turn = _dedupe_tool_results(_tools_module._last_tool_results)
-            assistant_text = final_text if final_text else "_No text response from agent._"
-
-            # The audit panel is built from the turn record the loop just
-            # wrote — the same input the offline graders read, so the panel and
-            # the evaluation cannot disagree about a turn. Never allowed to
-            # break the answer: a missing panel costs an audit, a raised
-            # exception costs the reply.
-            turn_trace = None
-            turn_record = None
-            try:
-                record = _loop_module.session_log[-1] if _loop_module.session_log else None
-                # Verify the record belongs to *this* question. A turn that
-                # aborts before logging leaves the previous turn's record at
-                # the end of the list, and attributing one answer's evidence to
-                # a different question is the worst thing this panel could do —
-                # it would assert provenance for numbers never produced. No
-                # panel is strictly better than a wrong one.
-                if record is not None and record.get("user") == llm_input:
-                    turn_record = record
-                    turn_trace = _trace.build(record)
-                elif record is not None:
-                    logging.getLogger(__name__).warning(
-                        "Skipping the audit panel: the newest log record is for "
-                        "a different prompt.")
-            except Exception:  # noqa: BLE001
-                logging.getLogger(__name__).warning(
-                    "Could not build the answer trace.", exc_info=True)
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "text": assistant_text,
-                "charts": charts_this_turn,
-                "trace": turn_trace,
-                # Kept for the AI Agent Suggestion: the record is what it reads
-                # and what its figures are grounded against.
-                "record": turn_record,
-                "attention": _recommender.needs_attention(turn_record),
-            })
 
             # Render reply inside the same chat bubble
             st.markdown(assistant_text)
@@ -4063,3 +4639,24 @@ def _chat_input_fragment():
 
 
 _chat_input_fragment()
+
+# A requested AI agent call runs last, once the page — the panel's thinking
+# indicator and the chat box's waiting line included — is on screen; then a
+# rerun shows its result in the panel. Outside every guard: `st.rerun` works
+# by raising, and a broad `except` would swallow it.
+# The request stays until the call has finished: a click during the call stops
+# the script, and the next run resumes it (at most _MAX_ATTEMPTS times).
+_pending_suggestion = st.session_state.get("_suggestion_request")
+_pending_advice = st.session_state.get("_advisor_request")
+if _pending_suggestion is not None or _pending_advice is not None:
+    if _attempt("_agent"):
+        with _AGENT_SLOT.get("slot") or st.container():
+            if _pending_suggestion is not None:
+                _run_ai_suggestion(*_pending_suggestion)
+            else:
+                _run_advisor(*_pending_advice)
+    st.session_state.pop("_suggestion_request", None)
+    st.session_state.pop("_advisor_request", None)
+    st.session_state.pop("_attempts_agent", None)
+    _AGENT_SLOT.clear()
+    st.rerun()

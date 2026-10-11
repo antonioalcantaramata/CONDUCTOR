@@ -1403,7 +1403,8 @@ _edit_proposal = genai.types.FunctionDeclaration(
         "Create a network proposal — the loaded (base) network plus edits — or add edits "
         "to one. Use it for what-if questions about changing the grid: a new load (data "
         "centre, factory, electrolyser), a new generator, a reinforced line, or a branch or "
-        "unit switched in or out, a larger transformer, or a new bus (site) joined by a line. "
+        "unit switched in or out, a larger transformer, a new bus (site) joined by a line, or a "
+        "new bus at another voltage behind a new transformer (optionally at the end of a new line). "
         "The base is never modified. Then study the proposal by "
         "passing its id as `network` to any analysis tool, or call compare_networks. "
         "Returns the edits as stored and a summary. Edits are validated; an invalid one "
@@ -1422,11 +1423,11 @@ _edit_proposal = genai.types.FunctionDeclaration(
                     properties={
                         "op": _S(type=_T.STRING, enum=[
                             "add_load", "add_generator", "reinforce_line", "upgrade_trafo",
-                            "add_bus_with_connection", "set_in_service"]),
+                            "add_bus_with_connection", "add_bus_with_transformer", "set_in_service"]),
                         "name": _S(type=_T.STRING, description=(
                             "add_load / add_generator: a unique name, e.g. 'Data centre'. "
-                            "add_bus_with_connection: the new bus's name, usable as `bus` in later "
-                            "edits of the same proposal.")),
+                            "add_bus_with_connection / add_bus_with_transformer: the new bus's name, "
+                            "usable as `bus` in later edits of the same proposal.")),
                         "bus": _S(type=_T.STRING, description=(
                             "add_load / add_generator: bus name as results show it, or index.")),
                         "p_mw": _S(type=_T.NUMBER, description=(
@@ -1455,14 +1456,74 @@ _edit_proposal = genai.types.FunctionDeclaration(
                             "upgrade_trafo: new rating in MVA, above the present one (same design: "
                             "impedance falls in proportion).")),
                         "connect_to": _S(type=_T.STRING, description=(
-                            "add_bus_with_connection: existing bus the new line starts from (same voltage).")),
-                        "length_km": _S(type=_T.NUMBER, description="add_bus_with_connection: line length in km."),
+                            "add_bus_with_connection: existing bus the new line starts from (same "
+                            "voltage). add_bus_with_transformer: existing bus the new transformer (or "
+                            "the line before it) starts from; either voltage side.")),
+                        "vn_kv": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: the new bus's voltage in kV, different from "
+                            "connect_to's. May be left out with trafo_like or trafo_std_type (the "
+                            "unit's other side).")),
+                        "length_km": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_connection: line length in km. add_bus_with_transformer: "
+                            "optional — a line of this length first, the transformer at its far end "
+                            "(a remote substation); leave out for a transformer at connect_to.")),
                         "line_like": _S(type=_T.STRING, description=(
-                            "add_bus_with_connection: existing line whose conductor to copy "
-                            "(or give std_type).")),
+                            "add_bus_with_connection / add_bus_with_transformer (with length_km): "
+                            "existing line whose conductor to copy (or give std_type / line_std_type).")),
                         "std_type": _S(type=_T.STRING, description=(
                             "add_bus_with_connection: pandapower line type, e.g. "
                             "'NA2XS2Y 1x240 RM/25 12/20 kV' (or give line_like).")),
+                        "line_std_type": _S(type=_T.STRING, description=(
+                            "add_bus_with_transformer (with length_km): pandapower line type of the "
+                            "line before the transformer (or give line_like).")),
+                        "trafo_like": _S(type=_T.STRING, description=(
+                            "add_bus_with_transformer: existing transformer whose design to copy "
+                            "(vk, losses, tap changer); with sn_mva, the same design at another size. "
+                            "Design values given override the copy.")),
+                        "trafo_std_type": _S(type=_T.STRING, description=(
+                            "add_bus_with_transformer: pandapower transformer type, e.g. "
+                            "'25 MVA 110/20 kV', '0.63 MVA 20/0.4 kV' or '160 MVA 380/110 kV'; its "
+                            "rated voltages must be within 20% of the two buses'. Fixes the design.")),
+                        "sn_mva": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: rating of one unit in MVA (required for "
+                            "explicit values; with trafo_like, a resized copy).")),
+                        "vk_percent": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: short-circuit voltage, % (typically 4–6 for "
+                            "MV/LV, 10–14 for HV/MV, 12–20 for EHV).")),
+                        "vkr_percent": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: its resistive part (copper losses), %, below "
+                            "vk_percent (typically 0.2–1.5).")),
+                        "pfe_kw": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: no-load (iron) losses in kW, default 0.")),
+                        "i0_percent": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: magnetising current, %; default the no-load "
+                            "losses' share.")),
+                        "shift_degree": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: vector-group phase shift in degrees "
+                            "(e.g. 150 for Dyn5), default 0.")),
+                        "vn_hv_kv": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: rated HV voltage if not the bus's (an "
+                            "off-nominal ratio), within 20%.")),
+                        "vn_lv_kv": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: rated LV voltage if not the bus's, within 20%.")),
+                        "tap_side": _S(type=_T.STRING, enum=["hv", "lv"], description=(
+                            "add_bus_with_transformer: side of the tap changer, default 'hv'.")),
+                        "tap_step_percent": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: voltage change per tap step, % (e.g. 1.5 for "
+                            "an on-load changer, 2.5 for an off-load one).")),
+                        "tap_min": _S(type=_T.INTEGER, description="add_bus_with_transformer: lowest tap, e.g. -9."),
+                        "tap_max": _S(type=_T.INTEGER, description="add_bus_with_transformer: highest tap, e.g. 9."),
+                        "tap_pos": _S(type=_T.INTEGER, description=(
+                            "add_bus_with_transformer: tap position, default neutral.")),
+                        "parallel": _S(type=_T.INTEGER, description=(
+                            "add_bus_with_transformer: identical units in parallel, 1–4, default 1.")),
+                        "max_loading_percent": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_transformer: loading limit of the new unit, %, if not 100.")),
+                        "min_vm_pu": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_connection / add_bus_with_transformer: the new bus's lower "
+                            "voltage limit, if not that of connect_to.")),
+                        "max_vm_pu": _S(type=_T.NUMBER, description=(
+                            "add_bus_with_connection / add_bus_with_transformer: its upper limit.")),
                         "element_type": _S(type=_T.STRING, enum=["line", "trafo", "load", "sgen", "gen"],
                                            description="set_in_service: element type."),
                         "element": _S(type=_T.STRING, description="set_in_service: element name or index."),
@@ -1493,10 +1554,11 @@ _compare_networks = genai.types.FunctionDeclaration(
         type=_T.OBJECT,
         properties={
             "proposal": _S(type=_T.STRING, description="The proposal id to compare with the base."),
-            "study": _S(type=_T.STRING, enum=["rsa", "n1", "scan"], description=(
+            "study": _S(type=_T.STRING, enum=["rsa", "n1", "opf", "scan"], description=(
                 "'rsa' (security assessment at one moment, default), 'n1' (every single line "
-                "and transformer outage at one moment), or 'scan' (the security assessment at "
-                "every tick of a window).")),
+                "and transformer outage at one moment), 'opf' (the deterministic flexibility "
+                "OPF at one moment: whether a corrective dispatch exists on each network and "
+                "what it takes), or 'scan' (the security assessment at every tick of a window).")),
             "start_timestamp": _S(type=_T.STRING, description=(
                 "scan: window start (timestamp prefix); default the first tick.")),
             "end_timestamp": _S(type=_T.STRING, description=(

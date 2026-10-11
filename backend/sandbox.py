@@ -45,7 +45,8 @@ LOAD_PROFILES = ("flat", "follow_bus", "shift")
 GENERATOR_KINDS = ("dispatchable", "pv", "wind")
 SWITCHABLE = ("line", "trafo", "load", "sgen", "gen")
 OPS = ("add_load", "add_generator", "reinforce_line", "upgrade_trafo",
-       "add_bus_with_connection", "set_in_service")
+       "add_bus_with_connection", "add_bus_with_transformer", "set_in_service")
+TRAFO_SIDES = ("hv", "lv")
 
 # Sanity bounds, not engineering limits: they catch a mistyped 5000 MW, not
 # an ambitious proposal.
@@ -53,6 +54,11 @@ MAX_REINFORCE_FACTOR = 10.0
 MAX_CONNECTION_KM = 200.0
 MAX_SIZE_VS_NETWORK = 10.0   # an added MW figure may be up to 10× the base demand
 MAX_EDITS = 50
+MAX_KV = 1000.0
+MAX_PARALLEL_UNITS = 4
+RATED_KV_TOLERANCE = 0.2     # a rated voltage may sit up to 20 % off its bus's nominal voltage
+MAX_VK_PERCENT = 50.0        # real units: 4–25 %
+MAX_TAP_STEPS = 40
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +220,257 @@ def _size_cap(net) -> float:
     return max(MAX_SIZE_VS_NETWORK * demand, 1.0)
 
 
+def _new_bus_name(net, edit: dict) -> str:
+    name = str(edit.get("name") or "").strip()
+    if not name:
+        raise EditError(f"{edit['op']}: a name is required for the new bus.")
+    _bus_name_free(net, name, edit["op"])
+    return name
+
+
+def _bus_name_free(net, name: str, op: str) -> None:
+    if any(_bus_label(net, int(i)).casefold() == name.casefold() for i in net.bus.index):
+        raise EditError(f"{op}: a bus is already named {name!r}.")
+
+
+def _given(edit: dict, key: str) -> bool:
+    return edit.get(key) not in (None, "")
+
+
+def _line_choice(net, edit: dict, like_key: str, std_key: str) -> dict:
+    """The conductor of a new line: copied from an existing line, or a
+    pandapower standard type — exactly one."""
+    op = edit["op"]
+    std = str(edit.get(std_key) or "").strip()
+    if _given(edit, like_key) == bool(std):
+        raise EditError(f"{op}: give exactly one of {like_key} (an existing line whose conductor "
+                        f"to copy) or {std_key} (a pandapower line type).")
+    if std:
+        if not pp.std_type_exists(net, std, element="line"):
+            raise EditError(f"{op}: {std!r} is not a known line type.")
+        return {std_key: std}
+    return {like_key: resolve_element(net, "line", edit[like_key])}
+
+
+def _voltage_band(edit: dict) -> dict:
+    """Optional voltage limits for a new bus (otherwise those of the bus it joins)."""
+    out = {k: _number(edit, k, low=0.5, high=1.5) for k in ("min_vm_pu", "max_vm_pu") if _given(edit, k)}
+    if "min_vm_pu" in out and "max_vm_pu" in out and out["min_vm_pu"] >= out["max_vm_pu"]:
+        raise EditError(f"{edit['op']}: min_vm_pu must be below max_vm_pu.")
+    return out
+
+
+def _integer(edit: dict, key: str, **bounds) -> int:
+    value = _number(edit, key, **bounds)
+    if value != int(value):
+        raise EditError(f"{edit.get('op')}: {key} must be a whole number, not {edit[key]!r}.")
+    return int(value)
+
+
+def _finite(value) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def substation_bus_name(name: str, kv: float) -> str:
+    """The bus at the far end of the line, where the new transformer stands."""
+    return f"{name} {kv:g} kV"
+
+
+_DESIGN = ("vk_percent", "vkr_percent", "pfe_kw", "i0_percent", "shift_degree")
+_TAP_RANGE = ("tap_side", "tap_step_percent", "tap_min", "tap_max")
+_RATED = ("vn_hv_kv", "vn_lv_kv")
+
+
+def _normalise_transformer_site(net, edit: dict) -> dict:
+    """A new bus at another voltage behind a new transformer, optionally at
+    the end of a new line (a remote substation). See `trafo_design` for how
+    the unit's data are built from the three ways of giving them."""
+    op = edit["op"]
+    name = _new_bus_name(net, edit)
+    at = resolve_bus(net, edit.get("connect_to"))
+    v_at = float(net.bus.at[at, "vn_kv"])
+    out = {"op": op, "name": name, "connect_to": at}
+
+    std = str(edit.get("trafo_std_type") or "").strip()
+    like = edit.get("trafo_like") if _given(edit, "trafo_like") else None
+    if std and like is not None:
+        raise EditError(f"{op}: give trafo_like or trafo_std_type, not both.")
+
+    # The new bus's voltage: given, or the other side of the copied unit or type.
+    vn = _number(edit, "vn_kv", low=0, high=MAX_KV, low_open=True) if _given(edit, "vn_kv") else None
+    if std:
+        if not pp.std_type_exists(net, std, element="trafo"):
+            raise EditError(f"{op}: {std!r} is not a known transformer type.")
+        data = pp.load_std_type(net, std, "trafo")
+        pair, source = (float(data["vn_hv_kv"]), float(data["vn_lv_kv"])), f"type {std!r}"
+    elif like is not None:
+        like = resolve_element(net, "trafo", like)
+        row = net.trafo.loc[like]
+        pair = (float(net.bus.at[int(row["hv_bus"]), "vn_kv"]), float(net.bus.at[int(row["lv_bus"]), "vn_kv"]))
+        source = trafo_display_name(net, like)
+    else:
+        pair, source = None, None
+    if vn is None:
+        if pair is None:
+            raise EditError(f"{op}: vn_kv (the new bus's voltage) is required.")
+        near = [k for k in (0, 1) if abs(pair[k] - v_at) <= RATED_KV_TOLERANCE * pair[k]]
+        if abs(pair[0] - pair[1]) <= 1e-6 * pair[0]:
+            raise EditError(f"{op}: {source} joins two {pair[0]:g} kV buses, so the new bus's voltage "
+                            "cannot be taken from it; give vn_kv.")
+        if not near:
+            raise EditError(f"{op}: {_bus_label(net, at)} is at {v_at:g} kV, which is neither side of "
+                            f"{source} ({pair[0]:g}/{pair[1]:g} kV); give vn_kv.")
+        side = min(near, key=lambda k: abs(pair[k] - v_at))
+        vn = pair[1 - side]
+    if abs(vn - v_at) <= 1e-6 * v_at:
+        raise EditError(f"{op}: the new bus would be at {v_at:g} kV like {_bus_label(net, at)}; "
+                        "use add_bus_with_connection (a line) for a bus at the same voltage.")
+    out["vn_kv"] = vn
+    hv_kv, lv_kv = max(vn, v_at), min(vn, v_at)
+
+    # Optional line first: from connect_to to the substation where the unit stands.
+    if any(_given(edit, k) for k in ("length_km", "line_like", "line_std_type")):
+        out["length_km"] = _number(edit, "length_km", low=0, high=MAX_CONNECTION_KM, low_open=True)
+        out.update(_line_choice(net, edit, "line_like", "line_std_type"))
+        sub = substation_bus_name(name, v_at)
+        if sub.casefold() == name.casefold():
+            raise EditError(f"{op}: the new bus cannot be named like its substation bus {sub!r}.")
+        _bus_name_free(net, sub, op)
+
+    out["parallel"] = _integer(edit, "parallel", default=1, low=1, high=MAX_PARALLEL_UNITS)
+
+    # The unit: a type, a copy, or explicit values.
+    if std:
+        fixed = [k for k in ("sn_mva", *_DESIGN, *_TAP_RANGE, *_RATED) if _given(edit, k)]
+        if fixed:
+            raise EditError(f"{op}: a standard type fixes {', '.join(fixed)}; use trafo_like or "
+                            "explicit values (sn_mva, vk_percent, vkr_percent, ...) to change them.")
+        for k, rated, bus_kv in (("hv", pair[0], hv_kv), ("lv", pair[1], lv_kv)):
+            if abs(rated - bus_kv) > RATED_KV_TOLERANCE * bus_kv:
+                raise EditError(f"{op}: type {std!r} is a {pair[0]:g}/{pair[1]:g} kV unit; it cannot "
+                                f"join {hv_kv:g} kV and {lv_kv:g} kV.")
+        out["trafo_std_type"] = std
+    else:
+        if like is not None:
+            out["trafo_like"] = like
+        elif not all(_given(edit, k) for k in ("sn_mva", "vk_percent", "vkr_percent")):
+            raise EditError(f"{op}: give trafo_like (an existing transformer to copy), trafo_std_type "
+                            "(a pandapower type) or the unit's sn_mva, vk_percent and vkr_percent.")
+        cap = _size_cap(net)
+        if like is not None:
+            cap = max(cap, MAX_REINFORCE_FACTOR * float(net.trafo.at[like, "sn_mva"]))
+        if _given(edit, "sn_mva"):
+            out["sn_mva"] = _number(edit, "sn_mva", low=0, high=cap, low_open=True)
+        for k, low, high, low_open in (("vk_percent", 0, MAX_VK_PERCENT, True),
+                                       ("vkr_percent", 0, MAX_VK_PERCENT, False),
+                                       ("pfe_kw", 0, None, False),
+                                       ("i0_percent", 0, 10, False),
+                                       ("shift_degree", -360, 360, False)):
+            if _given(edit, k):
+                out[k] = _number(edit, k, low=low, high=high, low_open=low_open)
+        for k, bus_kv in (("vn_hv_kv", hv_kv), ("vn_lv_kv", lv_kv)):
+            if _given(edit, k):
+                out[k] = _number(edit, k, low=(1 - RATED_KV_TOLERANCE) * bus_kv,
+                                 high=(1 + RATED_KV_TOLERANCE) * bus_kv)
+        if _given(edit, "tap_side"):
+            out["tap_side"] = str(edit["tap_side"]).strip().lower()
+            if out["tap_side"] not in TRAFO_SIDES:
+                raise EditError(f"{op}: tap_side must be 'hv' or 'lv'.")
+        if _given(edit, "tap_step_percent"):
+            out["tap_step_percent"] = _number(edit, "tap_step_percent", low=0, high=10, low_open=True)
+        if _given(edit, "tap_min"):
+            out["tap_min"] = _integer(edit, "tap_min", low=-MAX_TAP_STEPS, high=0)
+        if _given(edit, "tap_max"):
+            out["tap_max"] = _integer(edit, "tap_max", low=0, high=MAX_TAP_STEPS)
+        if like is None:
+            out.setdefault("pfe_kw", 0.0)
+            out.setdefault("shift_degree", 0.0)
+            # With no magnetising current given, the no-load losses alone flow in it.
+            out.setdefault("i0_percent", round(out["pfe_kw"] / (10.0 * out["sn_mva"]), 6))
+            if any(k in out for k in _TAP_RANGE) and not all(
+                    k in out for k in ("tap_step_percent", "tap_min", "tap_max")):
+                raise EditError(f"{op}: a tap changer needs tap_step_percent, tap_min and tap_max "
+                                "(tap_side defaults to 'hv').")
+    if _given(edit, "max_loading_percent"):
+        out["max_loading_percent"] = _number(edit, "max_loading_percent", low=0, high=200, low_open=True)
+
+    # The resulting unit must be physical, and the tap position inside its range.
+    design = trafo_design(net, out)
+    if design["vkr_percent"] >= design["vk_percent"]:
+        raise EditError(f"{op}: vkr_percent ({design['vkr_percent']:g}) must be below vk_percent "
+                        f"({design['vk_percent']:g}); the copper losses are part of the short-circuit voltage.")
+    if design["pfe_kw"] > 50.0 * design["sn_mva"]:
+        raise EditError(f"{op}: pfe_kw {design['pfe_kw']:g} is over 5 % of the rating; no-load losses "
+                        "are typically 0.05–0.3 %.")
+    if _given(edit, "tap_pos"):
+        if design["tap_step_percent"] is None:
+            raise EditError(f"{op}: tap_pos needs a tap changer, and this unit has none.")
+        pos = _integer(edit, "tap_pos", low=-MAX_TAP_STEPS, high=MAX_TAP_STEPS)
+        lo, hi = design["tap_min"], design["tap_max"]
+        if (lo is not None and pos < lo) or (hi is not None and pos > hi):
+            raise EditError(f"{op}: tap_pos {pos} is outside the tap range {lo:g}…{hi:g}.")
+        out["tap_pos"] = pos
+    out.update(_voltage_band(edit))
+    return out
+
+
+def trafo_design(net, e: dict) -> dict:
+    """The data of the unit an `add_bus_with_transformer` edit builds, for one
+    unit (`parallel` multiplies it).
+
+    - `trafo_std_type`: the pandapower catalogue entry, as it is.
+    - `trafo_like`: an existing unit's design copied in per unit — short-circuit
+      voltage, copper and no-load losses, magnetising current, vector-group
+      shift and tap changer. With a new `sn_mva` it is a unit of the same
+      design and another size: percentages kept, no-load losses scaled with
+      size. Any design or tap value given overrides the copy.
+    - explicit values: as given.
+    Rated voltages are the buses' nominal voltages unless given (a type keeps
+    its own). The tap starts at neutral unless `tap_pos` says otherwise.
+    """
+    hv_kv = max(e["vn_kv"], float(net.bus.at[e["connect_to"], "vn_kv"]))
+    lv_kv = min(e["vn_kv"], float(net.bus.at[e["connect_to"], "vn_kv"]))
+    d = {"sn_mva": None, "vn_hv_kv": hv_kv, "vn_lv_kv": lv_kv, "vk_percent": None,
+         "vkr_percent": None, "pfe_kw": 0.0, "i0_percent": 0.0, "shift_degree": 0.0,
+         "tap_side": None, "tap_neutral": None, "tap_min": None, "tap_max": None,
+         "tap_step_percent": None, "tap_step_degree": None, "tap_changer_type": None,
+         "max_loading_percent": None}
+    if "trafo_std_type" in e:
+        data = pp.load_std_type(net, e["trafo_std_type"], "trafo")
+        for k in d:
+            if k in data:
+                d[k] = data[k] if isinstance(data[k], str) else _finite(data[k])
+    elif "trafo_like" in e:
+        src = net.trafo.loc[e["trafo_like"]]
+        for k in d:
+            if k in _RATED or k not in src.index:
+                continue
+            d[k] = src[k] if isinstance(src[k], str) else _finite(src[k])
+        if "sn_mva" in e:
+            f = e["sn_mva"] / float(src["sn_mva"])
+            d["pfe_kw"] = (d["pfe_kw"] or 0.0) * f
+    for k in ("sn_mva", *_DESIGN, *_TAP_RANGE, *_RATED, "max_loading_percent"):
+        if k in e:
+            d[k] = e[k]
+    for k in ("pfe_kw", "i0_percent", "shift_degree"):
+        d[k] = d[k] or 0.0
+    if d["tap_step_percent"] is not None:
+        d["tap_side"] = d["tap_side"] if d["tap_side"] in TRAFO_SIDES else "hv"
+        d["tap_neutral"] = d["tap_neutral"] if d["tap_neutral"] is not None else 0.0
+        if not isinstance(d["tap_changer_type"], str):
+            d["tap_changer_type"] = "Ratio"
+        d["tap_pos"] = e.get("tap_pos", d["tap_neutral"])
+    else:
+        for k in ("tap_side", "tap_neutral", "tap_min", "tap_max", "tap_step_degree", "tap_changer_type"):
+            d[k] = None
+        d["tap_pos"] = None
+    return d
+
+
 def normalise_edit(net, raw: dict) -> dict:
     """Check one edit against `net` (the network it will be applied to) and
     return it in canonical form — every default filled, the bus or element
@@ -269,30 +526,21 @@ def normalise_edit(net, raw: dict) -> dict:
                                       low_open=True)}
 
     if op == "add_bus_with_connection":
-        name = str(edit.get("name") or "").strip()
-        if not name:
-            raise EditError("add_bus_with_connection: a name is required for the new bus.")
-        if any(_bus_label(net, int(i)).casefold() == name.casefold() for i in net.bus.index):
-            raise EditError(f"add_bus_with_connection: a bus is already named {name!r}.")
+        name = _new_bus_name(net, edit)
         at = resolve_bus(net, edit.get("connect_to"))
         vn = float(net.bus.at[at, "vn_kv"])
         if edit.get("vn_kv") is not None and abs(_number(edit, "vn_kv", low=0, low_open=True) - vn) > 1e-6:
             raise EditError(
                 f"add_bus_with_connection: {_bus_label(net, at)} is at {vn:g} kV; a line joins buses "
-                "of one voltage (a new transformer is not an edit yet).")
+                "of one voltage. Use add_bus_with_transformer for a bus at another voltage.")
         out = {"op": op, "name": name, "connect_to": at, "vn_kv": vn,
                "length_km": _number(edit, "length_km", low=0, high=MAX_CONNECTION_KM, low_open=True)}
-        like, std = edit.get("line_like"), str(edit.get("std_type") or "").strip()
-        if (like is None or like == "") == (not std):
-            raise EditError("add_bus_with_connection: give exactly one of line_like (an existing "
-                            "line whose conductor to copy) or std_type (a pandapower line type).")
-        if std:
-            if not pp.std_type_exists(net, std, element="line"):
-                raise EditError(f"add_bus_with_connection: {std!r} is not a known line type.")
-            out["std_type"] = std
-        else:
-            out["line_like"] = resolve_element(net, "line", like)
+        out.update(_line_choice(net, edit, "line_like", "std_type"))
+        out.update(_voltage_band(edit))
         return out
+
+    if op == "add_bus_with_transformer":
+        return _normalise_transformer_site(net, edit)
 
     # set_in_service
     etype = str(edit.get("element_type") or "").strip()
@@ -345,28 +593,69 @@ def _apply(net, edit: dict) -> None:
             net.trafo.at[i, "pfe_kw"] = float(net.trafo.at[i, "pfe_kw"]) * f
     elif op == "add_bus_with_connection":
         at = edit["connect_to"]
-        bus = pp.create_bus(net, vn_kv=edit["vn_kv"], name=edit["name"])
-        # The site takes its voltage limits and zone from the bus it joins.
-        for col in ("min_vm_pu", "max_vm_pu", "zone", "type"):
-            if col in net.bus.columns and pd.notna(net.bus.at[at, col]):
-                net.bus.at[bus, col] = net.bus.at[at, col]
-        line_name = f"{edit['name']} connection"
-        if "std_type" in edit:
-            line = pp.create_line(net, from_bus=at, to_bus=bus, length_km=edit["length_km"],
-                                  std_type=edit["std_type"], name=line_name)
+        bus = _new_bus(net, edit["vn_kv"], edit["name"], at, edit)
+        _new_line(net, at, bus, edit["length_km"], f"{edit['name']} connection",
+                  like=edit.get("line_like"), std=edit.get("std_type"))
+    elif op == "add_bus_with_transformer":
+        at = edit["connect_to"]
+        v_at = float(net.bus.at[at, "vn_kv"])
+        if "length_km" in edit:
+            sub = _new_bus(net, v_at, substation_bus_name(edit["name"], v_at), at, {})
+            _new_line(net, at, sub, edit["length_km"], f"{edit['name']} connection",
+                      like=edit.get("line_like"), std=edit.get("line_std_type"))
+            at = sub
+        bus = _new_bus(net, edit["vn_kv"], edit["name"], edit["connect_to"], edit)
+        hv, lv = (at, bus) if v_at > edit["vn_kv"] else (bus, at)
+        d = trafo_design(net, edit)
+        name = f"{edit['name']} transformer"
+        if "trafo_std_type" in edit:
+            extra = {k: edit[k] for k in ("tap_pos", "max_loading_percent") if k in edit}
+            idx = pp.create_transformer(net, hv, lv, std_type=edit["trafo_std_type"], name=name,
+                                        parallel=edit["parallel"], **extra)
         else:
-            src = net.line.loc[edit["line_like"]]
-            extra = {c: float(src[c]) for c in ("g_us_per_km", "max_loading_percent")
-                     if c in net.line.columns and pd.notna(src.get(c))}
-            line = pp.create_line_from_parameters(
-                net, from_bus=at, to_bus=bus, length_km=edit["length_km"],
-                r_ohm_per_km=float(src["r_ohm_per_km"]), x_ohm_per_km=float(src["x_ohm_per_km"]),
-                c_nf_per_km=float(src["c_nf_per_km"]), max_i_ka=float(src["max_i_ka"]),
-                df=float(src["df"]) if pd.notna(src.get("df")) else 1.0, name=line_name, **extra)
-        _mark(net.bus, bus)
-        _mark(net.line, line)
+            optional = {k: d[k] for k in ("tap_side", "tap_neutral", "tap_min", "tap_max",
+                                          "tap_step_percent", "tap_step_degree", "tap_pos",
+                                          "tap_changer_type", "max_loading_percent")
+                        if d[k] is not None}
+            idx = pp.create_transformer_from_parameters(
+                net, hv, lv, sn_mva=d["sn_mva"], vn_hv_kv=d["vn_hv_kv"], vn_lv_kv=d["vn_lv_kv"],
+                vk_percent=d["vk_percent"], vkr_percent=d["vkr_percent"], pfe_kw=d["pfe_kw"],
+                i0_percent=d["i0_percent"], shift_degree=d["shift_degree"], name=name,
+                parallel=edit["parallel"], **optional)
+        _mark(net.trafo, idx)
     else:
         net[edit["element_type"]].at[edit["element"], "in_service"] = edit["in_service"]
+
+
+def _new_bus(net, vn_kv: float, name: str, like_bus: int, edit: dict) -> int:
+    """A proposed bus; voltage limits, zone and type from `like_bus` unless
+    the edit gives its own limits."""
+    bus = pp.create_bus(net, vn_kv=vn_kv, name=name)
+    for col in ("min_vm_pu", "max_vm_pu", "zone", "type"):
+        if col in edit:
+            net.bus.at[bus, col] = edit[col]
+        elif col in net.bus.columns and pd.notna(net.bus.at[like_bus, col]):
+            net.bus.at[bus, col] = net.bus.at[like_bus, col]
+    _mark(net.bus, bus)
+    return bus
+
+
+def _new_line(net, from_bus: int, to_bus: int, length_km: float, name: str, *, like=None, std=None) -> int:
+    """A proposed line: a pandapower type, or the conductor of line `like`."""
+    if std:
+        line = pp.create_line(net, from_bus=from_bus, to_bus=to_bus, length_km=length_km,
+                              std_type=std, name=name)
+    else:
+        src = net.line.loc[like]
+        extra = {c: float(src[c]) for c in ("g_us_per_km", "max_loading_percent")
+                 if c in net.line.columns and pd.notna(src.get(c))}
+        line = pp.create_line_from_parameters(
+            net, from_bus=from_bus, to_bus=to_bus, length_km=length_km,
+            r_ohm_per_km=float(src["r_ohm_per_km"]), x_ohm_per_km=float(src["x_ohm_per_km"]),
+            c_nf_per_km=float(src["c_nf_per_km"]), max_i_ka=float(src["max_i_ka"]),
+            df=float(src["df"]) if pd.notna(src.get("df")) else 1.0, name=name, **extra)
+    _mark(net.line, line)
+    return line
 
 
 def _mark(tbl: pd.DataFrame, idx: int) -> None:
@@ -434,6 +723,24 @@ def describe(net, edit: dict) -> str:
                      else f"as {line_display_name(net, edit['line_like'])}")
         return (f"New bus {edit['name']!r} ({edit['vn_kv']:g} kV), {edit['length_km']:g} km line "
                 f"from {_bus_label(net, edit['connect_to'])} ({conductor})")
+    if op == "add_bus_with_transformer":
+        d = trafo_design(net, edit)
+        units = f"{edit['parallel']} × " if edit["parallel"] > 1 else ""
+        if "trafo_std_type" in edit:
+            spec = f"type {edit['trafo_std_type']!r}"
+        elif "trafo_like" in edit:
+            spec = f"design of {trafo_display_name(net, edit['trafo_like'])}"
+        else:
+            spec = f"vk {d['vk_percent']:g} %, vkr {d['vkr_percent']:g} %"
+        if d["tap_pos"] is not None and d["tap_pos"] != d["tap_neutral"]:
+            spec += f", tap {int(d['tap_pos']):+d}"
+        where = _bus_label(net, edit["connect_to"])
+        if "length_km" in edit:
+            conductor = (edit["line_std_type"] if "line_std_type" in edit
+                         else f"as {line_display_name(net, edit['line_like'])}")
+            where = f"the end of a {edit['length_km']:g} km line from {where} ({conductor})"
+        return (f"New bus {edit['name']!r} ({edit['vn_kv']:g} kV) behind a new {units}{d['sn_mva']:g} MVA "
+                f"{d['vn_hv_kv']:g}/{d['vn_lv_kv']:g} kV transformer ({spec}) at {where}")
     # set_in_service
     etype = edit["element_type"]
     labels = _element_labels(net, etype, edit["element"])
@@ -454,7 +761,12 @@ def summary(net, edits: list[dict]) -> dict:
         "added_generation_mw": total("add_generator", "p_max_mw"),
         "reinforced_lines": sum(e["op"] == "reinforce_line" for e in edits),
         "upgraded_trafos": sum(e["op"] == "upgrade_trafo" for e in edits),
-        "new_buses": sum(e["op"] == "add_bus_with_connection" for e in edits),
+        "new_buses": sum((e["op"] == "add_bus_with_connection")
+                         + (e["op"] == "add_bus_with_transformer") * (1 + ("length_km" in e))
+                         for e in edits),
+        "new_trafos": sum(e["op"] == "add_bus_with_transformer" for e in edits),
+        "new_transformer_mva": round(sum(trafo_design(net, e)["sn_mva"] * e["parallel"] for e in edits
+                                         if e["op"] == "add_bus_with_transformer"), 4),
         "switched_elements": sum(e["op"] == "set_in_service" for e in edits),
         "edits": [describe(net, e) for e in edits],
         "notes": notes(net, edits),
@@ -467,13 +779,60 @@ def notes(net, edits: list[dict]) -> list[str]:
     lengths = net.line.loc[~lg._proposed_mask(net.line), "length_km"] if len(net.line) else []
     placeholder = len(lengths) > 1 and bool((pd.Series(lengths).round(6) == 1.0).all())
     for e in edits:
-        if e["op"] == "add_bus_with_connection" and "line_like" in e and placeholder:
+        if e["op"] in ("add_bus_with_connection", "add_bus_with_transformer") and "line_like" in e \
+                and placeholder:
             # MATPOWER/PGLib conversions give every line 1 km and its whole
             # impedance per km: the copied line's length is not geography.
             out.append(
                 f"Every line of this network has length 1 km (a converted per-unit case), so "
                 f"{e['length_km']:g} km of {line_display_name(net, e['line_like'])}'s conductor "
                 f"means {e['length_km']:g}× that line's impedance, not a {e['length_km']:g} km route.")
+        if e["op"] == "add_bus_with_transformer":
+            out.extend(_transformer_notes(net, e))
+    return out
+
+
+def _transformer_notes(net, e: dict) -> list[str]:
+    out = []
+    d = trafo_design(net, e)
+    label = f"The new transformer for {e['name']}"
+    if "trafo_like" in e:
+        src = net.trafo.loc[e["trafo_like"]]
+        name = trafo_display_name(net, e["trafo_like"])
+        vk = _finite(src.get("vk_percent"))
+        if vk is not None and vk > 30 and "vk_percent" not in e:
+            out.append(
+                f"{name} has a short-circuit voltage of {vk:g} % on {float(src['sn_mva']):g} MVA — not a "
+                "physical unit: a converted per-unit case stores the branch impedance that way. "
+                f"{label} copies it{' on its new rating' if 'sn_mva' in e else ''}; give vk_percent and "
+                "vkr_percent (or a trafo_std_type) for a realistic unit.")
+        a = float(net.bus.at[int(src["hv_bus"]), "vn_kv"])
+        b = float(net.bus.at[int(src["lv_bus"]), "vn_kv"])
+        if (round(a, 6), round(b, 6)) != (round(d["vn_hv_kv"], 6), round(d["vn_lv_kv"], 6)):
+            out.append(f"{name} joins {a:g}/{b:g} kV; its design is copied in per unit to a "
+                       f"{d['vn_hv_kv']:g}/{d['vn_lv_kv']:g} kV unit.")
+        pos, neutral = _finite(src.get("tap_pos")), _finite(src.get("tap_neutral")) or 0.0
+        if pos is not None and pos != neutral and "tap_pos" not in e and d["tap_pos"] is not None:
+            out.append(f"{name} runs at tap {int(pos):+d}; {label} starts at its neutral tap "
+                       "(give tap_pos to match).")
+    if "trafo_std_type" not in e and "trafo_like" not in e and d["pfe_kw"] == 0 and d["i0_percent"] == 0:
+        out.append(f"{label} has no no-load losses or magnetising current (pfe_kw and i0_percent 0): "
+                   "it draws nothing when unloaded.")
+    hv_kv = max(e["vn_kv"], float(net.bus.at[e["connect_to"], "vn_kv"]))
+    lv_kv = min(e["vn_kv"], float(net.bus.at[e["connect_to"], "vn_kv"]))
+    off = (d["vn_hv_kv"] / d["vn_lv_kv"]) / (hv_kv / lv_kv) - 1
+    if abs(off) > 1e-4:
+        out.append(f"{label} is rated {d['vn_hv_kv']:g}/{d['vn_lv_kv']:g} kV between buses of "
+                   f"{hv_kv:g}/{lv_kv:g} kV: at neutral tap its ratio is {off:+.1%} off nominal, which "
+                   "shifts the new bus's voltage by about that much.")
+    base_kv = net.bus.loc[~lg._proposed_mask(net.bus), "vn_kv"]
+    if len(net.trafo) > 1 and base_kv.nunique() == 1:
+        out.append(f"Every bus of this network is at {float(base_kv.iloc[0]):g} kV (a converted per-unit "
+                   f"case): the new bus's {e['vn_kv']:g} kV is a label. In per unit the transformer "
+                   "adds its impedance and rating; its voltage ratio has no effect.")
+    if e["parallel"] > 1:
+        out.append(f"{label} is {e['parallel']} units in parallel, modelled as one branch: the N-1 sweep "
+                   "takes all of them out together, which is harsher than losing one unit.")
     return out
 
 
@@ -553,6 +912,14 @@ def profile_factor(net, spec: dict, ts: str, meas: pd.DataFrame, peaks: dict) ->
         raise EditError(f"{spec['name']!r} ({spec['kind']}) follows measured production, "
                         "and this dataset has none.")
     return float(meas["production"].abs().sum()) / total, "total measured production"
+
+
+def fixed_load_mask(tbl: pd.DataFrame) -> pd.Series:
+    """Loads a proposal added with a flat profile: a stated, fixed demand that
+    load-stress factors and demand-uncertainty draws leave unchanged."""
+    if not len(tbl) or "profile" not in tbl.columns:
+        return pd.Series(False, index=tbl.index)
+    return lg._proposed_mask(tbl) & (tbl["profile"].astype(object) == "flat")
 
 
 def _proposed_rows(tbl: pd.DataFrame):

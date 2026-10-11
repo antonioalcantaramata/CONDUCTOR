@@ -343,7 +343,7 @@ class TestCompare:
         assert client.post("/api/proposals/compare", json={"proposal": "base"}).status_code == 400
         assert client.post("/api/proposals/compare", json={"proposal": "x"}).status_code == 400
         _create(client)
-        assert client.post("/api/proposals/compare", json={"proposal": "dc_bus9", "study": "opf"}).status_code == 400
+        assert client.post("/api/proposals/compare", json={"proposal": "dc_bus9", "study": "load_flow"}).status_code == 400
 
 
 @pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
@@ -728,6 +728,222 @@ class TestAddedOnTheDiffMap:
         assert any("Site</b>" in h and "added by the proposal · 0.9700 pu" in h for h in hover)
 
 
+# ---------------------------------------------------------------------------
+# A new bus at another voltage behind a new transformer
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mv():
+    """A small 110/20 kV network with real voltages: HV — T — MV — line — MV2 (load)."""
+    n = pp.create_empty_network()
+    hv, b1, b2 = (pp.create_bus(n, vn_kv=kv, name=name, min_vm_pu=0.9, max_vm_pu=1.1)
+                  for kv, name in ((110, "HV"), (20, "MV"), (20, "MV2")))
+    pp.create_ext_grid(n, hv)
+    pp.create_transformer(n, hv, b1, std_type="25 MVA 110/20 kV", name="Main")
+    pp.create_line(n, b1, b2, length_km=4, std_type="NA2XS2Y 1x240 RM/25 12/20 kV", name="Feeder")
+    pp.create_load(n, b2, p_mw=6, q_mvar=1, name="Town")
+    return n
+
+
+TRAFO = {"op": "add_bus_with_transformer", "name": "Site"}
+
+
+class TestNewTransformer:
+    def test_a_copy_at_double_rating_is_two_copies_in_parallel(self, net):
+        like = {**TRAFO, "connect_to": 3, "trafo_like": 1}
+        resized, _ = sb.materialise(net, [{**like, "sn_mva": 2 * float(net.trafo.sn_mva[1])}])
+        doubled, _ = sb.materialise(net, [{**like, "parallel": 2}])
+        a, b = (nl.build_ybus_full(n) for n in (doubled, resized))
+        new = int(resized.bus.index[-1])
+        keys = [key for key in a["Yff_r"] if set(key[0]) == {3, new}]
+        assert keys
+        for k in ("Yff_r", "Yff_i", "Yft_r", "Yft_i"):
+            for key in keys:
+                assert a[k][key] == pytest.approx(b[k][key])
+        assert fe._branch_current_data(resized)[(3, new)]["I_from_max"] == pytest.approx(
+            fe._branch_current_data(doubled)[(3, new)]["I_from_max"])
+
+    def test_a_copy_is_the_same_unit_at_neutral_tap(self, net):
+        prop, edits = sb.materialise(net, [{**TRAFO, "connect_to": 3, "trafo_like": "T1"}])
+        new, t = int(prop.bus.index[-1]), prop.trafo.iloc[-1]
+        assert edits[0]["vn_kv"] == net.bus.vn_kv[8]               # the copied unit's other side
+        assert (int(t.hv_bus), int(t.lv_bus)) == (3, new) and t["proposed"] is True
+        for col in ("sn_mva", "vk_percent", "vkr_percent", "tap_step_percent", "shift_degree"):
+            assert t[col] == pytest.approx(net.trafo.at[1, col])
+        assert t.tap_pos == 0 and net.trafo.tap_pos[1] == -1
+        assert any("runs at tap -1" in n and "neutral tap" in n for n in sb.notes(prop, edits))
+        pp.runpp(prop)
+        assert prop.res_bus.vm_pu[new] == pytest.approx(prop.res_bus.vm_pu[3], abs=0.05)
+
+    def test_a_catalogue_type_with_its_other_voltage(self, mv):
+        prop, edits = sb.materialise(mv, [{**TRAFO, "connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV"},
+                                          {**DC, "bus": "Site", "p_mw": 0.3, "name": "Shop"}])
+        t, new = prop.trafo.iloc[-1], int(prop.bus.index[-1])
+        assert edits[0]["vn_kv"] == 0.4 and prop.bus.vn_kv[new] == 0.4
+        assert t.std_type == "0.63 MVA 20/0.4 kV" and t.sn_mva == 0.63 and t.vk_percent == 6.0
+        assert prop.bus.max_vm_pu[new] == 1.1                       # limits from the bus it joins
+        pp.runpp(prop)
+        assert 40 < prop.res_trafo.loading_percent.iloc[-1] < 60
+        assert prop.res_bus.vm_pu[new] < prop.res_bus.vm_pu[2]
+        assert sb.describe(prop, edits[0]) == ("New bus 'Site' (0.4 kV) behind a new 0.63 MVA 20/0.4 kV "
+                                               "transformer (type '0.63 MVA 20/0.4 kV') at MV2")
+
+    def test_explicit_values_and_the_tap_position(self, mv):
+        unit = {**TRAFO, "connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6,
+                "vkr_percent": 1, "pfe_kw": 1.5, "tap_step_percent": 2.5, "tap_min": -2, "tap_max": 2}
+        vm = {}
+        for pos in (0, 2):
+            prop, edits = sb.materialise(mv, [{**unit, "tap_pos": pos}])
+            pp.runpp(prop)
+            vm[pos] = prop.res_bus.vm_pu.iloc[-1]
+        t = prop.trafo.iloc[-1]
+        assert (t.tap_side, t.tap_neutral, t.tap_pos, t.i0_percent) == ("hv", 0, 2, 0.15)
+        assert vm[0] / vm[2] == pytest.approx(1.05, abs=0.003)     # +2 steps of 2.5 % on the HV side
+        assert "tap +2" in sb.describe(prop, edits[0])
+
+    def test_step_up_puts_the_new_bus_on_the_high_side(self, mv):
+        prop, edits = sb.materialise(mv, [{**TRAFO, "connect_to": "MV2", "vn_kv": 66, "sn_mva": 40,
+                                           "vk_percent": 10, "vkr_percent": 0.3, "shift_degree": 150}])
+        t, new = prop.trafo.iloc[-1], int(prop.bus.index[-1])
+        assert (int(t.hv_bus), int(t.lv_bus), t.vn_hv_kv, t.vn_lv_kv) == (new, 2, 66, 20)
+        assert "66/20 kV" in sb.describe(prop, edits[0])
+        pp.runpp(prop)
+
+    def test_a_line_first_then_the_transformer(self, mv):
+        prop, edits = sb.materialise(mv, [{
+            **TRAFO, "connect_to": "MV", "length_km": 10, "line_std_type": "NA2XS2Y 1x240 RM/25 12/20 kV",
+            "trafo_std_type": "0.63 MVA 20/0.4 kV", "parallel": 2},
+            {**DC, "bus": "Site", "p_mw": 0.8, "name": "Factory"}])
+        sub, new = (int(i) for i in prop.bus.index[-2:])
+        assert list(prop.bus.name[-2:]) == ["Site 20 kV", "Site"] and prop.bus.vn_kv[sub] == 20
+        line, t = prop.line.iloc[-1], prop.trafo.iloc[-1]
+        assert (int(line.from_bus), int(line.to_bus), line.length_km) == (1, sub, 10)
+        assert (int(t.hv_bus), int(t.lv_bus), int(t.parallel)) == (sub, new, 2)
+        assert all(tbl["proposed"].iloc[-1] is True for tbl in (prop.line, prop.trafo))
+        assert prop.bus["proposed"].iloc[-2:].tolist() == [True, True]
+        summary = sb.summary(prop, edits)
+        assert (summary["new_buses"], summary["new_trafos"], summary["new_transformer_mva"]) == (2, 1, 1.26)
+        assert "2 × 0.63 MVA" in summary["edits"][0] and "end of a 10 km line from MV" in summary["edits"][0]
+        assert any("2 units in parallel" in n for n in summary["notes"])
+        pp.runpp(prop)
+        assert prop.res_bus.vm_pu[new] < prop.res_bus.vm_pu[sub] < prop.res_bus.vm_pu[1]
+
+    def test_overrides_on_a_copy_and_the_canonical_form_replays(self, mv):
+        raw = {**TRAFO, "connect_to": "HV", "trafo_like": "Main", "sn_mva": 50, "vk_percent": 14,
+               "max_loading_percent": 120, "min_vm_pu": 0.95}
+        prop, edits = sb.materialise(mv, [raw])
+        t = prop.trafo.iloc[-1]
+        src = mv.trafo.iloc[0]
+        assert (t.sn_mva, t.vk_percent, t.vkr_percent, t.max_loading_percent) == (50, 14, src.vkr_percent, 120)
+        assert t.pfe_kw == pytest.approx(2 * src.pfe_kw)            # no-load losses grow with size
+        assert prop.bus.min_vm_pu.iloc[-1] == 0.95 and prop.bus.max_vm_pu.iloc[-1] == 1.1
+        again, same = sb.materialise(mv, edits)
+        assert same == edits and pp.toolbox.nets_equal(prop, again)
+
+    @pytest.mark.parametrize("change, fragment", [
+        ({"connect_to": "MV2", "vn_kv": 0.4}, "give trafo_like"),
+        ({"connect_to": "MV2", "vn_kv": 20, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1}, "same voltage"),
+        ({"connect_to": "MV2", "trafo_like": "Main", "trafo_std_type": "0.63 MVA 20/0.4 kV"}, "not both"),
+        ({"connect_to": "MV2", "trafo_std_type": "nope"}, "not a known transformer type"),
+        ({"connect_to": "MV2", "trafo_std_type": "160 MVA 380/110 kV"}, "neither side"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "trafo_std_type": "25 MVA 110/20 kV"}, "cannot join"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "vk_percent": 4}, "fixes vk_percent"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 6}, "must be below"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1, "tap_pos": 1},
+         "needs a tap changer"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1,
+          "tap_step_percent": 2.5}, "needs tap_step_percent, tap_min and tap_max"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "tap_pos": 5}, "outside the tap range"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "parallel": 5}, "at most 4"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "parallel": 1.5}, "whole number"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "line_like": "Feeder"},
+         "length_km is required"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "length_km": 3}, "exactly one of"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1,
+          "vn_lv_kv": 0.6}, "vn_lv_kv must be at most"),
+        ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1,
+          "pfe_kw": 80}, "over 5 %"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "min_vm_pu": 1.05,
+          "max_vm_pu": 1.0}, "below max_vm_pu"),
+        ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "name": "MV"}, "already named"),
+    ])
+    def test_invalid_units_are_refused(self, mv, change, fragment):
+        with pytest.raises(sb.EditError, match=fragment):
+            sb.materialise(mv, [{**TRAFO, **change}])
+
+    def test_notes_say_how_the_unit_was_modelled(self, mv, net):
+        prop, edits = sb.materialise(mv, [{**TRAFO, "connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1,
+                                           "vk_percent": 6, "vkr_percent": 1, "vn_lv_kv": 0.42}])
+        notes = " ".join(sb.notes(prop, edits))
+        assert "no no-load losses" in notes and "off nominal" in notes
+        prop, edits = sb.materialise(net, [{**TRAFO, "connect_to": 3, "vn_kv": 20, "trafo_like": "T0",
+                                            "sn_mva": 50}])
+        notes = " ".join(sb.notes(prop, edits))
+        assert "not a physical unit" in notes and "copied in per unit to a 135/20 kV unit" in notes
+
+    def test_a_unit_between_equal_voltages_needs_the_new_voltage(self, net):
+        net = copy.deepcopy(net)
+        net.bus["vn_kv"] = 1.0                                       # a converted per-unit case
+        with pytest.raises(sb.EditError, match="joins two 1 kV buses"):
+            sb.materialise(net, [{**TRAFO, "connect_to": 3, "trafo_like": 1}])
+        prop, edits = sb.materialise(net, [{**TRAFO, "connect_to": 3, "trafo_like": 1, "vn_kv": 20}])
+        assert any("is a label" in n for n in sb.notes(prop, edits))
+
+
+SUBSTATION = [{"op": "add_bus_with_transformer", "name": "DC 20 kV", "connect_to": "Bus 9", "vn_kv": 20,
+               "sn_mva": 40, "vk_percent": 12, "vkr_percent": 0.4, "parallel": 2},
+              {**DC, "bus": "DC 20 kV", "p_mw": 10}]
+
+
+class TestTransformerSiteThroughTheBackend:
+    def test_topology_and_studies_see_the_new_transformer(self, client):
+        out = _create(client, "sub", SUBSTATION)
+        assert out["summary"]["new_trafos"] == 1 and out["summary"]["new_transformer_mva"] == 80
+        topo = client.get("/api/network/topology", params={"network": "sub"}).json()
+        assert [b["name"] for b in topo["buses"] if b.get("added")] == ["DC 20 kV"]
+        added = [b for b in topo["branches"] if b.get("added")]
+        assert [b["kind"] for b in added] == ["trafo"] and "DC 20 kV transformer" in added[0]["name"]
+        rsa = client.post("/api/grid/rsa", json={"network": "sub"}).json()
+        assert any(v["bus_name"] == "DC 20 kV" for v in rsa["all_voltages"])
+        assert any("DC 20 kV transformer" in (t.get("trafo_name") or "") for t in rsa["all_trafo_loading"])
+        n1 = client.post("/api/proposals/compare", json={"proposal": "sub", "study": "n1"}).json()
+        assert n1["proposal"]["total_outages_tested"] == n1["base"]["total_outages_tested"] + 1
+        scan = client.post("/api/proposals/compare", json={
+            "proposal": "sub", "study": "scan", "start_timestamp": "2000-01-03",
+            "end_timestamp": "2000-01-03", "step_size": 16}).json()
+        assert scan["study"] == "scan" and scan["network"]["id"] == "sub"
+
+    @pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
+    def test_the_opf_runs_on_the_new_transformer(self, client):
+        _create(client, "sub", SUBSTATION)
+        out = client.post("/api/proposals/compare", json={"proposal": "sub", "study": "opf",
+                                                         "timestamp": "2000-01-04 03:15"}).json()
+        assert out["base"]["feasible"] and out["proposal"]["feasible"], out
+
+    def test_it_survives_a_restart(self, restartable):
+        mb, start = restartable
+        with start() as c:
+            before = _create(c, "sub", SUBSTATION)["edits"]
+        mb.app_data["proposals"] = {}
+        with start() as c:
+            [after] = c.get("/api/proposals").json()["proposals"]
+            assert after["id"] == "sub" and after["edits"] == before
+
+
+def test_an_added_transformer_is_drawn_as_added_and_dotted():
+    pytest.importorskip("plotly")
+    from llm_agent.agent.network_map import Edge, NetworkMap, Node
+    from llm_agent.agent.renderers import render_network_diff
+    base = NetworkMap("Grid", {0: Node(0, "Bus_0", 20.0, True, "substation", vm_pu=1.0)}, [])
+    prop = NetworkMap("Grid", {0: Node(0, "Bus_0", 20.0, True, "substation", vm_pu=0.99),
+                               1: Node(1, "Site", 0.4, True, "distribution", vm_pu=0.97)},
+                      [Edge(3, "Site transformer", 0, 1, "trafo", True, 45.0)])
+    fig = render_network_diff(base, prop, {0: (0.0, 0.0), 1: (1.0, 0.0)})
+    hover = [h for d in fig.data for h in (d.hovertext or []) if isinstance(h, str)]
+    assert any("Site transformer</b><br>trafo · added by the proposal · 45.0% loaded" in h for h in hover)
+    assert any(d.mode == "lines" and d.line.dash == "dot" for d in fig.data)
+
+
 class TestGraderAndPrompt:
     def _turn(self, user, assistant="On proposal dc_bus9 the grid is secure."):
         net = {"id": "dc_bus9", "edits": ["Add load"]}
@@ -998,3 +1214,48 @@ def test_the_comparison_states_its_differences(client):
     ch = out["changes"]
     assert ch["total_load_mw"] == pytest.approx(out["proposal"]["total_load_mw"] - out["base"]["total_load_mw"], abs=1e-3)
     assert ch["slack_import_mw"] == pytest.approx(out["proposal"]["slack_import_mw"] - out["base"]["slack_import_mw"], abs=1e-3)
+
+
+class TestFlatAddedLoadsAreFixed:
+    """Load stress and demand-uncertainty draws leave a flat added load at its
+    stated size; an added load that follows its bus's demand scales with it."""
+
+    EDITS = [{**DC, "p_mw": 30, "profile": "flat"},
+             {**DC, "name": "Factory", "bus": "Bus 4", "p_mw": 10, "profile": "follow_bus"}]
+
+    def test_the_helper(self, net):
+        import main_backend as mb
+        prop, _ = sb.materialise(net, self.EDITS)
+        before = prop.load.p_mw.copy()
+        mb._scale_loads(prop, 1.5)
+        flat, follow = prop.load.index[-2], prop.load.index[-1]
+        assert prop.load.p_mw[flat] == pytest.approx(before[flat])
+        assert prop.load.p_mw[follow] == pytest.approx(1.5 * before[follow])
+        assert prop.load.p_mw[0] == pytest.approx(1.5 * before[0])
+
+    def test_through_the_rsa(self, client):
+        _create(client, "fixed", self.EDITS)
+        ts = "2000-01-03 14:45:00"
+        base1 = client.post("/api/grid/rsa", json={"timestamp": ts}).json()["total_load_mw"]
+        prop = client.post("/api/grid/rsa", json={"timestamp": ts, "network": "fixed",
+                                                  "load_scaling_factor": 1.2}).json()
+        added = {e["element"]: e["p_mw"] for e in prop["network"]["added_elements_at_tick"]["elements"]}
+        expected = (base1 + added["Factory"]) * 1.2 + added["Data centre"]
+        assert prop["total_load_mw"] == pytest.approx(expected, abs=1e-2)
+
+
+@pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
+def test_the_opf_comparison(client):
+    import main_backend as mb
+    _create(client, "small", [{**DC, "p_mw": 10}])
+    mb.app_data["last_dispatch_result"], mb.app_data["last_dispatch_timestamp"] = ["kept"], "t0"
+    out = client.post("/api/proposals/compare", json={"proposal": "small", "study": "opf",
+                                                     "timestamp": "2000-01-04 03:15"}).json()
+    assert out["study"] == "opf" and out["network"]["id"] == "small"
+    for side in ("base", "proposal"):
+        assert {"status", "feasible", "units_moved", "redispatch_mw", "grid_import_after_mw"} <= set(out[side])
+    assert out["base"]["feasible"] and out["proposal"]["feasible"]
+    assert out["changes"]["grid_import_after_mw"] == pytest.approx(
+        out["proposal"]["grid_import_after_mw"] - out["base"]["grid_import_after_mw"], abs=1e-3)
+    assert isinstance(out["units"], list)
+    assert mb.app_data["last_dispatch_result"] == ["kept"]      # the comparison left it alone

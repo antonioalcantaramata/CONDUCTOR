@@ -113,16 +113,23 @@ _CHANGE_ANGLE = (
     "plus edits: add a load (flat; follow_bus — the demand shape of its own bus or, with "
     "`follow`, of another bus, since a new bus has no measured demand; or shift), add a "
     "generator (dispatchable, pv or wind), reinforce a line, upgrade a transformer, "
-    "add a new bus joined by a line, or switch a branch or unit in or out of service"
+    "add a new bus joined by a line, add a new bus at another voltage behind a new "
+    "transformer (optionally after a new line; parallel units for redundancy), or switch "
+    "a branch or unit in or out of service"
 )
 
-_BASE_PROMPT = """\
-You are the suggestion agent of CONDUCTOR, a decision-support system for power \
-system operators. A separate orchestrator agent answers the operator's \
-questions by running validated power-system tools. You do not run tools and \
-you do not compute anything. Your only job is to help the operator decide what \
-to look at next.
+# One agent, two modes: suggestions (a comment and 3–4 next steps, on click)
+# and discussion (a side thread with the operator under an answer). Both see
+# the same session and follow the same rules; each adds its task.
 
+_ROLE = """\
+You are the advisor of CONDUCTOR, a decision-support system for power system \
+operators. A separate orchestrator agent answers the operator's questions by \
+running validated power-system tools. You do not run tools and you do not \
+compute anything. {task_sentence}
+"""
+
+_INPUTS = """\
 You receive:
 - the most recent messages of the conversation;
 - a digest of every earlier turn: the question, the tools run with their key \
@@ -130,10 +137,43 @@ arguments, and the verdicts they returned — use it to see patterns across a \
 long session;
 - a compact record of the latest turn (tools run, their arguments, key \
 results, and any concerns the system raised);
-- the session context (network, simulation time, data source);
+- the session context (network, simulation time, data source, proposals);
 - the list of capabilities the orchestrator can run;
-- suggestions already given in this conversation.
+- {task_input}.
+"""
 
+_SHARED_RULES = """\
+Always:
+- Do not state engineering figures except those that appear in the turn \
+records or the conversation, copied exactly. Never estimate, extrapolate or \
+calculate. Figures you write are checked against the session, and any that \
+are not found are flagged to the operator.
+- Never claim the result of a study that has not been run.
+- Propose analyses and options to explore; do not instruct operational \
+actions. Never write "you should curtail…" or "dispatch…". Write "Study…", \
+"Compare…", "Check whether…".
+- Everything you propose must be answerable with the listed capabilities, \
+written as a complete, self-contained request the orchestrator can execute: \
+name the timestamp, the data source, the elements and any proposal by name. \
+Never rely on "the same as before" or "that bus".
+- Match the operator's language.
+- A bus in `voltage_controlled_buses` is held at its setpoint by a unit: its \
+voltage is not a weak spot. Its margin is that unit's `q_headroom_up_mvar`.
+- Concerns that start with "answer check:" are about how the answer was \
+written, found by deterministic checks — not about the grid. Say plainly what \
+each means for the operator (e.g. a figure the tools never produced) and, \
+where a study would settle it, propose that study; never restate an \
+unverified figure as if it were confirmed.
+- A result carrying a `network` block was computed on a network proposal, \
+not on the loaded network; name the proposal whenever you refer to it.
+- To look beyond one moment at a proposal, `compare_networks` with study \
+"scan" compares it with the base at every tick of a window — by default the \
+whole dataset, so it needs no timestamp (give start_timestamp / end_timestamp \
+only to narrow it). Study "rsa" and "n1" each cover one moment; never ask \
+them for a window.
+"""
+
+_SUGGEST_TASK = """\
 First, write a short "comment": 2 to 4 sentences giving your reading of \
 what happened in the latest turn and what it means for the operator — \
 whether the result answers the question, what is surprising or uncertain, \
@@ -150,37 +190,16 @@ pattern across the session, a question behind the question, a different \
 framing of the problem.
 Use step_back for genuinely new perspectives, not a restatement of the others.
 
-Rules:
-1. Every suggestion must be answerable with the listed capabilities. If an \
-idea needs data or tools CONDUCTOR does not have, do not suggest it.
-2. Write each "prompt" as a complete, self-contained request the orchestrator \
-can execute: name the timestamp, the data source, and the elements by name. \
-Never rely on "the same as before" or "that bus".
-3. Do not state engineering figures — in the comment or the suggestions — \
-except those that appear in the turn records or the conversation, copied \
-exactly. Never estimate, extrapolate or calculate.
-4. You suggest analyses and options to explore; you do not instruct \
-operational actions. Never write "you should curtail…" or "dispatch…". Write \
-"Study…", "Compare…", "Check whether…".
-5. If the latest result shows a problem (violations, insecure or infeasible \
+Rules for suggestions:
+1. If the latest result shows a problem (violations, insecure or infeasible \
 results, contingency failures, concerns raised by the system), at least one \
 suggestion must address it directly.
-6. Do not repeat analyses already done in this conversation or suggestions \
+2. Do not repeat analyses already done in this conversation or suggestions \
 already given, unless a changed parameter makes them meaningfully new — and \
 then say what changed.
-7. Keep "title" under 12 words and "why" to one sentence that points to what \
+3. Keep "title" under 12 words and "why" to one sentence that points to what \
 in the conversation motivates the suggestion.
-8. Match the operator's language.
-8b. A bus in `voltage_controlled_buses` is held at its setpoint by a unit: its \
-voltage is not a weak spot. Its margin is that unit's `q_headroom_up_mvar`.
-8b2. Concerns that start with "answer check:" are about how the answer was \
-written, found by deterministic checks — not about the grid. In the comment, \
-say plainly what each means for the operator (e.g. a figure the tools never \
-produced). Where a study would settle it, suggest that study; never restate \
-an unverified figure as if it were confirmed.
-8c. Network proposals. A result carrying a `network` block was computed on a \
-proposal, not on the loaded network; name the proposal whenever you refer to \
-it. When the latest turn studied a proposal:
+4. When the latest turn studied a network proposal:
    - "stress" should cover what a planner would check before trusting it: other \
 hours (compare_networks with study "scan" over the dataset, the forecast), and \
 an N-1 screen on the proposal at its worst moment, if the session has not done them;
@@ -192,7 +211,7 @@ hosting capacity — e.g. the same load at another bus, a different profile or \
 size, reinforcing the branch that overloaded, a dispatchable unit near the bus \
 that dropped, or opening/closing a branch. Say what motivates it; never claim \
 the alternative is better — that is for the study to show.
-9. If there is nothing useful to suggest, return an empty list and a one-line \
+5. If there is nothing useful to suggest, return an empty list and a one-line \
 "note" explaining why; still write the comment.
 
 Respond with JSON only, in this format:
@@ -200,6 +219,52 @@ Respond with JSON only, in this format:
 "title": "...", "prompt": "...", "why": "..."}}], "note": "optional"}}
 """
 
+_DISCUSS_TASK = """\
+You are now in a side discussion with the operator about the results of this \
+session — the thread is given below the session. Answer the operator's latest \
+message directly, in at most about 200 words.
+
+Rules for the discussion:
+1. Separate evidence from opinion. When you say what the results show, say \
+which result (the tool, and the turn when it helps). When you give your \
+reading, say it is your view.
+2. When the operator is deciding something, ask what matters to them — which \
+limits, how much risk, which time horizon — before recommending.
+3. Asked why a conclusion might be wrong, argue against it using only what the \
+session shows, and say which study would test each objection.
+4. When the discussion needs evidence the session does not have, propose at \
+most 3 studies. The operator sends them to the orchestrator; you will see \
+their results in later messages of the thread.
+5. Do not repeat a study the session already ran unless a changed parameter \
+makes it new; say what changed.
+6. Before any question has been asked (the request says so), help the operator \
+plan: what exactly to ask, at which moment or period, against which limits, and \
+which studies to run first. There are no results yet — say nothing about the \
+grid's state (voltages, loadings, security, margins); only the session context \
+describes the network.
+
+Respond with JSON only, in this format:
+{{"reply": "...", "studies": [{{"title": "...", "prompt": "...", "why": "..."}}]}}
+"""
+
+_NOTE_TASK = """\
+The operator is closing the side discussion below and asks you to record it. \
+Write a short decision note from the thread and the session.
+
+Rules for the note:
+1. "decision": what the operator decided, in their words or close to them. If \
+no decision was reached, write "No decision recorded" and say what remains open.
+2. "evidence": the results the decision rests on — each naming the study and \
+the turn, figures copied exactly. Only results in the session; nothing from \
+studies that were proposed but not run.
+3. "open_risks": what the evidence does not cover, or modelling choices it \
+depends on.
+4. "studies_run": the studies in this session that bear on the decision.
+Keep each item to one sentence.
+
+Respond with JSON only, in this format:
+{{"decision": "...", "evidence": ["..."], "open_risks": ["..."], "studies_run": ["..."]}}
+"""
 
 def capability_list() -> list[tuple[str, str]]:
     """(tool name, first sentence of its description) for every runnable tool.
@@ -224,15 +289,35 @@ def _first_sentence(text: str) -> str:
     return text[: match.start()] if match else text
 
 
-def build_system_prompt(capabilities: list[tuple[str, str]] | None = None) -> str:
+def _prompt(task: str, task_sentence: str, task_input: str,
+            capabilities: list[tuple[str, str]] | None, **fmt) -> str:
     caps = capability_list() if capabilities is None else capabilities
     lines = "\n".join(f"- {name}: {summary}" for name, summary in caps)
-    return (
-        _BASE_PROMPT.format(change_angle=_CHANGE_ANGLE)
-        + "\nCapabilities the orchestrator can run:\n"
-        + lines
-        + "\n"
-    )
+    return (_ROLE.format(task_sentence=task_sentence) + "\n"
+            + _INPUTS.format(task_input=task_input) + "\n"
+            + _SHARED_RULES + "\n"
+            + task.format(**fmt)
+            + "\nCapabilities the orchestrator can run:\n" + lines + "\n")
+
+
+def build_system_prompt(capabilities: list[tuple[str, str]] | None = None) -> str:
+    """The suggestion mode."""
+    return _prompt(_SUGGEST_TASK, "Here your job is to help the operator decide what to look at next.",
+                   "suggestions already given in this conversation", capabilities,
+                   change_angle=_CHANGE_ANGLE)
+
+
+def build_discussion_prompt(capabilities: list[tuple[str, str]] | None = None) -> str:
+    """The discussion mode: a side thread with the operator."""
+    return _prompt(_DISCUSS_TASK, "Here you are the operator's advisor: they think a result "
+                   "through with you, and decide what to do and what to study next.",
+                   "the side discussion so far", capabilities)
+
+
+def build_note_prompt(capabilities: list[tuple[str, str]] | None = None) -> str:
+    """The decision note that closes a discussion."""
+    return _prompt(_NOTE_TASK, "Here you record what a side discussion with the operator decided.",
+                   "the side discussion to record", capabilities)
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +570,9 @@ def session_digest(records: list[dict], latest: dict | None) -> str:
     return "\n".join(head + list(reversed(kept)))
 
 
-def build_request(messages: list[dict], record: dict | None, context: dict,
-                  shown: list[dict], records: list[dict] | None = None) -> str:
-    """The single user message sent to the suggestion agent."""
+def _session_parts(messages: list[dict], record: dict | None, context: dict,
+                   records: list[dict] | None) -> list[str]:
+    """What both modes are shown about the session."""
     parts = [
         "## Conversation (most recent messages)\n" + (_conversation_text(messages) or "(empty)"),
         "## Earlier turns (digest)\n" + (session_digest(records or [], record) or "(none)"),
@@ -499,6 +584,13 @@ def build_request(messages: list[dict], record: dict | None, context: dict,
     if attention:
         parts.append("## Concerns raised by the system\n" + "\n".join(f"- {r}" for r in attention))
     parts.append("## Session context\n" + json.dumps(context, ensure_ascii=False, default=str))
+    return parts
+
+
+def build_request(messages: list[dict], record: dict | None, context: dict,
+                  shown: list[dict], records: list[dict] | None = None) -> str:
+    """The single user message sent to the suggestion agent."""
+    parts = _session_parts(messages, record, context, records)
     if shown:
         parts.append("## Suggestions already given (do not repeat)\n" + "\n".join(
             f"- [{s.get('angle')}] {s.get('title')}" for s in shown))
@@ -643,3 +735,193 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
         except Exception:  # noqa: BLE001
             logger.warning("Could not ground suggestion figures.", exc_info=True)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Discussion mode — a side thread with the operator under an answer
+# ---------------------------------------------------------------------------
+
+MAX_STUDIES = 3
+_MAX_THREAD_MESSAGES = 16
+_MAX_THREAD_CHARS = 2000
+
+
+class Study(NamedTuple):
+    """A study the advisor proposes; the operator sends it to the orchestrator."""
+    title: str
+    prompt: str
+    why: str = ""
+    unverified: tuple[str, ...] = ()
+
+    def as_record(self) -> dict:
+        return {"title": self.title, "prompt": self.prompt, "why": self.why,
+                "unverified": list(self.unverified)}
+
+
+class AdvisorReply(NamedTuple):
+    text: str
+    studies: tuple[Study, ...] = ()
+    # Figures in `text` that appear nowhere in this conversation's evidence.
+    unverified: tuple[str, ...] = ()
+    error: str = ""
+    raw: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+class DecisionNote(NamedTuple):
+    decision: str
+    evidence: tuple[str, ...] = ()
+    open_risks: tuple[str, ...] = ()
+    studies_run: tuple[str, ...] = ()
+    unverified: tuple[str, ...] = ()
+    error: str = ""
+    raw: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+    def as_record(self) -> dict:
+        return {"decision": self.decision, "evidence": list(self.evidence),
+                "open_risks": list(self.open_risks), "studies_run": list(self.studies_run),
+                "unverified": list(self.unverified)}
+
+
+def _thread_text(thread: list[dict]) -> str:
+    """The side discussion so far, newest kept when it is long. A study the
+    operator sent is shown with the turn it was answered in, when known."""
+    lines = []
+    for item in thread[-_MAX_THREAD_MESSAGES:]:
+        role = item.get("role")
+        text = " ".join(str(item.get("text") or "").split())[:_MAX_THREAD_CHARS]
+        if role == "operator":
+            lines.append(f"Operator: {text}")
+        elif role == "advisor":
+            studies = "; ".join(s.get("title", "") for s in item.get("studies") or [])
+            lines.append(f"You: {text}" + (f" [proposed studies: {studies}]" if studies else ""))
+        elif role == "sent":
+            lines.append(f"(The operator sent the study \"{text}\" to the orchestrator"
+                         + (f"; it was answered in turn {item['answered_turn']}." if item.get("answered_turn")
+                            else "; no answer yet.") + ")")
+    return "\n".join(lines)
+
+
+def build_discussion_request(question: str, thread: list[dict], messages: list[dict],
+                             record: dict | None, context: dict, records: list[dict]) -> str:
+    parts = _session_parts(messages, record, context, records)
+    if not records and not any(m.get("role") == "user" for m in messages):
+        parts.append("## Before the first question\nThe operator has not asked the orchestrator "
+                     "anything yet and no study has run: this is planning (rule 6).")
+    parts.append("## Side discussion so far\n" + (_thread_text(thread) or "(this is its first message)"))
+    parts.append("## The operator's message\n" + question.strip())
+    parts.append("Return the JSON now.")
+    return "\n\n".join(parts)
+
+
+def build_note_request(thread: list[dict], messages: list[dict], record: dict | None,
+                       context: dict, records: list[dict]) -> str:
+    parts = _session_parts(messages, record, context, records)
+    parts.append("## Side discussion to record\n" + (_thread_text(thread) or "(empty)"))
+    parts.append("Return the JSON now.")
+    return "\n\n".join(parts)
+
+
+def _json_object(text: str) -> dict | None:
+    body = _FENCE_RE.sub("", (text or "").strip())
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(body[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def parse_discussion(text: str) -> AdvisorReply:
+    data = _json_object(text)
+    if data is None:
+        return AdvisorReply("", error="The advisor did not return a readable reply.", raw=text or "")
+    reply = str(data.get("reply") or "").strip()
+    studies = []
+    for entry in data.get("studies") or []:
+        if not isinstance(entry, dict):
+            continue
+        title, prompt = str(entry.get("title") or "").strip(), str(entry.get("prompt") or "").strip()
+        if title and prompt:
+            studies.append(Study(title, prompt, str(entry.get("why") or "").strip()))
+        if len(studies) == MAX_STUDIES:
+            break
+    if not reply and not studies:
+        return AdvisorReply("", error="The advisor returned an empty reply.", raw=text or "")
+    return AdvisorReply(reply, tuple(studies), raw=text or "")
+
+
+def parse_note(text: str) -> DecisionNote:
+    data = _json_object(text)
+    if data is None:
+        return DecisionNote("", error="The advisor did not return a readable note.", raw=text or "")
+
+    def items(key):
+        return tuple(str(x).strip() for x in (data.get(key) or []) if str(x).strip())
+
+    decision = str(data.get("decision") or "").strip() or "No decision recorded"
+    return DecisionNote(decision, items("evidence"), items("open_risks"), items("studies_run"),
+                        raw=text or "")
+
+
+def _call(system: str, request: str, provider):
+    from .providers import get_provider, user_message
+    provider = provider or get_provider()
+    return provider.chat(messages=[user_message(request)], tools=[], system=system)
+
+
+def discuss(question: str, thread: list[dict], messages: list[dict], latest: dict | None,
+            records: list[dict], context: dict, provider=None) -> AdvisorReply:
+    """One reply of the advisor in a side discussion.
+
+    `thread` is the discussion so far, `[{role: operator|advisor|sent, text, ...}]`;
+    `records` are every turn record of the conversation, including answers to
+    studies sent from the thread. Figures in the reply and in each study's
+    `why` are checked against those records and flagged when not found.
+    """
+    try:
+        response = _call(build_discussion_prompt(),
+                         build_discussion_request(question, thread, messages, latest, context, records),
+                         provider)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Advisor call failed.", exc_info=True)
+        return AdvisorReply("", error=f"The advisor could not be reached: {exc}")
+    reply = parse_discussion(response.text or "")
+    if reply.ok:
+        try:
+            check = _figure_check(records)
+            reply = reply._replace(unverified=check(reply.text),
+                                   studies=tuple(st._replace(unverified=check(st.why)) for st in reply.studies))
+        except Exception:  # noqa: BLE001 — shown unmarked rather than lost
+            logger.warning("Could not ground the advisor's figures.", exc_info=True)
+    return reply
+
+
+def decision_note(thread: list[dict], messages: list[dict], latest: dict | None,
+                  records: list[dict], context: dict, provider=None) -> DecisionNote:
+    """The note that closes a side discussion: decision, evidence, open risks,
+    studies run. Its figures are checked like every other text of the agent."""
+    try:
+        response = _call(build_note_prompt(),
+                         build_note_request(thread, messages, latest, context, records), provider)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Decision note call failed.", exc_info=True)
+        return DecisionNote("", error=f"The advisor could not be reached: {exc}")
+    note = parse_note(response.text or "")
+    if note.ok:
+        try:
+            check = _figure_check(records)
+            text = " ".join([note.decision, *note.evidence, *note.open_risks])
+            note = note._replace(unverified=check(text))
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not ground the decision note's figures.", exc_info=True)
+    return note

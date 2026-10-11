@@ -58,10 +58,14 @@ pio.templates["conductor"] = go.layout.Template(
         "colorway": [_C.PRIMARY, _C.TEAL, _C.PURPLE, _C.WARN, _C.NEUTRAL, _C.OK],
         "paper_bgcolor": "white",
         "plot_bgcolor": "white",
+        # `automargin`: long category labels ("Bus_3 -> Bus_8 [T1]") widen the
+        # margin instead of being cut off in a narrow column.
         "xaxis": {"gridcolor": _C.GRID, "linecolor": "#D5DAE3", "zerolinecolor": "#C9CFDA",
-                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}}},
+                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}},
+                  "automargin": True},
         "yaxis": {"gridcolor": _C.GRID, "linecolor": "#D5DAE3", "zerolinecolor": "#C9CFDA",
-                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}}},
+                  "ticks": "outside", "tickcolor": "#D5DAE3", "title": {"font": {"size": 12}},
+                  "automargin": True},
         "legend": {"font": {"size": 11}, "bgcolor": "rgba(255,255,255,0.8)"},
         "hoverlabel": {"bgcolor": "white", "bordercolor": "#D5DAE3",
                        "font": {"size": 12, "color": _C.INK}},
@@ -3110,6 +3114,26 @@ def render_network_comparison(result: dict) -> list[go.Figure]:
             figures.append(fig)
         return figures
 
+    if result.get("study") == "opf":
+        units = result.get("units") or []
+        if not units:
+            b, p = result.get("base") or {}, result.get("proposal") or {}
+            text = (f"No unit is moved on either network ({where})" if b.get("feasible") and p.get("feasible")
+                    else f"Corrective dispatch — base: {b.get('status')}, proposal: {p.get('status')} ({where})")
+            return [_empty_figure(text)]
+        names = _safe_labels([u["element"] for u in units], "Unit")
+        fig = go.Figure([
+            go.Bar(name="base", y=names, x=[u["base_dP_mw"] for u in units], orientation="h",
+                   marker_color=_C.NEUTRAL),
+            go.Bar(name=net.get("id", "proposal"), y=names, x=[u["proposal_dP_mw"] for u in units],
+                   orientation="h", marker_color=_C.PRIMARY),
+        ])
+        fig.update_layout(**CHART_THEME, barmode="group",
+                          title=f"Corrective redispatch by unit ({where})",
+                          xaxis_title="Change in active power (MW)", yaxis_title="",
+                          height=max(240, 46 * len(units) + 140))
+        return [fig]
+
     if result.get("study") == "n1":
         def per_outage(rows):
             counts: dict[str, int] = {}
@@ -3565,7 +3589,8 @@ def render_network_diff(base: NetworkMap, proposal: NetworkMap, positions: dict,
         elif b is None:
             # Built by the proposal: there is nothing to subtract.
             load = "" if edge.loading_pct is None else f" · {edge.loading_pct:.1f}% loaded"
-            colour, width, dash, detail = _C.PRIMARY, 3.0, "solid", "added by the proposal" + load
+            colour, width, detail = _C.PRIMARY, 3.0, "added by the proposal" + load
+            dash = "dot" if edge.kind == "trafo" else "solid"
         elif opened:
             colour, width, dash, detail = _OUT_OF_SERVICE, 2.0, "dash", "opened by the proposal"
         elif d is None:
