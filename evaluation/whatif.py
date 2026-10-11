@@ -101,6 +101,17 @@ TASKS: tuple[Task, ...] = (
          ({"kind": "edit", "label": "edit: T1 to 80 MVA",
            "match": {"op": "upgrade_trafo", "trafo": 1, "new_sn_mva": 80}},
           {"kind": "over_time", "label": "found the worst hour"})),
+    Task("new_substation_trafo",
+         ("Build a new 20 kV substation at Bus 9 with two 40 MVA transformers (vk 12 %, vkr 0.4 %) "
+          "and connect a 30 MW data centre to it. Is it N-1 secure?",),
+         ({"kind": "edit", "label": "edit: 2 × 40 MVA transformer to a 20 kV bus at Bus_9",
+           "match": {"op": "add_bus_with_transformer", "connect_to": 9, "vn_kv": 20, "sn_mva": 40,
+                     "parallel": 2, "vk_percent": 12}},
+          {"kind": "edit", "label": "edit: 30 MW load at the new bus",
+           "match": {"op": "add_load", "bus": 14, "p_mw": 30}},
+          {"kind": "n1_on_proposal", "label": "N-1 on the proposal"},
+          {"kind": "mentions", "label": "reported how the units are modelled",
+           "any": ["together", "one branch", "label", "per unit"]})),
 )
 
 _ALWAYS = ({"kind": "named", "label": "named the proposal"},

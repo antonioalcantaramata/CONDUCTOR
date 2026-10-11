@@ -913,6 +913,23 @@ def _dataset_of(request) -> dict:
     return _resolve_dataset(getattr(request, "data_source", None) or "measurements")[1]
 
 
+def _scale_loads(net, factor) -> None:
+    """Multiply demand by `factor`: a load-stress scenario, or one draw of
+    demand uncertainty (probabilistic RSA, robust OPF, hosting capacity).
+
+    A flat load a network proposal added (a data centre at a fixed size) is
+    left as it is: it is a stated quantity, not a measured demand that could
+    be higher or uncertain. An added load that follows its bus's demand
+    (`follow_bus`) scales with it, as the demand it follows does.
+    """
+    f = float(factor)
+    if f == 1.0 or not len(net.load):
+        return
+    rows = net.load.index[~sb.fixed_load_mask(net.load)]
+    net.load.loc[rows, "p_mw"] *= f
+    net.load.loc[rows, "q_mvar"] *= f
+
+
 def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | None = None):
     """Give `net` the values of one tick: measured loads and generation, then
     every element a proposal added at its own profile.
@@ -2553,6 +2570,7 @@ async def network_topology(network: str | None = None):
             "kind": "trafo",
             "in_service": bool(net.trafo.at[idx, "in_service"])
             if "in_service" in net.trafo.columns else True,
+            **added("trafo", idx),
         })
 
     external_grids = [
@@ -3584,8 +3602,7 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, timestamp, _dataset_of(request))
     pg_max = _pg_max_for(request, net_copy)
-    net_copy.load['p_mw'] *= request.load_scaling_factor
-    net_copy.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net_copy, request.load_scaling_factor)
     if request.sgen_scaling_factor != 1.0:
         net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
         net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
@@ -4462,8 +4479,7 @@ def _scan_one_scenario(
             meas = prepare_measurement_df(measurements[ts])
             net_copy, _ = _assign_tick(net_copy, meas, ts, measurements, subs=substations_list)
             if load_scaling_factor != 1.0:
-                net_copy.load["p_mw"] *= load_scaling_factor
-                net_copy.load["q_mvar"] *= load_scaling_factor
+                _scale_loads(net_copy, load_scaling_factor)
             if sgen_scale != 1.0:
                 net_copy.sgen["p_mw"] *= sgen_scale
                 net_copy.sgen["q_mvar"] *= sgen_scale
@@ -4658,8 +4674,7 @@ def _run_probabilistic_sample(
             net_copy.sgen["p_mw"] = p_inj
 
         if abs(load_mult - 1.0) > 1e-6:
-            net_copy.load["p_mw"] *= load_mult
-            net_copy.load["q_mvar"] *= load_mult
+            _scale_loads(net_copy, load_mult)
         pp.runpp(net_copy, algorithm="nr", numba=False)
     except Exception:
         return None
@@ -5108,8 +5123,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
             meas = prepare_measurement_df(ets_measurements[ts])
             net_copy, _ = _assign_tick(net_copy, meas, ts, ets_measurements)
             if request.load_scaling_factor != 1.0:
-                net_copy.load["p_mw"] *= request.load_scaling_factor
-                net_copy.load["q_mvar"] *= request.load_scaling_factor
+                _scale_loads(net_copy, request.load_scaling_factor)
             pp.runpp(net_copy, algorithm="nr", numba=False)
         except HTTPException:
             raise  # a request error (unknown network, profile) is not a non-converged tick
@@ -5227,8 +5241,7 @@ async def simulate_contingency(request: ContingencyRequest):
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
-    net_copy.load['p_mw'] *= request.load_scaling_factor
-    net_copy.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net_copy, request.load_scaling_factor)
 
     if request.element_type == "line":
         net_copy.line.at[request.element_index, "in_service"] = False
@@ -5343,8 +5356,7 @@ async def simulate_all_contingencies(request: GridRequest):
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
-    net_copy.load['p_mw'] *= request.load_scaling_factor
-    net_copy.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net_copy, request.load_scaling_factor)
     # Accepted by the request and the agent's wrapper, but never applied: the
     # sweep ran at measured renewable output whatever was asked.
     if request.sgen_scaling_factor != 1.0:
@@ -5468,8 +5480,7 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
-    net_copy.load['p_mw'] *= request.load_scaling_factor
-    net_copy.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net_copy, request.load_scaling_factor)
     # Transformers stay at the taps of the network as loaded — the ones the
     # assessments use and the admittance database was built at; the starting
     # point used to come from a neutral-tap power flow (review 2.2).
@@ -5813,8 +5824,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         if len(_net.sgen.index) > 0:
             _net.sgen["p_mw"] = p_ceiling
             _net.sgen["q_mvar"] = q_set
-        _net.load["p_mw"] *= request.load_scaling_factor
-        _net.load["q_mvar"] *= request.load_scaling_factor
+        _scale_loads(_net, request.load_scaling_factor)
         return _net
 
     def _to_prob_dict(counts: dict[str, int], denom: int) -> dict[str, float]:
@@ -5858,8 +5868,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
                 _net.sgen["p_mw"] = p_inj
                 _net.sgen["q_mvar"] = q_set
                 curtailment_mw = float(np.maximum(xi - p_ceiling, 0.0).sum())
-            _net.load["p_mw"] *= float(lm)
-            _net.load["q_mvar"] *= float(lm)
+            _scale_loads(_net, float(lm))
             try:
                 pp.runpp(_net, algorithm="nr", numba=False)
             except Exception:
@@ -5974,8 +5983,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         # Build deterministic warm-start dispatch on base forecast.
         db = _db_for("full", request)
         net_warm = copy.deepcopy(net_base)
-        net_warm.load["p_mw"] *= request.load_scaling_factor
-        net_warm.load["q_mvar"] *= request.load_scaling_factor
+        _scale_loads(net_warm, request.load_scaling_factor)
         try:
             pp.runpp(net_warm, algorithm="nr", numba=False)
         except Exception:
@@ -6795,8 +6803,7 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
 
     net_base = copy.deepcopy(net)
     net_base, _ = _assign_tick(net_base, meas, ts, _dataset_of(request))
-    net_base.load["p_mw"] *= request.load_scaling_factor
-    net_base.load["q_mvar"] *= request.load_scaling_factor
+    _scale_loads(net_base, request.load_scaling_factor)
 
     reference_state_requested = str(request.reference_state or "scada").strip().lower()
     if reference_state_requested not in {"scada", "post_opf", "custom"}:
@@ -7291,8 +7298,7 @@ def _run_hosting_probabilistic_sample(
     """Evaluate one uncertain realization for a hosting-capacity candidate."""
     net_copy = copy.deepcopy(net_base)
     if abs(float(load_mult) - 1.0) > 1e-6 and len(net_copy.load.index) > 0:
-        net_copy.load["p_mw"] *= float(load_mult)
-        net_copy.load["q_mvar"] *= float(load_mult)
+        _scale_loads(net_copy, float(load_mult))
 
     realized_p = max(0.0, float(availability) * float(p_candidate_mw))
     q_mvar = _hosting_q_target(q_mode, realized_p, base_q_mvar, power_factor, pf_sign, q_cap_mvar)
@@ -7907,8 +7913,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
         pass
 
     net = copy.deepcopy(net_base)
-    net.load['p_mw'] *= request.load_scaling_factor
-    net.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net, request.load_scaling_factor)
 
     try:
         pp.runpp(net)
@@ -8130,8 +8135,7 @@ async def evaluate_kpis(request: KPIRequest):
         pass
 
     net = copy.deepcopy(net_base)
-    net.load['p_mw'] *= request.load_scaling_factor
-    net.load['q_mvar'] *= request.load_scaling_factor
+    _scale_loads(net, request.load_scaling_factor)
 
     # --- Pre-optimization RSA: informational context only ---
     try:
@@ -8335,8 +8339,7 @@ async def forecast_kpi(request: KPIRequest):
             pass
 
         net = copy.deepcopy(net_base)
-        net.load['p_mw'] *= request.load_scaling_factor
-        net.load['q_mvar'] *= request.load_scaling_factor
+        _scale_loads(net, request.load_scaling_factor)
 
         try:
             pp.runpp(net)
@@ -8655,8 +8658,7 @@ async def violation_attribution(request: AttributionRequest):
     meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
     net_copy = copy.deepcopy(_net_for(request))
     net_copy, _ = _assign_tick(net_copy, meas, ts, _dataset_of(request))
-    net_copy.load["p_mw"] *= request.load_scaling_factor
-    net_copy.load["q_mvar"] *= request.load_scaling_factor
+    _scale_loads(net_copy, request.load_scaling_factor)
     if request.sgen_scaling_factor != 1.0:
         net_copy.sgen["p_mw"] *= request.sgen_scaling_factor
         net_copy.sgen["q_mvar"] *= request.sgen_scaling_factor
@@ -8714,8 +8716,10 @@ class CompareNetworksRequest(GridRequest):
     proposal : str
         The proposal compared with the base.
     study : str
-        "rsa" (security assessment), "n1" (all single outages) or "scan" (the
-        security assessment at every tick of a window, on both networks).
+        "rsa" (security assessment), "n1" (all single outages), "opf" (the
+        deterministic flexibility OPF: can a corrective dispatch restore
+        security, and what does it take) or "scan" (the security assessment
+        at every tick of a window, on both networks).
     start_timestamp / end_timestamp : str | None
         scan: the window (prefix match); the whole dataset by default.
     step_size : int | None
@@ -8869,8 +8873,8 @@ async def compare_networks(request: CompareNetworksRequest):
     and the difference. Two separate calls could land on two different ticks;
     one call cannot."""
     study = (request.study or "rsa").strip().lower()
-    if study not in ("rsa", "n1", "scan"):
-        raise HTTPException(status_code=400, detail="study must be 'rsa', 'n1' or 'scan'.")
+    if study not in ("rsa", "n1", "opf", "scan"):
+        raise HTTPException(status_code=400, detail="study must be 'rsa', 'n1', 'opf' or 'scan'.")
     name = (request.proposal or "").strip()
     if name in ("", BASE_NETWORK):
         raise HTTPException(status_code=400, detail="Name a proposal to compare with the base.")
@@ -8878,6 +8882,8 @@ async def compare_networks(request: CompareNetworksRequest):
         raise HTTPException(status_code=400, detail=f"No proposal {name!r}. Existing: {sorted(_proposals())}.")
     if study == "scan":
         return _compare_over_time(request, name)
+    if study == "opf":
+        return await _compare_opf(request, name)
     ts = _resolve_tick(request.data_source, request.timestamp)
     runner = run_security_assessment if study == "rsa" else simulate_all_contingencies
 
@@ -9074,4 +9080,86 @@ def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
     first = getattr(_tick_report, "first", None)
     if first:
         out["network"]["added_elements_at_tick"] = first
+    return out
+
+
+def _opf_digest(r: dict) -> dict:
+    """What a flexibility OPF result says, in comparable figures."""
+    acts = r.get("activated_resources") or []
+    units = [a for a in acts if a.get("type") != "External Grid"]
+
+    def moved(a, key):
+        new, base = a.get(f"{key}_new"), a.get(f"{key}_base")
+        return abs(float(new) - float(base)) if isinstance(new, (int, float)) and isinstance(base, (int, float)) else 0.0
+
+    grid = next((a for a in acts if a.get("type") == "External Grid"), {})
+    volts = [v["vm_pu"] for v in r.get("bus_voltages_post_opf") or []
+             if isinstance(v, dict) and isinstance(v.get("vm_pu"), (int, float))]
+    out = {
+        "status": r.get("status"), "feasible": r.get("feasible"),
+        "units_moved": sum(1 for a in units if moved(a, "Pg") > 1e-3 or moved(a, "Qg") > 1e-3),
+        "redispatch_mw": round(sum(moved(a, "Pg") for a in units), 4),
+        "reactive_redispatch_mvar": round(sum(moved(a, "Qg") for a in units), 4),
+        "grid_import_before_mw": grid.get("Pg_base"), "grid_import_after_mw": grid.get("Pg_new"),
+        "min_vm_after": min(volts) if volts else None, "max_vm_after": max(volts) if volts else None,
+    }
+    diagnosis = r.get("infeasibility_diagnosis")
+    if not r.get("feasible"):
+        out["why_not"] = (diagnosis or {}).get("explanation") or r.get("message")
+    return out
+
+
+async def _compare_opf(request: CompareNetworksRequest, name: str) -> dict:
+    """The deterministic flexibility OPF on the base and on a proposal at one
+    operating point: whether a corrective dispatch exists on each, what it
+    takes, and how each unit's dispatch differs."""
+    ts = _resolve_tick(request.data_source, request.timestamp)
+    # The comparison must not leave the proposal's dispatch as "the last one".
+    last = (app_data.get("last_dispatch_result"), app_data.get("last_dispatch_timestamp"))
+    results = {}
+    try:
+        for label, network in (("base", BASE_NETWORK), ("proposal", name)):
+            req = FlexibilityRequest(
+                timestamp=ts, data_source=request.data_source, network=network,
+                load_scaling_factor=request.load_scaling_factor,
+                opf_vm_upper=request.vm_upper_pu, opf_vm_lower=request.vm_lower_pu)
+            _tick_report.first = None
+            results[label] = await optimise_flexibility(req)
+            results[label + "_added"] = getattr(_tick_report, "first", None)
+    finally:
+        app_data["last_dispatch_result"], app_data["last_dispatch_timestamp"] = last
+    base, prop = _opf_digest(results["base"]), _opf_digest(results["proposal"])
+
+    def by_unit(r):
+        return {a["element"]: a for a in r.get("activated_resources") or []
+                if a.get("type") != "External Grid" and a.get("element")}
+
+    def delta(a, key):
+        if not a:
+            return 0.0
+        new, old = a.get(f"{key}_new"), a.get(f"{key}_base")
+        return round(float(new) - float(old), 4) if isinstance(new, (int, float)) and isinstance(old, (int, float)) else 0.0
+
+    ub, up = by_unit(results["base"]), by_unit(results["proposal"])
+    units = []
+    for element in sorted(set(ub) | set(up)):
+        row = {"element": element,
+               "base_dP_mw": delta(ub.get(element), "Pg"), "proposal_dP_mw": delta(up.get(element), "Pg"),
+               "base_dQ_mvar": delta(ub.get(element), "Qg"), "proposal_dQ_mvar": delta(up.get(element), "Qg")}
+        if any(abs(v) > 1e-3 for k, v in row.items() if k != "element"):
+            units.append(row)
+    units.sort(key=lambda r: -max(abs(r["proposal_dP_mw"] - r["base_dP_mw"]),
+                                  abs(r["proposal_dQ_mvar"] - r["base_dQ_mvar"])))
+    numeric = ("units_moved", "redispatch_mw", "reactive_redispatch_mvar", "grid_import_after_mw")
+    out = {
+        "study": "opf", "timestamp": ts, "data_source": _dataset_label(request),
+        "thresholds_used": _thresholds_used(request), "load_scaling_factor": request.load_scaling_factor,
+        "network": {**_proposal_card(name), "compared_with": BASE_NETWORK},
+        "base": base, "proposal": prop,
+        "changes": {k: round(prop[k] - base[k], 4) for k in numeric
+                    if isinstance(prop.get(k), (int, float)) and isinstance(base.get(k), (int, float))},
+        "units": units[:12],
+    }
+    if results["proposal_added"]:
+        out["network"]["added_elements_at_tick"] = results["proposal_added"]
     return out

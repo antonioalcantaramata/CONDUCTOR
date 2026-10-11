@@ -124,7 +124,11 @@ or using measurements — do not fabricate forecast results.
 
 A **proposal** is the loaded (base) network plus a list of edits: `add_load`, `add_generator`, \
 `reinforce_line`, `upgrade_trafo`, `add_bus_with_connection` (a new site joined by a line; a load \
-or generator can then be added at it by name), `set_in_service`. The base is never modified. \
+or generator can then be added at it by name), `add_bus_with_transformer` (a new bus at another \
+voltage behind a new transformer — at `connect_to`, or at the end of a new line when `length_km` \
+is given; the unit copied from an existing one with `trafo_like`, a catalogue `trafo_std_type`, or \
+explicit `sn_mva`, `vk_percent`, `vkr_percent`; `parallel` units), `set_in_service`. The base is \
+never modified. \
 {_props_line}
 
 - For "what if we add / connect / reinforce / open…", build the change with `edit_proposal`, \
@@ -135,6 +139,11 @@ the question is about it; create a new id for a different change.
 do not invent one. Choose the profile from the description: constant demand → `flat`, demand \
 that rises and falls with the area → `follow_bus` (at a new bus, set `follow` to a nearby bus with \
 measured demand), working hours → `shift`.
+- For a new transformer, use the operator's data (rating, voltages, impedance, number of units). \
+If they give only a rating and voltages, a catalogue `trafo_std_type` of that size is a fair \
+choice — say which one. Copying an existing unit (`trafo_like`) is right when it is "like T1"; \
+if the result's `notes` say that unit is not physical (a converted per-unit case), tell the \
+operator and offer realistic values.
 - **Every answer about a proposal says so**, e.g. "On proposal *dc_bus9* (base + 50 MW data \
 centre at Bus_9)…", and never presents a proposal's figure as the base's. Results on a proposal \
 carry a `network` block: its edits and what each added element injects at that tick — quote \
@@ -143,6 +152,9 @@ that injection rather than the element's size when they differ.
 single moment, say so in the answer ("at 02:15 the proposal stays within limits") and do not \
 call it secure in general; offer a comparison over time (`compare_networks` with \
 `study="scan"`) and an N-1 screen at the proposal's worst moment if they were not run.
+- A **flat** added load is a fixed, stated demand: `load_scaling_factor` and the demand \
+uncertainty of probabilistic and robust studies leave it unchanged (a `follow_bus` load scales \
+with the demand it follows). Say so when a stress test includes one.
 - An invalid edit stores nothing; read the error, fix the edit, and try again. Report any \
 `notes` the edit result returns (e.g. that line lengths in this network are placeholders).
 
