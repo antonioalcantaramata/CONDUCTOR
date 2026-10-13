@@ -101,6 +101,12 @@ TASKS: tuple[Task, ...] = (
          ({"kind": "edit", "label": "edit: T1 to 80 MVA",
            "match": {"op": "upgrade_trafo", "trafo": 1, "new_sn_mva": 80}},
           {"kind": "over_time", "label": "found the worst hour"})),
+    Task("classical_generator",
+         ("Add a 30 MW generator at Bus 4 and tell me whether the grid stays secure.",
+          "A classical one that holds its bus voltage — use 1.0 p.u."),
+         ({"kind": "asked", "label": "asked how the unit is modelled before building it"},
+          {"kind": "edit", "label": "edit: 30 MW unit on voltage control at Bus_4",
+           "match": {"op": "add_generator", "bus": 4, "p_max_mw": 30, "control": "voltage", "vm_pu": 1.0}})),
     Task("new_substation_trafo",
          ("Build a new 20 kV substation at Bus 9 with two 40 MVA transformers (vk 12 %, vkr 0.4 %) "
           "and connect a 30 MW data centre to it. Is it N-1 secure?",),
@@ -149,6 +155,11 @@ def _on_proposal(result) -> bool:
     return isinstance(net, dict) and bool(net.get("id"))
 
 
+def _asks(result: dict) -> bool:
+    detail = result.get("detail")
+    return isinstance(detail, dict) and bool(detail.get("needs_operator"))
+
+
 def check(spec: dict, records: list[dict]) -> bool:
     kind = spec["kind"]
     if kind == "edit":
@@ -172,10 +183,18 @@ def check(spec: dict, records: list[dict]) -> bool:
         text = " ".join(rec.get("assistant") or "" for rec in records).casefold()
         return any(word.casefold() in text for word in spec["any"])
     if kind == "valid_edits":
+        # A question for the operator (needs_operator) is not a refused edit.
         return not any(call.get("name") == "edit_proposal" and isinstance(entry.get("result"), dict)
-                       and entry["result"].get("error")
+                       and entry["result"].get("error") and not _asks(entry["result"])
                        for rec in records
                        for call, entry in zip(rec.get("tool_calls") or [], rec.get("tool_results") or []))
+    if kind == "asked":
+        # A turn that ended with a question to the operator and stored no edit.
+        return any("?" in (rec.get("assistant") or "") and not any(
+            call.get("name") == "edit_proposal" and not (isinstance(entry.get("result"), dict)
+                                                         and entry["result"].get("error"))
+            for call, entry in zip(rec.get("tool_calls") or [], rec.get("tool_results") or []))
+            for rec in records)
     raise ValueError(f"Unknown check kind {kind!r}")
 
 

@@ -376,7 +376,8 @@ def simulate_all_contingencies(
     unsupported = _unsupported_kwargs_result(
         "simulate_all_contingencies",
         kwargs,
-        supported_extra={"sgen_scaling_factor", "data_source", "timestamp", "network"},
+        supported_extra={"sgen_scaling_factor", "data_source", "timestamp", "network",
+                         "load_power_factor"},
     )
     if unsupported is not None:
         return unsupported
@@ -1044,6 +1045,7 @@ def scan_rsa_over_time(
         supported_extra={
             "sgen_scaling_factor",
             "network",
+            "load_power_factor",
             "vm_upper_pu",
             "vm_lower_pu",
             "max_line_loading_pct",
@@ -1560,7 +1562,7 @@ def compute_violation_attribution(
     """Rank the injections driving each violated element at one operating point."""
     unsupported = _unsupported_kwargs_result(
         "compute_violation_attribution", kwargs,
-        {"sgen_scaling_factor", "delta_mw", "delta_mvar", "network"},
+        {"sgen_scaling_factor", "delta_mw", "delta_mvar", "network", "load_power_factor"},
     )
     if unsupported is not None:
         return unsupported
@@ -1584,6 +1586,63 @@ def compute_violation_attribution(
             body[key] = value
 
     return _record("compute_violation_attribution", _post("/api/rsa/attribution", body))
+
+
+# ---------------------------------------------------------------------------
+# Study assumptions
+# ---------------------------------------------------------------------------
+
+def get_data_quality(**kwargs) -> dict:
+    """
+    GET /api/data/quality
+
+    The quality report of the loaded measurements and forecasts: which columns
+    they carry (measured reactive power), coverage, gaps and how they were
+    filled, implausible values. Reads the data; studies nothing.
+    """
+    unsupported = _unsupported_kwargs_result("get_data_quality", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    return _record("get_data_quality", _get("/api/data/quality"))
+
+
+def set_load_power_factor(value: float | None = None, reset: bool = False, **kwargs) -> dict:
+    """
+    POST /api/assumptions
+
+    Change the session's load power factor — the default every later study
+    uses to give measured loads their reactive power — or, with reset=True,
+    go back to 0.95. For one study only, pass `load_power_factor` to that
+    study instead.
+    """
+    unsupported = _unsupported_kwargs_result("set_load_power_factor", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    if reset == (value is not None):
+        return {"error": "Give either value (a power factor between 0.5 and 1.0) or reset=true."}
+    return _record("set_load_power_factor",
+                   _post("/api/assumptions", {"load_power_factor": None if reset else value}))
+
+
+def set_generator_model(changes: list | None = None, reset: bool = False, **kwargs) -> dict:
+    """
+    GET / POST /api/generators
+
+    How each generating unit is modelled — voltage control or a fixed power
+    factor, its set-point and reactive limits, whether the OPF may dispatch it.
+    With no arguments, returns every unit and its model; with `changes`, applies
+    them (kept for this network, visible in the System tab); reset=True takes
+    every unit back to how it was loaded.
+    """
+    unsupported = _unsupported_kwargs_result("set_generator_model", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    if not changes and not reset:
+        return _record("set_generator_model", _get("/api/generators"))
+    if changes and reset:
+        return {"error": "Give either changes or reset=true, not both."}
+    return _record("set_generator_model",
+                   _post("/api/generators", {"changes": list(changes or []), "reset": bool(reset)}))
 
 
 # ---------------------------------------------------------------------------
@@ -1623,7 +1682,7 @@ def compare_networks(
     unsupported = _unsupported_kwargs_result(
         "compare_networks", kwargs,
         supported_extra={"data_source", "timestamp", "sgen_scaling_factor",
-                         "start_timestamp", "end_timestamp", "step_size"})
+                         "start_timestamp", "end_timestamp", "step_size", "load_power_factor"})
     if unsupported is not None:
         return unsupported
     body = {

@@ -92,13 +92,36 @@ being present and pass identically on a machine that has none.
 Runs once when the server boots; all expensive loads happen here so requests
 stay fast:
 
-1. Resolve the active network profile from the `GRID_PROFILE` env var
-   (defaults to `pglib_case14`), or restore the last uploaded network.
+1. Load the saved **scenario** (`systems/scenario.json`, chosen in the app —
+   see *Starting scenarios* below): a demo, or Resume — the last uploaded
+   network, else the profile named by `GRID_PROFILE` (defaults to `pglib_case14`).
 2. Load the network (MATPOWER `.m`, pandapower JSON/Excel, or UCTE).
 3. Generate (or restore) the **measurement** and **forecast** time-series.
 4. Apply the first operating point and run a seed power flow.
 5. Build the Ybus / admittance database used by the optimizer (one power flow; an
    outage is that database without the outaged branch).
+
+### Starting scenarios (`scenarios.py`)
+
+| Scenario | Loads |
+|---|---|
+| `resume` | The last uploaded network and data (the "last uploaded" records). Only offered once something has been uploaded. |
+| `ieee14` | PGLib IEEE 14-bus with its synthetic week, active power only (loads use the load power factor). The nominal operating point is included. |
+| `ieee14_reactive` | The same network and week plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
+
+`GET /api/assumptions` also returns `data_key`, which changes whenever other
+measurements or forecasts are loaded (a hash of a few sums, so it survives a
+restart); the app stamps each answer with it to tell when an answer was
+computed on other data.
+
+`GET /api/scenario` returns the current one and the options (Resume with what it
+would load, and whether it is available); `POST /api/scenario {name}` loads one
+and remembers it for the next start. Demos never read or write the "last
+uploaded" records, so Resume stays as it was; an upload makes Resume current;
+`reset_active` forgets the choice. Saved proposals and assumptions are kept **per
+network** (`{"version": 2, "by_fingerprint": {...}}` in `proposals.json` /
+`assumptions.json`; the older single-network format is still read), so switching
+between a demo and your own network keeps each one's work.
 
 ## In-memory state (`app_data`)
 
@@ -133,7 +156,17 @@ optionally at the far end of a new line; the unit copied from an existing one �
 in per unit, resized with `sn_mva` — or a pandapower catalogue type, or given
 explicitly: rating, vk/vkr, no-load losses, magnetising current, vector-group
 shift, rated voltages, tap changer and position; up to 4 units in `parallel`,
-one branch in the model), `set_in_service`
+one branch in the model), `add_shunt` (a capacitor bank or reactor, Mvar),
+`set_in_service`. `add_generator` takes the unit's model like the System tab:
+`control` (`voltage` — a `gen` row holding `vm_pu`, Q within `q_min/q_max_mvar`;
+`power_factor` — an `sgen` at `pf`, injecting or `absorbing`), `dispatchable`,
+`p_min_mw`; `add_load` takes `leading`. **Missing decisions are questions, not
+guesses:** an edit that lacks something essential (the unit's kind; how a
+conventional unit is controlled; capacitor or reactor; a set-point clashing with
+the bus's) raises `sandbox.EditQuestion`, which the endpoint returns as
+`{"needs_operator": true, "question", "options"}` — nothing is stored. Every
+default the tool fills in is returned as `assumed`. Edits stored before a field
+existed replay with what they meant then (`sandbox.upgrade_stored`).
 (`sandbox.py`). Edits only
 append rows or change existing ones, so base indices are the same in every
 proposal, and the base itself is never modified. Every analysis endpoint takes
@@ -168,12 +201,81 @@ resolved against the chosen series. On network upload, both series are generated
 synthetically and persisted to `data_files/`; users can replace either with their
 own CSV via `/api/data/upload`.
 
+**Nominal operating point** (`data_source="nominal"`, `nominal.py`): the network's
+own values as loaded — each load's P and Q, each generator's set-point — kept in
+`app_data["nominal"]` before the first synthetic tick is written over them (at
+every network load, uploads included). Point studies apply them per element and
+exactly (a tick is spread per substation at a 0.95 power factor; nominal keeps the
+case's own reactive power); it has no time, so a `timestamp` is refused and studies
+over a time window (`_window_dataset`: worst case, scans, historical risk, forecast
+KPIs, data series, comparison over time) refuse it with the reason. Elements added
+by a proposal sit at their design value there. The snapshot at nominal adds a
+`nominal` block: totals, and how the measurement and forecast series relate to it
+per substation. Missing values in the file (NaN, the −9999 marker) make it
+unavailable — the timeline's `nominal` block says why.
+
+**Measured reactive power** (`data_quality.py`): an uploaded CSV may add
+`consumption_mvar` (reactive demand; positive draws) and `production_mvar`
+(reactive generation, same sign as `production_mw`). When present they are always
+used — loads take the measured Q, split over a substation's loads like its P;
+fixed-power-factor / fixed-Q units at a measured bus take the measured Q, split
+by capacity and protected from their own model (`_q_from_meas`); a bus with a
+voltage-controlled unit is left to that unit — and the load power factor only
+fills cells left empty (a missing value is never read as 0; a −9999 marker is
+missing). Missing **active** power (an empty cell or a marker) is interpolated in
+time per substation (nearest value at the ends; a substation with none is 0) and
+reported. `POST /api/generators/follow_measured` switches the voltage-controlled
+units at given substations to fixed Q (their median measured Q where data are
+missing), so they follow the measured reactive generation. Every parse keeps notes, and `GET /api/data/quality` (also in the upload
+response) reports coverage, empty columns, power factors below 0.7, leading
+loads, reactive demand without load, values that look like kvar, all-zero
+columns, interpolated or absent active power, missing-value markers, and measured
+generation at voltage-controlled units. Results
+state the share of load whose Q was measured (`load_power_factor.
+measured_reactive_power`); the timeline, the assumptions and the grid constants
+say whether each dataset carries reactive power; the data series include it.
+
+**Load power factor** (reactive power of measured loads): where the series carry
+active power only, each measured load gets Q = P·tan(acos pf), lagging.
+`lg.DEFAULT_LOAD_POWER_FACTOR` = 0.95 is the default of a session setting
+(`GET/POST /api/assumptions`, saved for that network in
+`systems/assumptions.json` like the proposals, reset when the network changes);
+any study can override it for itself with `load_power_factor` (every request
+model takes it, via `_NetworkLimitsMixin`). The study running in a thread carries
+its value (`_study`, set where `_off_event_loop` starts it), so every tick
+assignment uses it, and every result that assigned a tick carries a
+`load_power_factor` block (value, and source: default / session setting / this
+study). The nominal point uses none. Measured generation on the
+measured-substation path (a network loaded without a `gen` table) uses
+`MEASURED_GENERATION_POWER_FACTOR` = 0.99 (the code comment said 0.95); the
+generic path keeps each unit's own Q. The robust OPF takes
+`opf_min_power_factor` like the other OPFs (it hardcoded 0.95).
+
+**Generator models** (`generators.py`, `GET/POST /api/generators`): each unit's
+*control* — `voltage` (a `gen` row: holds `vm_pu`, Q free within its limits) or
+`power_factor` (an `sgen` row: fixed pf, injecting or absorbing; Q set for each
+tick's P by `generators.set_reactive`) — and whether it is *dispatchable*
+(`controllable`; the OPFs pin a unit that is not, `flex_engine._fixed_output_units`).
+A model is a set of differences from the network as loaded (`app_data["net_loaded"]`),
+always applied to it, so it can be changed and reset freely; changing it rebuilds
+the base, the capacities and the admittances, re-checks the proposals (those that
+no longer apply are dropped and reported) and is saved with the load power factor
+in `systems/assumptions.json`, keyed to the network as loaded (restored before the
+proposals at startup). Defaults reproduce the previous behaviour: generators with
+active power at pf 1.0 (Q = 0), condensers on voltage control. `gen_to_sgen` keeps
+a converted unit's set-point and reactive limits on its row (`orig_*`) so it can go
+back to voltage control. In the OPF every voltage-controlled unit keeps its own Q
+limits (they used to get the power-factor cone whenever they had active power).
+Networks loaded without a `gen` table (measured substations, rebuilt every tick)
+are not editable.
+
 ## Endpoints
 
 | Group | Endpoints |
 |---|---|
+| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee14\|ieee14_reactive`) |
 | **State / clock** | `GET /api/grid_constants`, `GET /api/time/current`, `GET /api/time/timeline`, `POST /api/time/advance` |
-| **Upload** | `POST /api/network/upload`, `POST /api/data/upload` (`kind=measurements\|forecasts`), `POST /api/network/snapshot` |
+| **Upload** | `POST /api/network/upload`, `POST /api/data/upload` (`kind=measurements\|forecasts`), `GET /api/data/template` (a CSV for the loaded network: substation names, the first hour as example values, the optional reactive columns), `GET /api/data/quality`, `POST /api/network/snapshot` |
 | **Security** | `POST /api/grid/rsa`, `POST /api/rsa/worst_case`, `POST /api/rsa/scan_scenarios`, `POST /api/rsa/probabilistic`, `POST /api/rsa/historical_risk`, `POST /api/grid/element_timeseries` |
 | **Contingency (N-1)** | `POST /api/contingency/simulate`, `POST /api/contingency/simulate_all`, `POST /api/contingency/optimize` |
 | **Flexibility / OPF** | `POST /api/flexibility/optimize`, `POST /api/flexibility/robust`, `POST /api/flexibility/envelope`, `POST /api/flexibility/hosting_capacity` |

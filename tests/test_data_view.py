@@ -60,3 +60,19 @@ def test_the_endpoint_serves_both_datasets(backend_client):
 def test_long_series_are_thinned(backend_client):
     r = backend_client.post("/api/data/series", json={"max_points": 100}).json()
     assert len(r["timestamps"]) <= 100 and r["stride"] > 1 and r["n_total"] > 100
+
+
+def test_the_nominal_value_is_a_flat_reference_line():
+    payload = {"timestamps": ["2000-01-01 00:00:00", "2000-01-01 00:15:00"],
+               "totals": {"consumption": [100.0, 120.0], "production": [10.0, 12.0]},
+               "substations": {"Bus_9": {"consumption": [5.0, 6.0], "production": [0.0, 0.0]}},
+               "nominal": {"totals": {"consumption": 110.0, "production": 11.0},
+                           "substations": {"Bus_9": {"consumption": 5.5, "production": 0.0}}}}
+    assert dv.nominal_value(payload, dv.TOTAL, "net") == 99.0
+    assert dv.nominal_value(payload, "Bus_9", "consumption") == 5.5
+    assert dv.nominal_value(payload, "Bus_3", "consumption") is None
+    assert dv.nominal_value({**payload, "nominal": None}, dv.TOTAL, "consumption") is None
+    pytest.importorskip("plotly")
+    fig = dv.figure({"measured": payload, "forecast": None}, [dv.TOTAL], "consumption")
+    line = [t for t in fig.data if t.name == "System total — nominal"]
+    assert line and list(line[0].y) == [110.0, 110.0] and line[0].line.dash == "dot"

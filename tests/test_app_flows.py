@@ -44,7 +44,7 @@ def backend_url(tmp_path_factory):
     patch.setattr(mb, "SYSTEMS_DIR", str(store / "systems"))
     patch.setattr(mb, "DATA_FILES_DIR", str(store / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
-                 "_PROPOSALS_FILE"):
+                 "_PROPOSALS_FILE", "_ASSUMPTIONS_FILE", "_SCENARIO_FILE"):
         patch.setattr(mb, name, str(store / f"{name}.json"))
     saved = dict(mb.app_data)
     port = _free_port()
@@ -335,4 +335,167 @@ def test_each_side_says_what_it_is_for_and_they_hand_over(agent, monkeypatch):
     assert at.session_state["_box_value"] == "Run N-1 now."
     _send(at, "Run N-1 now.")
     assert calls["turn"] == ["Run N-1 now."]
+    assert not at.exception
+
+
+def test_the_nominal_switch_replaces_the_clock_and_tells_conductor(agent, monkeypatch):
+    calls = _script(agent, monkeypatch)
+    at = _app()
+    switch = at.toggle(key="op_nominal")
+    assert switch.value is False and not switch.disabled
+    switch.set_value(True).run()
+    assert any("op-time'>Nominal" in m.value for m in at.markdown)
+    assert not any(s.key and str(s.key).startswith("op_time_") for s in at.select_slider)
+    assert at.session_state["op_view"] == {"mode": "nominal", "ts": None}
+    _send(at, "Is the grid secure?")
+    assert "NOMINAL operating point" in calls["turn"][0] and calls["turn"][0].endswith("Is the grid secure?")
+    at.toggle(key="op_nominal").set_value(False).run()
+    assert at.session_state["op_view"]["mode"] == "measured" and at.session_state["op_view"]["ts"]
+    assert not at.exception
+
+
+def test_the_load_power_factor_is_visible_and_changeable(agent, monkeypatch, backend_url):
+    import httpx
+    _script(agent, monkeypatch)
+    at = _app()
+
+    def chips():
+        return [b.label for b in at.button if str(b.key).startswith("chip_")]
+    assert "Loads pf 0.95" in chips()                       # in view on the System tab, always
+    _button(at, key_prefix="chip_pf").click().run()         # the chip opens the assumptions
+    assert at.session_state["system_pane"] == "assumptions"
+    box = [n for n in at.number_input if n.label == "Load power factor (lagging)"][0]
+    box.set_value(0.9).run()
+    _button(at, key_prefix="pf_apply").click().run()
+    assert httpx.get(f"{backend_url}/api/assumptions").json()["load_power_factor"]["value"] == 0.9
+    assert "Loads pf 0.90 · changed" in chips()
+    # A change CONDUCTOR makes shows at the next redraw.
+    httpx.post(f"{backend_url}/api/assumptions", json={"load_power_factor": 0.85})
+    at.run()
+    assert "Loads pf 0.85 · changed" in chips()
+    _button(at, "Reset").click().run()
+    assert "Loads pf 0.95" in chips()
+    assert not at.exception
+
+
+def test_the_system_tab_lists_the_generators_to_edit(agent, monkeypatch, backend_url):
+    import httpx
+    _script(agent, monkeypatch)
+    at = _app(extra={"system_pane": "assumptions"})
+    assert any(m.value.startswith("##### Generators — how each unit is modelled") for m in at.markdown)
+    assert any("Synchronous condensers" in m.value for m in at.markdown)
+    assert {b.key for b in at.button if str(b.key).startswith("gen_edit_")} == {
+        "gen_edit_Gen_bus1", "gen_edit_Gen_bus2", "gen_edit_Gen_bus5", "gen_edit_Gen_bus7"}
+    assert [b.disabled for b in at.button if b.key == "gen_reset"] == [True]
+    assert "Generators · as loaded" in [b.label for b in at.button]
+    httpx.post(f"{backend_url}/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]})
+    at.run()
+    assert "Generators · 1 changed" in [b.label for b in at.button]
+    assert any("Generators on voltage control" in m.value for m in at.markdown)
+    assert any("gen-changed" in m.value and "Gen_bus1" in m.value for m in at.markdown)
+    [b for b in at.button if b.key == "gen_reset"][0].click().run()
+    assert httpx.get(f"{backend_url}/api/generators").json()["changed"] == {}
+    assert not at.exception
+
+
+def test_the_header_and_the_nominal_chip(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    at = _app()
+    assert any("14 buses · 17 lines · 3 transformers" in m.value for m in at.markdown)
+    assert any(c.value == "per-unit case (every bus at 1 kV)" for c in at.caption)
+    assert "Nominal point · off" in [b.label for b in at.button]
+    _button(at, key_prefix="chip_nominal").click().run()
+    assert at.session_state["op_nominal"] is True and at.session_state["op_view"]["mode"] == "nominal"
+    assert "Nominal point · on" in [b.label for b in at.button]
+    assert not at.exception
+
+
+def test_the_launch_screen_chooses_what_to_load(agent, monkeypatch, backend_url):
+    import httpx
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+    assert any(m.value == "### 1 · Choose what to load" for m in at.markdown)
+    picker = at.radio(key="scenario_launch")
+    assert picker.value == "ieee14"
+    assert picker.options == ["Resume", "Demo: IEEE 14 · active only",
+                              "Demo: IEEE 14 · with reactive measurements"]
+    picker.set_value("ieee14_reactive").run()                   # loads at once
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee14_reactive"
+    at.radio(key="scenario_launch").set_value("resume").run()   # nothing to resume: refused, kept
+    assert at.radio(key="scenario_launch").value == "ieee14_reactive"
+    assert any("Nothing uploaded yet" in w.value for w in at.warning)
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+    assert not at.exception
+
+
+def test_the_sidebar_switches_the_scenario_and_starts_afresh(agent, monkeypatch, backend_url):
+    import httpx
+    _script(agent, monkeypatch)
+    at = _app()
+    assert "Scenario · Demo: IEEE 14 · active only" in [e.label for e in at.expander]
+    load = _button(at, key_prefix="scenario_sidebar_load")
+    assert load.disabled                                        # already loaded
+    at.radio(key="scenario_sidebar").set_value("ieee14_reactive").run()
+    _button(at, key_prefix="scenario_sidebar_load").click().run()
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee14_reactive"
+    assert at.session_state["messages"] == []                    # a new conversation
+    assert any("a new conversation has started" in s.value for s in at.success)
+    assert "Scenario · Demo: IEEE 14 · with reactive measurements" in [e.label for e in at.expander]
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+    assert not at.exception
+
+
+def test_an_answer_under_other_settings_offers_a_rerun(agent, monkeypatch, backend_url):
+    calls = _script(agent, monkeypatch)
+    at = _app(messages=[
+        {"role": "user", "text": "Is the system secure?", "charts": None},
+        {"role": "assistant", "text": "a", "charts": None, "trace": None, "record": REC, "attention": [],
+         "context": {"pf": 0.9, "gm": {}, "data_key": None}}])
+    stale = [m.value for m in at.markdown if "class='conductor-stale'" in m.value]
+    assert stale and "load power factor 0.90 → 0.95" in stale[0]
+    _button(at, key_prefix="rerun_1").click().run()
+    assert calls["turn"] and calls["turn"][0].endswith("Is the system secure?")
+    assert "Run this again with the current settings" in calls["turn"][0]
+    assert at.session_state["messages"][-2]["text"].startswith("Run this again")
+    # The new answer used no tick (scripted), so it has no power factor to compare: no badge on it.
+    assert (at.session_state["messages"][-1].get("context") or {}).get("pf") is None
+    assert not [b for b in at.button if b.key == f"rerun_{len(at.session_state['messages']) - 1}"]
+    assert not at.exception
+
+
+def test_an_answer_under_the_current_settings_has_no_badge(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    at = _app(messages=[
+        {"role": "user", "text": "q", "charts": None},
+        {"role": "assistant", "text": "a", "charts": None, "trace": None, "record": REC, "attention": [],
+         "context": {"pf": 0.95, "gm": {}, "data_key": None}}])
+    assert not [m for m in at.markdown if "class='conductor-stale'" in m.value]
+    assert not [b for b in at.button if str(b.key).startswith("rerun_")]
+
+
+def test_the_session_report_can_be_exported(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    at = _app()
+    export = [d for d in at.get("download_button") if d.proto.label == "Export session report"]
+    assert export and not export[0].proto.disabled
+    empty = _app(messages=[])
+    assert [d.proto.disabled for d in empty.get("download_button") if d.proto.label == "Export session report"] == [True]
+
+
+def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
+    import httpx
+    _script(agent, monkeypatch)
+    at = _app()
+    assert any("conductor-eq-group'>For this scenario" in m.value for m in at.markdown)
+    assert "load power factor" in _button(at, key_prefix="eq_s0").label
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14_reactive"})
+    try:
+        at = _app()
+        labels = [b.label for b in at.button if str(b.key).startswith("eq_s")]
+        assert any("reactive measurements" in x for x in labels)
+        _button(at, key_prefix="eq_s0").click().run()
+        assert "reactive measurements" in at.session_state["_box_value"]
+    finally:
+        httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
     assert not at.exception

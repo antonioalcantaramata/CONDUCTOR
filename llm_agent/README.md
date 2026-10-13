@@ -30,13 +30,47 @@ llm_agent/
 │   ├── renderers.py       ← Plotly renderers, keyed by tool name (RENDERER_MAP)
 │   ├── system_prompt.py   ← system instruction, built from live grid constants
 │   ├── recommender.py     ← the advisor: suggestions and side discussions, no tools
-│   ├── timeline.py        ← operating point: measured / forecast / compare, and at what time
+│   ├── timeline.py        ← operating point: measured / forecast / compare (and at what time), or nominal
 │   ├── data_view.py       ← Data tab: the loaded series, forecast against measured
+│   ├── staleness.py       ← is an earlier answer still computed under today's settings?
+│   ├── report.py          ← the session as one standalone HTML report
 │   └── errors.py          ← error classification / retry helpers
 ├── assets/                ← logo marks (colour, reversed, black) and app icon
 ├── requirements.txt       ← pip deps (installed by start.sh)
 └── .env.example           ← copy to .env and add your key
 ```
+
+## Starting scenarios
+
+The launch screen has two columns: on the left **what to load** — *Resume* (your last uploaded
+network and data; offered once something has been uploaded), *Demo: IEEE 14 ·
+active only*, or *Demo: IEEE 14 · with reactive measurements* — and on the right
+how to run the assistant, with Start. A choice there loads at once. Later, the sidebar's
+*Scenario* expander switches with **Load**, which starts a new conversation (the
+old one described another grid). Demos never replace your uploads; each network
+keeps its own proposals and assumptions. Backend side: `backend/scenarios.py`,
+`GET/POST /api/scenario`.
+
+## Working aids
+
+- **Answers under other settings.** Each answer is stamped with what its studies
+  ran under — the load power factor and generator models (read from the results'
+  own `load_power_factor` / `generator_model` blocks) and the loaded data
+  (`data_key`). If one changes later, the answer gets a line such as "⏱ Computed
+  under other settings: load power factor 0.95 → 0.90", and **↻ Rerun with the
+  current settings** asks the same question again as a new turn (asking for fresh
+  studies). The earlier answer stays for comparison. `agent/staleness.py`.
+- **Session report.** *Export session report* (sidebar, under New conversation)
+  downloads one HTML file that opens offline: scenario, network, data, model,
+  assumptions, data quality and proposals, then every question and answer with
+  its interactive charts, its evidence (tools and arguments, where each figure
+  came from, what to check, what the checks cannot see) and any stale-settings
+  note. Built only when clicked. `agent/report.py`.
+- **Example queries for the scenario.** The sidebar's examples start with
+  questions that fit what is loaded (Resume, either demo), then the general ones.
+- **Data template.** The data-upload pop-up links to `GET /api/data/template`: a
+  CSV with every substation name the network expects, the loaded data's first
+  hour as example values, and the optional reactive columns.
 
 ## Environment variables
 
@@ -112,10 +146,54 @@ that, answers from different backends cannot be compared after the fact.
 
 Every analysis tool accepts a `data_source` parameter — `"measurements"`
 (historical actuals, the default; drives the simulation clock) or `"forecasts"`
-(read-only look-ahead). Point-in-time tools also accept an optional `timestamp`.
-The agent picks the source from the user's intent and reports it in its answer.
+(read-only look-ahead). Point-in-time tools also accept an optional `timestamp`,
+and `"nominal"` — the network's own operating point as loaded, with no time. The
+agent picks the source from the user's intent and reports it in its answer.
+
+In the sidebar, the dataset switch (Measured / Forecast / Compare) chooses data
+in time; the **Nominal point** switch below it sits apart, because nominal has no
+time: when on, the clock and slider give way to "Nominal" and the agent is told to
+study that point. The Data tab draws the nominal value as a dotted reference line
+beside the series.
+
+**Reactive power.** The data carry active power only; each measured load's
+reactive power comes from a power factor — 0.95 lagging by default, shown and
+changeable in the System tab: a strip of chips at the top shows the assumptions
+in force ("Loads pf 0.95", "Generators · as loaded", "Nominal point · off") and
+opens the **Model assumptions** view (beside the **Network map** view), where the
+load power factor and the generator models are explained and edited. The map's
+subtitle names any assumption that is not the default. Every study tool
+takes `load_power_factor` to rerun one study at another value;
+`set_load_power_factor` changes the session's value (or resets it) when the
+operator asks. Results state the value they used.
+
+**Measured reactive power.** An uploaded dataset may carry
+`consumption_mvar` / `production_mvar`; then measured reactive power is used
+wherever it is given and the power factor only fills gaps. The Data tab shows the
+reactive series and a **Data quality** panel (coverage, implausible power factors,
+kvar instead of Mvar, missing-value markers…), which CONDUCTOR reads with the
+`get_data_quality` tool; the System tab's chip reads "Loads
+Q measured · pf 0.95 for gaps". Missing active power is interpolated in time and
+reported; units on voltage control at buses with measured reactive generation can
+be switched to follow it with one click (or by CONDUCTOR, on request). The header's
+Upload Network / Upload Data / Info open as centred pop-ups (controls left, format
+guide right).
+
+**Generators.** Each unit's model — voltage control or a fixed power factor,
+set-point, reactive limits, dispatchable — is shown and edited in the System tab
+("Generators — how each unit is modelled") and by `set_generator_model` (no
+arguments: read). Changes apply to every later study and are kept for the
+network; "Reset to as loaded" undoes them. The upload dialog's checkbox only sets
+the starting model.
 
 ## Network proposals (sandbox)
+
+When a what-if leaves a real decision open — what kind of unit, whether a
+conventional generator holds voltage or runs at a fixed power factor, a
+capacitor or a reactor — `edit_proposal` returns `needs_operator` with a
+question and options, and CONDUCTOR asks the operator (a numbered list) instead
+of choosing. Every value the tool fills in is returned as `assumed` and stated
+in the answer, so the operator can change it.
 
 `edit_proposal` builds a proposal — the loaded network plus edits (add a load or
 a generator, reinforce a line, upgrade a transformer, add a new bus joined by a

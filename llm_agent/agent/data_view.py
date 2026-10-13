@@ -13,6 +13,23 @@ from __future__ import annotations
 
 TOTAL = "System total"
 QUANTITIES = {"consumption": "Consumption", "production": "Production", "net": "Net load"}
+# Shown only when a dataset carries them (optional upload columns), in Mvar.
+REACTIVE = {"consumption_q": "Reactive demand", "production_q": "Reactive generation"}
+
+
+def quantities(*payloads) -> dict:
+    """The quantities to offer: active power always; reactive when any of the
+    payloads carries it."""
+    out = dict(QUANTITIES)
+    for p in payloads:
+        for key, label in REACTIVE.items():
+            if p and (p.get("totals") or {}).get(key):
+                out[key] = label
+    return out
+
+
+def unit(quantity: str) -> str:
+    return "Mvar" if quantity in REACTIVE else "MW"
 _DATASET_LABELS = {"measured": "measured", "forecast": "forecast"}
 
 
@@ -24,12 +41,28 @@ def values(payload: dict | None, item: str, quantity: str) -> list[float | None]
     source = payload.get("totals") if item == TOTAL else (payload.get("substations") or {}).get(item)
     if not source:
         return []
+    if quantity in REACTIVE:
+        return list(source.get(quantity) or [])
     cons, prod = source.get("consumption") or [], source.get("production") or []
     if quantity == "consumption":
         return list(cons)
     if quantity == "production":
         return list(prod)
     return [None if c is None or p is None else round(c - p, 4) for c, p in zip(cons, prod)]
+
+
+def nominal_value(payload: dict | None, item: str, quantity: str) -> float | None:
+    """The network's own value for `item` (TOTAL or a substation), from the
+    payload's `nominal` block; None when there is none."""
+    nominal = (payload or {}).get("nominal")
+    if not nominal or quantity in REACTIVE:
+        return None
+    source = nominal.get("totals") if item == TOTAL else (nominal.get("substations") or {}).get(item)
+    if not source:
+        return None
+    if quantity == "net":
+        return round(source["consumption"] - source["production"], 4)
+    return source.get(quantity)
 
 
 def forecast_error(measured: dict | None, forecast: dict | None, item: str, quantity: str) -> dict | None:
@@ -66,6 +99,7 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
 
     `series` maps "measured" / "forecast" to a payload (or None). Where the two
     share timestamps the window is shaded; `marker` draws the operating point.
+    The network's own (nominal) value is a flat dotted line, when there is one.
     """
     import plotly.graph_objects as go
 
@@ -87,8 +121,24 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
                 name=f"{item} — {_DATASET_LABELS[dataset]}",
                 line={"color": colour, "width": 1.6 if dataset == "measured" else 1.4,
                       "dash": "solid" if dataset == "measured" else "dash"},
-                hovertemplate="%{x}<br>%{y:.2f} MW<extra>%{fullData.name}</extra>",
+                hovertemplate="%{x}<br>%{y:.2f} " + unit(quantity) + "<extra>%{fullData.name}</extra>",
             ))
+
+    payload = next((p for p in series.values() if p), None)
+    for k, item in enumerate(items):
+        level = nominal_value(payload, item, quantity)
+        if level is None or not payload.get("timestamps"):
+            continue
+        xs = [payload["timestamps"][0], payload["timestamps"][-1]]
+        for other in series.values():
+            if other and other.get("timestamps"):
+                xs = [min(xs[0], other["timestamps"][0]), max(xs[1], other["timestamps"][-1])]
+        colour = _C.INK if len(items) == 1 else line_colours[k % len(line_colours)]
+        fig.add_trace(go.Scatter(
+            x=xs, y=[level, level], mode="lines", name=f"{item} — nominal",
+            line={"color": colour, "width": 1.2, "dash": "dot"}, opacity=0.75,
+            hovertemplate=f"nominal {level:.2f} MW<extra>{item}</extra>",
+        ))
 
     measured, forecast = series.get("measured"), series.get("forecast")
     if measured and forecast:
@@ -109,7 +159,7 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
     fig.update_layout(
         **{**CHART_THEME, "margin": {"l": 60, "r": 20, "t": 40, "b": 50}},
         height=420,
-        yaxis_title=f"{QUANTITIES.get(quantity, quantity)} (MW)",
+        yaxis_title=f"{QUANTITIES.get(quantity) or REACTIVE.get(quantity, quantity)} ({unit(quantity)})",
         legend={"orientation": "h", "y": -0.18, "x": 0},
         hovermode="x unified",
     )

@@ -29,6 +29,7 @@ Overview
 
 import asyncio
 import functools
+import hashlib
 import json
 import math
 import threading
@@ -36,6 +37,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import io
 import os
@@ -45,7 +47,7 @@ import copy
 import pandas as pd
 import numpy as np
 import requests
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 import anyio
 from pyomo.environ import value
 from pyomo.opt import TerminationCondition
@@ -70,6 +72,10 @@ import ca_engine as ca
 
 import flex_engine as fe
 import network_loader as nl
+import data_quality as dq
+import scenarios as scn
+import generators as gm
+import nominal as nom
 import sandbox as sb
 
 from dotenv import load_dotenv
@@ -90,6 +96,8 @@ _LAST_TIMESERIES_SENTINEL  = os.path.join(DATA_FILES_DIR, "last_uploaded_timeser
 _LAST_FORECAST_SENTINEL    = os.path.join(DATA_FILES_DIR, "last_uploaded_forecast.json")
 # Network proposals, kept across restarts for the network they were built on.
 _PROPOSALS_FILE            = os.path.join(SYSTEMS_DIR,    "proposals.json")
+_ASSUMPTIONS_FILE          = os.path.join(SYSTEMS_DIR,    "assumptions.json")
+_SCENARIO_FILE             = os.path.join(SYSTEMS_DIR,    "scenario.json")
 
 
 def _ensure_storage_dirs() -> None:
@@ -200,9 +208,11 @@ def get_substation_names(net) -> list:
                 if n and n not in raw:
                     raw.append(n)
 
-    names = _nonempty(raw)
+    # Always text: some networks name their buses with numbers (case33bw: 1, 2, …),
+    # and every consumer — matching, the CSV, the agent's prompt — reads names as text.
+    names = [str(v).strip() for v in _nonempty(raw)]
     if names:
-        return names
+        return list(dict.fromkeys(names))
     # Fallback for MATPOWER / nameless networks: use bus indices of load buses
     if not net.load.empty:
         return [f"Bus {i}" for i in sorted(net.load["bus"].unique())]
@@ -733,25 +743,154 @@ def _discard_proposals() -> None:
     app_data["_peaks_cache"] = {}
 
 
-def _save_proposals() -> None:
-    """Write the proposals to disk with the base network's fingerprint.
+def _read_store(path: str) -> dict:
+    """A saved file as {network fingerprint: entry}. Each network keeps its
+    own entry, so moving between scenarios or networks loses nothing; a file in
+    the older one-network format is read as a single entry."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        print(f"[store] Could not read {path}: {exc}")
+        return {}
+    if isinstance(data.get("by_fingerprint"), dict):
+        return dict(data["by_fingerprint"])
+    if data.get("base_fingerprint"):
+        fp = data.pop("base_fingerprint")
+        data.pop("version", None)
+        return {fp: data}
+    return {}
 
-    Called after every change to them. A failure to write is reported, not
-    raised: the proposal itself was stored and works until the next restart.
+
+def _write_store(path: str, store: dict) -> None:
+    """Write {fingerprint: entry}; no entries left removes the file."""
+    try:
+        if not store:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": 2, "by_fingerprint": store}, fh, indent=1, default=str)
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[store] Could not write {path}: {exc}")
+
+
+def _save_proposals() -> None:
+    """Write this network's proposals to disk under its fingerprint (other
+    networks' entries are kept). Called after every change to them. A failure to
+    write is reported, not raised: the proposal itself was stored and works
+    until the next restart.
     """
     base = app_data.get("net")
     if base is None:
         return
-    payload = {"version": 1, "base_fingerprint": sb.network_fingerprint(base),
-               "proposals": app_data.get("proposals") or {}}
+    store = _read_store(_PROPOSALS_FILE)
+    fp, proposals = sb.network_fingerprint(base), app_data.get("proposals") or {}
+    if proposals:
+        store[fp] = {"proposals": proposals}
+    else:
+        store.pop(fp, None)
+    _write_store(_PROPOSALS_FILE, store)
+
+
+def _remember_loaded(net) -> None:
+    """The network as loaded: the reference every generator model is applied
+    to (generators.py), and the identity the saved assumptions are keyed to."""
+    app_data["net_loaded"] = copy.deepcopy(net)
+    app_data["loaded_fingerprint"] = sb.network_fingerprint(net)
+    app_data["generator_model"] = {}
+
+
+def _apply_generator_model(model: dict) -> list[str]:
+    """Make the base the network as loaded with `model` applied; refresh what
+    is derived from it; re-check the proposals. Returns the proposals that no
+    longer apply (dropped, with the reason). Raises gm.ModelError."""
+    loaded = app_data.get("net_loaded")
+    if loaded is None:
+        raise gm.ModelError("No network is loaded.")
+    new = gm.apply(loaded, model)
+    app_data["net"] = new
+    app_data["generator_model"] = model
+    PG_MAX_DATA.clear()
+    PG_MAX_DATA.update(get_pg_max_data(new))
+    # The admittances do not depend on which units control voltage; rebuilt
+    # anyway when they were generated here (an uploaded set is the operator's).
+    if app_data.get("admittance_source") != "uploaded_csv":
+        _build_and_store_ybus(new)
+    app_data["_proposal_cache"] = {}
+    dropped = []
+    for pid, prop in list(_proposals().items()):
+        try:
+            net, canonical = sb.materialise(new, sb.upgrade_stored(prop["edits"]))
+        except sb.EditError as exc:
+            dropped.append(f"{pid}: {exc}")
+            _proposals().pop(pid)
+            continue
+        _proposals()[pid] = {**prop, "edits": canonical, "hash": sb.edits_hash(canonical),
+                             "summary": sb.summary(net, canonical)}
+    if _proposals() or dropped:
+        _save_proposals()
+    return dropped
+
+
+def _load_pf_setting() -> tuple[float, str]:
+    """(the session's load power factor, "default" or "session setting")."""
+    value = app_data.get("load_power_factor")
+    if value is None:
+        return lg.DEFAULT_LOAD_POWER_FACTOR, "default"
+    return float(value), "session setting"
+
+
+def _save_assumptions() -> None:
+    """Keep the session's assumptions for this network across a restart; the
+    default is not stored (no file means the default)."""
+    value = app_data.get("load_power_factor")
+    model = app_data.get("generator_model") or {}
+    # Keyed to the network as loaded: the generator model changes the base's own
+    # fingerprint, the network it applies to does not change.
+    store = _read_store(_ASSUMPTIONS_FILE)
+    fp = app_data.get("loaded_fingerprint")
+    if value is None and not model:
+        store.pop(fp, None)
+    else:
+        store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model}
+    _write_store(_ASSUMPTIONS_FILE, store)
+
+
+def _forget_saved_assumptions() -> None:
     try:
-        os.makedirs(os.path.dirname(_PROPOSALS_FILE), exist_ok=True)
-        tmp = _PROPOSALS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=1, default=str)
-        os.replace(tmp, _PROPOSALS_FILE)
+        os.remove(_ASSUMPTIONS_FILE)
+    except FileNotFoundError:
+        pass
     except OSError as exc:
-        print(f"[proposals] Could not save proposals: {exc}")
+        print(f"[assumptions] Could not remove {_ASSUMPTIONS_FILE}: {exc}")
+
+
+def _restore_assumptions() -> None:
+    """At startup, the setting saved for this same network, if any."""
+    if app_data.get("net") is None:
+        return
+    saved = _read_store(_ASSUMPTIONS_FILE).get(app_data.get("loaded_fingerprint"))
+    if saved is None:
+        return
+    value = saved.get("load_power_factor")
+    if isinstance(value, (int, float)) and LOAD_PF_MIN <= value <= 1.0:
+        app_data["load_power_factor"] = float(value)
+        print(f"[assumptions] Load power factor {value:g} restored.")
+    model = saved.get("generator_model") or {}
+    if model:
+        try:
+            # Validated again against the network as loaded, as a proposal is.
+            changes = [{"unit": name, **diff} for name, diff in model.items()]
+            _apply_generator_model(gm.merge({}, gm.normalise(app_data["net_loaded"], changes)))
+            print(f"[assumptions] Generator model restored for {len(model)} unit(s).")
+        except gm.ModelError as exc:
+            print(f"[assumptions] Generator model no longer applies ({exc}) — not restored.")
 
 
 def _forget_saved_proposals() -> None:
@@ -772,21 +911,18 @@ def _restore_proposals() -> list[str]:
     ids restored.
     """
     base = app_data.get("net")
-    if base is None or not os.path.isfile(_PROPOSALS_FILE):
+    if base is None:
         return []
-    try:
-        with open(_PROPOSALS_FILE, encoding="utf-8") as fh:
-            saved = json.load(fh)
-    except (OSError, ValueError) as exc:
-        print(f"[proposals] Could not read saved proposals: {exc}")
-        return []
-    if saved.get("base_fingerprint") != sb.network_fingerprint(base):
-        print("[proposals] Saved proposals belong to a different network — not restored.")
+    store = _read_store(_PROPOSALS_FILE)
+    saved = store.get(sb.network_fingerprint(base))
+    if saved is None:
+        if store:
+            print("[proposals] None saved for this network.")
         return []
     restored = []
     for pid, prop in (saved.get("proposals") or {}).items():
         try:
-            net, canonical = sb.materialise(base, prop["edits"])
+            net, canonical = sb.materialise(base, sb.upgrade_stored(prop["edits"]))
         except (sb.EditError, KeyError, TypeError) as exc:
             print(f"[proposals] {pid!r} no longer applies ({exc}) — dropped.")
             continue
@@ -828,7 +964,7 @@ def _materialised(name: str) -> dict:
     entry = cache.get(name)
     if entry is None or entry["key"] != key:
         try:
-            net, _ = sb.materialise(base, proposal["edits"])
+            net, _ = sb.materialise(base, sb.upgrade_stored(proposal["edits"]))
         except sb.EditError as exc:
             raise HTTPException(status_code=409, detail=f"Proposal {name!r} no longer applies: {exc}")
         entry = {"key": key, "net": net, "db_full": None, "db_error": None}
@@ -894,6 +1030,9 @@ def _pg_max_for(request=None, net=None) -> dict:
         if not isinstance(name, str):
             name = src.sgen.at[idx, "name"]
         out[str(name)] = float(src.sgen.at[idx, "max_p_mw"])
+    # A unit a proposal added on voltage control is a `gen` row.
+    for idx in src.gen.index[lg._proposed_mask(src.gen)]:
+        out[str(src.gen.at[idx, "name"])] = float(src.gen.at[idx, "max_p_mw"])
     return out
 
 
@@ -940,9 +1079,27 @@ def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | N
     what it injects at this tick, empty on the base.
     """
     subs = substations if subs is None else subs
-    net, _ = lg.assign_load_values_from_measurements(net, meas, subs)
-    net, _ = lg.assign_generators_values_from_measurements(net, meas, subs)
-    if not (lg._proposed_mask(net.load).any() or lg._proposed_mask(net.sgen).any()):
+    if ts == nom.NOMINAL:
+        # The case's own values, per element and exactly — not spread per
+        # substation at a 0.95 power factor as a tick is.
+        try:
+            net = nom.apply(net, _nominal_snapshot())
+        except nom.NominalError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    else:
+        own = getattr(_study, "load_pf", None)
+        pf = own if own is not None else _load_pf_setting()[0]
+        net, _ = lg.assign_load_values_from_measurements(net, meas, subs, power_factor=pf)
+        net, _ = lg.assign_generators_values_from_measurements(net, meas, subs)
+        _study.pf_used = True
+        share = net.get("_q_measured_share", 0.0) if hasattr(net, "get") else 0.0
+        if share:
+            seen = getattr(_study, "q_share", None) or (share, share)
+            _study.q_share = (min(seen[0], share), max(seen[1], share))
+    # Units the operator set to a fixed power factor: Q for this tick's P.
+    gm.set_reactive(net)
+    if not (lg._proposed_mask(net.load).any() or lg._proposed_mask(net.sgen).any()
+            or lg._proposed_mask(net.gen).any()):
         return net, []
     if dataset is None:
         raise HTTPException(status_code=500, detail="Internal: a proposal tick needs its dataset.")
@@ -981,6 +1138,8 @@ def _resolve_dataset(data_source: str = "measurements"):
     so the LLM gets a clear, actionable error rather than a silent fallback.
     """
     src = (data_source or "measurements").strip().lower()
+    if src == nom.NOMINAL:
+        return [nom.NOMINAL], {nom.NOMINAL: _nominal_measurements()}, nom.NOMINAL
     if src in ("forecast", "forecasts"):
         ts = app_data.get("forecast_timestamps") or []
         if not ts:
@@ -993,9 +1152,45 @@ def _resolve_dataset(data_source: str = "measurements"):
     if src not in ("measurement", "measurements"):
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown data_source {data_source!r}. Use 'measurements' or 'forecasts'.",
+            detail=f"Unknown data_source {data_source!r}. Use 'measurements', 'forecasts' or 'nominal'.",
         )
     return app_data["timestamps"], app_data["measurements"], "measurements"
+
+
+def _nominal_snapshot() -> dict:
+    """The loaded network's nominal point, or a 422 saying why it cannot be used."""
+    snap = app_data.get("nominal")
+    ok, why = nom.usable(snap)
+    if not ok:
+        raise HTTPException(status_code=422, detail=f"The nominal operating point is not available. {why}")
+    return snap
+
+
+def _nominal_measurements() -> pd.DataFrame:
+    """The nominal point in the measurement schema (per substation), so code
+    reading a tick's table works on it. The study itself uses the exact
+    per-element values (`_assign_tick`)."""
+    snap = _nominal_snapshot()
+    net = _net_for(None)          # the base: rows a proposal adds are not in the snapshot
+    names = list(substations)
+
+    def key(bus: int) -> str:
+        return sb.measurement_key_for_bus(net, bus, names) or _bus_display_name(net, bus)
+
+    return nom.as_measurements(net, snap, key)
+
+
+def _window_dataset(data_source: str = "measurements"):
+    """`_resolve_dataset` for studies over a time window: the nominal point is
+    one moment with no time, so they refuse it with the reason."""
+    if (data_source or "").strip().lower() == nom.NOMINAL:
+        raise HTTPException(
+            status_code=400,
+            detail="The nominal operating point is a single moment with no time, so a study over a "
+                   "time window cannot use it. Use data_source='measurements' or 'forecasts' here, "
+                   "or a point study (security assessment, N-1, OPF, snapshot…) with "
+                   "data_source='nominal'.")
+    return _resolve_dataset(data_source)
 
 
 def _dispatch_rows_from_overrides(dispatch_overrides):
@@ -1178,6 +1373,9 @@ def _fill_network_limits(request) -> None:
             setattr(request, field, limit)
 
 
+LOAD_PF_MIN = 0.5
+
+
 class _NetworkLimitsMixin(BaseModel):
     """Fills every security limit the caller did not send with the network's own.
 
@@ -1194,6 +1392,17 @@ class _NetworkLimitsMixin(BaseModel):
     record of the fields set — one rule, applied to every request that carries
     limits, wherever it is built.
     """
+
+    # Power factor (lagging) giving each measured load its reactive power, for
+    # this study only; None = the session setting (`/api/assumptions`).
+    load_power_factor: float | None = None
+
+    @field_validator("load_power_factor")
+    @classmethod
+    def _valid_power_factor(cls, value):
+        if value is not None and not (LOAD_PF_MIN <= value <= 1.0):
+            raise ValueError(f"load_power_factor must be between {LOAD_PF_MIN} and 1.0 (lagging).")
+        return value
 
     @model_validator(mode="after")
     def _fill_unset_limits(self):
@@ -1733,40 +1942,45 @@ def _write_upload_sentinel(
         print(f"[upload] WARNING: Could not write upload sentinel: {exc}")
 
 
-def _parse_timeseries_csv(content: bytes) -> tuple[dict, list]:
+def _parse_timeseries_csv(content: bytes, kind: str | None = None) -> tuple[dict, list]:
     """Parse a long-format timeseries CSV into (measurements_dict, timestamps_list).
 
-    Shared by the measurement and forecast upload/restore paths. Raises
-    ``ValueError`` with a human-readable message on any problem so callers can
-    surface it as a 400 or log it on restart.
+    Shared by the measurement and forecast upload/restore paths. Optional
+    reactive columns (`consumption_mvar`, `production_mvar`) are kept
+    (data_quality.py). With `kind`, the parse notes are kept for that dataset's
+    quality report. Raises ``ValueError`` with a human-readable message on any
+    problem so callers can surface it as a 400 or log it on restart.
     """
-    text = content.decode("utf-8-sig")  # strip BOM if Excel-exported
-    df_raw = pd.read_csv(io.StringIO(text))
-
-    required = {"timestamp", "substation_name", "production_mw", "consumption_mw"}
-    missing = required - set(df_raw.columns)
-    if missing:
-        raise ValueError(
-            f"CSV is missing required columns: {sorted(missing)}. "
-            f"Required: timestamp, substation_name, production_mw, consumption_mw"
-        )
-
-    df_raw["timestamp"] = pd.to_datetime(df_raw["timestamp"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-    df_raw["production_mw"] = pd.to_numeric(df_raw["production_mw"], errors="coerce").fillna(0.0)
-    df_raw["consumption_mw"] = pd.to_numeric(df_raw["consumption_mw"], errors="coerce").fillna(0.0)
-
-    measurements: dict = {}
-    for ts, group in df_raw.groupby("timestamp", sort=False):
-        measurements[ts] = (
-            group[["substation_name", "production_mw", "consumption_mw"]]
-            .rename(columns={"production_mw": "production", "consumption_mw": "consumption"})
-            .reset_index(drop=True)
-        )
-
-    timestamps = sorted(measurements.keys())
-    if not timestamps:
-        raise ValueError("CSV contained no valid rows after parsing.")
+    measurements, timestamps, notes = dq.parse(content)
+    if kind:
+        app_data.setdefault("_parse_notes", {})[kind] = notes
     return measurements, timestamps
+
+
+def _voltage_substations() -> set:
+    """Substations whose units control voltage (they decide their own Q)."""
+    net = _net_for(None)
+    names = list(substations)
+    out = set()
+    for idx in net.gen.index[~lg._proposed_mask(net.gen)] if len(net.gen) else []:
+        bus = int(net.gen.at[idx, "bus"])
+        out.add(sb.measurement_key_for_bus(net, bus, names) or _bus_display_name(net, bus))
+    return out
+
+
+def _data_quality(kind: str) -> dict | None:
+    """The quality report of a loaded dataset ("measurements" / "forecasts"),
+    cached until the data or the generator model change."""
+    dataset = app_data.get("measurements" if kind == "measurements" else "forecasts") or {}
+    if not dataset:
+        return None
+    key = (id(dataset), len(dataset), _assumptions_key())
+    cache = app_data.setdefault("_quality_cache", {})
+    if cache.get(kind, (None,))[0] != key:
+        report = dq.quality(dataset, (app_data.get("_parse_notes") or {}).get(kind), _voltage_substations())
+        report["source"] = app_data.get(f"{kind}_source")
+        cache[kind] = (key, report)
+    return cache[kind][1]
 
 
 def _empty_admittance_entry() -> dict:
@@ -2059,7 +2273,7 @@ def _restore_timeseries_from_sentinel() -> bool:
     try:
         with open(csv_path, "rb") as fh:
             content = fh.read()
-        new_measurements, new_timestamps = _parse_timeseries_csv(content)
+        new_measurements, new_timestamps = _parse_timeseries_csv(content, "measurements")
     except Exception as exc:
         print(f"[lifespan] Could not parse timeseries CSV: {exc} — using synthetic.")
         return False
@@ -2133,7 +2347,7 @@ def _restore_forecast_from_sentinel() -> bool:
     try:
         with open(csv_path, "rb") as fh:
             content = fh.read()
-        measurements, timestamps = _parse_timeseries_csv(content)
+        measurements, timestamps = _parse_timeseries_csv(content, "forecasts")
     except Exception as exc:
         print(f"[lifespan] Could not parse forecast CSV: {exc} — using synthetic forecast.")
         return False
@@ -2156,6 +2370,11 @@ def _prepare_runtime_reload() -> None:
     app_data["measurements_source"] = "synthetic"
     app_data["last_dispatch_result"] = []
     app_data["last_dispatch_timestamp"] = None
+    app_data["nominal"] = None
+    app_data["load_power_factor"] = None
+    app_data["generator_model"] = {}
+    app_data["_parse_notes"] = {}
+    app_data["_quality_cache"] = {}
     _discard_proposals()
 
 
@@ -2223,6 +2442,8 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42)
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
 
+    # The case's own operating point, before the first tick is written over it.
+    app_data["nominal"] = nom.snapshot(net)
     initial_meas = measurements[timestamps[0]]
     subs = get_substation_names(net)
     substations.extend(subs)
@@ -2251,13 +2472,14 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     print(f"[lifespan] PG_MAX_DATA: {len(PG_MAX_DATA)} generators.")
 
     _build_and_store_ybus(net)
+    _remember_loaded(net)
     _restore_timeseries_from_sentinel()
     _restore_forecast_from_sentinel()
     print("\n !API IS READY TO RECEIVE REQUESTS! \n")
     return True
 
 
-def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
+def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool = True) -> None:
     """Startup path for any YAML profile.
 
     Loads the network via network_loader, generates a synthetic timeseries,
@@ -2323,6 +2545,8 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
         load_profile=load_prof, generation_profile=gen_prof, seed=137, peak_load_factor=peak,
     )
 
+    # The case's own operating point, before the first tick is written over it.
+    app_data["nominal"] = nom.snapshot(net)
     # Assign first-tick measurements to initialise operating point.
     initial_meas = measurements[timestamps[0]]
     subs = get_substation_names(net)
@@ -2362,8 +2586,12 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
 
     # Build Ybus on-the-fly (generic profiles never use pre-computed pickles).
     _build_and_store_ybus(net)
-    _restore_timeseries_from_sentinel()
-    _restore_forecast_from_sentinel()
+    _remember_loaded(net)
+    if restore_uploads:
+        # Not for a demo: it must load the same data every time, and leave the
+        # operator's uploaded data for Resume.
+        _restore_timeseries_from_sentinel()
+        _restore_forecast_from_sentinel()
     # Uploaded measurements never come with an invented forecast (the same rule
     # as uploading them at runtime): a forecast appears only when uploaded.
     if app_data.get("measurements_source") == "uploaded" and app_data.get("forecasts_source") == "synthetic":
@@ -2372,6 +2600,82 @@ def _lifespan_generic(profile_name: str, backend_dir: str) -> None:
         app_data["forecasts_source"] = "none"
 
     print("\n !API IS READY TO RECEIVE REQUESTS! \n")
+
+
+def _restore_proposals_after_upload() -> list[str]:
+    _restore_assumptions()
+    return _restore_proposals()
+
+
+def _read_json(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _saved_scenario() -> str | None:
+    name = (_read_json(_SCENARIO_FILE) or {}).get("scenario")
+    return name if name in scn.SCENARIOS else None
+
+
+def _save_scenario(name: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SCENARIO_FILE), exist_ok=True)
+        with open(_SCENARIO_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"scenario": name}, fh)
+    except OSError as exc:
+        print(f"[scenario] Could not save the choice: {exc}")
+
+
+def _has_uploads() -> bool:
+    return os.path.isfile(_LAST_UPLOAD_SENTINEL) or os.path.isfile(_LAST_TIMESERIES_SENTINEL)
+
+
+def _load_demo(name: str) -> None:
+    """A demo scenario: the bundled network and its synthetic week (with
+    measured reactive power for the reactive demo). The "last uploaded" records
+    are not read or touched, so Resume stays as it was."""
+    spec = scn.SCENARIOS[name]
+    _lifespan_generic(spec["profile"], BACKEND_DIR, restore_uploads=False)
+    if spec.get("reactive"):
+        content = scn.demo_reactive_csv(app_data["measurements"])
+        measurements, timestamps = _parse_timeseries_csv(content, "measurements")
+        app_data["measurements"], app_data["timestamps"] = measurements, timestamps
+        app_data["current_index"] = 0
+        app_data["measurements_source"] = "demo"
+        _assign_tick(_net_for(None), prepare_measurement_df(measurements[timestamps[0]]), timestamps[0])
+    app_data["scenario"] = name
+
+
+def _load_resume() -> bool:
+    """The operator's last uploaded network and data. False when the uploaded
+    network cannot be restored (the default profile with any uploaded data is
+    loaded instead)."""
+    sentinel = _read_json(_LAST_UPLOAD_SENTINEL) if os.path.isfile(_LAST_UPLOAD_SENTINEL) else None
+    ok = bool(sentinel) and _lifespan_from_uploaded(sentinel)
+    if not ok:
+        profile_name = os.environ.get("GRID_PROFILE", DEFAULT_GRID_PROFILE).lower().strip()
+        _lifespan_generic(profile_name, BACKEND_DIR)
+    app_data["scenario"] = "resume" if _has_uploads() else "ieee14"
+    return ok
+
+
+def _scenario_payload() -> dict:
+    resume = scn.resume_detail(_read_json(_LAST_UPLOAD_SENTINEL), _read_json(_LAST_TIMESERIES_SENTINEL))
+    current = app_data.get("scenario") or ("resume" if _has_uploads() else "ieee14")
+    options = []
+    for key, spec in scn.SCENARIOS.items():
+        option = {"name": key, "label": spec["label"], "description": spec["description"], "available": True}
+        if key == "resume":
+            option["available"] = resume["available"]
+            parts = [p for p in (resume["network"] and f"network {resume['network']}",
+                                 resume["data"] and f"data {resume['data']}") if p]
+            option["description"] = ("Your last upload: " + ", ".join(parts) + "." if parts else
+                                     "Nothing uploaded yet — upload a network or data to have something to resume.")
+        options.append(option)
+    return {"current": current, "label": scn.SCENARIOS[current]["label"], "options": options}
 
 
 @asynccontextmanager
@@ -2402,6 +2706,18 @@ async def lifespan(app: FastAPI):
             "Install it with: conda install -c conda-forge ipopt"
         )
 
+    # The scenario chosen last time: a demo loads as itself; otherwise the
+    # operator's uploads (Resume), as before.
+    _chosen = _saved_scenario()
+    if _chosen in scn.DEMOS:
+        print(f"[lifespan] Scenario: {_chosen}")
+        _load_demo(_chosen)
+        _restore_assumptions()
+        _restore_proposals()
+        yield
+        print("Shutting down backend")
+        return
+
     # Prefer a previously uploaded network over the default YAML profile.
     if os.path.isfile(_LAST_UPLOAD_SENTINEL):
         print(f"[lifespan] Found upload sentinel: {_LAST_UPLOAD_SENTINEL}")
@@ -2409,6 +2725,8 @@ async def lifespan(app: FastAPI):
             with open(_LAST_UPLOAD_SENTINEL, encoding="utf-8") as fh:
                 sentinel = json.load(fh)
             if _lifespan_from_uploaded(sentinel):
+                app_data["scenario"] = "resume"
+                _restore_assumptions()
                 _restore_proposals()
                 yield
                 print("Shutting down backend")
@@ -2421,6 +2739,8 @@ async def lifespan(app: FastAPI):
     print(f"[lifespan] GRID_PROFILE={profile_name!r}")
 
     _lifespan_generic(profile_name, BACKEND_DIR)
+    app_data["scenario"] = "resume" if _has_uploads() else "ieee14"
+    _restore_assumptions()
     _restore_proposals()
 
     yield
@@ -2441,6 +2761,41 @@ _holds_state = threading.local()
 # What the elements a proposal added inject at the first tick a request
 # studied (set by `_assign_tick`, read by `_echo_network`).
 _tick_report = threading.local()
+# The load power factor of the study running in this thread, and whether a
+# tick used it (studies run one at a time, under _STATE_LOCK).
+_study = threading.local()
+
+
+def _echo_power_factor(result):
+    """A result that assigned a tick says which load power factor gave the
+    loads their reactive power — and whether it was the default, the
+    session's setting or this study's own."""
+    if not isinstance(result, dict) or not getattr(_study, "pf_used", False) or "load_power_factor" in result:
+        return result
+    own = getattr(_study, "load_pf", None)
+    value, source = (own, "this study") if own is not None else _load_pf_setting()
+    result["load_power_factor"] = {"value": value, "source": source, "lagging": True,
+                                   "applies_to": "measured loads (Q = P·tan(acos pf)); the nominal "
+                                                 "point keeps the case's own Q"}
+    q_share = getattr(_study, "q_share", None)
+    if q_share:
+        lo, hi = q_share
+        result["load_power_factor"]["measured_reactive_power"] = {
+            "share_of_load": round(hi, 4) if abs(hi - lo) < 1e-4 else [round(lo, 4), round(hi, 4)],
+            # Judged on the least-covered tick: a window where any tick had a
+            # gap used the power factor there.
+            "note": ("The data carry measured reactive demand: loads with a measurement use it; the power "
+                     "factor applies only to the rest." if lo < 0.9999 else
+                     "The data carry measured reactive demand for every load: the power factor is not used."),
+        }
+    model = app_data.get("generator_model") or {}
+    if model and "generator_model" not in result:
+        # Units modelled differently from the network as loaded: said in every
+        # result, so a figure under a changed model is never read as the default.
+        result["generator_model"] = {"changed_units": model,
+                                     "note": "These units are modelled differently from the network "
+                                             "as loaded (System tab / set_generator_model)."}
+    return result
 
 
 def _echo_network(result, args, kwargs):
@@ -2472,11 +2827,16 @@ def _off_event_loop(endpoint):
             with _STATE_LOCK:
                 _holds_state.active = True
                 _tick_report.first = None
+                request = next((a for a in (*args, *kwargs.values()) if hasattr(a, "load_power_factor")), None)
+                _study.load_pf = getattr(request, "load_power_factor", None)
+                _study.pf_used = False
+                _study.q_share = None
                 try:
                     result = asyncio.run(endpoint(*args, **kwargs))
-                    return _echo_network(result, args, kwargs)
+                    return _echo_power_factor(_echo_network(result, args, kwargs))
                 finally:
                     _holds_state.active = False
+                    _study.load_pf = None
 
         return await anyio.to_thread.run_sync(locked)
 
@@ -2625,6 +2985,10 @@ async def get_grid_constants_endpoint():
         "first_timestamp": meas_ts[0] if meas_ts else None,
         "last_timestamp": meas_ts[-1] if meas_ts else None,
         "source": app_data.get("measurements_source", "synthetic"),
+        "reactive_measured": dq.has_reactive(app_data.get("measurements") or {}),
+        "voltage_units_not_following_measured_q": next(
+            (f.get("substations") for f in ((_data_quality("measurements") or {}).get("findings") or [])
+             if f["code"] == "reactive_at_voltage_units"), []),
     }
     forecast_info = {
         "loaded": bool(fc_ts),
@@ -2632,12 +2996,14 @@ async def get_grid_constants_endpoint():
         "first_timestamp": fc_ts[0] if fc_ts else None,
         "last_timestamp": fc_ts[-1] if fc_ts else None,
         "source": app_data.get("forecasts_source", "synthetic"),
+        "reactive_measured": dq.has_reactive(app_data.get("forecasts") or {}),
         "n_shared_with_measurements": len(shared),
         "first_shared": shared[0] if shared else None,
         "last_shared": shared[-1] if shared else None,
     }
     return {
         "name": profile.get("name", "Unknown Grid"),
+        "scenario": scn.SCENARIOS.get(app_data.get("scenario") or "", {}).get("label"),
         "n_substations": len(subs),
         "n_lines": len(net.line),
         "n_trafos": len(net.trafo),
@@ -2695,7 +3061,274 @@ async def get_timeline():
             "n": len(fc),
             "source": app_data.get("forecasts_source", "synthetic"),
         },
+        "nominal": dict(zip(("available", "reason"), nom.usable(app_data.get("nominal")))),
+        "reactive_measured": {"measurements": dq.has_reactive(app_data.get("measurements") or {}),
+                              "forecasts": dq.has_reactive(app_data.get("forecasts") or {})},
     }
+
+
+class FollowMeasuredRequest(BaseModel):
+    """Substations whose voltage-controlled units should follow the measured
+    reactive generation instead (switched to fixed Q)."""
+    substations: list[str] = []
+
+
+@app.post("/api/generators/follow_measured")
+async def follow_measured_reactive(request: FollowMeasuredRequest):
+    """Switch the voltage-controlled units at these substations to fixed Q, so
+    the measured reactive generation is used at every tick that has it; their
+    fixed value (the substation's median measured Q) applies where it is
+    missing. Condensers stay on voltage control (reported)."""
+    dataset = app_data.get("measurements") or {}
+    if not dq.has_reactive(dataset)["production"]:
+        raise HTTPException(status_code=400, detail="The measured data carry no reactive generation to follow.")
+    frame = pd.concat([df[["substation_name", "production_q"]] for df in dataset.values()], ignore_index=True)
+    median = frame.groupby("substation_name")["production_q"].median()
+    with _STATE_LOCK:
+        base, loaded = _net_for(None), app_data.get("net_loaded")
+        names = list(substations)
+        units = {u["unit"]: u for u in gm.describe(base)}
+        wanted = set(request.substations or [])
+        changes, skipped = [], []
+        for idx in base.gen.index[~lg._proposed_mask(base.gen)] if len(base.gen) else []:
+            bus = int(base.gen.at[idx, "bus"])
+            sub = sb.measurement_key_for_bus(base, bus, names) or _bus_display_name(base, bus)
+            if sub not in wanted:
+                continue
+            name = gm.unit_name(base, "gen", idx)
+            if units.get(name, {}).get("condenser"):
+                skipped.append(f"{name} (a condenser: it stays on voltage control)")
+                continue
+            q = median.get(sub)
+            changes.append({"unit": name, "control": "fixed_q", "q_mvar": float(q) if pd.notna(q) else 0.0})
+        if not changes:
+            raise HTTPException(status_code=400, detail="No voltage-controlled generator at those substations"
+                                + (f" ({'; '.join(skipped)})" if skipped else "") + ".")
+        try:
+            current = app_data.get("generator_model") or {}
+            model = gm.merge(current, gm.normalise(loaded, changes, current))
+            dropped = _apply_generator_model(model)
+        except gm.ModelError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        _save_assumptions()
+        out = _generators_payload()
+    out.update({"switched": [c["unit"] for c in changes], "skipped": skipped, "proposals_dropped": dropped})
+    return out
+
+
+def _template_csv(hours: int = 1) -> str:
+    """An upload CSV for the loaded network: its substation names, the loaded
+    data's first hour as example values (zeros without data), and the optional
+    reactive columns (filled when the loaded data carry them, else empty)."""
+    dataset = app_data.get("measurements") or {}
+    ts = sorted(dataset)[: max(1, 4 * hours)]
+    names = list(dict.fromkeys(str(n) for n in substations))
+    if ts:
+        names = list(dict.fromkeys(dataset[ts[0]]["substation_name"].astype(str))) or names
+    stamps = ts or [f"2026-01-01 {h:02d}:{m:02d}:00" for h in range(hours) for m in (0, 15, 30, 45)]
+    rows = ["timestamp,substation_name,consumption_mw,production_mw,consumption_mvar,production_mvar"]
+
+    def fmt(v):
+        return "" if v is None or pd.isna(v) else f"{float(v):.4f}"
+    for t in stamps:
+        frame = dataset[t].set_index(dataset[t]["substation_name"].astype(str)) if ts else None
+        for n in names:
+            if frame is None or n not in frame.index:
+                rows.append(f"{t},{n},0,0,,")
+                continue
+            r = frame.loc[n]
+            rows.append(f"{t},{n},{fmt(r['consumption'])},{fmt(r['production'])},"
+                        f"{fmt(r.get('consumption_q'))},{fmt(r.get('production_q'))}")
+    return "\n".join(rows) + "\n"
+
+
+@app.get("/api/data/template")
+async def data_template(hours: int = 1):
+    """A CSV to start an upload from, for the loaded network: every substation
+    name it expects, the loaded data's first hour as example values, and the
+    optional reactive columns."""
+    hours = min(max(int(hours), 1), 24)
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", str((app_data.get("grid_profile") or {}).get("name") or "network")).strip("_") or "network"
+    return Response(_template_csv(hours), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="conductor_template_{name}.csv"'})
+
+
+@app.get("/api/data/quality")
+async def data_quality():
+    """What the loaded datasets look like: reactive columns, coverage, and
+    anything implausible (data_quality.py). Never changes the data."""
+    return {"measurements": _data_quality("measurements"), "forecasts": _data_quality("forecasts")}
+
+
+class ScenarioRequest(BaseModel):
+    name: str
+
+
+@app.get("/api/scenario")
+async def get_scenario():
+    """What is loaded (Resume or a demo) and what can be loaded."""
+    return _scenario_payload()
+
+
+@app.post("/api/scenario")
+async def set_scenario(request: ScenarioRequest):
+    """Load a scenario. Demos never touch the uploaded network and data, so
+    Resume stays available; each network keeps its own saved proposals and
+    assumptions. The choice is remembered for the next start."""
+    name = (request.name or "").strip()
+    if name not in scn.SCENARIOS:
+        raise HTTPException(status_code=400, detail=f"Unknown scenario {request.name!r}. Use one of "
+                                                    f"{list(scn.SCENARIOS)}.")
+    if name == "resume" and not _has_uploads():
+        raise HTTPException(status_code=400, detail="Nothing to resume yet: upload a network or data first.")
+    with _STATE_LOCK:
+        try:
+            if name in scn.DEMOS:
+                _load_demo(name)
+            else:
+                _load_resume()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Could not load {name}: {exc}")
+        _restore_assumptions()
+        _restore_proposals()
+        _save_scenario(app_data["scenario"])
+        return _scenario_payload()
+
+
+class AssumptionsRequest(BaseModel):
+    """Change the session's study assumptions. `load_power_factor` None goes
+    back to the default."""
+    load_power_factor: float | None = None
+
+    @field_validator("load_power_factor")
+    @classmethod
+    def _valid(cls, value):
+        if value is not None and not (LOAD_PF_MIN <= value <= 1.0):
+            raise ValueError(f"load_power_factor must be between {LOAD_PF_MIN} and 1.0 (lagging).")
+        return value
+
+
+def _assumptions_key() -> str:
+    """Changes whenever an assumption does: the UI keys its caches on it, so a
+    map drawn before a change is never shown after it."""
+    payload = {"pf": app_data.get("load_power_factor"), "gm": app_data.get("generator_model") or {}}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _dataset_key(dataset: dict) -> str:
+    """Identifies a loaded series by its content (a few sums), so it survives a
+    restart and changes whenever other data are loaded."""
+    if not dataset:
+        return "none"
+    ts = sorted(dataset)
+    parts = [len(ts), ts[0], ts[-1]]
+    for t in (ts[0], ts[len(ts) // 2], ts[-1]):
+        frame = dataset[t]
+        parts += [round(float(pd.to_numeric(frame[c], errors="coerce").sum()), 6)
+                  for c in ("consumption", "production", "consumption_q", "production_q") if c in frame]
+    return hashlib.sha1(json.dumps(parts, default=str).encode()).hexdigest()[:12]
+
+
+def _data_key() -> str:
+    """Changes whenever other measurements or forecasts are loaded: an answer
+    stamped with an older key was computed on other data."""
+    m, f = app_data.get("measurements") or {}, app_data.get("forecasts") or {}
+    marker = (id(m), len(m), id(f), len(f))
+    cached = app_data.get("_data_key_cache")
+    if not cached or cached[0] != marker:
+        cached = (marker, f"{_dataset_key(m)}-{_dataset_key(f)}")
+        app_data["_data_key_cache"] = cached
+    return cached[1]
+
+
+def _assumptions_payload() -> dict:
+    value, source = _load_pf_setting()
+    return {"key": _assumptions_key(), "data_key": _data_key(),
+            "scenario": app_data.get("scenario"),
+            "generator_model": app_data.get("generator_model") or {},
+            "reactive_measured": {"measurements": dq.has_reactive(app_data.get("measurements") or {}),
+                                  "forecasts": dq.has_reactive(app_data.get("forecasts") or {})},
+            "load_power_factor": {
+        "value": value, "default": lg.DEFAULT_LOAD_POWER_FACTOR, "source": source, "lagging": True,
+        "meaning": "The measurements carry active power only: each measured load's reactive power is "
+                   "P·tan(acos pf). Every study uses this unless it is given its own load_power_factor; "
+                   "the nominal point keeps the case's own reactive power."}}
+
+
+@app.get("/api/assumptions")
+async def get_assumptions():
+    """The session's study assumptions (today: the load power factor)."""
+    return _assumptions_payload()
+
+
+@app.post("/api/assumptions")
+async def set_assumptions(request: AssumptionsRequest):
+    """Set (or, with null, reset) the session's load power factor. Kept for
+    this network across a restart, like a proposal."""
+    with _STATE_LOCK:
+        before = _load_pf_setting()
+        app_data["load_power_factor"] = request.load_power_factor
+        _save_assumptions()
+        out = _assumptions_payload()
+    out["previous"] = {"value": before[0], "source": before[1]}
+    return out
+
+
+class GeneratorModelRequest(BaseModel):
+    """Change how units are modelled (generators.py). `changes`: one object per
+    unit — unit, and any of control, vm_pu, pf, absorbing, q_min_mvar,
+    q_max_mvar, dispatchable. `reset` takes every unit back to how it was
+    loaded."""
+    changes: list[dict] = []
+    reset: bool = False
+
+
+def _generators_payload() -> dict:
+    base = _net_for(None)
+    ok, why = gm.editable(app_data.get("net_loaded") if app_data.get("net_loaded") is not None else base)
+    return {
+        "editable": ok, "reason": why,
+        "units": [{**u, "bus_name": _bus_display_name(base, u["bus"])} for u in gm.describe(base)],
+        "changed": app_data.get("generator_model") or {},
+        "meaning": {
+            "voltage": "holds its voltage set-point; its reactive power is what that takes (within "
+                       "q_min/q_max in the OPF; power flows do not enforce the limits)",
+            "power_factor": "injects its active power at a fixed power factor (injecting, or absorbing "
+                            "reactive power); pf 1.0 is no reactive power",
+            "dispatchable": "the OPF may move its active power; otherwise it keeps its output",
+        },
+    }
+
+
+@app.get("/api/generators")
+async def get_generators():
+    """Every unit of the loaded network and how it is modelled now."""
+    return _generators_payload()
+
+
+@app.post("/api/generators")
+async def set_generators(request: GeneratorModelRequest):
+    """Change units' models (or reset them all). Applied to the network as
+    loaded; proposals are re-checked; kept for this network across a restart."""
+    with _STATE_LOCK:
+        loaded = app_data.get("net_loaded")
+        if loaded is None:
+            raise HTTPException(status_code=503, detail="No network loaded yet.")
+        try:
+            if request.reset:
+                model = {}
+            else:
+                if not request.changes:
+                    raise gm.ModelError("Give at least one unit change, or reset=true.")
+                current = app_data.get("generator_model") or {}
+                model = gm.merge(current, gm.normalise(loaded, request.changes, current))
+            dropped = _apply_generator_model(model)
+        except gm.ModelError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        _save_assumptions()
+        out = _generators_payload()
+    out["proposals_dropped"] = dropped
+    return out
 
 
 class DataSeriesRequest(BaseModel):
@@ -2715,20 +3348,25 @@ async def data_series(request: DataSeriesRequest):
     power flow. Long series are thinned to about `max_points` evenly spaced
     ticks (a year of 15-minute data is ~35k), and the response says so.
     """
-    timestamps, dataset, label = _resolve_dataset(request.data_source)
+    timestamps, dataset, label = _window_dataset(request.data_source)
     if not timestamps:
         return {"data_source": label, "timestamps": [], "n_total": 0, "available_substations": [],
                 "totals": {"consumption": [], "production": []}, "substations": {}}
     stride = max(1, -(-len(timestamps) // max(1, int(request.max_points))))
     picked = timestamps[::stride]
     wanted = set(request.substations or [])
-    totals_c, totals_p = [], []
-    per: dict = {name: {"consumption": [], "production": []} for name in wanted}
+    totals_c, totals_p, totals_qc, totals_qp = [], [], [], []
+    per: dict = {name: {"consumption": [], "production": [], "consumption_q": [], "production_q": []}
+                 for name in wanted}
     available: set = set()
     for ts in picked:
         df = prepare_measurement_df(dataset[ts])
         totals_c.append(round(float(df["consumption"].sum()), 4))
         totals_p.append(round(float(df["production"].sum()), 4))
+        for col, acc in (("consumption_q", totals_qc), ("production_q", totals_qp)):
+            if col in df.columns:
+                v = df[col].sum(min_count=1)
+                acc.append(None if pd.isna(v) else round(float(v), 4))
         by_name = df.set_index("substation_name")
         available.update(str(n) for n in by_name.index)
         for name in wanted:
@@ -2737,6 +3375,9 @@ async def data_series(request: DataSeriesRequest):
                 row = row.sum(numeric_only=True)
             per[name]["consumption"].append(None if row is None else round(float(row["consumption"]), 4))
             per[name]["production"].append(None if row is None else round(float(row["production"]), 4))
+            for col in ("consumption_q", "production_q"):
+                v = None if row is None or col not in row.index else row[col]
+                per[name][col].append(None if v is None or pd.isna(v) else round(float(v), 4))
     source = app_data.get("measurements_source" if label == "measurements" else "forecasts_source")
     return {
         "data_source": label,
@@ -2745,8 +3386,28 @@ async def data_series(request: DataSeriesRequest):
         "n_total": len(timestamps),
         "stride": stride,
         "available_substations": sorted(available),
-        "totals": {"consumption": totals_c, "production": totals_p},
+        "totals": {"consumption": totals_c, "production": totals_p,
+                   **({"consumption_q": totals_qc} if totals_qc else {}),
+                   **({"production_q": totals_qp} if totals_qp else {})},
         "substations": per,
+        "reactive_measured": dq.has_reactive(dataset),
+        # The network's own values, drawn as a reference beside the series.
+        "nominal": _nominal_for_series(wanted),
+    }
+
+
+def _nominal_for_series(wanted: set) -> dict | None:
+    """The nominal point in the data viewer's shape: totals and the wanted
+    substations. None when the loaded network has no usable nominal point."""
+    if not nom.usable(app_data.get("nominal"))[0]:
+        return None
+    df = _nominal_measurements().groupby("substation_name")[["consumption", "production"]].sum()
+    return {
+        "totals": {"consumption": round(float(df["consumption"].sum()), 4),
+                   "production": round(float(df["production"].sum()), 4)},
+        "substations": {name: {"consumption": round(float(df.at[name, "consumption"]), 4),
+                               "production": round(float(df.at[name, "production"]), 4)}
+                        for name in wanted if name in df.index},
     }
 
 
@@ -2854,7 +3515,7 @@ async def upload_timeseries(
     # Parsed before anything is written: a file that fails to parse must not
     # replace the one the next restart would load.
     try:
-        new_measurements, new_timestamps = _parse_timeseries_csv(content)
+        new_measurements, new_timestamps = _parse_timeseries_csv(content, kind_norm)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -2881,6 +3542,7 @@ async def upload_timeseries(
             "last_timestamp": new_timestamps[-1],
             "unmatched_buses": [],
             "stored_path": stored_path,
+            "quality": _data_quality("forecasts"),
         }
 
     # --- Measurement path: drives the simulation clock.
@@ -2926,6 +3588,8 @@ async def upload_timeseries(
 
     unmatched = sorted(set(unmatched_loads) | set(unmatched_gens))
     _write_timeseries_sentinel(stored_path, source="uploaded")
+    app_data["scenario"] = "resume"
+    _save_scenario("resume")
     return {
         "status": "success",
         "kind": "measurements",
@@ -2934,6 +3598,7 @@ async def upload_timeseries(
         "last_timestamp": new_timestamps[-1],
         "unmatched_buses": unmatched,
         "stored_path": stored_path,
+        "quality": _data_quality("measurements"),
     }
 
 
@@ -3065,6 +3730,7 @@ async def upload_network(
 
     # Replace global app_data atomically.
     net_name = os.path.splitext(file.filename)[0] if file.filename else "Uploaded Network"
+    app_data["nominal"] = nom.snapshot(net)
     app_data["net"] = net
     app_data["measurements"] = measurements
     app_data["timestamps"] = timestamps
@@ -3076,7 +3742,11 @@ async def upload_network(
     app_data["db_full"] = None
     app_data["admittance_source"] = "generated"
     _discard_proposals()
-    _forget_saved_proposals()
+    # A new network starts from its own saved assumptions and proposals, if it
+    # has been loaded before (each network keeps its own entry), else defaults.
+    app_data["load_power_factor"] = None
+    app_data["scenario"] = "resume"
+    _save_scenario("resume")
     # Derive the ext_grid active power cap from the .m file (Pmax of the slack-bus
     # generator).  Fall back to 999 (effectively uncapped) if the column is absent.
     _ext_pmax = None
@@ -3119,6 +3789,7 @@ async def upload_network(
     PG_MAX_DATA.clear()
     PG_MAX_DATA.update(get_pg_max_data(net))
     print(f"[upload] PG_MAX_DATA populated ({len(PG_MAX_DATA)} generators): {PG_MAX_DATA}")
+    _remember_loaded(net)
 
     # Build admittance databases on-the-fly (required for OPF / RSA / N-1)
     print(f"[upload] Building admittance databases ({len(net.line)} lines, {len(net.trafo)} trafos)...")
@@ -3172,6 +3843,7 @@ async def upload_network(
         "active_bus_names": active_bus_names,
         "stored_path": stored_path,
         "note": f"Network loaded.{gen_conversion_note}{ybus_note}",
+        "restored": {"proposals": _restore_proposals_after_upload()},
         "n_sgens": len(net.sgen),
         "n_gens_remaining": len(net.gen),
         "gen_conversion_applied": convert_gen_to_sgen and bool(gen_conversion_note),
@@ -3268,7 +3940,7 @@ async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveN
     # so every tick silently fell back to the same static load — and left the
     # upload record in place, so the next restart loaded the old network again.
     # Only the records go; the uploaded files themselves stay on disk.
-    for record in (_LAST_UPLOAD_SENTINEL, _LAST_TIMESERIES_SENTINEL, _LAST_FORECAST_SENTINEL):
+    for record in (_LAST_UPLOAD_SENTINEL, _LAST_TIMESERIES_SENTINEL, _LAST_FORECAST_SENTINEL, _SCENARIO_FILE):
         try:
             os.remove(record)
         except FileNotFoundError:
@@ -3279,6 +3951,8 @@ async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveN
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to reset active network: {exc}")
     _forget_saved_proposals()
+    _forget_saved_assumptions()
+    app_data["scenario"] = "ieee14"
 
     net = app_data.get("net")
     if net is None:
@@ -3435,7 +4109,50 @@ async def network_snapshot(request: _TimeseriesRequest = _TimeseriesRequest()):
                                       "voltage-controlled units, the external grid's reactive "
                                       "exchange and the losses are unknown; import is load minus "
                                       "generation."}),
+        **({"nominal": _nominal_relation(meas_df)} if current_ts == nom.NOMINAL else {}),
     }
+
+
+def _nominal_relation(nominal_df: pd.DataFrame) -> dict:
+    """At the nominal point: what it is, and how the loaded datasets relate to
+    it — per substation, the nominal demand against the series' range."""
+    out = {"meaning": "The network's own operating point as loaded (the case file's values, as the "
+                      "twin models it) — the design point the synthetic data are built from. It has "
+                      "no time.",
+           "totals": nom.totals(_nominal_snapshot())}
+    nominal = nominal_df.set_index("substation_name")
+    for label in ("measurements", "forecasts"):
+        timestamps, dataset, _ = _resolve_dataset(label) if (
+            label == "measurements" or app_data.get("forecast_timestamps")) else ([], {}, label)
+        if not timestamps:
+            continue
+        frames = [prepare_measurement_df(dataset[t])[["substation_name", "consumption", "production"]]
+                  .assign(_t=t) for t in timestamps]
+        series = pd.concat(frames, ignore_index=True)
+        total = series.groupby("_t")[["consumption", "production"]].sum()
+        nom_load = float(nominal["consumption"].sum())
+        rows = []
+        for sub, grp in series.groupby("substation_name"):
+            if sub not in nominal.index:
+                continue
+            n_load = float(nominal.at[sub, "consumption"])
+            c = grp["consumption"]
+            rows.append({"substation": sub, "nominal_load_mw": round(n_load, 4),
+                         "min_mw": round(float(c.min()), 4), "mean_mw": round(float(c.mean()), 4),
+                         "max_mw": round(float(c.max()), 4),
+                         "share_of_ticks_above_nominal": round(float((c > n_load + 1e-9).mean()), 4)})
+        rows.sort(key=lambda r: -abs(r["max_mw"] - r["nominal_load_mw"]))
+        out[label] = {
+            "source": app_data.get(f"{label}_source"),
+            "n_ticks": len(timestamps),
+            "total_load_mw": {"nominal": round(nom_load, 4),
+                              "min": round(float(total["consumption"].min()), 4),
+                              "mean": round(float(total["consumption"].mean()), 4),
+                              "max": round(float(total["consumption"].max()), 4)},
+            "share_of_ticks_above_nominal_load": round(float((total["consumption"] > nom_load + 1e-9).mean()), 4),
+            "by_substation": rows[:15],
+        }
+    return out
 
 
 def _sgen_names(net) -> pd.Series:
@@ -3784,6 +4501,13 @@ def _resolve_tick(data_source: str = "measurements", requested_ts: str | None = 
     Raises HTTP 400 if forecasts are requested but none are loaded.
     """
     timestamps, _dataset, label = _resolve_dataset(data_source)
+    if label == nom.NOMINAL:
+        if requested_ts is not None and str(requested_ts).strip() not in ("", nom.NOMINAL):
+            raise HTTPException(
+                status_code=400,
+                detail="The nominal operating point has no time: leave timestamp out with "
+                       "data_source='nominal', or use 'measurements' / 'forecasts' for a moment.")
+        return nom.NOMINAL
     if requested_ts is not None and str(requested_ts).strip():
         return _resolve_window_timestamp(requested_ts, "timestamp", timestamps=timestamps)
     idx = app_data["current_index"] if label == "measurements" else 0
@@ -4088,7 +4812,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
 
     (request.vm_lower_pu, request.vm_upper_pu,
      request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
-    timestamps, measurements, source_label = _resolve_dataset(request.data_source)
+    timestamps, measurements, source_label = _window_dataset(request.data_source)
     grid_profile = app_data.get("grid_profile", {}) or {}
     system_name = str(grid_profile.get("name") or grid_profile.get("grid_type") or "active system")
     if not timestamps or not measurements:
@@ -4340,7 +5064,7 @@ async def worst_case_scan(request: WorstCaseRequest):
         )
     if request.n_steps is not None and request.n_steps <= 0:
         raise HTTPException(status_code=400, detail="n_steps must be a positive number of ticks.")
-    timestamps, dataset, source_label = _resolve_dataset(request.data_source)
+    timestamps, dataset, source_label = _window_dataset(request.data_source)
     vlo, vhi, mll, mtl = _effective_thresholds(request)
     # Forecasts have no simulation clock — always scan from their start.
     start = app_data["current_index"] if source_label == "measurements" else 0
@@ -4586,7 +5310,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     """
     (request.vm_lower_pu, request.vm_upper_pu,
      request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
-    all_timestamps, scenario_measurements, source_label = _resolve_dataset(request.data_source)
+    all_timestamps, scenario_measurements, source_label = _window_dataset(request.data_source)
     n = len(all_timestamps)
     # Forecasts have no simulation clock — default the window start to index 0.
     default_start = app_data["current_index"] if source_label == "measurements" else 0
@@ -5059,7 +5783,7 @@ async def element_timeseries_scan(request: ElementTimeseriesRequest):
     """
     (request.vm_lower_pu, request.vm_upper_pu,
      request.max_line_loading_pct, request.max_trafo_loading_pct) = _effective_thresholds(request)
-    all_timestamps, ets_measurements, ets_source = _resolve_dataset(request.data_source)
+    all_timestamps, ets_measurements, ets_source = _window_dataset(request.data_source)
     n = len(all_timestamps)
     default_start = app_data["current_index"] if ets_source == "measurements" else 0
 
@@ -5582,6 +6306,7 @@ class RobustFlexibilityRequest(_TimeseriesRequest):
     slack_max_mw: float | None = None
     opf_lambda_p: float = 0.01
     opf_lambda_q: float = 0.001
+    opf_min_power_factor: float = 0.95
     load_scaling_factor: float = 1.0
     target_p_any: float | None = None
     max_iter: int = 3
@@ -6001,7 +6726,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             lambda_q=request.opf_lambda_q,
             pg_max_overrides=None,
             pg_min_overrides=None,
-            min_power_factor=0.95,
+            min_power_factor=request.opf_min_power_factor,
             current_safety_margin=0.9,
             fixed_setpoints=None,
             vm_upper_per_bus=None,
@@ -6116,7 +6841,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             lambda_q=request.opf_lambda_q,
             pg_max_overrides=None,
             pg_min_overrides=None,
-            min_power_factor=0.95,
+            min_power_factor=request.opf_min_power_factor,
             current_safety_margin=0.9,
             fixed_setpoints=None,
             allowed_violation_fraction=max(0.0, min(float(request.allowed_violation_fraction), 0.5)),
@@ -8311,7 +9036,7 @@ async def forecast_kpi(request: KPIRequest):
     if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
 
-    fk_timestamps, fk_measurements, fk_source = _resolve_dataset(request.data_source)
+    fk_timestamps, fk_measurements, fk_source = _window_dataset(request.data_source)
     # Start from the chosen tick (clock for measurements, or an explicit timestamp);
     # forecasts default to their first tick.
     start_ts = _resolve_tick(request.data_source, request.timestamp)
@@ -8786,10 +9511,18 @@ async def edit_proposal(request: ProposalEditRequest):
     if not request.edits and not previous:
         raise HTTPException(status_code=400, detail="A proposal needs at least one edit.")
     try:
-        net, canonical = sb.materialise(base, previous + list(request.edits))
+        net, canonical = sb.materialise(base, sb.upgrade_stored(previous) + list(request.edits))
+    except sb.EditQuestion as exc:
+        # Not an error to report: a decision to put to the operator.
+        raise HTTPException(status_code=400, detail={
+            "needs_operator": True, "edit": (exc.edit - len(previous)) if exc.edit else None,
+            "question": exc.question.split(": ", 1)[-1], "options": exc.options,
+            "instruction": "Ask the operator this question with these options; do not choose for them. "
+                           "Build the edit once they answer."})
     except sb.EditError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     checked = _check_profiles_now(net, name)
+    assumed = _assumed_defaults(net, request.edits, canonical[len(previous):])
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     _proposals()[name] = {
@@ -8800,7 +9533,20 @@ async def edit_proposal(request: ProposalEditRequest):
     app_data.setdefault("_proposal_cache", {}).pop(name, None)
     _save_proposals()
     return {**_proposal_view(name), "status": "created" if existing is None else "updated",
-            "profiles_checked": checked}
+            "profiles_checked": checked,
+            **({"assumed": assumed} if assumed else {})}
+
+
+def _assumed_defaults(net, raw_edits: list, canonical: list) -> list[dict]:
+    """Every value the edit tool filled in that the request did not give —
+    to be stated to the operator, who can change any of them."""
+    out = []
+    for n, (raw, edit) in enumerate(zip(raw_edits, canonical), start=1):
+        given = set(raw) if isinstance(raw, dict) else set()
+        filled = {k: v for k, v in edit.items() if k not in given and k != "op"}
+        if filled:
+            out.append({"edit": n, "description": sb.describe(net, edit), "defaults": filled})
+    return out
 
 
 @app.delete("/api/proposals/{name}")
@@ -8952,7 +9698,7 @@ def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
     where the base does not (and the reverse), which elements, for how long,
     and its worst moments — the hour to take an N-1 screen to next.
     """
-    timestamps, _dataset, label = _resolve_dataset(request.data_source)
+    timestamps, _dataset, label = _window_dataset(request.data_source)
     if not timestamps:
         raise HTTPException(status_code=400, detail=f"No {label} loaded.")
     start = _window_index(timestamps, request.start_timestamp, "start_timestamp", label,

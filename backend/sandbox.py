@@ -34,6 +34,7 @@ import pandas as pd
 import pandapower as pp
 
 import load_gen_assignment as lg
+from nominal import NOMINAL
 from element_names import bus_display_name, clean_label, line_display_name, trafo_display_name
 
 
@@ -41,10 +42,25 @@ class EditError(ValueError):
     """An edit that cannot be applied; the message says why."""
 
 
+class EditQuestion(EditError):
+    """An edit that needs the operator's decision: something essential is
+    missing or contradicts the network, and no default would be defensible.
+    Carries the question and the options to put to them."""
+
+    def __init__(self, question: str, options: list[str], edit: int | None = None):
+        super().__init__(question)
+        self.question, self.options, self.edit = question, list(options), edit
+
+
 LOAD_PROFILES = ("flat", "follow_bus", "shift")
 GENERATOR_KINDS = ("dispatchable", "pv", "wind")
+GENERATOR_CONTROLS = ("voltage", "power_factor", "fixed_q")
+SHUNT_KINDS = ("capacitor", "reactor")
+# Assumed reactive limits of a new voltage-controlling unit when none are
+# given: a synchronous machine's typical rated power factor (reported).
+ASSUMED_RATED_PF = 0.85
 SWITCHABLE = ("line", "trafo", "load", "sgen", "gen")
-OPS = ("add_load", "add_generator", "reinforce_line", "upgrade_trafo",
+OPS = ("add_load", "add_generator", "add_shunt", "reinforce_line", "upgrade_trafo",
        "add_bus_with_connection", "add_bus_with_transformer", "set_in_service")
 TRAFO_SIDES = ("hv", "lv")
 
@@ -471,6 +487,111 @@ def trafo_design(net, e: dict) -> dict:
     return d
 
 
+def _measured_substation(net) -> bool:
+    """A network whose units are rebuilt from the measurements at every tick
+    (loaded with no `gen` table): a voltage-controlled unit would change how
+    its ticks are assigned."""
+    own = net.gen[~lg._proposed_mask(net.gen)] if len(net.gen) else net.gen
+    return not len(own) and not net.get("_gen_to_sgen_applied", False)
+
+
+def _bus_setpoint(net, bus: int) -> tuple[float, str] | None:
+    """(the voltage a bus is already held at, by what) — a unit or the grid."""
+    for idx in net.ext_grid.index[net.ext_grid.bus == bus]:
+        return float(net.ext_grid.at[idx, "vm_pu"]), "the external grid"
+    for idx in net.gen.index[net.gen.bus == bus]:
+        raw = net.gen.at[idx, "name"]
+        name = raw if isinstance(raw, str) and raw.strip() else f"Gen_bus{bus}"
+        return float(net.gen.at[idx, "vm_pu"]), name
+    return None
+
+
+def _normalise_generator(net, edit: dict) -> dict:
+    """A new unit: what it is, how it behaves in a power flow (control), and
+    whether the optimiser may move it. Essentials the operator did not give
+    are asked (EditQuestion); standard defaults are filled and reported by
+    the endpoint as assumed."""
+    op = edit["op"]
+    cap = _size_cap(net)
+    kind = str(edit.get("kind") or "").strip().lower()
+    if kind not in GENERATOR_KINDS:
+        raise EditQuestion("What kind of unit is it?", [
+            "dispatchable — a conventional unit whose output is set (gas, diesel, hydro, a battery…)",
+            "pv — solar, following the measured production shape (curtailable)",
+            "wind — wind, following the measured production shape (curtailable)"])
+    out = {"op": op, "name": _name(edit, net), "bus": resolve_bus(net, edit.get("bus")),
+           "p_max_mw": _number(edit, "p_max_mw", low=0, high=cap, low_open=True), "kind": kind}
+    if kind == "dispatchable":
+        out["p_min_mw"] = _number(edit, "p_min_mw", default=0.0, low=0, high=out["p_max_mw"])
+        out["p_mw"] = _number(edit, "p_mw", default=out["p_min_mw"], low=out["p_min_mw"], high=out["p_max_mw"])
+
+    control = str(edit.get("control") or "").strip().lower()
+    if control and control not in GENERATOR_CONTROLS:
+        raise EditError(f"{op}: control must be 'voltage', 'power_factor' or 'fixed_q'.")
+    if not control:
+        if kind != "dispatchable":
+            control = "power_factor"            # inverter-based: the usual grid-code behaviour
+        else:
+            raise EditQuestion(
+                f"How should {out['name']!r} behave in a power flow?",
+                ["voltage — a synchronous (classical) generator: holds its bus voltage at a set-point, "
+                 "reactive power within its limits",
+                 "power_factor — an inverter-based unit: fixed power factor (1.0 = no reactive power)"])
+    out["control"] = control
+    if control == "voltage":
+        if _measured_substation(net):
+            raise EditQuestion(
+                "This network's units are rebuilt from the measurements at every tick, so a new unit "
+                "cannot control voltage here. How should it run instead?",
+                ["power_factor at 1.0 — no reactive power", "power_factor at another value (give pf)"])
+        held = _bus_setpoint(net, out["bus"])
+        if edit.get("vm_pu") not in (None, ""):
+            vm = _number(edit, "vm_pu", low=0.8, high=1.2)
+            if held and abs(held[0] - vm) > 1e-6:
+                raise EditQuestion(
+                    f"{_bus_label(net, out['bus'])} is already held at {held[0]:g} p.u. by {held[1]}, and two "
+                    "units on one bus must hold the same voltage. Which do you want?",
+                    [f"hold {held[0]:g} p.u., like {held[1]}",
+                     f"run {out['name']!r} at a fixed power factor instead",
+                     "put it on another bus"])
+        else:
+            vm = held[0] if held else 1.0
+        out["vm_pu"] = vm
+        default_q = round(out["p_max_mw"] * math.tan(math.acos(ASSUMED_RATED_PF)), 4)
+        out["q_min_mvar"] = _number(edit, "q_min_mvar", default=-default_q)
+        out["q_max_mvar"] = _number(edit, "q_max_mvar", default=default_q)
+        if out["q_min_mvar"] > out["q_max_mvar"]:
+            raise EditError(f"{op}: q_min_mvar is above q_max_mvar.")
+    elif control == "fixed_q":
+        if edit.get("q_mvar") in (None, ""):
+            raise EditQuestion(
+                f"What reactive power should {out['name']!r} hold?",
+                ["0 Mvar — none", "a value in Mvar: positive injects (raises nearby voltage), negative "
+                 "absorbs (lowers it)"])
+        out["q_mvar"] = _number(edit, "q_mvar")
+    else:
+        out["pf"] = _number(edit, "pf", default=1.0, low=0.5, high=1.0)
+        if edit.get("absorbing") is not None and not isinstance(edit["absorbing"], bool):
+            raise EditError(f"{op}: absorbing must be true or false.")
+        out["absorbing"] = bool(edit.get("absorbing", False))
+    if edit.get("dispatchable") is not None and not isinstance(edit["dispatchable"], bool):
+        raise EditError(f"{op}: dispatchable must be true or false.")
+    out["dispatchable"] = bool(edit.get("dispatchable", True))
+    return out
+
+
+def upgrade_stored(edits: list[dict]) -> list[dict]:
+    """Edits stored before a field existed, completed with what they meant
+    then — a generator was a fixed-power-factor (1.0) unit the optimiser could
+    move — so a saved proposal replays as it was built instead of asking."""
+    out = []
+    for e in edits:
+        if isinstance(e, dict) and e.get("op") == "add_generator" and "control" not in e:
+            e = {**e, "control": "power_factor", "pf": 1.0, "absorbing": False, "dispatchable": True}
+        out.append(e)
+    return out
+
+
 def normalise_edit(net, raw: dict) -> dict:
     """Check one edit against `net` (the network it will be applied to) and
     return it in canonical form — every default filled, the bus or element
@@ -488,6 +609,11 @@ def normalise_edit(net, raw: dict) -> dict:
                "p_mw": _number(edit, "p_mw", low=0, high=cap, low_open=True),
                "pf": _number(edit, "pf", default=0.95, low=0.5, high=1.0),
                "profile": str(edit.get("profile") or "flat").strip()}
+        if edit.get("leading") is not None:
+            if not isinstance(edit["leading"], bool):
+                raise EditError("add_load: leading must be true or false.")
+            if edit["leading"]:
+                out["leading"] = True       # injects reactive power (capacitive); only stored when so
         if out["profile"] not in LOAD_PROFILES:
             raise EditError(f"add_load: profile must be one of {list(LOAD_PROFILES)}.")
         if out["profile"] == "follow_bus":
@@ -503,15 +629,17 @@ def normalise_edit(net, raw: dict) -> dict:
         return out
 
     if op == "add_generator":
-        cap = _size_cap(net)
-        out = {"op": op, "name": _name(edit, net), "bus": resolve_bus(net, edit.get("bus")),
-               "p_max_mw": _number(edit, "p_max_mw", low=0, high=cap, low_open=True),
-               "kind": str(edit.get("kind") or "").strip()}
-        if out["kind"] not in GENERATOR_KINDS:
-            raise EditError(f"add_generator: kind must be one of {list(GENERATOR_KINDS)}.")
-        if out["kind"] == "dispatchable":
-            out["p_mw"] = _number(edit, "p_mw", default=0.0, low=0, high=out["p_max_mw"])
-        return out
+        return _normalise_generator(net, edit)
+
+    if op == "add_shunt":
+        kind = str(edit.get("kind") or "").strip().lower()
+        if kind not in SHUNT_KINDS:
+            raise EditQuestion(
+                "Is it a capacitor bank or a reactor?",
+                ["capacitor — injects reactive power (raises nearby voltage)",
+                 "reactor — absorbs reactive power (lowers nearby voltage)"])
+        return {"op": op, "name": _name(edit, net), "bus": resolve_bus(net, edit.get("bus")),
+                "kind": kind, "q_mvar": _number(edit, "q_mvar", low=0, high=_size_cap(net), low_open=True)}
 
     if op == "reinforce_line":
         idx = resolve_element(net, "line", edit.get("line"))
@@ -558,20 +686,38 @@ def normalise_edit(net, raw: dict) -> dict:
 def _apply(net, edit: dict) -> None:
     op = edit["op"]
     if op == "add_load":
-        q = edit["p_mw"] * math.tan(math.acos(edit["pf"]))
+        q = edit["p_mw"] * math.tan(math.acos(edit["pf"])) * (-1 if edit.get("leading") else 1)
         idx = pp.create_load(net, bus=edit["bus"], p_mw=edit["p_mw"], q_mvar=q, name=edit["name"])
         _tag(net.load, idx, edit)
         if "substation_name" in net.load.columns:
             net.load.at[idx, "substation_name"] = edit["name"]
     elif op == "add_generator":
         p0 = edit.get("p_mw", 0.0)
-        idx = pp.create_sgen(net, bus=edit["bus"], p_mw=p0, q_mvar=0.0, name=edit["name"],
-                             max_p_mw=edit["p_max_mw"], min_p_mw=0.0, type=edit["kind"])
-        _tag(net.sgen, idx, edit)
-        # The OPF and every result name an sgen by `substation_name` when the
-        # column exists; an added unit gets its own name, not NaN.
-        if "substation_name" in net.sgen.columns:
-            net.sgen.at[idx, "substation_name"] = edit["name"]
+        common = dict(bus=edit["bus"], p_mw=p0, name=edit["name"], max_p_mw=edit["p_max_mw"],
+                      min_p_mw=edit.get("p_min_mw", 0.0))
+        if edit.get("control") == "voltage":
+            # A synchronous machine: holds its bus voltage, Q within its limits.
+            idx = pp.create_gen(net, vm_pu=edit["vm_pu"], min_q_mvar=edit["q_min_mvar"],
+                                max_q_mvar=edit["q_max_mvar"], **common)
+            table = "gen"
+        else:
+            idx = pp.create_sgen(net, q_mvar=float(edit.get("q_mvar", 0.0) if edit.get("control") == "fixed_q"
+                                                   else 0.0), type=edit["kind"], **common)
+            table = "sgen"
+            # The OPF and every result name an sgen by `substation_name` when the
+            # column exists; an added unit gets its own name, not NaN.
+            if "substation_name" in net.sgen.columns:
+                net.sgen.at[idx, "substation_name"] = edit["name"]
+        _tag(net[table], idx, edit)
+        if "controllable" not in net[table].columns:
+            net[table]["controllable"] = None
+        net[table]["controllable"] = net[table]["controllable"].astype(object)
+        net[table].at[idx, "controllable"] = bool(edit.get("dispatchable", True))
+    elif op == "add_shunt":
+        # pandapower's sign: q_mvar > 0 absorbs (a reactor), < 0 injects (a capacitor).
+        q = edit["q_mvar"] if edit["kind"] == "reactor" else -edit["q_mvar"]
+        idx = pp.create_shunt(net, bus=edit["bus"], q_mvar=q, p_mw=0.0, name=edit["name"])
+        _mark(net.shunt, idx)
     elif op == "reinforce_line":
         f, i = edit["factor"], edit["line"]
         # Equivalent to `factor` identical circuits in parallel (exact in the
@@ -691,6 +837,8 @@ def materialise(base_net, edits: list[dict]) -> tuple[object, list[dict]]:
     for n, raw in enumerate(edits, start=1):
         try:
             edit = normalise_edit(net, raw)
+        except EditQuestion as exc:
+            raise EditQuestion(f"Edit {n}: {exc.question}", exc.options, edit=n) from None
         except EditError as exc:
             raise EditError(f"Edit {n}: {exc}") from None
         _apply(net, edit)
@@ -708,11 +856,28 @@ def describe(net, edit: dict) -> str:
         elif prof == "follow_bus" and edit.get("follow", edit["bus"]) != edit["bus"]:
             prof = f"follow_bus (demand shape of {_bus_label(net, edit['follow'])})"
         return (f"Add load {edit['name']!r}: {edit['p_mw']:g} MW at {_bus_label(net, edit['bus'])}, "
-                f"pf {edit['pf']:g}, profile {prof}")
+                f"pf {edit['pf']:g}{' leading' if edit.get('leading') else ''}, profile {prof}")
     if op == "add_generator":
         extra = f", set-point {edit['p_mw']:g} MW" if edit["kind"] == "dispatchable" else ""
+        if edit.get("p_min_mw"):
+            extra += f" (minimum {edit['p_min_mw']:g} MW)"
+        if edit.get("control") == "voltage":
+            how = (f"holds {edit['vm_pu']:g} p.u., Q {edit['q_min_mvar']:g} to {edit['q_max_mvar']:g} Mvar")
+        elif edit.get("control") == "fixed_q":
+            q = edit["q_mvar"]
+            how = f"fixed Q {abs(q):g} Mvar {'absorbed' if q < 0 else 'injected'}"
+        else:
+            pf = edit.get("pf", 1.0)
+            how = "pf 1.00 (no reactive power)" if pf >= 1.0 else \
+                f"pf {pf:g} {'absorbing' if edit.get('absorbing') else 'injecting'}"
+        if edit.get("dispatchable") is False:
+            how += ", not dispatchable"
         return (f"Add {edit['kind']} generator {edit['name']!r}: up to {edit['p_max_mw']:g} MW at "
-                f"{_bus_label(net, edit['bus'])}{extra}")
+                f"{_bus_label(net, edit['bus'])}{extra}; {how}")
+    if op == "add_shunt":
+        return (f"Add {edit['kind']} {edit['name']!r}: {edit['q_mvar']:g} Mvar at "
+                f"{_bus_label(net, edit['bus'])} ({'injects' if edit['kind'] == 'capacitor' else 'absorbs'} "
+                "reactive power)")
     if op == "reinforce_line":
         return f"Reinforce line {line_display_name(net, edit['line'])} ×{edit['factor']:g}"
     if op == "upgrade_trafo":
@@ -767,6 +932,8 @@ def summary(net, edits: list[dict]) -> dict:
         "new_trafos": sum(e["op"] == "add_bus_with_transformer" for e in edits),
         "new_transformer_mva": round(sum(trafo_design(net, e)["sn_mva"] * e["parallel"] for e in edits
                                          if e["op"] == "add_bus_with_transformer"), 4),
+        "new_shunts_mvar": {k: round(sum(e["q_mvar"] for e in edits if e["op"] == "add_shunt"
+                                         and e["kind"] == k), 4) for k in SHUNT_KINDS},
         "switched_elements": sum(e["op"] == "set_in_service" for e in edits),
         "edits": [describe(net, e) for e in edits],
         "notes": notes(net, edits),
@@ -884,6 +1051,15 @@ def _value(meas: pd.DataFrame, key: str, column: str) -> float:
 
 def profile_factor(net, spec: dict, ts: str, meas: pd.DataFrame, peaks: dict) -> tuple[float, str]:
     """(share of the element's size it injects at `ts`, where that comes from)."""
+    if ts == NOMINAL:
+        # The nominal point has no time: every element at its design value —
+        # loads at their size, pv and wind at their rating, a dispatchable
+        # unit at its set-point.
+        if spec["op"] == "add_load":
+            return 1.0, "nominal: its full size"
+        if spec["kind"] == "dispatchable":
+            return spec["p_mw"] / spec["p_max_mw"], "set-point"
+        return 1.0, "nominal: its rated output"
     names = meas["substation_name"].dropna().astype(str).tolist()
     if spec["op"] == "add_load":
         prof = spec["profile"]
@@ -944,17 +1120,25 @@ def apply_profiles(net, ts: str, meas: pd.DataFrame, peaks: dict) -> list[dict]:
         f, source = profile_factor(net, spec, ts, meas, peaks)
         p = spec["p_mw"] * f
         net.load.at[idx, "p_mw"] = p
-        net.load.at[idx, "q_mvar"] = p * math.tan(math.acos(spec["pf"]))
+        net.load.at[idx, "q_mvar"] = p * math.tan(math.acos(spec["pf"])) * (-1 if spec.get("leading") else 1)
         report.append({"element": spec["name"], "type": "load", "p_mw": round(p, 4),
                        "size_mw": spec["p_mw"], "profile": spec["profile"], "source": source})
-    for idx, spec in _proposed_rows(net.sgen):
-        f, source = profile_factor(net, spec, ts, meas, peaks)
-        p = spec["p_max_mw"] * min(max(f, 0.0), 1.0)
-        net.sgen.at[idx, "p_mw"] = p
-        net.sgen.at[idx, "q_mvar"] = 0.0
-        net.sgen.at[idx, "max_p_mw"] = spec["p_max_mw"] if spec["kind"] == "dispatchable" else p
-        report.append({"element": spec["name"], "type": "generator", "p_mw": round(p, 4),
-                       "size_mw": spec["p_max_mw"], "profile": spec["kind"], "source": source})
+    for table in ("sgen", "gen"):
+        for idx, spec in _proposed_rows(net[table]):
+            f, source = profile_factor(net, spec, ts, meas, peaks)
+            p = spec["p_max_mw"] * min(max(f, 0.0), 1.0)
+            net[table].at[idx, "p_mw"] = p
+            net[table].at[idx, "max_p_mw"] = spec["p_max_mw"] if spec["kind"] == "dispatchable" else p
+            if table == "sgen" and spec.get("control") == "fixed_q":
+                net.sgen.at[idx, "q_mvar"] = float(spec["q_mvar"])     # whatever its output
+            elif table == "sgen":
+                # A fixed-power-factor unit's reactive power follows its output.
+                pf = spec.get("pf", 1.0)
+                q = p * math.tan(math.acos(pf)) if pf < 1.0 else 0.0
+                net.sgen.at[idx, "q_mvar"] = -q if spec.get("absorbing") else q
+            report.append({"element": spec["name"], "type": "generator", "p_mw": round(p, 4),
+                           "size_mw": spec["p_max_mw"], "profile": spec["kind"], "source": source,
+                           "control": spec.get("control", "power_factor")})
     return report
 
 
@@ -965,7 +1149,8 @@ def check_profiles(net, report: list[dict], load_scaling: float = 1.0) -> list[s
     discrepancies, empty when there are none."""
     wrong = []
     by_name = {r["element"]: r for r in report}
-    for tbl, kind, scale in ((net.load, "load", load_scaling), (net.sgen, "generator", 1.0)):
+    for tbl, kind, scale in ((net.load, "load", load_scaling), (net.sgen, "generator", 1.0),
+                             (net.gen, "generator", 1.0)):
         for idx, spec in _proposed_rows(tbl):
             want = by_name.get(spec["name"], {}).get("p_mw")
             got = float(tbl.at[idx, "p_mw"])

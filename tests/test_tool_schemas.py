@@ -57,3 +57,19 @@ class TestSharedParameterRegistration:
             if name in tool_schemas._NO_DATA_SOURCE_TOOLS:
                 continue
             assert "data_source" in props[name], f"{name} lacks data_source"
+
+
+def test_point_tools_offer_the_nominal_point_and_window_tools_do_not():
+    def desc(name):
+        fd = next(fd for t in ts.TOOLS for fd in t.function_declarations if fd.name == name)
+        return fd.parameters.properties["data_source"].description or ""
+    for name in ("run_rsa", "get_current_conditions", "optimize_flexibility", "compare_networks"):
+        assert "'nominal'" in desc(name)
+    for name in ("find_worst_case_timestamp", "forecast_kpis", "compute_historical_risk"):
+        assert "'nominal'" not in desc(name)
+
+
+def test_the_data_quality_tool_reads_the_data_and_studies_nothing():
+    decl = next(fd for t in ts.TOOLS for fd in t.function_declarations if fd.name == "get_data_quality")
+    assert not (decl.parameters.properties or {})          # no network, data source or power factor
+    assert "get_data_quality" in ts.TOOL_DISPATCH
