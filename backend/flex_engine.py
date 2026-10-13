@@ -450,6 +450,29 @@ def _load_data(net) -> tuple[list, dict, dict, dict]:
     return keys, p, q, bus
 
 
+def _fixed_output_units(net) -> set:
+    """Units the operator marked not dispatchable (`controllable` False, set by
+    generators.py): the optimisers keep their active power. Unset (NaN) is
+    dispatchable, as every unit was before the setting existed."""
+    out = set()
+    for table, name_of in (("sgen", lambda row, idx: _clean_name(
+            row.get("substation_name" if "substation_name" in net.sgen.columns else "name"), f"sgen_{idx}")),
+                           ("gen", lambda row, idx: _clean_name(row.get("name"), f"Gen_bus{int(row.get('bus', idx))}"))):
+        tbl = net[table]
+        if tbl.empty or "controllable" not in tbl.columns:
+            continue
+        for idx, row in tbl.iterrows():
+            flag = row.get("controllable")
+            if flag is not None and not pd.isna(flag) and not bool(flag):
+                out.add(name_of(row, idx))
+    return out
+
+
+def _clean_name(raw, fallback: str) -> str:
+    s = str(raw).strip() if raw is not None and not (isinstance(raw, float) and math.isnan(raw)) else ""
+    return s if s else fallback
+
+
 def _extract_pg_max(net) -> dict:
     """Build {name -> Pg_max_mw} from net.sgen and net.gen.
 
@@ -790,6 +813,10 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # convert_gen_to_sgen off) could never move (code review 2.7).
     for g in true_condensers:
         Pg_max_data[g] = 0.0
+    # Units the operator marked not dispatchable keep their output (a study's
+    # own overrides below still win).
+    for g in _fixed_output_units(net) & set(gen_name_list):
+        Pg_min_data[g] = Pg_max_data[g] = P_base_data[g]
 
     if missing_substation:
         _to_remove = [missing_substation] if isinstance(missing_substation, str) else list(missing_substation)
@@ -856,7 +883,10 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # Every unit gets a reactive limit: condensers their own Q range, every
     # other unit the power-factor cone. A unit under 1 MW that is not a
     # condenser used to get neither, and could supply unlimited Q (review 2.8).
-    cond_gens = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) <  1.0 and g in condenser_q_max]
+    # A voltage-controlled unit (`net.gen`: a condenser, or a generator the
+    # operator keeps on voltage control) has its own reactive range; it used
+    # to get the cone whenever it had active power, unlike the real machine.
+    cond_gens = [g for g in gen_name_list if g in condenser_q_max]
     pf_gens   = [g for g in gen_name_list if g not in set(cond_gens)]
 
     model.PF_set = Set(initialize=pf_gens)
@@ -1552,6 +1582,8 @@ def scenario_optimization_model_base(
 
     for g in true_condensers:
         Pg_max_data[g] = 0.0
+    for g in _fixed_output_units(net) & set(gen_name_list):
+        Pg_min_data[g] = Pg_max_data[g] = P_base_data[g]
 
     if pg_max_overrides:
         Pg_max_data.update(pg_max_overrides)
@@ -1574,7 +1606,7 @@ def scenario_optimization_model_base(
     PF_min = min_power_factor
     tan_phi = math.tan(math.acos(PF_min))
     model.tan_phi_sq = Param(initialize=tan_phi ** 2)
-    cond_gens = [g for g in gen_name_list if Pg_max_data.get(g, 0.0) < 1.0 and g in condenser_q_max]
+    cond_gens = [g for g in gen_name_list if g in condenser_q_max]   # own range (see the base model)
     pf_gens = [g for g in gen_name_list if g not in set(cond_gens)]  # review 2.8
     model.PF_set = Set(initialize=pf_gens)
     model.PF_cone = Constraint(model.PF_set, rule=lambda m, g: m.Qg_new[g] ** 2 <= m.tan_phi_sq * m.Pg_new[g] ** 2)

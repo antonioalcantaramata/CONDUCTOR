@@ -1006,6 +1006,10 @@ _optimize_robust_flexibility = genai.types.FunctionDeclaration(
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "opf_min_power_factor": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=_MIN_PF_DESC,
+            ),
             "risk_target": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=(
@@ -1397,18 +1401,94 @@ _compute_violation_attribution = genai.types.FunctionDeclaration(
 _S = genai.types.Schema
 _T = genai.types.Type
 
+_get_data_quality = genai.types.FunctionDeclaration(
+    name="get_data_quality",
+    description=(
+        "The quality report of the loaded data (measurements and forecasts): which columns they "
+        "carry (measured reactive demand / generation), coverage, gaps and how each was filled "
+        "(active power interpolated in time; missing reactive demand from the load power factor), "
+        "implausible values (power factor below 0.7, values that look like kvar, all-zero columns), "
+        "leading loads, and measured reactive generation that voltage-controlled units do not follow. "
+        "Use it for any question about the data themselves. Reads the data; runs no study."
+    ),
+    parameters=_S(type=_T.OBJECT, properties={}),
+)
+
+_set_load_power_factor = genai.types.FunctionDeclaration(
+    name="set_load_power_factor",
+    description=(
+        "Change the session's load power factor: the measurements carry active power only, so "
+        "every study gives each measured load the reactive power Q = P·tan(acos pf) (lagging). "
+        "Default 0.95. The change applies to every later study and is kept for this network; "
+        "the operator sees it in the System tab. Use it only when the operator asks to change the "
+        "assumption itself — to rerun one study under another power factor, pass "
+        "`load_power_factor` to that study instead. reset=true goes back to 0.95."
+    ),
+    parameters=_S(
+        type=_T.OBJECT,
+        properties={
+            "value": _S(type=_T.NUMBER, description="Power factor, 0.5–1.0 (lagging), e.g. 0.92."),
+            "reset": _S(type=_T.BOOLEAN, description="True: back to the default 0.95."),
+        },
+    ),
+)
+
+_set_generator_model = genai.types.FunctionDeclaration(
+    name="set_generator_model",
+    description=(
+        "Read or change how each generating unit is modelled. Call with no arguments to list "
+        "every unit (name, bus, control, set-point, power factor, reactive limits, dispatchable). "
+        "control='voltage': holds a voltage set-point, reactive power free within q_min/q_max "
+        "(the OPF keeps those limits); control='power_factor': fixed power factor, injecting or "
+        "absorbing (pf 1.0 = no reactive power); control='fixed_q': a set reactive output q_mvar. "
+        "dispatchable: whether the OPF may move its active "
+        "power. Changes apply to the base network (proposals are re-checked) and are kept for this "
+        "network; the operator sees and edits them in the System tab. Change the model only when "
+        "the operator asks; reset=true takes every unit back to how it was loaded."
+    ),
+    parameters=_S(
+        type=_T.OBJECT,
+        properties={
+            "changes": _S(
+                type=_T.ARRAY,
+                description="One object per unit to change; give only the fields to change.",
+                items=_S(
+                    type=_T.OBJECT,
+                    properties={
+                        "unit": _S(type=_T.STRING, description="Unit name as listed, e.g. 'Gen_bus1'."),
+                        "control": _S(type=_T.STRING, enum=["voltage", "power_factor", "fixed_q"]),
+                        "q_mvar": _S(type=_T.NUMBER, description=(
+                            "For control='fixed_q': reactive output in Mvar (positive injects).")),
+                        "vm_pu": _S(type=_T.NUMBER, description="Voltage set-point (p.u.), 0.8–1.2."),
+                        "pf": _S(type=_T.NUMBER, description="Power factor for control='power_factor', 0.5–1.0."),
+                        "absorbing": _S(type=_T.BOOLEAN, description="True: absorbs reactive power (inductive)."),
+                        "q_min_mvar": _S(type=_T.NUMBER, description="Lower reactive limit (Mvar)."),
+                        "q_max_mvar": _S(type=_T.NUMBER, description="Upper reactive limit (Mvar)."),
+                        "dispatchable": _S(type=_T.BOOLEAN, description="False: the OPF keeps its output."),
+                    },
+                    required=["unit"],
+                ),
+            ),
+            "reset": _S(type=_T.BOOLEAN, description="True: every unit back to how it was loaded."),
+        },
+    ),
+)
+
 _edit_proposal = genai.types.FunctionDeclaration(
     name="edit_proposal",
     description=(
         "Create a network proposal — the loaded (base) network plus edits — or add edits "
         "to one. Use it for what-if questions about changing the grid: a new load (data "
-        "centre, factory, electrolyser), a new generator, a reinforced line, or a branch or "
-        "unit switched in or out, a larger transformer, a new bus (site) joined by a line, or a "
-        "new bus at another voltage behind a new transformer (optionally at the end of a new line). "
-        "The base is never modified. Then study the proposal by "
+        "centre, factory, electrolyser), a new generator (synchronous on voltage control, or "
+        "inverter-based at a fixed power factor), a capacitor bank or reactor, a reinforced line, a "
+        "branch or unit switched in or out, a larger transformer, a new bus (site) joined by a line, "
+        "or a new bus at another voltage behind a new transformer (optionally at the end of a new "
+        "line). The base is never modified. Then study the proposal by "
         "passing its id as `network` to any analysis tool, or call compare_networks. "
-        "Returns the edits as stored and a summary. Edits are validated; an invalid one "
-        "stores nothing and the error says why. Give each edit only the fields its op uses."
+        "Returns the edits as stored, a summary, and `assumed`: every value it filled in that you "
+        "did not give — state them to the operator. When a decision is missing it stores nothing and "
+        "returns `needs_operator` with a question and options: ask the operator, do not choose. "
+        "Give each edit only the fields its op uses."
     ),
     parameters=_S(
         type=_T.OBJECT,
@@ -1422,18 +1502,22 @@ _edit_proposal = genai.types.FunctionDeclaration(
                     type=_T.OBJECT,
                     properties={
                         "op": _S(type=_T.STRING, enum=[
-                            "add_load", "add_generator", "reinforce_line", "upgrade_trafo",
+                            "add_load", "add_generator", "add_shunt", "reinforce_line", "upgrade_trafo",
                             "add_bus_with_connection", "add_bus_with_transformer", "set_in_service"]),
                         "name": _S(type=_T.STRING, description=(
-                            "add_load / add_generator: a unique name, e.g. 'Data centre'. "
+                            "add_load / add_generator / add_shunt: a unique name, e.g. 'Data centre'. "
                             "add_bus_with_connection / add_bus_with_transformer: the new bus's name, "
                             "usable as `bus` in later edits of the same proposal.")),
                         "bus": _S(type=_T.STRING, description=(
-                            "add_load / add_generator: bus name as results show it, or index.")),
+                            "add_load / add_generator / add_shunt: bus name as results show it, or index.")),
                         "p_mw": _S(type=_T.NUMBER, description=(
                             "add_load: size in MW (its peak). add_generator (dispatchable): "
-                            "set-point, default 0.")),
-                        "pf": _S(type=_T.NUMBER, description="add_load: power factor, default 0.95."),
+                            "output set-point, default p_min_mw.")),
+                        "pf": _S(type=_T.NUMBER, description=(
+                            "add_load: power factor, default 0.95 (lagging unless `leading`). "
+                            "add_generator with control='power_factor': its power factor, default 1.0.")),
+                        "leading": _S(type=_T.BOOLEAN, description=(
+                            "add_load: true = leading power factor (the load injects reactive power).")),
                         "profile": _S(type=_T.STRING, enum=["flat", "follow_bus", "shift"], description=(
                             "add_load: 'flat' (constant, default), 'follow_bus' (a bus's measured "
                             "demand shape, peaking at p_mw — its own bus, or `follow`), 'shift' (p_mw "
@@ -1444,10 +1528,35 @@ _edit_proposal = genai.types.FunctionDeclaration(
                         "start_hour": _S(type=_T.INTEGER, description="shift: first hour on (0–23)."),
                         "end_hour": _S(type=_T.INTEGER, description="shift: hour it stops (1–24)."),
                         "p_max_mw": _S(type=_T.NUMBER, description="add_generator: capacity in MW."),
-                        "kind": _S(type=_T.STRING, enum=["dispatchable", "pv", "wind"], description=(
+                        "p_min_mw": _S(type=_T.NUMBER, description=(
+                            "add_generator (dispatchable): minimum output in MW, default 0.")),
+                        "kind": _S(type=_T.STRING, enum=["dispatchable", "pv", "wind", "capacitor", "reactor"],
+                                   description=(
                             "add_generator: pv and wind follow the dataset's measured production "
                             "shape (curtailable, never above it); dispatchable holds p_mw and may "
-                            "be redispatched up to p_max_mw.")),
+                            "be redispatched between p_min_mw and p_max_mw. add_shunt: capacitor "
+                            "(injects reactive power) or reactor (absorbs it).")),
+                        "control": _S(type=_T.STRING, enum=["voltage", "power_factor", "fixed_q"], description=(
+                            "add_generator: 'voltage' = a synchronous (classical) machine holding its "
+                            "bus at vm_pu, reactive power within q_min/q_max; 'power_factor' = an "
+                            "inverter-based unit at a fixed pf (pv/wind default); 'fixed_q' = a set "
+                            "reactive output q_mvar whatever its active power. For a dispatchable "
+                            "unit, ask the operator if they did not say.")),
+                        "vm_pu": _S(type=_T.NUMBER, description=(
+                            "add_generator (voltage): set-point in p.u.; default the bus's existing one, "
+                            "else 1.0.")),
+                        "q_min_mvar": _S(type=_T.NUMBER, description=(
+                            "add_generator (voltage): lowest reactive output, Mvar.")),
+                        "q_max_mvar": _S(type=_T.NUMBER, description=(
+                            "add_generator (voltage): highest reactive output, Mvar (default for both: "
+                            "± its rating at pf 0.85).")),
+                        "absorbing": _S(type=_T.BOOLEAN, description=(
+                            "add_generator (power_factor): true = absorbs reactive power.")),
+                        "dispatchable": _S(type=_T.BOOLEAN, description=(
+                            "add_generator: false = the OPF keeps its output (default true).")),
+                        "q_mvar": _S(type=_T.NUMBER, description=(
+                            "add_shunt: size in Mvar. add_generator (fixed_q): reactive output in Mvar, "
+                            "positive injects, negative absorbs.")),
                         "line": _S(type=_T.STRING, description="reinforce_line: line name or index."),
                         "factor": _S(type=_T.NUMBER, description=(
                             "reinforce_line: capacity multiplier, e.g. 2 = a second identical circuit.")),
@@ -1602,6 +1711,9 @@ TOOLS: list = [
             _compute_historical_risk,
             _compute_violation_attribution,
             _edit_proposal,
+            _get_data_quality,
+            _set_load_power_factor,
+            _set_generator_model,
             _compare_networks,
         ]
     )
@@ -1614,6 +1726,17 @@ TOOLS: list = [
 # ---------------------------------------------------------------------------
 _DATA_SOURCE_SCHEMA_DESC = (
     "'measurements' (default, historical actuals) or 'forecasts' (look-ahead). "
+    "See 'Data sources' in the system prompt."
+)
+_LOAD_PF_SCHEMA_DESC = (
+    "Power factor (0.5–1.0, lagging) giving each measured load its reactive power, for THIS "
+    "study only. Omit to use the session setting (default 0.95). Use it to rerun a study under "
+    "another reactive-power assumption. See 'Reactive power' in the system prompt."
+)
+# Point-in-time tools also study the network's own operating point as loaded.
+_POINT_DATA_SOURCE_SCHEMA_DESC = (
+    "'measurements' (default, historical actuals), 'forecasts' (look-ahead) or 'nominal' "
+    "(the network's own operating point as loaded — no time; leave timestamp out). "
     "See 'Data sources' in the system prompt."
 )
 _TIMESTAMP_SCHEMA_DESC = (
@@ -1629,6 +1752,9 @@ _NETWORK_SCHEMA_DESC = (
 # Clock-control and pure post-processing tools never read a selectable dataset.
 _NO_DATA_SOURCE_TOOLS = {
     "edit_proposal",       # edits a proposal; studies nothing
+    "set_load_power_factor",   # a session setting; studies nothing
+    "get_data_quality",        # reads the loaded data; studies nothing
+    "set_generator_model",     # the units' model; studies nothing
 
     "locate_network_element",  # topology, not a time series
     "get_current_timestamp",
@@ -1653,6 +1779,9 @@ _POINT_IN_TIME_TOOLS = {
     "compute_hosting_capacity",
     "compare_networks",
 }
+# Point-in-time in their parameters, but they read a window (the next 24 h):
+# the nominal point, which has no time, is refused by them.
+_WINDOW_ONLY_TOOLS = {"forecast_kpis"}
 # Every tool that studies a network takes `network`, except the comparison
 # (which names its proposal) and the tools that study none.
 _NO_NETWORK_TOOLS = (_NO_DATA_SOURCE_TOOLS - {"scan_rsa_over_time", "locate_network_element"}
@@ -1671,11 +1800,18 @@ for _tool in TOOLS:
             props["network"] = genai.types.Schema(
                 type=genai.types.Type.STRING, description=_NETWORK_SCHEMA_DESC
             )
+        if _fd.name not in _NO_DATA_SOURCE_TOOLS - {"scan_rsa_over_time"}:
+            # Every study that assigns a tick: its load power factor.
+            props.setdefault("load_power_factor", genai.types.Schema(
+                type=genai.types.Type.NUMBER, description=_LOAD_PF_SCHEMA_DESC))
         if _fd.name in _NO_DATA_SOURCE_TOOLS:
             continue
         if "data_source" not in props:
             props["data_source"] = genai.types.Schema(
-                type=genai.types.Type.STRING, description=_DATA_SOURCE_SCHEMA_DESC
+                type=genai.types.Type.STRING,
+                description=(_POINT_DATA_SOURCE_SCHEMA_DESC
+                             if _fd.name in _POINT_IN_TIME_TOOLS - _WINDOW_ONLY_TOOLS
+                             else _DATA_SOURCE_SCHEMA_DESC),
             )
         if _fd.name in _POINT_IN_TIME_TOOLS and "timestamp" not in props:
             props["timestamp"] = genai.types.Schema(
@@ -1707,5 +1843,8 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "compute_historical_risk": tools.compute_historical_risk,
     "compute_violation_attribution": tools.compute_violation_attribution,
     "edit_proposal": tools.edit_proposal,
+    "get_data_quality": tools.get_data_quality,
+    "set_load_power_factor": tools.set_load_power_factor,
+    "set_generator_model": tools.set_generator_model,
     "compare_networks": tools.compare_networks,
 }

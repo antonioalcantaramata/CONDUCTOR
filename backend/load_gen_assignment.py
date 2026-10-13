@@ -14,6 +14,14 @@ import unicodedata
 # In[2]:
 
 
+# The measurements carry active power only; reactive power comes from these.
+# Loads: the default of a setting the operator (or the agent) can change per
+# study or for the session (main_backend). Measured generation: only on the
+# measured-substation path (a network loaded without a `gen` table).
+DEFAULT_LOAD_POWER_FACTOR = 0.95
+MEASURED_GENERATION_POWER_FACTOR = 0.99
+
+
 def normalize(text):
     """
     Normalize a string by removing diacritics and converting to lowercase.
@@ -190,7 +198,8 @@ def _proposed_mask(df: pd.DataFrame) -> pd.Series:
     return df["proposed"].map(lambda v: bool(v) if pd.notna(v) else False).astype(bool)
 
 
-def assign_load_values_from_measurements(net, measurement_prod_cons, substations):
+def assign_load_values_from_measurements(net, measurement_prod_cons, substations,
+                                         power_factor=DEFAULT_LOAD_POWER_FACTOR):
     """
     Assigns active (p_mw) and reactive (q_mvar) power values to loads in a pandapower network
     based on substation-level consumption measurements.
@@ -201,7 +210,8 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     3. Map bus indices to bus names.
     4. Match loads to substations.
     5. Assign active power (p_mw) using substation consumption.
-    6. Calculate reactive power (q_mvar) assuming a power factor of 0.95 (lagging).
+    6. Calculate reactive power (q_mvar) from `power_factor` (lagging; default 0.95):
+       the measurements carry active power only.
     7. Drop temporary columns and retain original indices.
 
     Parameters:
@@ -292,12 +302,14 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     if '_meas_weight' not in net.load.columns:
         net.load['_meas_weight'] = net.load['p_mw'].clip(lower=0).fillna(0.0)
     keyed = net.load['_meas_key'].notna()
+    share_all = pd.Series(1.0, index=net.load.index)
     if keyed.any():
         weights = net.load.loc[keyed, '_meas_weight'].astype(float)
         keys = net.load.loc[keyed, '_meas_key']
         totals = weights.groupby(keys).transform('sum')
         counts = keys.groupby(keys).transform('count')
         share = (weights / totals).where(totals > 0, 1.0 / counts)
+        share_all.loc[keyed] = share
         net.load.loc[keyed, 'consumption'] = net.load.loc[keyed, 'consumption'] * share
 
     # Identify buses that are still unmatched after both attempts.
@@ -309,11 +321,26 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     # Only overwrite p_mw / q_mvar for matched rows — unmatched rows keep their
     # original base-case values so the power flow doesn't receive NaN injections.
     matched = ~still_unmatched & ~own
-    power_factor = 0.95
     net.load.loc[matched, 'p_mw'] = net.load.loc[matched, 'consumption']
     net.load.loc[matched, 'q_mvar'] = (
         net.load.loc[matched, 'p_mw'] * np.tan(np.arccos(power_factor))
     )
+    # Measured reactive demand, when the data carry it, always wins over the
+    # power factor — split over the substation's loads like its active power.
+    # Where it is missing (NaN) the power factor above stays.
+    measured_share = 0.0
+    if 'consumption_q' in measurement_prod_cons.columns:
+        # One value per substation (a name listed twice: its total; all missing: NaN).
+        q_map = measurement_prod_cons.groupby('substation_name')['consumption_q'].sum(min_count=1)
+        q_meas = net.load['_meas_key'].map(q_map) * share_all
+        use = matched & q_meas.notna()
+        net.load.loc[use, 'q_mvar'] = q_meas[use].astype(float)
+        total = float(net.load.loc[matched, 'p_mw'].clip(lower=0).sum())
+        if total > 0:
+            measured_share = float(net.load.loc[use, 'p_mw'].clip(lower=0).sum()) / total
+        elif use.any():
+            measured_share = 1.0
+    net["_q_measured_share"] = round(measured_share, 4)
 
     # -------- Step 6 (old): reactive power already handled above --------
 
@@ -361,6 +388,34 @@ def _update_gen_table_inplace(gen_df: pd.DataFrame, bus_id_to_prod: dict, scale_
                 gen_df.at[idx, 'q_mvar'] = float(gen_df.at[idx, 'q_mvar']) * ratio
 
 
+def _assign_measured_generation_q(net, measurement_prod_cons, bus_name_map) -> None:
+    """Measured reactive generation, when the data carry it: given to the
+    fixed-power-factor / fixed-Q units (`sgen`) of each measured bus, split by
+    capacity, and marked so the units' own model does not overwrite it. A bus
+    with a voltage-controlled unit is left alone — that unit decides its own
+    reactive power (the data-quality report says so)."""
+    if len(net.sgen):
+        net.sgen['_q_from_meas'] = False
+    if 'production_q' not in measurement_prod_cons.columns or not len(net.sgen):
+        return
+    q_map = measurement_prod_cons.groupby('substation_name')['production_q'].sum(min_count=1)
+    own_s, own_g = _proposed_mask(net.sgen), _proposed_mask(net.gen) if len(net.gen) else None
+    for bus_id, name in bus_name_map.items():
+        q = q_map.get(name)
+        if q is None or pd.isna(q):
+            continue
+        if len(net.gen) and ((net.gen['bus'] == bus_id) & ~own_g).any():
+            continue
+        rows = net.sgen.index[(net.sgen['bus'] == bus_id) & ~own_s]
+        if not len(rows):
+            continue
+        weights = net.sgen.loc[rows, 'max_p_mw'] if 'max_p_mw' in net.sgen.columns else pd.Series(1.0, index=rows)
+        w = weights.clip(lower=0).fillna(0.0).astype(float)
+        w = w / w.sum() if w.sum() > 0 else pd.Series(1.0 / len(rows), index=rows)
+        net.sgen.loc[rows, 'q_mvar'] = (w * float(q)).astype(float)
+        net.sgen.loc[rows, '_q_from_meas'] = True
+
+
 def _capacity_on_bus(gen_df: pd.DataFrame, bus_id) -> tuple[float, int]:
     """(total max_p_mw, number of units) of `gen_df` on one bus."""
     rows = gen_df[gen_df['bus'] == bus_id] if len(gen_df) else gen_df
@@ -398,8 +453,10 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
 
     This function populates the net.sgen DataFrame by copying bus and name information from net.load,
     replaces load names with generator names, and assigns active (p_mw) and reactive (q_mvar) power values 
-    based on measured production data from the measurement_prod_cons DataFrame. It assumes a lagging 
-    power factor of 0.95 for q_mvar calculation.
+    based on measured production data from the measurement_prod_cons DataFrame. On the
+    measured-substation path (a network with no `gen` table) q_mvar follows
+    MEASURED_GENERATION_POWER_FACTOR (0.99); on the generic path each unit keeps its
+    own power factor (Q scales with P — 0 for units converted from `gen`).
 
     Parameters:
     -----------
@@ -445,6 +502,7 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
         _update_gen_table_inplace(net.gen, gen_share, scale_q=False)
         if len(net.sgen) > 0:
             _update_gen_table_inplace(net.sgen, sgen_share, scale_q=True)
+        _assign_measured_generation_q(net, measurement_prod_cons, bus_name_map_local)
 
         # Identify generator buses that had no matching row in the CSV.
         gen_buses = set(net.gen['bus'].tolist()) | set(net.sgen['bus'].tolist())
@@ -508,8 +566,10 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
         net.sgen['substation_name'] = sgen_substation_name
 
     # --- Step 6: Merge production data based on substation_name
+    measured_cols = ['substation_name', 'production'] + (
+        ['production_q'] if 'production_q' in measurement_prod_cons.columns else [])
     net.sgen = net.sgen.merge(
-        measurement_prod_cons[['substation_name', 'production']],
+        measurement_prod_cons[measured_cols],
         on='substation_name',
         how='left'
     )
@@ -517,9 +577,17 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
     # --- Step 7: Assign p_mw (note: sign convention; sgens inject power → positive)
     net.sgen['p_mw'] = -1 * net.sgen['production']
 
-    # --- Step 8: Calculate q_mvar assuming power factor 0.95 lagging
-    power_factor = 0.99
-    net.sgen['q_mvar'] = net.sgen['p_mw'] * np.tan(np.arccos(power_factor))
+    # --- Step 8: reactive power at the measured-generation power factor (0.99;
+    # the comment here used to say 0.95 while the code used 0.99)
+    net.sgen['q_mvar'] = net.sgen['p_mw'] * np.tan(np.arccos(MEASURED_GENERATION_POWER_FACTOR))
+    # Measured reactive generation wins where the data carry it (same sign
+    # convention as the production column: it is negated like p_mw above).
+    net.sgen['_q_from_meas'] = False
+    if 'production_q' in net.sgen.columns:
+        has = net.sgen['production_q'].notna()
+        net.sgen.loc[has, 'q_mvar'] = -1 * net.sgen.loc[has, 'production_q'].astype(float)
+        net.sgen.loc[has, '_q_from_meas'] = True
+        net.sgen.drop(columns=['production_q'], inplace=True)
 
     # --- Step 9: Clean up
     net.sgen.drop(columns=['production'], inplace=True)

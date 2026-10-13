@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import pandapower as pp
 import yaml
 
@@ -164,7 +165,7 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
             name = f"Gen_bus{bus_id}_{suffix}"
             suffix += 1
         min_p = float(row["min_p_mw"]) if "min_p_mw" in row.index and not np.isnan(float(row["min_p_mw"])) else 0.0
-        pp.create_sgen(
+        new = pp.create_sgen(
             net,
             bus=bus_id,
             p_mw=float(row["p_mw"]),
@@ -175,6 +176,14 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
             controllable=True,
             in_service=bool(row.get("in_service", True)),
         )
+        # Kept so the unit can be switched back to voltage control later
+        # (generators.py): its set-point and reactive limits as loaded.
+        for col, src in (("orig_vm_pu", "vm_pu"), ("orig_min_q_mvar", "min_q_mvar"),
+                         ("orig_max_q_mvar", "max_q_mvar")):
+            value = row.get(src)
+            if col not in net.sgen.columns:
+                net.sgen[col] = np.nan
+            net.sgen.at[new, col] = float(value) if value is not None and pd.notna(value) else np.nan
         rows_to_drop.append(idx)
         created_names.append(name)
 

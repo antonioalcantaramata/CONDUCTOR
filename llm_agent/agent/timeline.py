@@ -12,6 +12,10 @@ Two datasets can be loaded, and either may be missing:
 - **forecasts** — what was expected. Query-only: a forecast does not happen,
   so there is nothing for a clock to replay.
 
+A third choice has no time at all: the **nominal** point — the network's own
+operating point as loaded (the case file's values), which the synthetic data
+are built from. It sits beside the datasets, not on the timeline.
+
 They may cover different periods or share timestamps (a day-ahead forecast
 uploaded for a period that was also measured). Where they share a timestamp
 the operator can look at either, or at both side by side ("compare").
@@ -27,8 +31,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from bisect import bisect_left
 
-MEASURED, FORECAST, COMPARE = "measured", "forecast", "compare"
-LABELS = {MEASURED: "Measured", FORECAST: "Forecast", COMPARE: "Compare"}
+MEASURED, FORECAST, COMPARE, NOMINAL = "measured", "forecast", "compare", "nominal"
+LABELS = {MEASURED: "Measured", FORECAST: "Forecast", COMPARE: "Compare", NOMINAL: "Nominal"}
 
 
 def _parse(ts: str) -> datetime:
@@ -42,6 +46,8 @@ class Timeline:
     measured_source: str = "synthetic"
     forecast_source: str = "synthetic"
     clock: str | None = None
+    nominal_available: bool = False
+    nominal_reason: str = ""
     shared: tuple[str, ...] = field(init=False)
 
     def __post_init__(self):
@@ -57,6 +63,8 @@ class Timeline:
             measured_source=payload.get("measurements_source") or "synthetic",
             forecast_source=(payload.get("forecast") or {}).get("source") or "synthetic",
             clock=payload.get("current_timestamp"),
+            nominal_available=bool((payload.get("nominal") or {}).get("available")),
+            nominal_reason=(payload.get("nominal") or {}).get("reason") or "",
         )
 
     def modes(self) -> list[str]:
@@ -145,6 +153,13 @@ def agent_note(mode: str, ts: str | None) -> str | None:
     Nothing for measurements: the simulation clock is already there, and every
     tool defaults to it.
     """
+    if mode == NOMINAL:
+        return (
+            "[The user has selected the NOMINAL operating point — the network's own values as "
+            "loaded, with no time. Treat it as the point of interest: use data_source=\"nominal\" "
+            "(no timestamp) for point studies unless they ask otherwise; a study over a time window "
+            "cannot use it — say so and offer measurements or forecasts.]"
+        )
     if not ts or mode == MEASURED:
         return None
     if mode == FORECAST:

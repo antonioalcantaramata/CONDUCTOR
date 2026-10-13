@@ -72,7 +72,7 @@ class TestMaterialise:
         ({**DC, "profile": "weekly"}, "profile must be"),
         ({**DC, "profile": "shift"}, "start_hour is required"),
         ({**DC, "pf": 1.2}, "at most 1.0"),
-        ({"op": "add_generator", "bus": 3, "p_max_mw": 5, "kind": "nuclear", "name": "G"}, "kind must be"),
+        ({"op": "add_generator", "bus": 3, "p_max_mw": 5, "kind": "nuclear", "name": "G"}, "What kind of unit"),
         ({"op": "add_generator", "bus": 3, "p_max_mw": 5, "kind": "dispatchable", "p_mw": 9,
           "name": "G"}, "at most 5"),
         ({"op": "reinforce_line", "line": 3, "factor": 1.0}, "above 1.0"),
@@ -160,7 +160,8 @@ class TestProfiles:
         assert rep[0]["p_mw"] == pytest.approx(5.0) and rep[0]["source"] == "measured production of Bus_1"
 
     def test_dispatchable_keeps_its_set_point_and_capacity(self, net):
-        gen = {"op": "add_generator", "bus": 9, "p_max_mw": 20, "kind": "dispatchable", "p_mw": 8, "name": "CHP"}
+        gen = {"op": "add_generator", "bus": 9, "p_max_mw": 20, "kind": "dispatchable", "p_mw": 8, "name": "CHP",
+               "control": "power_factor"}
         prop, rep = self._report(net, [gen])
         assert rep[0]["p_mw"] == pytest.approx(8.0) and prop.sgen.iloc[-1]["max_p_mw"] == 20
 
@@ -200,7 +201,7 @@ class TestMeasuredSubstationNetworks:
         pp.create_line(net, b0, b1, 5, "NA2XS2Y 1x95 RM/25 12/20 kV")
         pp.create_load(net, b1, p_mw=2.0, name="Alpha Load")
         gen = {"op": "add_generator", "bus": "Alpha", "p_max_mw": 3, "kind": "dispatchable",
-               "p_mw": 1.5, "name": "Battery"}
+               "p_mw": 1.5, "name": "Battery", "control": "power_factor"}
         prop, _ = sb.materialise(net, [gen])
         meas = _meas({"Alpha": 2.5}, {"Alpha": -0.7})
         prop, _ = lg.assign_load_values_from_measurements(prop, meas, ["Alpha"])
@@ -1046,6 +1047,8 @@ def restartable(tmp_path, monkeypatch):
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL"):
         monkeypatch.setattr(mb, name, str(tmp_path / f"{name}.json"))
     monkeypatch.setattr(mb, "_PROPOSALS_FILE", str(tmp_path / "systems" / "proposals.json"))
+    monkeypatch.setattr(mb, "_ASSUMPTIONS_FILE", str(tmp_path / "systems" / "assumptions.json"))
+    monkeypatch.setattr(mb, "_SCENARIO_FILE", str(tmp_path / "scenario.json"))
     saved = dict(mb.app_data)
 
     def start():
@@ -1078,18 +1081,31 @@ class TestPersistence:
         with start() as c:
             _create(c)
         saved = json.loads(open(mb._PROPOSALS_FILE).read())
-        saved["base_fingerprint"] = "another network"
+        (entry,) = saved["by_fingerprint"].values()             # one entry per network
+        saved["by_fingerprint"] = {"another network": entry}
         open(mb._PROPOSALS_FILE, "w").write(json.dumps(saved))
         mb.app_data["proposals"] = {}
         with start() as c:
             assert c.get("/api/proposals").json()["proposals"] == []
+
+    def test_a_file_in_the_older_one_network_format_is_still_read(self, restartable):
+        mb, start = restartable
+        with start() as c:
+            _create(c)
+        saved = json.loads(open(mb._PROPOSALS_FILE).read())
+        ((fp, entry),) = saved["by_fingerprint"].items()
+        open(mb._PROPOSALS_FILE, "w").write(json.dumps({"version": 1, "base_fingerprint": fp, **entry}))
+        mb.app_data["proposals"] = {}
+        with start() as c:
+            assert [p["id"] for p in c.get("/api/proposals").json()["proposals"]] == ["dc_bus9"]
 
     def test_an_edit_that_no_longer_applies_is_dropped(self, restartable):
         mb, start = restartable
         with start() as c:
             _create(c)
         saved = json.loads(open(mb._PROPOSALS_FILE).read())
-        saved["proposals"]["broken"] = {**saved["proposals"]["dc_bus9"], "id": "broken",
+        (entry,) = saved["by_fingerprint"].values()
+        entry["proposals"]["broken"] = {**entry["proposals"]["dc_bus9"], "id": "broken",
                                         "edits": [{**DC, "bus": 999}]}
         open(mb._PROPOSALS_FILE, "w").write(json.dumps(saved))
         mb.app_data["proposals"] = {}

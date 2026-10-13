@@ -133,3 +133,14 @@ def test_grid_constants_report_overlap_and_source(backend_client):
     body = backend_client.get("/api/grid_constants").json()
     assert body["measurements"]["source"] in ("synthetic", "uploaded")
     assert body["forecasts"]["n_shared_with_measurements"] >= 0
+
+
+def test_the_nominal_point_sits_beside_the_datasets():
+    timeline = tl.Timeline.from_payload({"timestamps": ["2000-01-01 00:00:00"],
+                                         "nominal": {"available": True, "reason": ""}})
+    assert timeline.nominal_available and tl.NOMINAL not in timeline.modes()   # not on the timeline
+    blocked = tl.Timeline.from_payload({"nominal": {"available": False, "reason": "no file values"}})
+    assert not blocked.nominal_available and blocked.nominal_reason == "no file values"
+    note = tl.agent_note(tl.NOMINAL, None)
+    assert 'data_source="nominal"' in note and "no time" in note
+    assert "**`nominal`**" in build_system_prompt(TestSystemPrompt.BASE)

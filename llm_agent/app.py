@@ -12,6 +12,7 @@ import copy
 import difflib
 import html
 import pandas as pd
+import functools
 import json
 import logging
 import os
@@ -60,8 +61,11 @@ from agent import model_check as _model_check
 from agent import recommender as _recommender
 from agent import update_check as _update_check
 from agent import timeline as _tl
+from agent import generator_table as _gen_table
 from agent import data_view as _dv
 from agent import trace as _trace
+from agent import staleness as _staleness
+from agent import report as _report
 from agent.loop import run_agent_turn
 from agent.providers import (
     active_provider_name,
@@ -388,6 +392,15 @@ st.markdown(
         min-height: 2.9rem; padding: 0 0.35rem;
         color: #5b6170; font-size: 0.98rem; line-height: 1.3;
     }
+    .conductor-stale {
+        font-size: 0.8rem; color: #8a5a00; background: rgba(240, 170, 30, 0.12);
+        border: 1px solid rgba(240, 170, 30, 0.35); border-radius: 999px; padding: 0.12rem 0.6rem;
+    }
+    .conductor-eq-group {
+        font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 700;
+        color: #9aa0b0; line-height: 1.4; padding: 0.45rem 0.45rem 0.15rem;
+    }
+    .st-key-examples_list [data-testid="stMarkdownContainer"]:has(.conductor-eq-group) { margin-bottom: 0; }
     .conductor-spin {
         flex: none; width: 1.05rem; height: 1.05rem; border-radius: 50%;
         border: 2.5px solid rgba(29, 111, 232, 0.18); border-top-color: #1D6FE8;
@@ -425,6 +438,20 @@ st.markdown(
         border: 1px solid rgba(107, 79, 216, 0.16); border-radius: 14px;
         padding: 0.6rem 0.75rem 0.4rem 0.75rem;
     }
+    /* The generator tables: plain text rows, a hairline between them. */
+    [class*="st-key-genrow_"] { border-top: 1px solid var(--cd-border); padding-top: 0.3rem; }
+    .gen-head { font-size: 0.8rem; font-weight: 600; color: var(--cd-muted); }
+    .gen-cell { font-size: 0.92rem; }
+    .gen-changed {
+        margin-left: 0.4rem; font-size: 0.7rem; font-weight: 600; color: var(--cd-brand);
+        background: var(--cd-brand-soft); border-radius: 0.6rem; padding: 0.05rem 0.45rem;
+    }
+    [class*="st-key-gentable_"] [data-testid="stButton"] button { min-height: 1.6rem; padding: 0 0.4rem; }
+    /* The System tab's assumption chips: small pills, filled when changed. */
+    .st-key-sys_chips button {
+        border-radius: 999px; min-height: 1.9rem; padding: 0.1rem 0.85rem;
+    }
+    .st-key-sys_chips button p { font-size: 0.85rem; }
     /* An advisor card: title, why, and a small hand-off to CONDUCTOR — tight. */
     [class*="st-key-card_"] { gap: 0.1rem; }
     /* Its title row never wraps: the title shrinks (and wraps its text). */
@@ -611,6 +638,43 @@ def _render_main_hero(compact: bool = False) -> None:
                     pointer-events: auto;
                 }
                 .cb-panel.is-open { display: flex; }
+                /* The upload and info panels as centred pop-ups over a dimmed page. */
+                .cb-panel.cb-modal {
+                    top: 50% !important; left: 50% !important; transform: translate(-50%, -50%);
+                    width: min(860px, 94vw); max-height: 86vh; overflow-y: auto;
+                    padding: 1.2rem 1.5rem 1.3rem; gap: 0.75rem; border-radius: 14px;
+                    box-shadow: 0 18px 60px rgba(15, 20, 35, 0.28);
+                }
+                #cb-info-panel.cb-modal { width: min(520px, 94vw); }
+                .cb-backdrop {
+                    position: fixed; inset: 0; z-index: 9999997; background: rgba(15, 20, 35, 0.32);
+                    display: none; pointer-events: auto;
+                }
+                .cb-backdrop.is-open { display: block; }
+                .cb-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+                .cb-panel-head .cb-panel-title { font-size: 1.02rem; }
+                .cb-close {
+                    border: none; background: transparent; font-size: 1.05rem; color: #5c6272; cursor: pointer;
+                    width: 2rem; height: 2rem; border-radius: 50%; line-height: 1;
+                }
+                .cb-close:hover { background: rgba(46,49,64,0.08); color: #2e3140; }
+                .cb-template {
+                    display: flex; gap: 0.6rem; align-items: flex-start; margin-top: 0.35rem;
+                    padding: 0.6rem 0.75rem; border: 1px dashed rgba(26,115,232,0.45); border-radius: 10px;
+                    background: rgba(26,115,232,0.04); color: #3c4152 !important; text-decoration: none !important;
+                    font-size: 0.78rem; line-height: 1.35;
+                }
+                .cb-template:hover { background: rgba(26,115,232,0.09); }
+                .cb-template strong { color: #1a73e8; font-size: 0.82rem; }
+                .cb-template-icon { font-size: 1.05rem; color: #1a73e8; line-height: 1.2; }
+                .cb-modal-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 1.25fr; gap: 1.6rem; align-items: start; }
+                .cb-modal-main { display: flex; flex-direction: column; gap: 0.6rem; }
+                .cb-modal-side .cb-fmt-guide { border-top: none; padding-top: 0; margin-top: 0; }
+                .cb-modal-side { border-left: 1px solid rgba(46,49,64,0.08); padding-left: 1.4rem; }
+                @media (max-width: 760px) {
+                    .cb-modal-grid { grid-template-columns: 1fr; }
+                    .cb-modal-side { border-left: none; padding-left: 0; }
+                }
                 .cb-panel-title { font-size: 0.88rem; font-weight: 700; color: #2e3140; }
                 .cb-panel input[type=file] { font-size: 0.8rem; color: #4a5270; }
                 .cb-check {
@@ -867,7 +931,7 @@ def _render_main_hero(compact: bool = False) -> None:
                 _headerH = rect.height;
                 brand.style.top = rect.top + 'px';
                 brand.style.height = rect.height + 'px';
-                parentDoc.querySelectorAll('.cb-panel').forEach(p => {
+                parentDoc.querySelectorAll('.cb-panel:not(.cb-modal)').forEach(p => {
                     p.style.top = (rect.top + rect.height + 4) + 'px';
                 });
             }
@@ -883,7 +947,7 @@ def _render_main_hero(compact: bool = False) -> None:
 
         const ensureUploadControls = () => {
             // Remove stale panels and old document-level click handler from prior runs
-            ['cb-net-panel', 'cb-data-panel', 'cb-info-panel', 'cb-adm-overlay', 'cb-adm-drawer'].forEach(id => {
+            ['cb-net-panel', 'cb-data-panel', 'cb-info-panel', 'cb-adm-overlay', 'cb-adm-drawer', 'cb-backdrop'].forEach(id => {
                 const el = parentDoc.getElementById(id);
                 if (el) el.remove();
             });
@@ -893,13 +957,15 @@ def _render_main_hero(compact: bool = False) -> None:
 
             const netPanel = parentDoc.createElement('div');
             netPanel.id = 'cb-net-panel';
-            netPanel.className = 'cb-panel';
+            netPanel.className = 'cb-panel cb-modal';
             netPanel.innerHTML = `
-                <div class="cb-panel-title">Upload Network</div>
+                <div class="cb-panel-head"><div class="cb-panel-title">Upload Network</div>
+                    <button type="button" class="cb-close" aria-label="Close">✕</button></div>
+                <div class="cb-modal-grid"><div class="cb-modal-main">
                 <input type="file" id="cb-net-file" accept=".m,.json,.xlsx,.uct" />
                 <label class="cb-check">
                     <input type="checkbox" id="cb-net-convert" checked />
-                    Convert generators to controllable sgen (enables OPF &amp; flexibility tools)
+                    Start generators at a fixed power factor (pf 1.0); unticked, they keep voltage control. Change each unit afterwards in the System tab.
                 </label>
                 <label class="cb-check" style="display:block; margin-top:0.35rem;">
                     Transformer tap policy
@@ -910,6 +976,7 @@ def _render_main_hero(compact: bool = False) -> None:
                 </label>
                 <button id="cb-net-submit" class="cb-submit">Upload &amp; Load</button>
                 <div id="cb-net-status" class="cb-status"></div>
+                </div><div class="cb-modal-side">
                 <div class="cb-fmt-guide">
                     <div class="cb-fmt-title">Supported formats</div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.m</span><span class="cb-fmt-desc">MATPOWER case file — IEEE cases, pglib-opf, or any compatible model</span></div>
@@ -933,6 +1000,7 @@ def _render_main_hero(compact: bool = False) -> None:
                         <div id="cb-adm-status" class="cb-status"></div>
                     </div>
                 </div>
+                </div></div>
             `;
             parentDoc.body.appendChild(netPanel);
 
@@ -1014,9 +1082,11 @@ full,,branch_to_trafo,3,33,0,,</pre>
 
             const dataPanel = parentDoc.createElement('div');
             dataPanel.id = 'cb-data-panel';
-            dataPanel.className = 'cb-panel';
+            dataPanel.className = 'cb-panel cb-modal';
             dataPanel.innerHTML = `
-                <div class="cb-panel-title">Upload Time-series Data (.csv)</div>
+                <div class="cb-panel-head"><div class="cb-panel-title">Upload Time-series Data (.csv)</div>
+                    <button type="button" class="cb-close" aria-label="Close">✕</button></div>
+                <div class="cb-modal-grid"><div class="cb-modal-main">
                 <div class="cb-ds-toggle">
                     <button type="button" id="cb-tab-meas" class="cb-ds-tab cb-ds-tab-active">Measurements</button>
                     <button type="button" id="cb-tab-fc" class="cb-ds-tab">Forecasts</button>
@@ -1033,6 +1103,12 @@ full,,branch_to_trafo,3,33,0,,</pre>
                     <button id="cb-fc-submit" class="cb-submit">Upload forecasts</button>
                     <div id="cb-fc-status" class="cb-status"></div>
                 </div>
+                <a class="cb-template" href="${baseUrl}/api/data/template" download>
+                    <span class="cb-template-icon">⬇</span>
+                    <span><strong>Download a template for this network</strong><br>
+                    Every substation name it expects, the loaded data's first hour as example values, and the
+                    optional reactive columns. Fill it in and upload it back.</span></a>
+                </div><div class="cb-modal-side">
                 <div class="cb-fmt-guide">
                     <div class="cb-fmt-desc" style="margin-bottom:0.4rem">Both datasets use the <strong>same CSV format</strong>. Measurements replace what the clock runs on now; forecasts are read-only look-ahead data for planning tools.</div>
                     <div class="cb-fmt-title">Required columns</div>
@@ -1040,6 +1116,10 @@ full,,branch_to_trafo,3,33,0,,</pre>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">substation_name</span><span class="cb-fmt-desc">Bus name from the loaded network. Fuzzy-matched — partial or prefix names are fine.</span></div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">production_mw</span><span class="cb-fmt-desc">Total generator output at that bus in MW. Use <code>0.0</code> for load-only buses.</span></div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">consumption_mw</span><span class="cb-fmt-desc">Total load at that bus in MW. Use <code>0.0</code> for generation-only buses.</span></div>
+                    <div class="cb-fmt-title" style="margin-top:0.45rem">Optional columns — reactive power</div>
+                    <div class="cb-fmt-row"><span class="cb-fmt-tag">consumption_mvar</span><span class="cb-fmt-desc">Reactive demand in Mvar (positive draws, negative injects). When given, it is always used; the load power factor only fills empty cells.</span></div>
+                    <div class="cb-fmt-row"><span class="cb-fmt-tag">production_mvar</span><span class="cb-fmt-desc">Reactive generation in Mvar, same sign as production_mw. Used for units at a fixed power factor or fixed Q; a voltage-controlled unit decides its own.</span></div>
+                    <div class="cb-fmt-desc" style="margin-top:0.2rem">Leave a cell empty when not measured. The upload is checked (coverage, implausible power factors, kvar instead of Mvar, -9999 markers) — see the Data tab.</div>
                     <div class="cb-fmt-title" style="margin-top:0.45rem">Example</div>
                     <pre class="cb-csv-example">timestamp,substation_name,production_mw,consumption_mw
 2024-01-01 00:00:00,Bus 1,2.5,1.2
@@ -1048,13 +1128,16 @@ full,,branch_to_trafo,3,33,0,,</pre>
 2024-01-01 00:15:00,Bus 2,0.0,3.6</pre>
                     <div class="cb-fmt-desc" style="margin-top:0.3rem">Long format — one row per timestamp × bus. Comma-separated UTF-8; Excel BOM exports accepted.</div>
                 </div>
+                </div></div>
             `;
             parentDoc.body.appendChild(dataPanel);
 
             const infoPanel = parentDoc.createElement('div');
             infoPanel.id = 'cb-info-panel';
-            infoPanel.className = 'cb-panel';
+            infoPanel.className = 'cb-panel cb-modal';
             infoPanel.innerHTML = `
+                <div class="cb-panel-head"><div class="cb-panel-title">About CONDUCTOR</div>
+                    <button type="button" class="cb-close" aria-label="Close">✕</button></div>
                 <div class="cb-info-row">
                     <span class="cb-info-label">LLM Model</span>
                     <span class="cb-info-value">LLM_MODEL_PLACEHOLDER</span>
@@ -1084,7 +1167,14 @@ full,,branch_to_trafo,3,33,0,,</pre>
             `;
             parentDoc.body.appendChild(infoPanel);
 
+            const backdrop = parentDoc.createElement('div');
+            backdrop.id = 'cb-backdrop';
+            backdrop.className = 'cb-backdrop';
+            parentDoc.body.appendChild(backdrop);
+
             const positionUnder = (panel, btn) => {
+                // A centred pop-up needs no position; a drop-down sits under its button.
+                if (panel.classList.contains('cb-modal')) { backdrop.classList.add('is-open'); return; }
                 const r = btn.getBoundingClientRect();
                 panel.style.left = r.left + 'px';
             };
@@ -1093,7 +1183,18 @@ full,,branch_to_trafo,3,33,0,,</pre>
                 netPanel.classList.remove('is-open');
                 dataPanel.classList.remove('is-open');
                 infoPanel.classList.remove('is-open');
+                backdrop.classList.remove('is-open');
             };
+            [netPanel, dataPanel, infoPanel].forEach(panel => {
+                panel.querySelectorAll('.cb-close').forEach(b => b.addEventListener('click', e => {
+                    e.stopPropagation(); closeAll();
+                }));
+            });
+            if (typeof parentWindow.__conductorEscape === 'function') {
+                parentDoc.removeEventListener('keydown', parentWindow.__conductorEscape);
+            }
+            parentWindow.__conductorEscape = e => { if (e.key === 'Escape') closeAll(); };
+            parentDoc.addEventListener('keydown', parentWindow.__conductorEscape);
             parentWindow.__conductorCloseAll = closeAll;
 
             const netBtn = parentDoc.getElementById('cb-net-btn');
@@ -2210,6 +2311,69 @@ def _model_rejected(provider: str, model: str, **kwargs) -> bool:
     return False
 
 
+def _fetch_scenarios() -> dict | None:
+    """What is loaded and what can be (Resume, the demos), from the backend."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.get(f"{BASE_URL}/api/scenario")
+            r.raise_for_status()
+            return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _switch_scenario(name: str) -> None:
+    """Load a scenario; the caches and the conversation start afresh (they
+    described the previous one). Errors are kept for the picker to show."""
+    try:
+        with httpx.Client(timeout=max(HTTP_TIMEOUT, 120)) as client:
+            r = client.post(f"{BASE_URL}/api/scenario", json={"name": name})
+        if r.status_code >= 400:
+            st.session_state._scenario_error = r.json().get("detail", r.text)
+            return
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._scenario_error = str(exc)
+        return
+    st.cache_data.clear()
+    if st.session_state.get("_launched"):
+        _reset_conversation_state()
+        st.session_state._scenario_note = f"Loaded **{r.json().get('label')}** — a new conversation has started."
+
+
+def _render_scenario_picker(*, key: str, immediate: bool) -> None:
+    """Resume or a demo. On the launch screen a choice loads at once; in the
+    sidebar it waits for Load (it starts a new conversation)."""
+    data = _fetch_scenarios()
+    error = st.session_state.pop("_scenario_error", None)
+    if error:
+        st.warning(error)
+    if data is None:
+        st.caption("The backend is not responding, so the scenario cannot be chosen yet.")
+        return
+    options = {o["name"]: o for o in data["options"]}
+    names = list(options)
+    widget = f"scenario_{key}"
+    if st.session_state.get(widget) not in names:
+        st.session_state[widget] = data["current"]
+
+    def _on_change() -> None:
+        chosen = st.session_state[widget]
+        if not options[chosen]["available"]:
+            st.session_state._scenario_error = options[chosen]["description"]
+            st.session_state[widget] = data["current"]
+        elif immediate and chosen != data["current"]:
+            _switch_scenario(chosen)
+
+    st.radio("Scenario", names, key=widget, format_func=lambda n: options[n]["label"], label_visibility="collapsed",
+             captions=[options[n]["description"] for n in names], on_change=_on_change)
+    if not immediate:
+        chosen = st.session_state[widget]
+        st.button("Load", key=f"{widget}_load", type="primary", width="stretch",
+                  disabled=chosen == data["current"] or not options[chosen]["available"],
+                  help="Loads it now and starts a new conversation.", on_click=_switch_scenario, args=(chosen,))
+        st.caption(f"Loaded now: **{data['label']}**. Demos never replace your uploads.")
+
+
 def _render_ready_to_start(provider: str) -> None:
     """
     The already-configured case: confirm what will be used and get out of the way.
@@ -2324,7 +2488,17 @@ def _render_ready_to_start(provider: str) -> None:
 if not st.session_state.get("_launched"):
     _render_brand_block(_BRAND_NAME, _BRAND_TAGLINE, image_width=120)
     st.caption(_BRAND_CAPTION)
-    st.markdown("### Choose how to run the assistant")
+    # Side by side: what to load, and how to run the assistant — both on one
+    # screen, with Start at the end of the second.
+    _col_load, _col_model = st.columns(2, gap="large", border=True)
+    with _col_load:
+        st.markdown("### 1 · Choose what to load")
+        _render_scenario_picker(key="launch", immediate=True)
+        st.divider()
+        st.caption("Switch any time from the sidebar (**Settings → Scenario**). To work on your own grid, "
+                   "start with any option and use **Upload Network** / **Upload Data** in the header — "
+                   "they become what *Resume* loads. Demos never replace your uploads.")
+    _col_model.markdown("### 2 · Choose how to run the assistant")
 
     _CHOICES = {
         "Google Gemini API": "google",
@@ -2337,11 +2511,10 @@ if not st.session_state.get("_launched"):
     _index = next((i for i, l in enumerate(_labels) if _CHOICES[l] == _current), 0)
 
     _picked = _CHOICES[
-        st.radio(
+        _col_model.radio(
             "Backend",
             _labels,
             index=_index,
-            horizontal=True,
             captions=[
                 "Hosted, needs a free API key, fastest to set up.",
                 "Hosted, paid per token — also Kimi, DeepSeek, Groq and any "
@@ -2353,11 +2526,12 @@ if not st.session_state.get("_launched"):
         )
     ]
 
-    st.divider()
-    if _provider_configured(_picked):
-        _render_ready_to_start(_picked)
-    else:
-        _SETUP_RENDERERS[_picked]()
+    with _col_model:
+        st.divider()
+        if _provider_configured(_picked):
+            _render_ready_to_start(_picked)
+        else:
+            _SETUP_RENDERERS[_picked]()
 
     st.stop()  # Do not render the rest of the app until a backend is chosen
 
@@ -2423,7 +2597,33 @@ EXAMPLE_QUERIES: list[tuple[str, str]] = [
     ("Find a robust corrective dispatch to clear any violations.", ":material/tune:"),
     ("What is the hosting capacity at the most heavily loaded bus?", ":material/solar_power:"),
     ("Evaluate the flexibility KPIs for the current operating point.", ":material/speed:"),
+    ("Is the network secure at its nominal operating point, and how do the synthetic data "
+     "compare with it?", ":material/push_pin:"),
 ]
+
+# Questions that fit what is loaded, listed first under "For this scenario".
+SCENARIO_QUERIES: dict[str, list[tuple[str, str]]] = {
+    "resume": [
+        ("Summarise the loaded network and data: what is there, and is anything missing or suspicious?",
+         ":material/summarize:"),
+        ("What does the data-quality report say about the uploaded data, and does any of it affect the "
+         "studies?", ":material/fact_check:"),
+    ],
+    "ieee14": [
+        ("How sensitive are the voltages to the load power factor? Compare 0.90, 0.95 and 1.0 at the "
+         "current timestamp.", ":material/tune:"),
+        ("Is the network secure at its nominal operating point, and how do the synthetic data compare "
+         "with it?", ":material/push_pin:"),
+    ],
+    "ieee14_reactive": [
+        ("What does the data-quality report say about the reactive measurements, and how are the gaps "
+         "filled?", ":material/fact_check:"),
+        ("Which loads have the lowest power factor right now, and does that matter for the voltages?",
+         ":material/bolt:"),
+        ("With the measured reactive demand, when is the worst moment of the week, and is the grid "
+         "still secure then?", ":material/trending_down:"),
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -2905,12 +3105,37 @@ def _coverage_strip(timeline: _tl.Timeline, cursor: str | None, mode: str) -> st
     return f"<div class='op-strip'>{''.join(bars)}{cursor_html}</div>{scale}{''.join(legend)}"
 
 
+def _nominal_switch(timeline: _tl.Timeline) -> bool:
+    """The nominal point: beside the datasets, not on the timeline (it has no
+    time). Off by itself when the loaded network has no usable one."""
+    ss = st.session_state
+    if not timeline.nominal_available:
+        ss.op_nominal = False
+    return st.toggle(
+        "Nominal point", key="op_nominal", disabled=not timeline.nominal_available,
+        help=("The network's own operating point as loaded — the case file's loads and generator "
+              "set-points, which the synthetic data are built from. No time: studies run on those "
+              "values, and the simulation clock stays where it is."
+              if timeline.nominal_available else
+              f"Not available for this network. {timeline.nominal_reason}"))
+
+
 def _render_operating_point() -> None:
     ss = st.session_state
     timeline = _tl.Timeline.from_payload(_fetch_timeline())
     modes = timeline.modes()
     if not modes:
         st.warning("Timeline unavailable — the backend is not responding.")
+        return
+
+    if ss.get("op_nominal") and timeline.nominal_available:
+        st.markdown("<div class='op-when'><span class='op-time'>Nominal</span></div>",
+                    unsafe_allow_html=True)
+        st.caption("The network's own values as loaded — no time. Studies use the case's own "
+                   "operating point"
+                   + (f"; the simulation clock stays at {timeline.clock[5:16]}." if timeline.clock else "."))
+        _nominal_switch(timeline)
+        ss.op_view = {"mode": _tl.NOMINAL, "ts": None}
         return
 
     # Which data.
@@ -2967,6 +3192,7 @@ def _render_operating_point() -> None:
     ss._op_mode_last = mode
     ss.op_time = value
     ss.op_view = {"mode": mode, "ts": value}
+    _nominal_switch(timeline)
 
 
 # ---------------------------------------------------------------------------
@@ -3026,6 +3252,196 @@ def _render_proposals() -> None:
                       args=(f"/api/proposals/{pid}",))
 
 
+def _fetch_assumptions() -> dict | None:
+    """The session's study assumptions from the backend, read on every run so
+    a change the agent made shows here at once. None when unreachable."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.get(f"{BASE_URL}/api/assumptions")
+            r.raise_for_status()
+            return r.json()
+    except Exception:  # noqa: BLE001 — the setting says so
+        return None
+
+
+# Read once per script run: every answer's staleness check compares with it.
+_RUN_MEMO: dict = {}
+
+
+def _settings_now() -> dict | None:
+    if "settings" not in _RUN_MEMO:
+        _RUN_MEMO["settings"] = _staleness.current(_fetch_assumptions())
+    return _RUN_MEMO["settings"]
+
+
+def _rerun_answer(question: str, why: list[str]) -> None:
+    """Ask the question again, as a new turn under the current settings."""
+    st.session_state._pending_turn = _staleness.rerun_prompt(question, why)
+    st.session_state.pop("_attempts_turn", None)
+
+
+def _render_staleness(msg: dict, idx: int) -> None:
+    """A line under an answer whose studies ran under other settings, and a
+    way to run it again."""
+    why = _staleness.reasons(msg.get("context"), _settings_now())
+    if not why:
+        return
+    question = next((m["text"] for m in reversed(st.session_state.messages[:idx]) if m["role"] == "user"), None)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"stale_{idx}"):
+        st.markdown(f"<span class='conductor-stale'>⏱ Computed under other settings: "
+                    f"{html.escape('; '.join(why))}</span>", unsafe_allow_html=True, width="content")
+        if question:
+            st.button("↻ Rerun with the current settings", key=f"rerun_{idx}", type="tertiary",
+                      disabled=_ui_busy(), on_click=_rerun_answer, args=(question, why),
+                      help="Asks CONDUCTOR the same question again, as a new turn, so its studies run "
+                           "under today's settings. The earlier answer stays for comparison.")
+
+
+def _report_charts_html(tool_results: list) -> str:
+    """One answer's charts for the report, as `render_charts` draws them:
+    caption, status lines, tables, then the figures (interactive)."""
+    out = []
+    for tool_name, result in tool_results or []:
+        renderer = RENDERER_MAP.get(tool_name)
+        if renderer is None or not isinstance(result, dict) or "error" in result:
+            continue
+        try:
+            figs = renderer(result)
+        except Exception:  # noqa: BLE001 — one chart, never the report
+            continue
+        figs = figs if isinstance(figs, list) else [figs] if figs is not None else []
+        flat = [f for row in figs for f in (row if isinstance(row, list) else [row]) if f is not None]
+        if not flat:
+            continue
+        out.append(f"<div class='chart-caption'>{_report.markdown(_chart_caption(tool_name, result))}</div>")
+        note = _non_converged_note(result)
+        if note:
+            out.append(f"<div class='status error'>{html.escape(note)}</div>")
+        charts = []
+        for fig in flat:
+            status, table = _status_of(fig), _table_of(fig)
+            if status:
+                tone = {"ok": "", "error": " error"}.get(status.get("tone"), " info")
+                out.append(f"<div class='status{tone}'>{html.escape(status['conductor_status'])}</div>")
+            elif table:
+                title, subtitle, frame = table
+                out.append((f"<p><strong>{html.escape(title)}</strong></p>" if title else "")
+                           + (f"<p class='limits'>{html.escape(subtitle)}</p>" if subtitle else "")
+                           + frame.to_html(index=False, border=0))
+            else:
+                try:
+                    fig = _polish(fig)
+                    fig.update_layout(width=None, autosize=True)       # fill the report's column
+                    charts.append(fig.to_html(full_html=False, include_plotlyjs=False, default_width="100%",
+                                              config={"displaylogo": False, "responsive": True}))
+                except Exception:  # noqa: BLE001
+                    continue
+        if charts:
+            out.append(f"<div class='charts'>{''.join(charts)}</div>")
+    return "".join(out)
+
+
+def _data_line(grid: dict) -> str | None:
+    """The loaded series in one line, for the report."""
+    parts = []
+    for kind in ("measurements", "forecasts"):
+        info = grid.get(kind) if isinstance(grid.get(kind), dict) else {}
+        if info.get("n_timestamps"):
+            parts.append(f"{kind} ({info.get('source')}): {info['n_timestamps']} ticks, "
+                         f"{str(info.get('first_timestamp'))[:16]} → {str(info.get('last_timestamp'))[:16]}")
+    return "; ".join(parts) or None
+
+
+def _session_report(messages: list, model_label: str) -> bytes:
+    """The conversation and what it ran on, as one standalone HTML file. Runs
+    when the download is clicked (no Streamlit calls in here)."""
+    from plotly.offline import get_plotlyjs
+
+    assumptions = _fetch_assumptions()
+    now = _staleness.current(assumptions)
+    scenario = (_fetch_scenarios() or {}).get("label")
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            grid = client.get(f"{BASE_URL}/api/grid_constants").json()
+            quality = (client.get(f"{BASE_URL}/api/data/quality").json().get("measurements") or {}).get("summary")
+    except Exception:  # noqa: BLE001 — the report says less, it still downloads
+        grid, quality = {}, None
+    meta = {
+        "title": f"CONDUCTOR session — {grid.get('name') or 'grid study'}",
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "scenario": scenario, "network": grid.get("name"), "model": model_label,
+        "data": _data_line(grid),
+        "assumptions": assumptions, "quality": quality, "proposals": _list_proposals(),
+    }
+    page = _report.build(messages, meta, charts_html=_report_charts_html, plotly_js=get_plotlyjs(),
+                         stale=lambda m: _staleness.reasons(m.get("context"), now))
+    return page.encode("utf-8")
+
+
+def _set_load_pf(value: float | None) -> None:
+    """Apply (or with None, reset) the load power factor; errors are shown."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.post(f"{BASE_URL}/api/assumptions", json={"load_power_factor": value})
+        if r.status_code >= 400:
+            st.session_state._pf_error = r.json().get("detail", r.text)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._pf_error = str(exc)
+
+
+_LOAD_PF_EXPLAINED = """
+The measured (and forecast) data give each substation's **active power only** — MW of
+consumption and production. A load's **reactive power** is therefore an assumption:
+**Q = P · tan(acos pf)**, lagging (the load draws reactive power).
+
+**What it changes:** every study that uses a measured moment — the security assessment,
+N-1, probabilistic risk, hosting capacity, the OPF and flexibility studies, the scans over
+time. A lower power factor means more reactive power drawn through the network: lower
+voltages, higher currents (line and transformer loading), more losses, more reactive power
+imported from the external grid, and a harder starting point for the OPF.
+
+**What it does not change:** the data themselves (nothing is regenerated), and the
+**nominal point**, which keeps the reactive power written in the network file.
+
+CONDUCTOR can also run **one study** at another power factor without changing this
+setting, and every result states the value it used.
+"""
+
+
+def _render_load_pf(assumptions: dict) -> None:
+    """The load power factor every study uses."""
+    pf = assumptions.get("load_power_factor")
+    if pf is None:
+        st.caption("Load power factor unavailable — the backend is not responding.")
+        return
+    changed = pf.get("source") != "default"
+    st.markdown(f"##### Loads — reactive power · pf {pf['value']:.2f}" + (" (changed)" if changed else ""))
+    c_set, c_why = st.columns([1, 2], gap="large")
+    with c_set, st.container(border=True, key="sys_load_pf"):
+        error = st.session_state.pop("_pf_error", None)
+        if error:
+            st.warning(error)
+        # Keyed by the current value: a change made by CONDUCTOR resets the box.
+        key = f"pf_input_{pf['value']:.4f}"
+        st.number_input("Load power factor (lagging)", min_value=0.5, max_value=1.0,
+                        value=float(pf["value"]), step=0.01, format="%.2f", key=key)
+        c_apply, c_reset = st.columns(2)
+        c_apply.button("Apply", key="pf_apply", width="stretch", type="primary",
+                       disabled=st.session_state.get(key) == pf["value"],
+                       on_click=lambda: _set_load_pf(float(st.session_state[key])))
+        c_reset.button("Reset", key="pf_reset", width="stretch", help=f"Back to {pf['default']:.2f}",
+                       disabled=not changed, on_click=lambda: _set_load_pf(None))
+        st.caption(f"Default {pf['default']:.2f}. " + ("Set for this session and kept for this network."
+                                                         if changed else "In use since the network was loaded."))
+        measured = (assumptions.get("reactive_measured") or {}).get("measurements") or {}
+        if measured.get("consumption"):
+            st.info("The measured data carry reactive demand: it is used wherever it is given, and this "
+                    "power factor only fills the gaps (see *Data quality* in the Data tab).",
+                    icon=":material/sensors:")
+    with c_why:
+        st.markdown(_LOAD_PF_EXPLAINED)
+
+
 def _env_reflection() -> str:
     """CONDUCTOR_REFLECTION, as the loop reads it: off, warn or inform."""
     return _loop_module.normalise_mode(_loop_module.REFLECTION_MODE)
@@ -3061,6 +3477,13 @@ with st.sidebar:
                  type="secondary", key="new_conversation"):
         _reset_conversation_state()
         st.rerun()
+    st.download_button(
+        "Export session report", icon=":material/download:", width="stretch", key="export_report",
+        data=functools.partial(_session_report, list(st.session_state.messages), _active_model_label()),
+        file_name=f"conductor_session_{datetime.now():%Y%m%d_%H%M}.html", mime="text/html",
+        on_click="ignore", disabled=not st.session_state.messages,
+        help="One HTML file that opens anywhere, offline: the scenario, network, assumptions and proposals, "
+             "then each question and answer with its charts and evidence. For co-authors and appendices.")
 
     st.markdown("<div class='conductor-sidebar-label'>Operating point</div>", unsafe_allow_html=True)
     with st.container(border=True, key="op_card"):
@@ -3071,6 +3494,13 @@ with st.sidebar:
 
     st.divider()
     st.markdown("<div class='conductor-sidebar-label'>Settings</div>", unsafe_allow_html=True)
+    _scn = _fetch_scenarios()
+    _scenario_note = st.session_state.pop("_scenario_note", None)
+    if _scenario_note:
+        st.success(_scenario_note)
+    with st.expander(f"Scenario · {(_scn or {}).get('label', 'unknown')}", icon=":material/dataset:",
+                     key="sb_scenario"):
+        _render_scenario_picker(key="sidebar", immediate=False)
 
     # Model settings stay reachable mid-session — switching backend or adjusting
     # a local model's context should not require a restart or a .env edit.
@@ -3193,7 +3623,18 @@ with st.sidebar:
     with st.expander("Example queries", expanded=True, icon=":material/lightbulb:"):
         st.caption("Click to drop into CONDUCTOR's chat box — edit if you like, then press Run.")
         examples = st.container(key="examples_list")
+        _for_scenario = SCENARIO_QUERIES.get((_scn or {}).get("current") or "", [])
+        if _for_scenario:
+            examples.markdown("<div class='conductor-eq-group'>For this scenario</div>", unsafe_allow_html=True)
+            for q_i, (query, q_icon) in enumerate(_for_scenario):
+                # "eq_" keys: the list's own styling (left-aligned, compact) applies.
+                if examples.button(query, icon=q_icon, type="tertiary", width="stretch", key=f"eq_s{q_i}"):
+                    st.session_state._box_pending = query
+            examples.markdown("<div class='conductor-eq-group'>Any network</div>", unsafe_allow_html=True)
+        _shown = {q for q, _ in _for_scenario}
         for q_i, (query, q_icon) in enumerate(EXAMPLE_QUERIES):
+            if query in _shown:
+                continue
             if examples.button(query, icon=q_icon, type="tertiary", width="stretch",
                                key=f"eq_{q_i}"):
                 # Copy into the input box (applied before the widget renders below);
@@ -3237,6 +3678,27 @@ def _layout_for(_fingerprint: str, payload: dict):
     network = _network_map.from_payload(payload)
     positions = _network_map.compute_layout(network)
     return network, positions
+
+
+def _assumptions_note(assumptions: dict) -> str:
+    """For the map's subtitle: the assumptions it was computed under, when they
+    are not the defaults."""
+    notes = []
+    pf = assumptions.get("load_power_factor") or {}
+    if pf.get("source") not in (None, "default"):
+        notes.append(f"loads pf {pf['value']:.2f}")
+    n = len(assumptions.get("generator_model") or {})
+    if n:
+        notes.append(f"{n} unit{'s' if n != 1 else ''} changed")
+    return "".join(f" · {x}" for x in notes)
+
+
+def _state_fingerprint() -> str:
+    """The network and the model assumptions together: a change of either
+    (load power factor, generator models) redraws the map instead of serving
+    the cached one."""
+    return (f"{st.session_state.get('_network_fingerprint') or ''}|"
+            f"{st.session_state.get('_assumptions_key') or ''}")
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -3287,7 +3749,7 @@ def _diff_figure(fingerprint, payload, positions, proposal_map, proposal_rsa, ti
     base_map = _network_map.from_payload(base_payload)
     try:
         base_rsa, base_snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper,
-                                               st.session_state.get("_network_fingerprint") or "")
+                                               _state_fingerprint())
     except Exception as exc:  # noqa: BLE001
         problems.append(f"The base could not be assessed for the difference view: {exc}")
         return None
@@ -3313,6 +3775,8 @@ def _render_system_view() -> None:
         return
 
     fingerprint = st.session_state.get("_network_fingerprint") or "unknown"
+    assumptions = _fetch_assumptions() or {}
+    st.session_state._assumptions_key = assumptions.get("key", "")
 
     # Which grid the picture is of: the base, or one of the proposals.
     proposals = {p["id"]: p for p in (_list_proposals() or [])}
@@ -3327,19 +3791,15 @@ def _render_system_view() -> None:
         st.error(f"Could not read the network topology from `{BASE_URL}`.")
         return
 
-    counts = payload.get("counts") or {}
-    columns = st.columns(5)
-    for column, (label, value) in zip(columns, (
-        ("Buses", counts.get("buses", "—")),
-        ("Lines", counts.get("lines", "—")),
-        ("Transformers", counts.get("trafos", "—")),
-        ("Loads", counts.get("loads", "—")),
-        ("Generators", counts.get("generators", "—")),
-    )):
-        column.metric(label, value)
-
-    levels = ", ".join(f"{v:g} kV" for v in payload.get("voltage_levels") or [])
-    st.caption(f"**{payload.get('name', 'network')}** · {levels or 'unknown voltage levels'}")
+    _render_system_header(payload, assumptions)
+    st.session_state.setdefault("system_pane", "map")
+    pane = st.segmented_control(
+        "System view", ["map", "assumptions"], key="system_pane", label_visibility="collapsed",
+        format_func={"map": "🗺️ Network map", "assumptions": "⚙️ Model assumptions"}.get,
+        selection_mode="single") or "map"
+    if pane == "assumptions":
+        _render_model_assumptions(assumptions)
+        return
 
     if proposals:
         st.segmented_control(
@@ -3370,7 +3830,7 @@ def _render_system_view() -> None:
 
     try:
         rsa, snapshot = _fetch_state(timestamp, limits.vm_lower, limits.vm_upper,
-                                     st.session_state.get("_network_fingerprint") or "",
+                                     _state_fingerprint(),
                                      chosen, (proposal or {}).get("edits_hash", ""))
         problems += _network_map.apply_assessment(network, rsa)
         problems += _network_map.apply_conditions(network, snapshot)
@@ -3378,7 +3838,8 @@ def _render_system_view() -> None:
         subtitle = ((f"Proposal {chosen} · " if proposal else "")
                     + f"{rsa.get('timestamp', timestamp)} · "
                     f"{rsa.get('total_violations', 0)} violation(s) · "
-                    f"band {limits.vm_lower}–{limits.vm_upper} pu")
+                    f"band {limits.vm_lower}–{limits.vm_upper} pu"
+                    + _assumptions_note(assumptions))
     except Exception as exc:  # noqa: BLE001
         subtitle = "topology only — the operating point could not be read"
         problems.append(str(exc))
@@ -3411,6 +3872,232 @@ def _render_system_view() -> None:
         st.warning(problem)
 
 
+def _generators_request(method: str, body: dict | None = None) -> dict | None:
+    """GET or POST /api/generators; an error is kept for the panel to show."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = (client.get(f"{BASE_URL}/api/generators") if method == "get"
+                 else client.post(f"{BASE_URL}/api/generators", json=body or {}))
+        if r.status_code >= 400:
+            st.session_state._gen_error = r.json().get("detail", r.text)
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._gen_error = str(exc)
+        return None
+
+
+_GENERATORS_INTRO = (
+    "Every unit that can produce power, grouped by how it is modelled. **Edit** a unit to change it; "
+    "*What the columns mean* explains each value.")
+_GENERATORS_WHEN = (
+    "Applies to the base network and every study from the next one on — nothing is regenerated "
+    "(the data carry active power only). Proposals are re-checked; one that no longer fits is "
+    "dropped and named. Earlier results are not recomputed; every new result lists the units that "
+    "differ from the network as loaded. Kept for this network across restarts; CONDUCTOR can read "
+    "and change it too, when you ask.")
+_GENERATORS_EXPLAINED = """
+| Value | What it means | Changing it affects |
+|---|---|---|
+| **The table a unit is in** (its control) | *Voltage control*: the unit holds its bus voltage, producing or absorbing whatever reactive power that takes. *Fixed power factor*: it injects its active power with reactive power in a fixed ratio; its bus voltage is free to move. *Fixed Q*: it injects or absorbs a set reactive power whatever its active power. Large synchronous machines usually control voltage; inverter-based units (solar, wind, batteries) usually run at a fixed power factor. | Voltages near the unit, reactive flows, losses and the reactive power imported from the grid — in every study. Change it in the unit's **Edit** form; the unit moves to the other table. |
+| **V set-point** | The voltage the unit holds (voltage control, condensers). | Higher V raises the voltages around it and its reactive output. |
+| **Reactive output** | A fixed-Q unit's set reactive power: positive injects (raises nearby voltage), negative absorbs. | Reactive power and voltages around the unit, whatever its active output. |
+| **Power factor** | The fixed ratio of reactive to active power, Q = P · tan(acos pf), injecting or absorbing (absorbing lowers nearby voltage). 1.00 = none. | Reactive power and voltages around the unit. |
+| **Reactive range** | The unit's reactive capability (lowest to highest output). | **OPF:** the unit stays within it. **Power flows** (security assessment, N-1) do not enforce it — they report each unit's Q against it. |
+| **Dispatchable** | Whether the OPF and flexibility studies may change the unit's active power. | No: it keeps its measured output in every optimisation (fewer corrective options). Assessments are not affected. |
+| **Pmax**, **Bus** | Capacity and location, from the network file. | — (read-only) |
+| **changed** | The unit differs from the network as loaded. | — |
+
+**Condensers** have no active power, so they are always on voltage control and never dispatched;
+only their set-point and reactive range can change. A generator at a fixed power factor keeps the
+set-point and range it had, so switching it back to voltage control restores them.
+"""
+
+
+def _render_unit_table(group: str, group_rows: list[dict], editable: bool) -> None:
+    """One kind of unit as a plain-text table (crisp at any zoom), each row
+    with its Edit button."""
+    spec = _gen_table.GROUPS[group]
+    st.markdown(f"**{spec['title']}** · {len(group_rows)}")
+    st.caption(spec["caption"])
+    widths = [1.0] * len(spec["columns"]) + [0.45]
+    with st.container(border=True, key=f"gentable_{group}", gap="small"):
+        head = st.columns(widths, vertical_alignment="center")
+        for col, name in zip(head, spec["columns"]):
+            col.markdown(f"<span class='gen-head'>{html.escape(name)}</span>", unsafe_allow_html=True)
+        for n, row in enumerate(group_rows):
+            with st.container(key=f"genrow_{group}_{n}"):
+                cols = st.columns(widths, vertical_alignment="center")
+                for k, (col, text) in enumerate(zip(cols, row["cells"])):
+                    mark = " <span class='gen-changed'>changed</span>" if k == 0 and row["changed"] else ""
+                    col.markdown(f"<span class='gen-cell'>{html.escape(text)}</span>{mark}",
+                                 unsafe_allow_html=True)
+                cols[-1].button("Edit", key=f"gen_edit_{row['unit']}", type="tertiary", disabled=not editable,
+                                icon=":material/edit:",
+                                on_click=lambda name=row["unit"]: st.session_state.update(_gen_editing=name))
+
+
+@st.dialog("Edit unit", width="medium")
+def _edit_unit_dialog(unit: dict) -> None:
+    """One unit's model, with only the fields that apply to it."""
+    st.markdown(f"**{unit['unit']}** · {unit.get('bus_name') or unit['bus']} · "
+                f"Pmax {unit['p_max_mw']:g} MW")
+    values: dict = {}
+    if unit.get("condenser"):
+        st.caption("A synchronous condenser: no active power, so it always controls voltage and is never "
+                   "dispatched. Its set-point and reactive range can change.")
+        control = "voltage"
+    else:
+        control = st.radio("Control", list(_gen_table.CONTROL_LABELS), horizontal=True,
+                           index=list(_gen_table.CONTROL_LABELS).index(unit["control"]),
+                           format_func=_gen_table.CONTROL_LABELS.get, key=f"dlg_control_{unit['unit']}")
+        values["control"] = control
+        st.caption({"voltage": "Holds its bus voltage at a set-point; its reactive power is whatever that takes.",
+                    "power_factor": "Injects its active power with reactive power in a fixed ratio; its bus "
+                                    "voltage is free.",
+                    "fixed_q": "Injects or absorbs a set reactive power, whatever its active power; its bus "
+                               "voltage is free."}[control])
+    fields = _gen_table.form_fields(unit, control)
+    if "vm_pu" in fields:
+        values["vm_pu"] = st.number_input("Voltage set-point (p.u.)", min_value=0.8, max_value=1.2,
+                                          value=float(unit["vm_pu"] or 1.0), step=0.005, format="%.3f")
+    if "q_min_mvar" in fields:
+        c_lo, c_hi = st.columns(2)
+        values["q_min_mvar"] = c_lo.number_input("Lowest reactive output (Mvar)", value=unit["q_min_mvar"],
+                                                 step=1.0, placeholder="none on record")
+        values["q_max_mvar"] = c_hi.number_input("Highest reactive output (Mvar)", value=unit["q_max_mvar"],
+                                                 step=1.0, placeholder="none on record")
+    if "q_mvar" in fields:
+        values["q_mvar"] = st.number_input("Reactive output (Mvar; positive injects, negative absorbs)",
+                                           value=float(unit.get("q_mvar") or 0.0), step=1.0, format="%.2f")
+    if "pf" in fields:
+        values["pf"] = st.number_input("Power factor (1.00 = no reactive power)", min_value=0.5, max_value=1.0,
+                                       value=float(unit["pf"] or 1.0), step=0.01, format="%.2f")
+    if "absorbing" in fields:
+        values["absorbing"] = st.toggle("Absorbs reactive power (lowers nearby voltage) instead of injecting it",
+                                        value=bool(unit["absorbing"]))
+    if "dispatchable" in fields:
+        values["dispatchable"] = st.toggle("Dispatchable — the OPF may change its active power",
+                                           value=bool(unit["dispatchable"]))
+    change = _gen_table.form_changes(unit, values)
+    error = st.session_state.pop("_gen_error", None)
+    if error:
+        st.warning(error)
+    c_apply, c_cancel = st.columns(2)
+    if c_apply.button("Apply", type="primary", disabled=change is None, width="stretch", key="gen_apply"):
+        result = _generators_request("post", {"changes": [change]})
+        if result is not None:
+            if result.get("proposals_dropped"):
+                st.session_state._gen_error = ("Applied. These proposals no longer apply and were dropped: "
+                                               + "; ".join(result["proposals_dropped"]))
+            st.rerun()
+        st.rerun(scope="fragment")              # keep the dialog open to show why
+    if c_cancel.button("Cancel", width="stretch", key="gen_cancel"):
+        st.rerun()
+
+
+def _render_model_assumptions(assumptions: dict) -> None:
+    """The assumptions every study is built on: how loads draw reactive power
+    and how each unit is modelled."""
+    st.caption("What every study assumes beyond the data. Changes take effect from the next study; "
+               "nothing needs to be regenerated.")
+    _render_generator_models()
+    st.divider()
+    _render_load_pf(assumptions)
+
+
+def _open_assumptions() -> None:
+    st.session_state.system_pane = "assumptions"
+
+
+def _toggle_nominal() -> None:
+    st.session_state.op_nominal = not st.session_state.get("op_nominal", False)
+
+
+def _render_system_header(payload: dict, assumptions: dict) -> None:
+    """One line for the network, then the assumptions every study uses, always
+    in view — each chip opens them (the nominal chip switches the point)."""
+    counts = payload.get("counts") or {}
+    parts = [f"{counts.get(k, '—')} {label}" for k, label in (
+        ("buses", "buses"), ("lines", "lines"), ("trafos", "transformers"),
+        ("loads", "loads"), ("generators", "units"))]
+    levels = payload.get("voltage_levels") or []
+    if len(levels) == 1 and (counts.get("buses") or 0) > 1:
+        volts = ("per-unit case (every bus at 1 kV)" if abs(levels[0] - 1.0) < 1e-9
+                 else f"every bus at {levels[0]:g} kV")
+    else:
+        volts = ", ".join(f"{v:g} kV" for v in levels) or "unknown voltage levels"
+    st.markdown(f"**{html.escape(str(payload.get('name', 'Network')))}** · " + " · ".join(parts))
+    st.caption(volts)
+
+    pf = assumptions.get("load_power_factor") or {}
+    pf_changed = pf.get("source") not in (None, "default")
+    n_changed = len(assumptions.get("generator_model") or {})
+    timeline = _tl.Timeline.from_payload(_fetch_timeline())
+    nominal_on = bool(st.session_state.get("op_nominal")) and timeline.nominal_available
+    with st.container(horizontal=True, vertical_alignment="center", gap="small", key="sys_chips"):
+        st.caption("Assumptions", width="content")
+        q_measured = ((assumptions.get("reactive_measured") or {}).get("measurements") or {}).get("consumption")
+        if pf and q_measured:
+            st.button(f"Loads Q measured · pf {pf['value']:.2f} for gaps", key="chip_pf",
+                      type="primary" if pf_changed else "secondary",
+                      help="The data carry reactive demand; the power factor fills only missing values — "
+                           "open the model assumptions", on_click=_open_assumptions)
+        elif pf:
+            st.button(f"Loads pf {pf['value']:.2f}" + (" · changed" if pf_changed else ""),
+                      key="chip_pf", type="primary" if pf_changed else "secondary",
+                      help="The power factor every study gives measured loads — open the model assumptions",
+                      on_click=_open_assumptions)
+        st.button("Generators · " + (f"{n_changed} changed" if n_changed else "as loaded"),
+                  key="chip_gen", type="primary" if n_changed else "secondary",
+                  help="How each unit is modelled — open the model assumptions", on_click=_open_assumptions)
+        st.button("Nominal point · " + ("on" if nominal_on else "off"), key="chip_nominal",
+                  type="primary" if nominal_on else "secondary", disabled=not timeline.nominal_available,
+                  help=("Studies use the network's own operating point instead of a moment of the data — "
+                        "click to switch (also in the sidebar)." if timeline.nominal_available
+                        else f"Not available for this network. {timeline.nominal_reason}"),
+                  on_click=_toggle_nominal)
+
+
+def _render_generator_models() -> None:
+    """How each unit of the loaded network is modelled — the operator's to
+    change at any time (CONDUCTOR can too, when asked)."""
+    data = _generators_request("get")
+    error = st.session_state.pop("_gen_error", None)
+    n_changed = len((data or {}).get("changed") or {})
+    st.markdown("##### Generators — how each unit is modelled"
+                + (f" · {n_changed} changed" if n_changed else ""))
+    with st.container(key="sys_generators"):
+        if error:
+            st.warning(error)
+        if data is None:
+            st.caption("Could not read the generators from the backend.")
+            return
+        if not data.get("editable"):
+            st.caption(data.get("reason") or "Unit models cannot be changed for this network.")
+        changed = data.get("changed") or {}
+        st.markdown(_GENERATORS_INTRO)
+        t_units, t_help = st.tabs(["Units", "What the columns mean"])
+        with t_help:
+            st.markdown(_GENERATORS_EXPLAINED)
+        with t_units:
+            units = {u["unit"]: u for u in data.get("units") or []}
+            groups = _gen_table.rows(list(units.values()), changed)
+            if not groups:
+                st.caption("This network has no generating units besides the external grid.")
+                return
+            editable = bool(data.get("editable"))
+            for group, group_rows in groups.items():
+                _render_unit_table(group, group_rows, editable)
+            if st.button("Reset all to as loaded", key="gen_reset", disabled=not changed):
+                _generators_request("post", {"reset": True})
+                st.rerun()
+            st.caption(_GENERATORS_WHEN)
+            editing = st.session_state.pop("_gen_editing", None)
+            if editing in units:
+                _edit_unit_dialog(units[editing])
+
+
 # ---------------------------------------------------------------------------
 # Main chat area
 # ---------------------------------------------------------------------------
@@ -3441,6 +4128,9 @@ _TOOL_LABELS = {
     "compute_violation_attribution": "Violation attribution",
     "compare_results": "Result comparison",
     "edit_proposal": "Network proposal",
+    "set_load_power_factor": "Load power factor setting",
+    "get_data_quality": "Data quality report",
+    "set_generator_model": "Generator model",
     "compare_networks": "Base vs proposal",
     "run_probabilistic_rsa": "Probabilistic security assessment",
     "scan_scenarios": "Renewable scenario scan",
@@ -3569,8 +4259,10 @@ def _suggestion_context() -> dict:
         "network": gc.get("name"),
         "simulation_clock": st.session_state.get("current_ts"),
         "data_source": {_tl.FORECAST: "forecasts",
-                        _tl.COMPARE: "measurements and forecasts"}.get(mode, "measurements"),
-        "viewing_timestamp": view.get("ts") if mode != _tl.MEASURED else None,
+                        _tl.COMPARE: "measurements and forecasts",
+                        _tl.NOMINAL: "nominal (the network's own operating point, no time)",
+                        }.get(mode, "measurements"),
+        "viewing_timestamp": view.get("ts") if mode not in (_tl.MEASURED, _tl.NOMINAL) else None,
         "default_voltage_band_pu": [gc.get("vm_lower"), gc.get("vm_upper")],
         "max_loading_pct": gc.get("max_loading_pct"),
         "substations": names[:40] + ([f"… and {len(names) - 40} more"] if len(names) > 40 else []),
@@ -4028,6 +4720,7 @@ def _render_answer_footer(msg: dict, idx: int) -> None:
     recorded here. Everything else of the AI agent lives in its panel."""
     is_last = idx == len(st.session_state.messages) - 1
     panel_open = st.session_state.get("agent_panel_open")
+    _render_staleness(msg, idx)
     if is_last and msg.get("attention"):
         where = "the advisor (right) can help" if panel_open else "open the advisor (✨ on the right) to"
         st.caption(f"⚠️ {_attention_hint(msg['attention'])} — {where} decide what to check next.")
@@ -4180,6 +4873,61 @@ def _fetch_series(signature: str, data_source: str, substations: tuple) -> dict 
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_quality(signature: str) -> dict | None:
+    """The loaded datasets' quality reports. `signature` changes with the data."""
+    try:
+        r = httpx.get(f"{BASE_URL}/api/data/quality", timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_QUALITY_ICONS = {"error": "⛔", "warning": "⚠️", "info": "ℹ️"}
+
+
+def _follow_measured(subs: tuple) -> None:
+    """Switch the voltage-controlled units at `subs` to fixed Q (they then
+    follow the measured reactive generation)."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.post(f"{BASE_URL}/api/generators/follow_measured", json={"substations": list(subs)})
+        st.session_state._dq_note = (("Switched to fixed Q: " + ", ".join(r.json().get("switched") or []))
+                                     if r.status_code < 400 else r.json().get("detail", r.text))
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._dq_note = str(exc)
+    _fetch_quality.clear()
+
+
+def _render_data_quality(signature: str) -> None:
+    """What the loaded data look like — reactive columns, coverage, anything
+    implausible. Nothing here changes the data."""
+    reports = _fetch_quality(signature) or {}
+    shown = [(label, reports.get(key)) for label, key in (("Measured", "measurements"), ("Forecast", "forecasts"))
+             if reports.get(key)]
+    if not shown:
+        return
+    worst = min((f["level"] for _, r in shown for f in r.get("findings") or []),
+                key=["error", "warning", "info"].index, default="info")
+    title = "Data quality" + {"error": " · problems found", "warning": " · check"}.get(worst, "")
+    note = st.session_state.pop("_dq_note", None)
+    with st.expander(title, icon=":material/fact_check:", expanded=worst == "error" or bool(note),
+                     key="dv_quality"):
+        if note:
+            st.info(note)
+        for label, report in shown:
+            st.markdown(f"**{label}** — {report.get('summary', '')}")
+            for f in report.get("findings") or []:
+                st.markdown(f"{_QUALITY_ICONS.get(f['level'], '')} {f['message']}".replace("$", "\\$"))
+                if f["code"] == "reactive_at_voltage_units" and label == "Measured":
+                    st.button("Switch these units to follow the data (fixed Q)", key="dq_follow",
+                              icon=":material/sync_alt:",
+                              help="They then take the measured reactive generation at every tick that has it; "
+                                   "the substation's median applies where it is missing. Undo in the System tab.",
+                              on_click=_follow_measured, args=(tuple(f.get("substations") or ()),))
+
+
 def _render_data_view() -> None:
     timeline = _tl.Timeline.from_payload(_fetch_timeline())
     if not timeline.modes():
@@ -4200,8 +4948,15 @@ def _render_data_view() -> None:
     choice = c_ds.radio("Dataset", datasets, index=len(datasets) - 1, horizontal=True, key="dv_dataset")
     picked = c_items.multiselect("Substations", names, key="dv_items", placeholder="System total",
                                  help="Leave empty for the system total.")
-    quantity = c_qty.segmented_control("Quantity", list(_dv.QUANTITIES), format_func=_dv.QUANTITIES.get,
-                                       default="consumption", required=True, key="dv_quantity")
+    offered = _dv.quantities(base)
+    if st.session_state.get("dv_quantity") not in offered:
+        st.session_state.dv_quantity = "consumption"
+    if len(offered) > len(_dv.QUANTITIES):
+        # With reactive power there are five: a dropdown fits where buttons overflow.
+        quantity = c_qty.selectbox("Quantity", list(offered), format_func=offered.get, key="dv_quantity")
+    else:
+        quantity = c_qty.segmented_control("Quantity", list(offered), format_func=offered.get,
+                                           default="consumption", required=True, key="dv_quantity")
     items = list(picked) or [_dv.TOTAL]
 
     subs = tuple(sorted(picked))
@@ -4234,6 +4989,8 @@ def _render_data_view() -> None:
                     f"shared ticks ({err['first'][5:16]} → {err['last'][5:16]}): "
                     f"bias {err['bias']:+.2f} MW · MAE {err['mae']:.2f} MW"
                     + (f" · MAPE {err['mape_pct']:.1f} %" if err["mape_pct"] is not None else ""))
+
+    _render_data_quality(signature)
 
     with st.expander("Table", icon=":material/table:"):
         columns = {}
@@ -4610,6 +5367,9 @@ def _process_turn(effective_input: str, work) -> None:
                     # and what its figures are grounded against.
                     "record": turn_record,
                     "attention": _safe_attention(turn_record),
+                    # What its studies ran under, to tell later whether the
+                    # settings have changed since (agent/staleness.py).
+                    "context": _staleness.stamp(charts_this_turn, _fetch_assumptions()),
                 })
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
                 # The turn just refetched grid constants; if that failed, the

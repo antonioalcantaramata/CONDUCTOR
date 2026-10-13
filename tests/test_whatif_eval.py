@@ -141,3 +141,20 @@ def test_the_runner_end_to_end_with_a_scripted_model(backend_client, monkeypatch
     assert written == [] and loop._append_to_log is not None
     assert "| dc_flat | 1 | edit: 50 MW load at Bus_9 | 1/1 |" in whatif.render(whatif.grade(out))
     mb._discard_proposals()
+
+
+def test_a_question_to_the_operator_is_asking_not_a_refusal():
+    question = {"error": "400", "detail": {"needs_operator": True, "question": "How should 'G' behave?",
+                                           "options": ["voltage", "power_factor"]}}
+    asked = {"tool_calls": [{"name": "edit_proposal", "args": {}}], "tool_results": [{"result": question}],
+             "assistant": "How should the new 30 MW unit behave: (1) voltage control or (2) a fixed power factor?"}
+    built = {"tool_calls": [{"name": "edit_proposal", "args": {}}],
+             "tool_results": [{"result": {"edits": [{"op": "add_generator", "bus": 4, "p_max_mw": 30,
+                                                     "control": "voltage", "vm_pu": 1.0}]}}],
+             "assistant": "On proposal g the unit holds 1.0 p.u."}
+    assert whatif.check({"kind": "valid_edits"}, [asked, built])
+    assert whatif.check({"kind": "asked"}, [asked, built])
+    assert not whatif.check({"kind": "asked"}, [built])
+    got = whatif.evaluate(_task("classical_generator"), [asked, built])
+    assert got["asked how the unit is modelled before building it"]
+    assert got["edit: 30 MW unit on voltage control at Bus_4"]

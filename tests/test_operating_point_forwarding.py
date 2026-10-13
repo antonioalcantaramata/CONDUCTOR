@@ -104,6 +104,28 @@ def test_network_is_forwarded(tool_name, captured, monkeypatch):
     assert studies and all(b.get("network") == "dc_bus9" for b in studies), sent
 
 
+def _power_factor_tools() -> list[str]:
+    from llm_agent.agent.providers.schema import to_json_schema_tools
+    from llm_agent.agent.tool_schemas import TOOLS
+    return sorted(t["function"]["name"] for t in to_json_schema_tools(TOOLS)
+                  if "load_power_factor" in t["function"]["parameters"].get("properties", {}))
+
+
+@pytest.mark.parametrize("tool_name", _power_factor_tools())
+def test_load_power_factor_is_forwarded(tool_name, monkeypatch):
+    """A tool that offers `load_power_factor` and drops it would run at the
+    session's power factor while the answer says "at pf 0.90"."""
+    required = {**REQUIRED_ARGS,
+                "get_element_timeseries": {"element_type": "line", "element_name": "L1"},
+                "compute_historical_risk": {"target": "line:L1"}}.get(tool_name, {})
+    sent = []
+    monkeypatch.setattr(tools, "_post", lambda endpoint, body: sent.append((endpoint, body)) or {"ok": True})
+    monkeypatch.setattr(tools, "_get", lambda endpoint: {"ok": True})
+    getattr(tools, tool_name)(load_power_factor=0.9, **required)
+    studies = [body for endpoint, body in sent if not endpoint.startswith("/api/time")]
+    assert studies and all(b.get("load_power_factor") == 0.9 for b in studies), sent
+
+
 class TestTheHarnessItself:
     """A test that silently stops exercising anything is worse than no test."""
 
