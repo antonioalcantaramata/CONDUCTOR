@@ -1,0 +1,461 @@
+# CONDUCTOR provider catalog — the single source of truth for every LLM option
+# the launch screen offers: tiers, limits, links and data-use notes.
+#
+# Data only. The UI reads everything from here (agent/catalog.py validates it on
+# load) and never hard-codes a limit, a URL or a policy sentence.
+#
+# Every number carries where it came from:
+#   source_url     the page it was read from
+#   verified       official   — stated by the provider's own docs or model card
+#                  third_party — reported elsewhere, not on an official page
+#                  unverified — not found in official docs (e.g. shown only in a
+#                               console); keep, but say so
+#   last_verified  the date it was last checked
+# `null` means not published / unknown — the UI says "not published".
+#
+# Limits change often. Re-check the sources and update `last_verified`.
+
+schema_version: 1
+
+defaults:
+  calls_per_question: 4          # until this machine has measured its own average
+  overhead_tokens_fallback: 28000
+
+tiers:
+  free: {label: "Free", caption: "Hosted, no cost. Rate-limited; for testing with sample networks."}
+  paid: {label: "Paid", caption: "Hosted, paid per token. Limits depend on your plan."}
+  local: {label: "Local", caption: "Runs on this machine. No grid data leaves it."}
+
+# Shown on every free and free-trial card.
+free_tier_notice: >-
+  Free tiers are meant for testing with sample networks such as the
+  bundled IEEE case. For real or confidential grid data, use Local (Ollama) or a
+  paid tier whose terms fit your organisation.
+
+options:
+
+  # ── Free ────────────────────────────────────────────────────────────────────
+
+  - id: gemini_free
+    display_name: "Gemini API · free tier"
+    tier: free
+    recommended: true
+    provider: google
+    tier_env: {GEMINI_TIER: free}
+    api_style: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    key_env: GEMINI_API_KEY
+    model_env: GEMINI_MODEL
+    key_url: https://aistudio.google.com/app/apikey
+    discovery: static
+    default_model: gemini-3.5-flash-lite
+    fallback_chain: [gemini-3.5-flash-lite, gemini-3.1-flash-lite]
+    fallback_env: GEMINI_FALLBACK_MODELS
+    reset_note: "Daily quotas reset at midnight Pacific time."
+    reset_source_url: https://ai.google.dev/gemini-api/docs/rate-limits
+    setup_steps:
+      - "Go to [aistudio.google.com](https://aistudio.google.com/app/apikey) and sign in with any Google account — no payment needed for the free tier."
+      - "Click Get API key, then Create API key, and copy it."
+      - "Paste it below."
+    signup_note: "A Google account; the key is created in Google AI Studio."
+    hosting_note: "Google. Users in the EEA, Switzerland or the UK get paid-tier data handling even on the free tier."
+    data_policy_summary: >-
+      Google may use free-tier prompts and responses to improve its products,
+      and human reviewers may read them. In the EEA, Switzerland and the UK the
+      paid-tier data terms apply instead (no use for product improvement).
+    data_policy_details: >-
+      Gemini API Additional Terms, "Unpaid Services": Google uses the content
+      you submit and the responses to provide, improve and develop its products;
+      human reviewers may read, annotate and process API input and output; do
+      not submit sensitive, confidential or personal information. If you are in
+      the European Economic Area, Switzerland or the United Kingdom, the "Paid
+      Services" data terms apply to all services, including unpaid quota: prompts
+      and responses are logged for a limited period only to detect abuse.
+      Grounding with Google Search (not used by CONDUCTOR) stores prompts for
+      30 days.
+    data_policy_url: https://ai.google.dev/gemini-api/terms
+    last_verified: 2026-10-14
+    source_url: https://ai.google.dev/gemini-api/docs/models
+    models:
+      - id: gemini-3.5-flash-lite
+        label: "Gemini 3.5 Flash-Lite"
+        context_window: 1048576
+        tools: true
+        limits: {rpm: 15, tpm: 250000, rpd: 500, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14,
+                 note: "Google's rate-limit page points to AI Studio for per-model numbers."}
+      - id: gemini-3.1-flash-lite
+        label: "Gemini 3.1 Flash-Lite"
+        context_window: 1048576
+        tools: true
+        limits: {rpm: 15, tpm: 250000, rpd: 500, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+      - id: gemini-3.8-flash
+        label: "Gemini 3.8 Flash"
+        advanced: true
+        context_window: 1048576
+        tools: true
+        limits: {rpm: 5, tpm: 250000, rpd: 20, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+      - id: gemini-3.6-flash
+        label: "Gemini 3.6 Flash"
+        advanced: true
+        context_window: 1048576
+        tools: true
+        limits: {rpm: 5, tpm: 250000, rpd: 20, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+      - id: gemini-3-flash-preview
+        label: "Gemini 3 Flash (preview)"
+        advanced: true
+        context_window: 1048576
+        tools: true
+        limits: {rpm: 5, tpm: 250000, rpd: 20, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+    incompatible_models:
+      - id: gemma-4-31b-it
+        label: "Gemma 4 31B"
+        context_window: 262144
+        tools: true
+        limits: {rpm: 30, tpm: 16000, rpd: 14400, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+      - id: gemma-4-26b-a4b-it
+        label: "Gemma 4 26B"
+        context_window: 262144
+        tools: true
+        limits: {rpm: 30, tpm: 16000, rpd: 14400, verified: unverified,
+                 source_url: https://aistudio.google.com/rate-limit, last_verified: 2026-10-14}
+
+  - id: nvidia_free
+    display_name: "NVIDIA Build · free endpoints"
+    tier: free
+    provider: nvidia
+    api_style: openai_chat
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+    model_env: NVIDIA_MODEL
+    timeout_env: NVIDIA_TIMEOUT_S
+    timeout_default_s: 180
+    key_url: https://build.nvidia.com/settings/api-keys
+    key_prefix: "nvapi-"
+    discovery: nvidia_allowlist
+    discovery_url: https://integrate.api.nvidia.com/v1/models
+    default_model: nvidia/nemotron-3-super-120b-a12b
+    slow_note: "Free endpoints can be slow: the first response may take a while."
+    setup_steps:
+      - "Sign in to [build.nvidia.com](https://build.nvidia.com), or create a free NVIDIA Developer account."
+      - "Verify your phone number when asked — it is required to create keys and is not available in every country (if yours is missing, write to help@build.nvidia.com)."
+      - "Create an API key at [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys). It starts with nvapi-."
+      - "Paste it below."
+    signup_note: >-
+      A free NVIDIA Developer account with phone verification. Verification is
+      not available in every country (it worked with a Spanish number); NVIDIA
+      asks users who cannot verify to write to help@build.nvidia.com.
+    signup_source_url: https://forums.developer.nvidia.com/t/cannot-verify-phone-country-not-in-dropdown/374813
+    hosting_note: "Served by NVIDIA. Free endpoints are for development and testing, not production."
+    data_policy_summary: >-
+      For development and testing only, per NVIDIA's API trial terms. NVIDIA
+      records inputs and outputs to provide the trial and to improve its
+      products and services, including AI models.
+    data_policy_details: >-
+      NVIDIA API Trial Terms of Service: access is "for limited trial purposes
+      only and without use of the API Service or Generated Content in
+      production"; NVIDIA collects user content and generated content "to
+      improve NVIDIA products and services, including AI models". Each model
+      card repeats that input and output are recorded for the trial and to
+      improve NVIDIA products. Free endpoints get deprecated over time.
+    data_policy_url: https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf
+    account_limits: {rpm: 40, rpd: 10000, verified: official,
+                     source_url: https://build.nvidia.com/z-ai/glm-5-3, last_verified: 2026-10-14,
+                     note: "\"Up to 40 rpm\" and \"10,000 requests per day\" on each model card; may vary by model and traffic."}
+    last_verified: 2026-10-14
+    source_url: https://build.nvidia.com/models
+    models:                      # the allowlist, validated against /v1/models at launch;
+                                 # ordered by measured speed on a 4-tool question (2026-10-14)
+      - id: nvidia/nemotron-3-super-120b-a12b
+        label: "Nemotron 3 Super (NVIDIA)"
+        context_window: 1000000
+        tools: true
+        card_url: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b
+        note: "NVIDIA's own; 120B MoE, 12B active. Measured 2026-10-14: a 4-tool question in 56 s (calls 2–14 s)."
+        thinking:                # from the model card: chat_template_kwargs.enable_thinking
+          "off": {chat_template_kwargs: {enable_thinking: false}}
+          "on": {chat_template_kwargs: {enable_thinking: true}}
+      - id: nvidia/nemotron-3-ultra-550b-a55b
+        label: "Nemotron 3 Ultra (NVIDIA)"
+        context_window: 1000000
+        tools: true
+        card_url: https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b
+        note: "NVIDIA's own; 550B MoE, 55B active. Measured 2026-10-14: a 4-tool question in 88 s."
+        thinking:                # from the model card: enable_thinking, medium_effort
+          "off": {chat_template_kwargs: {enable_thinking: false}}
+          "medium": {chat_template_kwargs: {enable_thinking: true, medium_effort: true}}
+          "on": {chat_template_kwargs: {enable_thinking: true}}
+      - id: nvidia/nemotron-3.5-lightning-30b-a3b
+        label: "Nemotron 3.5 Lightning (NVIDIA)"
+        context_window: 1000000
+        tools: true
+        card_url: https://build.nvidia.com/nvidia/nemotron-3.5-lightning-30b-a3b
+        note: "NVIDIA's own; 30B MoE, 3B active. Measured 2026-10-14: a 4-tool question in 83 s."
+        thinking:                # from the model card: chat_template_kwargs.enable_thinking
+          "off": {chat_template_kwargs: {enable_thinking: false}}
+          "on": {chat_template_kwargs: {enable_thinking: true}}
+
+      - id: z-ai/glm-5.3
+        label: "GLM 5.3 (Z.ai)"
+        context_window: 1048576
+        tools: true
+        card_url: https://build.nvidia.com/z-ai/glm-5-3
+        note: "753B MoE, ~40B active. Measured 2026-10-14: a 4-tool question in 657 s (one timeout); slow on the free endpoint."
+        thinking:                # from the model card: reasoning_effort low | high | max (default max)
+          "low": {reasoning_effort: low}
+          "high": {reasoning_effort: high}
+          "max": {reasoning_effort: max}
+      - id: z-ai/glm-5.3-flash
+        label: "GLM 5.3 Flash (Z.ai)"
+        context_window: 1048576
+        tools: true
+        card_url: https://build.nvidia.com/z-ai/glm-5-3-flash
+        note: "320B MoE, 18B active. Measured 2026-10-14: a 4-tool question in 757 s (one 504); slow on the free endpoint."
+        thinking:                # from the model card: reasoning_effort low | high | max (default max)
+          "low": {reasoning_effort: low}
+          "high": {reasoning_effort: high}
+          "max": {reasoning_effort: max}
+      - id: deepseek-ai/deepseek-v4.1-flash
+        label: "DeepSeek V4.1 Flash"
+        context_window: 1048576
+        tools: true
+        card_url: https://build.nvidia.com/deepseek-ai/deepseek-v4.1-flash
+        note: "552B MoE, 8B active (prefill). Measured 2026-10-14: the test request timed out at 180 s, and a 4-tool question did not finish within 30 min (repeated 504s) — not usable on the free endpoint that day."
+  - id: openrouter_free
+    display_name: "OpenRouter · free models"
+    tier: free
+    provider: openrouter
+    tier_env: {OPENROUTER_TIER: free}
+    api_style: openai_chat
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY
+    model_env: OPENROUTER_MODEL
+    key_url: https://openrouter.ai/settings/keys
+    discovery: openrouter
+    discovery_url: https://openrouter.ai/api/v1/models
+    privacy_settings_url: https://openrouter.ai/settings/privacy
+    guardrails_url: https://openrouter.ai/docs/guides/features/guardrails
+    thinking_values: [none, low, medium, high]     # OpenRouter's reasoning.effort; sent only to models that support it
+    thinking_doc_url: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+    fallbacks_doc_url: https://openrouter.ai/docs/guides/routing/model-fallbacks
+    data_collection_doc_url: https://openrouter.ai/docs/guides/routing/provider-selection
+    setup_steps:
+      - "Create an account at [openrouter.ai](https://openrouter.ai) — no card is needed for free models."
+      - "Create an API key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)."
+      - "Optional: choose which providers may use your prompts at [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy)."
+      - "Paste the key below."
+    signup_note: "An OpenRouter account; no card needed for free models."
+    hosting_note: "A router: each free model is served by its own provider, with its own data policy."
+    data_policy_summary: >-
+      OpenRouter does not store prompts unless you opt in, but each model's
+      provider has its own policy, and free-model hosts may store prompts and
+      train on them. CONDUCTOR allows them by default, because excluding them
+      currently leaves no free model working.
+    data_policy_details: >-
+      OpenRouter's privacy settings have separate switches for paid and free
+      models, including whether to allow providers that may train on your data
+      or free endpoints that publish prompts. CONDUCTOR can also ask, per
+      request, for providers that do not collect data (provider routing
+      "data_collection": "deny"; "Exclude providers that collect data" in the
+      settings). When tested on 14 October 2026 that left no free model with an
+      allowed provider ("No endpoints found matching your data policy"), so it
+      is off by default. OpenRouter's Guardrails can restrict a key to
+      specific models and block endpoints that train on or retain data. No
+      current free text model is on OpenRouter's zero-data-retention list. The
+      data-use warning on a model is a keyword heuristic on its description: no
+      warning does not mean a model is private.
+    data_policy_url: https://openrouter.ai/docs/guides/privacy/provider-logging
+    account_limits: {rpm: 20, rpd: 50, rpd_with_credit: 1000, credit_threshold_usd: 10, verified: official,
+                     source_url: https://openrouter.ai/docs/api_reference/limits, last_verified: 2026-10-14,
+                     note: "1,000 requests/day once $10 of credit has ever been bought; no published TPM."}
+    last_verified: 2026-10-14
+    source_url: https://openrouter.ai/docs/api_reference/limits
+
+  # ── Paid ────────────────────────────────────────────────────────────────────
+
+  - id: openai_paid
+    display_name: "OpenAI API"
+    tier: paid
+    provider: openai
+    api_style: openai_responses
+    base_url: https://api.openai.com/v1
+    key_env: OPENAI_API_KEY
+    model_env: OPENAI_MODEL
+    key_url: https://platform.openai.com/api-keys
+    discovery: static
+    setup_steps:
+      - "Go to [platform.openai.com/api-keys](https://platform.openai.com/api-keys) — an account with credit is needed (no free tier)."
+      - "Click Create new secret key and copy it."
+      - "Paste it below."
+    signup_note: "Paid per token."
+    hosting_note: "OpenAI."
+    data_policy_summary: "API data is governed by OpenAI's business terms; see the link."
+    data_policy_url: https://openai.com/policies/business-terms/
+    plan_limited: true
+    last_verified: 2026-10-14
+    source_url: https://platform.openai.com/docs/guides/rate-limits
+
+  - id: anthropic_paid
+    display_name: "Anthropic API (Claude)"
+    tier: paid
+    provider: anthropic
+    api_style: anthropic
+    base_url: https://api.anthropic.com
+    key_env: ANTHROPIC_API_KEY
+    model_env: ANTHROPIC_MODEL
+    key_url: https://console.anthropic.com/settings/keys
+    discovery: static
+    setup_steps:
+      - "Go to [console.anthropic.com](https://console.anthropic.com/settings/keys) — an account with credit is needed (no free tier)."
+      - "Click Create Key and copy it."
+      - "Paste it below."
+    signup_note: "Paid per token."
+    hosting_note: "Anthropic."
+    data_policy_summary: "API data is governed by Anthropic's commercial terms; see the link."
+    data_policy_url: https://www.anthropic.com/legal/commercial-terms
+    plan_limited: true
+    last_verified: 2026-10-14
+    source_url: https://docs.anthropic.com/en/api/rate-limits
+
+  - id: gemini_paid
+    display_name: "Gemini API · paid tier"
+    tier: paid
+    provider: google
+    tier_env: {GEMINI_TIER: paid}
+    api_style: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    key_env: GEMINI_API_KEY
+    model_env: GEMINI_MODEL
+    key_url: https://aistudio.google.com/app/apikey
+    discovery: static
+    default_model: gemini-3.5-flash-lite
+    setup_steps:
+      - "Go to [aistudio.google.com](https://aistudio.google.com/app/apikey) and sign in."
+      - "Link a Google Cloud billing account to the project, then create an API key."
+      - "Paste it below."
+    signup_note: "A Google Cloud billing account linked to the AI Studio project."
+    hosting_note: "Google."
+    data_policy_summary: "Paid-tier prompts are not used to improve Google's products; they are logged for a limited period for abuse detection."
+    data_policy_url: https://ai.google.dev/gemini-api/terms
+    plan_limited: true
+    last_verified: 2026-10-14
+    source_url: https://ai.google.dev/gemini-api/docs/pricing
+
+  - id: openrouter_paid
+    display_name: "OpenRouter · paid models"
+    tier: paid
+    provider: openrouter
+    tier_env: {OPENROUTER_TIER: paid}
+    api_style: openai_chat
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY
+    model_env: OPENROUTER_MODEL
+    key_url: https://openrouter.ai/settings/keys
+    discovery: openrouter
+    discovery_url: https://openrouter.ai/api/v1/models
+    privacy_settings_url: https://openrouter.ai/settings/privacy
+    setup_steps:
+      - "Create an account at [openrouter.ai](https://openrouter.ai) and add credit."
+      - "Create an API key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)."
+      - "Paste it below."
+    signup_note: "Paid per token from your OpenRouter credit."
+    hosting_note: "A router: each model is served by its own provider, with its own data policy."
+    data_policy_summary: "Each model's provider has its own data policy; OpenRouter's privacy settings choose which you allow."
+    data_policy_url: https://openrouter.ai/docs/guides/privacy/provider-logging
+    plan_limited: true
+    last_verified: 2026-10-14
+    source_url: https://openrouter.ai/docs/api_reference/limits
+
+  - id: deepseek_paid
+    display_name: "DeepSeek API"
+    tier: paid
+    provider: deepseek
+    api_style: openai_chat
+    base_url: https://api.deepseek.com
+    key_env: DEEPSEEK_API_KEY
+    model_env: DEEPSEEK_MODEL
+    key_url: https://platform.deepseek.com/api_keys
+    discovery: static
+    default_model: deepseek-flash
+    balance_url: https://api.deepseek.com/user/balance
+    trial: {grant_tokens: 5000000, validity_days: 30, verified: third_party,
+            source_url: https://pricepertoken.com/endpoints/deepseek/free, last_verified: 2026-10-14,
+            note: "A one-time signup credit for new accounts; not stated on DeepSeek's pricing page — check your console."}
+    setup_steps:
+      - "Create an account at [platform.deepseek.com](https://platform.deepseek.com)."
+      - "Create an API key at [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys); top up when any signup credit runs out."
+      - "Paste it below."
+    signup_note: "Pay-as-you-go; new accounts reportedly get a one-time signup credit first."
+    hosting_note: "DeepSeek stores data in the People's Republic of China. The same model is free on NVIDIA Build."
+    data_policy_summary: >-
+      DeepSeek's privacy policy says personal data is processed and stored in
+      the People's Republic of China and may be used to train and improve its
+      technology. Whether API inputs are used for training is not stated in its
+      platform terms.
+    data_policy_details: >-
+      DeepSeek privacy policy (Feb 2026): "we directly collect, process and
+      store your Personal Data in People's Republic of China"; uses include "to
+      train and improve our technology", with a right to opt out. The Open
+      Platform terms are governed by PRC law and do not say whether API inputs
+      are used for training.
+    data_policy_url: https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html
+    account_limits: {rpm: null, rpd: null, verified: official,
+                     source_url: https://api-docs.deepseek.com/quick_start/rate_limit, last_verified: 2026-10-14,
+                     note: "Limited by concurrency (2,500 requests for deepseek-flash), not per minute or day."}
+    last_verified: 2026-10-14
+    source_url: https://api-docs.deepseek.com/quick_start/pricing
+    models:
+      - id: deepseek-flash
+        label: "DeepSeek V4.1 Flash"
+        context_window: 1048576
+        tools: true
+        price_input_usd_per_mtok: 0.30
+        price_output_usd_per_mtok: 1.20
+        price_note: "Peak price for input (cache miss); off-peak is half."
+
+  - id: openai_compatible
+    display_name: "Other OpenAI-compatible endpoint"
+    tier: paid
+    provider: openai
+    custom_endpoint: true
+    api_style: openai_chat
+    base_url: null
+    key_env: OPENAI_API_KEY
+    model_env: OPENAI_MODEL
+    key_url: null
+    discovery: static
+    setup_steps:
+      - "Get your endpoint's base URL (it ends in /v1), an API key, and the name of a model that supports tool calling."
+      - "Paste them below — the base URL goes in the Base URL field."
+    signup_note: "Any server speaking OpenAI's chat-completions API (Azure, vLLM, …) via a base URL."
+    hosting_note: "Whoever runs the endpoint."
+    data_policy_summary: "Governed by the endpoint's operator."
+    data_policy_url: null
+    plan_limited: true
+    last_verified: 2026-10-14
+    source_url: null
+
+  # ── Local ───────────────────────────────────────────────────────────────────
+
+  - id: ollama_local
+    display_name: "Local model (Ollama)"
+    tier: local
+    provider: ollama
+    api_style: ollama
+    base_url: http://localhost:11434
+    key_env: null
+    model_env: OLLAMA_MODEL
+    key_url: https://ollama.com/download
+    discovery: static
+    signup_note: "No account. Needs a tool-capable model and enough memory."
+    hosting_note: "This machine."
+    data_policy_summary: "No grid data leaves your machine."
+    data_policy_url: null
+    hardware_limited: true
+    last_verified: 2026-10-14
+    source_url: https://ollama.com

@@ -230,7 +230,7 @@ class AnthropicProvider:
         # A tool-less call (the suggestion agent) sends no `tools` key at all.
         if tools:
             payload["tools"] = _anthropic_tools(tools)
-        # Prompt caching. The tool schemas and the system prompt (~20k tokens)
+        # Prompt caching. The tool schemas and the system prompt (~28k tokens)
         # are identical on every call of a turn and across turns until the
         # grid changes, so after the first call they are read from cache at a
         # fraction of the input price instead of being processed again.

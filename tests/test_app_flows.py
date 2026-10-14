@@ -172,10 +172,12 @@ def test_the_panel_suggestions(agent, monkeypatch):
     calls = _script(agent, monkeypatch)
     at = _app(attention=["run_rsa: 1 violation(s)"])
     assert any("advisor (right) can help" in c.value for c in at.caption)
-    assert [s.value for s in at.get("segmented_control") if s.label == "Advisor"] == ["suggest"]
+    advisor = [s for s in at.get("segmented_control") if s.label == "Advisor"][0]
+    assert advisor.value == "discuss" and list(advisor.options) == ["Discuss", "Next steps"]
+    _mode(at, "suggest")
     _button(at, "✨ Suggest next steps").click().run()
     assert calls["suggest"] == 1
-    assert any("Suggestions" in e.label for e in at.expander)
+    assert any("Next steps" in e.label for e in at.expander)
     assert _button(at, "✨ More ideas")
     assert any(m.value == "**One** moment only." for m in at.markdown)        # rendered as Markdown
     assert not at.exception
@@ -210,6 +212,7 @@ def test_while_anything_runs_the_chat_box_waits_and_the_panel_is_locked(agent, m
     _script(agent, monkeypatch, freeze={kind: 1})
     at = _app()
     if kind == "suggest":
+        _mode(at, "suggest")
         _button(at, "✨ Suggest next steps").click().run()
     elif kind == "discuss":
         _mode(at, "discuss")
@@ -498,4 +501,77 @@ def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
         assert "reactive measurements" in at.session_state["_box_value"]
     finally:
         httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+    assert not at.exception
+
+
+def _fill_discovery_caches():
+    """Discovery results the launch screen would fetch, from the saved
+    fixtures, so the test runs offline."""
+    import json
+    from llm_agent.agent.discovery import cache, openrouter
+    fixtures = ROOT / "tests" / "fixtures" / "providers"
+    cache.put("openrouter_free", openrouter.qualifying(json.loads((fixtures / "openrouter_models.json").read_text())))
+    ids = [m["id"] for m in json.loads((fixtures / "nvidia_models.json").read_text())["data"]]
+    cache.put("nvidia", {"ids": ids + ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b",
+                                       "nvidia/nemotron-3.5-lightning-30b-a3b", "z-ai/glm-5.4"]})
+    cache.put("gemini_models", {"models": []})          # no call to Google with the test key
+
+
+def test_the_launch_screen_offers_tiers_with_an_info_card(agent, monkeypatch, backend_url, tmp_path):
+    from streamlit.testing.v1 import AppTest
+    import agent.model_check as model_check
+    monkeypatch.setenv("CONDUCTOR_CACHE_DIR", str(tmp_path))      # no calls-per-question measured yet
+    monkeypatch.delenv("CONDUCTOR_CALLS_PER_QUESTION", raising=False)
+    monkeypatch.setattr(model_check, "check", lambda *a, **k: None)
+    monkeypatch.setenv("LLM_PROVIDER", "google")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    for var in ("GEMINI_TIER", "NVIDIA_API_KEY", "OPENROUTER_API_KEY", "GEMINI_MODEL", "NVIDIA_MODEL",
+                "OPENROUTER_MODEL", "NVIDIA_THINKING", "OPENROUTER_THINKING"):
+        monkeypatch.delenv(var, raising=False)
+    _fill_discovery_caches()
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+    tier = [s for s in at.get("segmented_control") if s.label == "Tier"][0]
+    assert tier.value == "free" and list(tier.options) == ["Free", "Paid", "Local"]
+    option = at.radio(key="launch_option_free")
+    assert option.value == "gemini_free"
+    assert [o for o in option.options] == ["Gemini API · free tier  · recommended", "NVIDIA Build · free endpoints",
+                                           "OpenRouter · free models"]
+    card = " ".join([m.value for m in at.markdown] + [c.value for c in at.caption])
+    assert "About 125 questions a day" in card and "midnight Pacific" in card
+    assert "≈125 / day" in card and "cd-tiles" in card                 # the figures at a glance
+    assert "sample networks" in card and "cd-note" in card                 # the notices, in the card
+    assert at.selectbox(key="launch_model_gemini_free").value == "gemini-3.5-flash-lite"
+
+    option.set_value("nvidia_free").run()
+    models = at.selectbox(key="launch_model_nvidia_free")
+    assert list(models.options)[0].startswith("Nemotron 3 Super") and models.value == "nvidia/nemotron-3-super-120b-a12b"
+    assert "Save & Start" in [b.label for b in at.button]          # no key yet: the key form
+    steps = " ".join(m.value for m in at.markdown if "cd-steps" in m.value)
+    assert "Get started with NVIDIA Build" in steps and "phone" in steps
+    assert "nvidia/nemotron-3-super-120b-a12b" in models.options or any(
+        "Nemotron 3 Super" in o for o in models.options)
+    models.set_value("z-ai/glm-5.4").run()                         # a newer version NVIDIA lists
+    assert any("tool-calling test" in m.value for m in at.markdown)
+    assert "Save key" in [b.label for b in at.button]               # gated until a test passes
+
+    at.radio(key="launch_option_free").set_value("openrouter_free").run()
+    assert at.selectbox(key="launch_model_openrouter_free").value == "thinkingmachines/inkling-small:free"
+    assert not at.exception
+
+
+def test_an_incompatible_option_cannot_start(agent, monkeypatch, backend_url, tmp_path):
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setenv("CONDUCTOR_CACHE_DIR", str(tmp_path))
+    import agent.model_check as model_check
+    from llm_agent.agent.discovery import cache
+    monkeypatch.setattr(model_check, "check", lambda *a, **k: None)
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.delenv("OPENROUTER_TIER", raising=False)
+    cache.put("openrouter_free", {"models": [], "excluded": {}, "n_free": 3})
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+    assert any("No free OpenRouter model qualifies" in w.value for w in at.warning)
+    assert not [b for b in at.button if b.label == "Start CONDUCTOR" and not b.disabled]
     assert not at.exception

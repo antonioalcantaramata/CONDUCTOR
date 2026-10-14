@@ -31,7 +31,7 @@ class TestStamp:
     def test_the_stamp_comes_from_the_results(self):
         stamp = staleness.stamp([("run_rsa", _result(0.9, "session setting", {"Gen_bus1": {"control": "voltage"}}))],
                                 ASSUMPTIONS)
-        assert stamp == {"pf": 0.9, "gm": {"Gen_bus1": {"control": "voltage"}}, "data_key": "d1"}
+        assert stamp == {"pf": 0.9, "gm": {"Gen_bus1": {"control": "voltage"}}, "data_key": "d1", "names": None}
 
     def test_a_study_with_its_own_power_factor_is_not_compared_on_it(self):
         stamp = staleness.stamp([("run_rsa", _result(0.8, "this study"))], ASSUMPTIONS)
@@ -39,7 +39,30 @@ class TestStamp:
 
     def test_a_result_that_used_no_tick_leaves_the_model_unknown(self):
         stamp = staleness.stamp([("get_grid_info", {"name": "x"})], ASSUMPTIONS)
-        assert stamp == {"pf": None, "gm": None, "data_key": "d1"}
+        assert stamp == {"pf": None, "gm": None, "data_key": "d1", "names": None}
+
+
+class TestRenames:
+    """A rename changes no figure: a note, not a reason to rerun."""
+    NAMED = {**ASSUMPTIONS, "names_key": "n1"}
+
+    def test_a_rename_is_a_note_not_a_reason(self):
+        then = staleness.stamp([("run_rsa", _result())], self.NAMED)
+        now = staleness.current({**self.NAMED, "names_key": "n2"})
+        assert staleness.reasons(then, now) == []
+        assert staleness.notes(then, now) == ["elements renamed since — this answer shows the names it ran with"]
+        assert staleness.notes(then, staleness.current(self.NAMED)) == []
+
+    def test_a_renamed_unit_is_not_a_model_change(self):
+        result = {"load_power_factor": {"value": 0.95, "source": "default"},
+                  "generator_model": {"changed_units": {"Plant A": {"dispatchable": False}},
+                                      "changed_units_as_loaded": {"Gen_bus1": {"dispatchable": False}}}}
+        then = staleness.stamp([("run_rsa", result)], self.NAMED)
+        now = staleness.current({**self.NAMED, "generator_model": {"Gen_bus1": {"dispatchable": False}}})
+        assert staleness.reasons(then, now) == []
+
+    def test_unknown_names_are_never_a_note(self):
+        assert staleness.notes({"names": None}, {"names": "n2"}) == []
 
 
 class TestReasons:

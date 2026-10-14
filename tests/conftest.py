@@ -12,6 +12,22 @@ import pandapower.networks as pn  # noqa: E402
 import pytest  # noqa: E402
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_llm_state(tmp_path_factory):
+    """Usage counts, discovery caches and tool-calling test results go to a
+    temporary folder, never to llm_agent/.cache; history compaction is off
+    unless a test turns it on, so results do not depend on this machine's .env."""
+    saved = {k: os.environ.get(k) for k in ("CONDUCTOR_CACHE_DIR", "CONDUCTOR_COMPACT_HISTORY")}
+    os.environ["CONDUCTOR_CACHE_DIR"] = str(tmp_path_factory.mktemp("conductor_cache"))
+    os.environ["CONDUCTOR_COMPACT_HISTORY"] = "off"
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 @pytest.fixture
 def case14_net():
     """A small, real pandapower network — fast to build, no solve required."""

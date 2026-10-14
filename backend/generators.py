@@ -74,6 +74,16 @@ def unit_name(net, table: str, idx) -> str:
     return raw.strip() if isinstance(raw, str) and raw.strip() else f"Gen_bus{int(row['bus'])}"
 
 
+def unit_key(net, table: str, idx) -> str:
+    """The unit's name as loaded — the key of its model, costs and nominal
+    values, which stay its own after the operator renames it (naming.py)."""
+    if "loaded_unit" in net[table].columns:
+        kept = net[table].at[idx, "loaded_unit"]
+        if isinstance(kept, str) and kept:
+            return kept
+    return unit_name(net, table, idx)
+
+
 def _proposed(tbl: pd.DataFrame, idx) -> bool:
     return "proposed" in tbl.columns and tbl.at[idx, "proposed"] is True
 
@@ -165,7 +175,11 @@ def normalise(net, changes: list[dict], model: dict | None = None) -> dict:
         name = str(raw.get("unit") or "").strip()
         unit = loaded.get(name) or next((u for k, u in loaded.items() if k.casefold() == name.casefold()), None)
         if unit is None:
-            raise ModelError(f"Change {n}: there is no unit {name!r}. Units: {sorted(loaded)[:20]}.")
+            hint = ""
+            if any(w in str(name).casefold() for w in ("grid", "slack", "ext")):
+                hint = (" The external grid is not a generator unit: change its voltage set-point in a proposal "
+                        "with edit_proposal op 'set_parameter' (element_type 'ext_grid', field 'vm_pu').")
+            raise ModelError(f"Change {n}: there is no unit {name!r}. Units: {sorted(loaded)[:20]}.{hint}")
         name = unit["unit"]
         if name in out:
             raise ModelError(f"Change {n}: {name} is changed twice; give one change per unit.")

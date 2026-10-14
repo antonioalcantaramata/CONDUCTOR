@@ -22,7 +22,7 @@ import math
 
 import pandas as pd
 
-from generators import unit_name
+from generators import unit_key, unit_name
 
 NOMINAL = "nominal"
 
@@ -113,7 +113,7 @@ def apply(net, snap: dict):
         if etype not in net or not len(net[etype]):
             continue
         for idx in net[etype].index:
-            row = by_name.get(unit_name(net, etype, idx))
+            row = by_name.get(unit_key(net, etype, idx))   # its name as loaded
             if row is None:
                 continue
             net[etype].at[idx, "p_mw"] = float(row["p_mw"])
@@ -161,5 +161,5 @@ def as_measurements(net, snap: dict, key_for_bus) -> pd.DataFrame:
 
 def _unit_buses(net) -> dict:
     """{unit name: bus} over both unit tables."""
-    return {unit_name(net, etype, idx): int(net[etype].at[idx, "bus"])
+    return {unit_key(net, etype, idx): int(net[etype].at[idx, "bus"])
             for etype in _UNITS if etype in net for idx in net[etype].index}

@@ -38,6 +38,16 @@ def bus_display_name(net, bus_idx: int) -> str:
     return f"Bus_{int(bus_idx)}"
 
 
+def measurement_name(net, bus_idx: int) -> str:
+    """The name a bus's measurements are filed under: its name as loaded, even
+    after the operator renamed it (naming.py keeps it in `loaded_name`)."""
+    if "loaded_name" in net.bus.columns:
+        kept = net.bus.at[bus_idx, "loaded_name"]
+        if isinstance(kept, str):
+            return clean_label(kept) or f"Bus_{int(bus_idx)}"
+    return bus_display_name(net, bus_idx)
+
+
 def _branch_display_name(net, table, idx: int, from_col: str, to_col: str,
                          tag: str) -> str:
     """Shared shape: original name if present, then endpoints and index.

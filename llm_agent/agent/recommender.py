@@ -29,6 +29,7 @@ import logging
 import re
 from typing import Any, NamedTuple
 
+from . import usage
 from .provenance import MISATTRIBUTED, UNGROUNDED, check_answer, collect_sources, subject_names
 
 logger = logging.getLogger(__name__)
@@ -720,6 +721,7 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
             tools=[],
             system=build_system_prompt(),
         )
+        usage.count_call(provider)            # the same quota as CONDUCTOR's own calls
     except Exception as exc:  # noqa: BLE001
         logger.warning("Suggestion agent call failed.", exc_info=True)
         return SuggestionResult((), error=f"The suggestion agent could not be reached: {exc}")
@@ -877,7 +879,9 @@ def parse_note(text: str) -> DecisionNote:
 def _call(system: str, request: str, provider):
     from .providers import get_provider, user_message
     provider = provider or get_provider()
-    return provider.chat(messages=[user_message(request)], tools=[], system=system)
+    response = provider.chat(messages=[user_message(request)], tools=[], system=system)
+    usage.count_call(provider)                # the same quota as CONDUCTOR's own calls
+    return response
 
 
 def discuss(question: str, thread: list[dict], messages: list[dict], latest: dict | None,

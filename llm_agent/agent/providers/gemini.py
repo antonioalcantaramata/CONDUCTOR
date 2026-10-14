@@ -12,6 +12,12 @@ noting:
   - tool results are sent back as a *user* turn carrying FunctionResponse
     parts, and consecutive results are batched into a single turn.
 
+On the free tier (`GEMINI_TIER=free`, the default) quotas are per model, so a
+daily-quota 429 switches to the next model of the fallback chain
+(`GEMINI_FALLBACK_MODELS`, default from the catalog: 3.5 Flash-Lite → 3.1
+Flash-Lite) and says so; a per-minute 429 backs off; a per-minute *token* cap
+smaller than one request (free-tier Gemma) stops at once instead of retrying.
+
 One setting is easy to misread. `include_thoughts=False` — set on every call
 since this provider was written — suppresses *returning* the thought trace; it
 does not stop the model thinking. Reasoning has therefore always been on here,
@@ -40,10 +46,15 @@ from ..config import (
     MODEL_REQUEST_TIMEOUT_MS,
     MODEL_RETRY_ATTEMPTS,
 )
+from .. import ratelimit as rl
 from ..errors import classify_error
 from .base import ModelResponse, ToolCall
 
 logger = logging.getLogger(__name__)
+
+# The smallest prompt CONDUCTOR can send (system prompt and tool schemas). A
+# per-minute input-token cap below it can never be met.
+_MIN_PROMPT_TOKENS = 25_000
 
 
 class GeminiProvider:
@@ -53,7 +64,10 @@ class GeminiProvider:
 
     def __init__(self, model: str | None = None,
                  thinking_level: str | None = None) -> None:
-        self.model = model or GEMINI_MODEL
+        # Live environment, not the import-time constant: a model saved in the
+        # settings applies to the next message, not after a restart.
+        self.model = model or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+        self.tier = (os.environ.get("GEMINI_TIER") or "free").strip().lower()
         # Read from the live environment so the settings panel can change it
         # mid-session (see providers.reset_providers). Empty is a real choice —
         # it means "leave the model on its own budget" — so `or` would be wrong.
@@ -119,6 +133,29 @@ class GeminiProvider:
             )
         return self._to_model_response(response)
 
+    def fallback_chain(self) -> list[str]:
+        """Models to try, in order, when the current one's daily free quota is
+        spent: GEMINI_FALLBACK_MODELS, else the catalog's chain. Free tier only."""
+        if self.tier != "free":
+            return []
+        raw = (os.environ.get("GEMINI_FALLBACK_MODELS") or "").strip()
+        if raw:
+            return [m.strip() for m in raw.split(",") if m.strip()]
+        try:
+            from .. import catalog
+            return list(catalog.option("gemini_free").get("fallback_chain") or [])
+        except Exception:  # noqa: BLE001 — a missing catalog must not break Gemini
+            return []
+
+    def _next_in_chain(self, tried: set[str]) -> str | None:
+        chain = self.fallback_chain()
+        if self.model in chain:
+            chain = chain[chain.index(self.model) + 1:]
+        for model in chain:
+            if model not in tried:
+                return model
+        return None
+
     def _config(self, tools: list, system: str, thinking_level: str):
         """One request config, with thinking pinned only when asked for.
 
@@ -153,8 +190,11 @@ class GeminiProvider:
         Raises a user-friendly RuntimeError on daily quota exhaustion.
         """
         retries = MODEL_RETRY_ATTEMPTS if max_retries is None else max_retries
+        tried: set[str] = set()
 
-        for attempt in range(retries + 1):
+        attempt = -1
+        while attempt < retries:
+            attempt += 1
             try:
                 return self._get_client().models.generate_content(
                     model=self.model,
@@ -172,20 +212,46 @@ class GeminiProvider:
                     raise RuntimeError(classification.user_message) from exc
 
             except ClientError as exc:
-                # google-genai raises ClientError for all 4xx. Only 429 is retryable;
-                # 400/401/403/404 are permanent and must surface immediately.
-                if exc.code != 429:
+                # google-genai raises ClientError for all 4xx. 429 is a rate
+                # limit or quota; 404 a retired model; the rest are permanent.
+                if exc.code not in (404, 429):
                     raise
-                classification = classify_error(str(exc), "ResourceExhausted")
-                if not classification.is_retryable:
-                    raise RuntimeError(classification.user_message) from exc
+                failure = rl.classify_gemini(str(exc), exc.code)
+                if failure.kind in (rl.PER_DAY, rl.MODEL_GONE):
+                    replacement = self._next_in_chain(tried)
+                    if replacement:
+                        tried.add(self.model)
+                        old, self.model = self.model, replacement
+                        os.environ["GEMINI_MODEL"] = replacement
+                        reason = ("its daily free quota is used up" if failure.kind == rl.PER_DAY
+                                  else "Google no longer serves it")
+                        logger.warning("Gemini %s: %s; switching to %s.", old, reason, replacement)
+                        if on_event:
+                            on_event("model_switch", {"from": old, "to": replacement,
+                                                      "reason": f"{old}: {reason}"})
+                        attempt -= 1          # a switch is not a retry
+                        continue
+                    if failure.kind == rl.MODEL_GONE:
+                        raise
+                    raise RuntimeError(self._daily_quota_message(failure)) from exc
+                if failure.kind != rl.PER_MINUTE:
+                    raise
+                if failure.metric == "input_tokens" and failure.limit_value \
+                        and failure.limit_value < _MIN_PROMPT_TOKENS:
+                    # One request is bigger than the whole per-minute token
+                    # budget (free-tier Gemma): waiting can never help.
+                    raise RuntimeError(
+                        f"⚠️ **`{self.model}` accepts at most {failure.limit_value:,} input tokens a minute "
+                        f"on this tier** — less than one CONDUCTOR request (system prompt and tool schemas, "
+                        f"~{_MIN_PROMPT_TOKENS:,} tokens). Choose a Flash or Flash-Lite model.") from exc
                 if attempt < retries:
-                    wait = classification.suggested_wait_s or 65
+                    wait = int(rl.backoff(attempt, failure.retry_after_s, base=10))
+                    classification = classify_error(str(exc), "ResourceExhausted")
                     self._announce_retry(classification, attempt, retries, wait,
-                                         "Rate limit hit (429)", on_event)
+                                         "Waiting for the per-minute rate limit", on_event)
                     time.sleep(wait)
                 else:
-                    raise RuntimeError(classification.user_message) from exc
+                    raise RuntimeError(classify_error(str(exc), "ResourceExhausted").user_message) from exc
 
             except httpx.TimeoutException as exc:
                 classification = classify_error(str(exc), "TimeoutException")
@@ -198,6 +264,14 @@ class GeminiProvider:
                     raise RuntimeError(classification.user_message) from exc
 
         raise RuntimeError("Unexpected exit from retry loop")  # pragma: no cover
+
+    def _daily_quota_message(self, failure) -> str:
+        reset = rl.describe_reset(failure.resets_at)
+        chain = self.fallback_chain()
+        tried = f" (the fallback chain {' → '.join(chain)} is spent too)" if len(chain) > 1 else ""
+        return (f"⚠️ **The Gemini free tier's daily quota for `{self.model}` is used up{tried}.**\n\n"
+                f"Free-tier quotas are per model and reset at midnight Pacific time"
+                f"{' — ' + reset if reset else ''}.\n\n{rl.alternatives_text('gemini_free')}")
 
     @staticmethod
     def _announce_retry(classification, attempt, retries, wait, reason, on_event) -> None:

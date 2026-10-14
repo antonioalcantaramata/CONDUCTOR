@@ -260,7 +260,7 @@ class OllamaProvider:
         """
         Prime the prompt cache with the system prompt and tool schemas.
 
-        Processing that ~25k-token prefix is the dominant cost of a cold local
+        Processing that ~28k-token prefix is the dominant cost of a cold local
         model — measured at roughly 3 minutes on a 12B model — but Ollama reuses
         the cached prefix on later calls, dropping it to near zero. Paying it
         once at startup, where it can be explained and shown, is far better than
@@ -327,7 +327,7 @@ class OllamaProvider:
             # disables them too; keep the two backends comparable.
             "think": self.think,
             # Keep the model — and its cached prompt prefix — resident between
-            # calls. Without this the ~25k-token prefix is reprocessed from cold
+            # calls. Without this the ~28k-token prefix is reprocessed from cold
             # on every question (~180s vs ~0.2s cached).
             "keep_alive": self.keep_alive,
             "options": {

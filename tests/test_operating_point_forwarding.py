@@ -33,7 +33,7 @@ DATA_SOURCE = "forecasts"
 # request never leaves the process.
 REQUIRED_ARGS = {
     "compute_flexibility_envelope": {"gen_name": "Alpha"},
-    "compare_networks": {"proposal": "dc_bus9"},
+    "compare_networks": {},
     "compute_hosting_capacity": {"bus": 23},
     "optimize_contingency": {"element_type": "line", "element_index": 0},
     "simulate_contingency": {"element_type": "line", "element_index": 0},

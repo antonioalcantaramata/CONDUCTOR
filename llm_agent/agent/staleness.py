@@ -33,11 +33,14 @@ def stamp(tool_results: list, assumptions: dict | None) -> dict | None:
         block = result.get("load_power_factor")
         if not isinstance(block, dict):
             continue
-        model = (result.get("generator_model") or {}).get("changed_units") or {}
+        block_gm = result.get("generator_model") or {}
+        # Keyed by the units' names as loaded, like the settings: a rename is not a model change.
+        model = block_gm.get("changed_units_as_loaded", block_gm.get("changed_units")) or {}
         gm = model                                     # every tick-assigning result says it
         if block.get("source") != "this study" and block.get("value") is not None:
             pf = float(block["value"])
-    return {"pf": pf, "gm": gm, "data_key": (assumptions or {}).get("data_key")}
+    return {"pf": pf, "gm": gm, "data_key": (assumptions or {}).get("data_key"),
+            "names": (assumptions or {}).get("names_key")}
 
 
 def current(assumptions: dict | None) -> dict | None:
@@ -47,7 +50,8 @@ def current(assumptions: dict | None) -> dict | None:
     value = (assumptions.get("load_power_factor") or {}).get("value")
     return {"pf": None if value is None else float(value),
             "gm": assumptions.get("generator_model") or {},
-            "data_key": assumptions.get("data_key")}
+            "data_key": assumptions.get("data_key"),
+            "names": assumptions.get("names_key")}
 
 
 def reasons(then: dict | None, now: dict | None) -> list[str]:
@@ -65,6 +69,15 @@ def reasons(then: dict | None, now: dict | None) -> list[str]:
     if then.get("data_key") and now.get("data_key") and then["data_key"] != now["data_key"]:
         out.append("other data loaded")
     return out
+
+
+def notes(then: dict | None, now: dict | None) -> list[str]:
+    """What changed since the answer without changing its figures — a
+    rename: the answer is still right, under the names it ran with."""
+    if not then or not now or not then.get("names") or not now.get("names"):
+        return []
+    return ["elements renamed since — this answer shows the names it ran with"] \
+        if then["names"] != now["names"] else []
 
 
 def rerun_prompt(question: str, why: list[str]) -> str:

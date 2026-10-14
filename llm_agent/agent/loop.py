@@ -28,6 +28,7 @@ from .config import (
     SESSION_LOG_PATH,
     last_grid_constants_status,
 )
+from . import usage as _usage
 from .errors import classify_error
 from .reflection import (
     INFORM,
@@ -260,6 +261,9 @@ def run_agent_turn(
     # 2. Append user message to history.
     history = list(history)  # shallow copy to avoid mutating caller's list
     history.append(make_user_message(user_message))
+    turn_start = len(history) - 1
+    model_calls = 0
+    prompt_tokens: list[int] = []
 
     # Per-turn log accumulators.
     turn_tool_calls: list[dict] = []
@@ -305,12 +309,28 @@ def run_agent_turn(
             # 4a. Call the model (the provider handles retry on transient errors).
             if on_event:
                 on_event("llm_call", {"turn": turns_used})
+            waited = []
+
+            def _watch(event: str, data: dict, _waited=waited) -> None:
+                if event == "retry":
+                    _waited.append(True)
+                if on_event:
+                    on_event(event, data)
+
+            started = time.monotonic()
             response = provider.chat(
-                messages=history,
+                messages=_messages_for_model(history, turn_start),
                 tools=TOOLS,
                 system=system_prompt,
-                on_event=on_event,
+                on_event=_watch,
             )
+            model_calls += 1
+            reported = _usage.prompt_tokens_from(response.raw)
+            if reported:
+                prompt_tokens.append(reported)
+            if not waited:      # a latency measured across retries means nothing
+                _usage.record_latency(getattr(provider, "name", "unknown"), getattr(provider, "model", ""),
+                                      time.monotonic() - started)
 
             # 4b. Append model response to history.
             history.append(assistant_message(response))
@@ -402,6 +422,7 @@ def run_agent_turn(
                         if on_event:
                             on_event("tool_start", {"name": tool_name, "args": kwargs})
                         result = tool_fn(**kwargs)
+                        _attach_call_args(tool_name, result, kwargs)
                         if isinstance(result, dict) and "error" in result:
                             # Values that produced no result are not the turn's.
                             turn_operating_point.rollback()
@@ -444,14 +465,32 @@ def run_agent_turn(
                 history.append(tool_message(tool_name, model_result, call_id=call.id))
 
         else:
-            # MAX_AGENT_TURNS exceeded.
-            warning = (
-                f"⚠️ Agent reached the maximum of {MAX_AGENT_TURNS} turns "
-                "without a final answer. The last partial result is shown above."
-            )
-            final_text = (final_text + "\n\n" + warning).strip()
-            turn_status = "max_turns_exceeded"
-            logger.warning("MAX_AGENT_TURNS (%d) exceeded.", MAX_AGENT_TURNS)
+            # MAX_AGENT_TURNS reached: one last call asking for an answer from
+            # the results so far, rather than ending on a bare warning. Tools
+            # stay declared (some providers refuse tool history without them);
+            # any tool call in the reply is ignored.
+            logger.warning("MAX_AGENT_TURNS (%d) reached; asking for an answer from what is known.",
+                           MAX_AGENT_TURNS)
+            summary_text = ""
+            try:
+                response = provider.chat(
+                    messages=_messages_for_model(history, turn_start) + [make_user_message(
+                        f"You have used all {MAX_AGENT_TURNS} steps allowed for this question. Do not call "
+                        "any more tools. Answer now from the tool results above: what was found, and plainly "
+                        "what could not be done and why.")],
+                    tools=TOOLS, system=system_prompt, on_event=on_event)
+                model_calls += 1
+                summary_text = (response.text or "").strip()
+            except Exception:  # noqa: BLE001 — the warning below still reaches the operator
+                logger.warning("The final summary call failed.", exc_info=True)
+            note = (f"⚠️ CONDUCTOR used all {MAX_AGENT_TURNS} steps allowed for one question "
+                    f"(`DT_MAX_AGENT_TURNS`) before finishing")
+            if summary_text:
+                final_text = f"{summary_text}\n\n*{note[2:]}; this answer is built from the results so far.*"
+                turn_status = "max_turns_summarised"
+            else:
+                final_text = (final_text + "\n\n" + note + ". The last partial result is shown above.").strip()
+                turn_status = "max_turns_exceeded"
 
     except RuntimeError as exc:
         # User-friendly error from retry logic
@@ -503,6 +542,13 @@ def run_agent_turn(
             final=final_text,
         )
 
+    # How many calls this question took and what the provider reported, for
+    # the launch screen's estimates (agent/usage.py). Never fatal.
+    try:
+        _usage.record_turn(getattr(provider, "name", "unknown"), getattr(provider, "model", ""), model_calls, prompt_tokens)
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record usage.", exc_info=True)
+
     _append_to_log({
         "turn": len(session_log) + 1,
         # The prompt this record belongs to. A consumer reading `session_log[-1]`
@@ -536,6 +582,8 @@ def run_agent_turn(
         "tool_call_count": len(turn_tool_calls),
         "tool_results": turn_tool_results,
         "tool_error_count": tool_error_count,
+        "model_calls": model_calls,
+        "prompt_tokens": prompt_tokens,
         "assistant": final_text,
         # Absent when reflection is off, so existing logs and the graders that
         # read them are unaffected.
@@ -575,6 +623,10 @@ def _without_long_series(tool_name: str, result: dict) -> dict:
         out["series_summary"] = summary
         out.pop("timestamps", None)
         out["n_points"] = len(stamps)
+    if tool_name == "compare_networks" and isinstance(out.get("comparisons"), list):
+        # Several proposals: each comparison of a scan carries its own series.
+        out["comparisons"] = [{k: v for k, v in c.items() if k != "series"} if isinstance(c, dict) else c
+                              for c in out["comparisons"]]
     if tool_name == "scan_scenarios":
         for scenario in out.get("scenarios") or []:
             if isinstance(scenario, dict):
@@ -589,6 +641,65 @@ def _without_long_series(tool_name: str, result: dict) -> dict:
 
 _SERIES_TOOLS = frozenset({"find_worst_case_timestamp", "get_element_timeseries", "scan_scenarios",
                            "compare_networks"})  # its scan carries per-tick series for the chart
+
+
+def _attach_call_args(tool_name: str, result, kwargs: dict) -> None:
+    """Give the chart copy of this result the arguments it ran with, so the
+    app can say on each chart what differs between runs of the same study in
+    one answer (load scaling, limits, the outage, …). Only the entry kept for
+    the charts changes; the model and the session record see the result as is."""
+    if not isinstance(result, dict):
+        return
+    entries = _tools_module._last_tool_results
+    for i in range(len(entries) - 1, -1, -1):
+        name, recorded = entries[i]
+        if recorded is result:
+            entries[i] = (name, {**result, "_call_args": dict(kwargs)})
+            return
+
+
+_COMPACT_CHARS = 1500
+
+
+def _compaction_on() -> bool:
+    """Whether earlier questions' tool results are shortened in what is sent:
+    CONDUCTOR_COMPACT_HISTORY=on|off|auto (default auto: on for free
+    tiers, whose per-minute token budgets shrink as a conversation grows)."""
+    mode = (os.environ.get("CONDUCTOR_COMPACT_HISTORY") or "auto").strip().lower()
+    if mode in ("on", "1", "true"):
+        return True
+    if mode in ("off", "0", "false"):
+        return False
+    try:
+        from . import catalog
+        return catalog.option(catalog.active_option_id()).is_cloud_free
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def compact_history(history: list[dict], turn_start: int, max_chars: int = _COMPACT_CHARS) -> list[dict]:
+    """A copy of `history` in which tool results from earlier questions (before
+    `turn_start`) longer than `max_chars` are cut to their start, with a note.
+    The current question's results are never touched, and the full results
+    stay in the session record and the charts."""
+    out = []
+    for index, message in enumerate(history):
+        if index < turn_start and message.get("role") == "tool":
+            try:
+                text = json.dumps(message.get("content"), default=str)
+            except (TypeError, ValueError):
+                text = str(message.get("content"))
+            if len(text) > max_chars:
+                message = {**message, "content": {
+                    "earlier_result_shortened": text[:max_chars] + " …",
+                    "note": "Shortened to save tokens (an earlier question). Re-run the tool for its full result.",
+                }}
+        out.append(message)
+    return out
+
+
+def _messages_for_model(history: list[dict], turn_start: int) -> list[dict]:
+    return compact_history(history, turn_start) if _compaction_on() else history
 
 
 def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001

@@ -115,7 +115,7 @@ OPENAI_BASE_URL: str = os.environ.get(
     "OPENAI_BASE_URL", "https://api.openai.com/v1"
 ).rstrip("/")
 
-# Hosted, so far quicker than Ollama, but this agent's turns carry ~25k tokens
+# Hosted, so far quicker than Ollama, but this agent's turns carry ~28k tokens
 # of prompt and can fan out over several tool calls. Matches the Gemini path's
 # DT_MODEL_REQUEST_TIMEOUT_MS rather than Ollama's much longer local budget.
 OPENAI_TIMEOUT_S: float = float(os.environ.get("OPENAI_TIMEOUT_S", "180"))
@@ -165,7 +165,7 @@ ANTHROPIC_BASE_URL: str = os.environ.get(
     "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
 ).rstrip("/")
 
-# Matches the OpenAI budget: hosted, but this agent's turns carry ~25k tokens
+# Matches the OpenAI budget: hosted, but this agent's turns carry ~28k tokens
 # of prompt and schemas, and a thinking model can spend a while on top.
 ANTHROPIC_TIMEOUT_S: float = float(os.environ.get("ANTHROPIC_TIMEOUT_S", "180"))
 
@@ -183,8 +183,8 @@ OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:12b-mlx")
 
 # Ollama defaults num_ctx to ~4096 REGARDLESS of what the model supports, and
 # silently truncates the *front* of an over-long prompt — which drops the system
-# prompt first, with no error. This agent's system prompt plus 20 tool schemas
-# measures ~25k tokens before any conversation, so a generous window is required.
+# prompt first, with no error. This agent's system prompt plus 27 tool schemas
+# measures ~28k tokens before any conversation, so a generous window is required.
 #
 # 32768 rather than 65536: measured on an M3 Pro, quadrupling the window made no
 # difference to prompt-processing speed (139 tok/s either way) while reserving
@@ -193,7 +193,7 @@ OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
 
 # How long Ollama keeps the model — and crucially its prompt cache — resident.
 #
-# This is the single biggest lever on perceived speed. Processing the ~25k-token
+# This is the single biggest lever on perceived speed. Processing the ~28k-token
 # prefix costs ~180s cold, but Ollama reuses the cached prefix on subsequent
 # calls, dropping that to ~0.2s. The default 5m unload throws the cache away
 # between questions and makes every one of them pay the cold cost again.
@@ -223,7 +223,12 @@ OLLAMA_TIMEOUT_S: float = float(os.environ.get("OLLAMA_TIMEOUT_S", "600"))
 # HTTP / agent loop
 # ---------------------------------------------------------------------------
 HTTP_TIMEOUT: float = float(os.environ.get("DT_HTTP_TIMEOUT", "120.0"))
-MAX_AGENT_TURNS: int = int(os.environ.get("DT_MAX_AGENT_TURNS", "8"))
+# A ceiling against runaway loops, not a budget: a question averages ~4 model
+# calls, and a multi-step one (worst moment, then security, then N-1, then a
+# proposal) needs more than the 8 this used to be. At the ceiling the loop asks
+# the model once more to answer from what it has (loop.py), so the operator gets
+# an answer rather than only a warning.
+MAX_AGENT_TURNS: int = int(os.environ.get("DT_MAX_AGENT_TURNS", "16"))
 
 # Timeout for the per-turn grid-constants fetch. Previously 3s — far tighter
 # than everything else here — which meant a briefly busy backend silently
@@ -278,8 +283,9 @@ SESSION_LOG_PATH: str = os.environ.get("CONDUCTOR_SESSION_LOG", "")
 # ---------------------------------------------------------------------------
 DEFAULT_GRID_CONSTANTS: dict = {
     "name": "PGLib IEEE 14-Bus System",
-    "n_lines": 15,
-    "n_trafos": 5,
+    "n_buses": 14,
+    "n_lines": 17,
+    "n_trafos": 3,
     "n_substations": 14,
     "substation_names": [f"Bus_{i}" for i in range(1, 15)],
     "vm_lower": 0.94,
@@ -393,10 +399,15 @@ def network_fingerprint(values: dict) -> str:
     Built from the properties that cannot differ between two networks anyone
     would consider the same: name, size, and bus names. Deliberately excludes
     operating limits, which an operator may legitimately retune on the same
-    grid without it becoming a different one.
+    grid without it becoming a different one. When the backend gives its own
+    identity of the network as loaded (`network_id`), that is used: renaming
+    a bus is not a different network, and must not reset the conversation.
     """
+    if values.get("network_id"):
+        return f"{values.get('name', '')}|{values['network_id']}"
     parts = [
         str(values.get("name", "")),
+        str(values.get("n_buses", "")),
         str(values.get("n_substations", "")),
         str(values.get("n_lines", "")),
         str(values.get("n_trafos", "")),

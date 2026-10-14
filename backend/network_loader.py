@@ -125,6 +125,15 @@ def apply_voltage_setpoints(net: pp.pandapowerNet, profile: dict) -> dict:
     return applied
 
 
+def _move_cost(net, et: str, idx, new_et: str, new_idx) -> None:
+    """Re-point the case's cost row of element (et, idx) to (new_et, new_idx)."""
+    if "poly_cost" not in net or not len(net.poly_cost):
+        return
+    rows = (net.poly_cost["et"] == et) & (net.poly_cost["element"] == idx)
+    net.poly_cost.loc[rows, "et"] = new_et
+    net.poly_cost.loc[rows, "element"] = new_idx
+
+
 def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
     """Convert ``net.gen`` PV-bus generators to ``net.sgen`` for OPF/flexibility
     tool compatibility.  The slack bus generator (already represented by
@@ -186,9 +195,18 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
             net.sgen.at[new, col] = float(value) if value is not None and pd.notna(value) else np.nan
         rows_to_drop.append(idx)
         created_names.append(name)
+        _move_cost(net, "gen", idx, "sgen", new)
 
     net.gen.drop(index=rows_to_drop, inplace=True)
+    # The case's cost rows follow their unit: re-pointed above for converted
+    # units, re-numbered here for the generators kept (costs.py reads them).
+    renumber = {int(old): new for new, old in enumerate(net.gen.index)}
     net.gen.reset_index(drop=True, inplace=True)
+    if "poly_cost" in net and len(net.poly_cost):
+        kept = net.poly_cost["et"] == "gen"
+        net.poly_cost.loc[kept, "element"] = net.poly_cost.loc[kept, "element"].map(
+            lambda e: renumber.get(int(e), -1))
+        net.poly_cost.drop(index=net.poly_cost.index[kept & (net.poly_cost["element"] < 0)], inplace=True)
     # Mark the network so assignment functions know to use the Generic path.
     net["_gen_to_sgen_applied"] = True
     return net, created_names, kept_condenser_names
