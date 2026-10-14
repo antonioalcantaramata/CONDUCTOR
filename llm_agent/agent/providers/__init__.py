@@ -10,6 +10,9 @@ the `LLMProvider` interface in `base.py`. Selection is driven by the
                 dialect (Azure OpenAI, OpenRouter, vLLM, …) via OPENAI_BASE_URL
     anthropic — the Anthropic Messages API (Claude), via the official SDK
     ollama    — a local Ollama server
+    openrouter, nvidia, deepseek
+              — OpenAI-compatible presets (openai_compat.py), each with its own
+                key and model variables; options and limits in the catalog
 
 Providers are imported lazily so that selecting one backend never requires the
 other's dependencies to be installed.
@@ -46,7 +49,7 @@ __all__ = [
     "reset_providers",
 ]
 
-_PROVIDERS = ("google", "openai", "anthropic", "ollama")
+_PROVIDERS = ("google", "openai", "anthropic", "ollama", "openrouter", "nvidia", "deepseek")
 
 _cache: dict[str, LLMProvider] = {}
 
@@ -94,6 +97,10 @@ def get_provider(name: str | None = None) -> LLMProvider:
             from .ollama import OllamaProvider
 
             _cache[key] = OllamaProvider()
+        elif key in ("openrouter", "nvidia", "deepseek"):
+            from .openai_compat import CompatProvider
+
+            _cache[key] = CompatProvider(key)
         else:
             raise RuntimeError(
                 f"Unknown LLM_PROVIDER {key!r}. "

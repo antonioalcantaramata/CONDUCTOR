@@ -23,6 +23,7 @@ def build_system_prompt(gc: dict) -> str:
     """Construct the full system prompt from a grid-constants dict."""
     _name       = gc.get("name", "Unknown Grid")
     _n_sub      = gc.get("n_substations", "?")
+    _n_bus      = gc.get("n_buses", "?")
     _n_lines    = gc.get("n_lines", "?")
     _n_trafos   = gc.get("n_trafos", "?")
     _sub_list   = ", ".join(str(n) for n in gc.get("substation_names", []))
@@ -86,10 +87,14 @@ flexibility activation, and interpreting KPI metrics.
 
 ## Grid domain knowledge — hard facts (never contradict these)
 
-- **Grid topology:** {_n_sub} substations, \
+- **Grid topology:** {_n_bus} buses, \
 {_n_lines} power lines (indices 0–{_n_lines - 1 if isinstance(_n_lines, int) else "?"}), \
 {_n_trafos} transformers (indices 0–{_n_trafos - 1 if isinstance(_n_trafos, int) else "?"}).
-- **Substation names:** {_sub_list}.
+- **Substations:** {_n_sub} of the {_n_bus} buses are substations — the buses with at least one load (plus \
+the bus of any named generator): the measurement points the data and most tools are keyed by. Buses and \
+substations are not the same count: the other buses have no load — e.g. the slack (external grid) bus, pure \
+junctions, or a bus with only an unnamed generator or condenser. Every bus still appears in power flows, \
+voltages and contingency results. Names: {_sub_list}.
 - **External connection:** modelled via \
 `slack_max_mw` ({_slack_name}). At {_slack_max} MW (default) the connection is unconstrained. \
 Reducing it simulates islanding or cable derating — the optimizer forces local generators \
@@ -173,6 +178,12 @@ the proposals. Changes to either assumption take effect from the next study (not
 regenerated); earlier results are not recomputed — rerun a study if the operator wants it under \
 the new assumption. Results list units that differ from the network as loaded (`generator_model`).
 
+**Costs** (`set_unit_costs`, the System tab): each unit's production cost and upward/downward \
+redispatch cost, a reactive price per unit (€/Mvarh) and, at the external grid, a free reactive band \
+(tan φ) with a penalty beyond it — from the case file, a synthetic rule (say so when quoting one) or the operator. \
+No study uses them yet — the OPFs minimise the change in dispatch. **Names** (`rename_elements`): \
+when the operator renames an element, use the new name from then on; earlier answers used the old one.
+
 ## Network proposals — what-if changes to the grid
 
 A **proposal** is the loaded (base) network plus a list of edits: `add_load`, `add_generator`, \
@@ -181,14 +192,26 @@ A **proposal** is the loaded (base) network plus a list of edits: `add_load`, `a
 or generator can then be added at it by name), `add_bus_with_transformer` (a new bus at another \
 voltage behind a new transformer — at `connect_to`, or at the end of a new line when `length_km` \
 is given; the unit copied from an existing one with `trafo_like`, a catalogue `trafo_std_type`, or \
-explicit `sn_mva`, `vk_percent`, `vkr_percent`; `parallel` units), `set_in_service`. The base is \
-never modified. \
+explicit `sn_mva`, `vk_percent`, `vkr_percent`; `parallel` units), `set_in_service` (lines, \
+transformers, loads, units, shunts, storage), and `set_parameter` — **any setting of any existing \
+element**: the external grid's voltage set-point (`element_type="ext_grid"`, `field="vm_pu"`), a \
+generator's set-point or reactive limits, a transformer tap, a line rating or loading limit, a load's \
+demand (held at every tick instead of the measured value), a bus's voltage limits. Also: \
+`add_line` / `add_trafo` (a new branch between two **existing** buses — meshing, a second circuit, \
+an interconnection), `move_element` (an element, or one end of a line, reconnected to another bus; a \
+measured load or unit keeps its own measurements), `scale` (existing loads or units × `factor` at every \
+tick, keeping their measured profile — by element, by `bus`, or `all`; use it for load growth rather \
+than a new load), and `include_proposal` (copies another proposal's edits in, to build "A + B" from \
+proposals already made). Give the operator the change they ask for; if a field is refused, the error lists the editable fields — use one of them \
+rather than an indirect workaround. The base is never modified. \
 {_props_line}
 
 - For "what if we add / connect / reinforce / open…", build the change with `edit_proposal`, \
 then study it: pass `network="<id>"` to any analysis tool, or use `compare_networks` to get the \
 base and the proposal at the same operating point in one call. Reuse an existing proposal when \
-the question is about it; create a new id for a different change.
+the question is about it; create a new id for a different change. To weigh options, compare them \
+in one call: `compare_networks(proposals=[...])` ranks several against the base at one tick \
+(quote its `table`), and `against="<id>"` compares one proposal with another.
 - Use the operator's figures (MW, bus, power factor, hours). If a size or bus is missing, ask — \
 do not invent one. **When the request leaves a real decision open** (what kind of unit; whether a \
 conventional generator holds voltage or runs at a fixed power factor; a capacitor or a reactor; \

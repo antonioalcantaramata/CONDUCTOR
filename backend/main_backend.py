@@ -67,6 +67,7 @@ from element_names import (
     bus_display_name as _bus_display_name,
     line_display_name as _line_display_name,
     trafo_display_name as _trafo_display_name,
+    measurement_name,
 )
 import ca_engine as ca
 
@@ -74,7 +75,9 @@ import flex_engine as fe
 import network_loader as nl
 import data_quality as dq
 import scenarios as scn
+import costs as uc
 import generators as gm
+import naming
 import nominal as nom
 import sandbox as sb
 
@@ -796,6 +799,7 @@ def _save_proposals() -> None:
     else:
         store.pop(fp, None)
     _write_store(_PROPOSALS_FILE, store)
+    _note_where_changes_are_kept()
 
 
 def _remember_loaded(net) -> None:
@@ -804,18 +808,23 @@ def _remember_loaded(net) -> None:
     app_data["net_loaded"] = copy.deepcopy(net)
     app_data["loaded_fingerprint"] = sb.network_fingerprint(net)
     app_data["generator_model"] = {}
+    app_data["unit_costs"] = {}
+    app_data["element_names"] = {}
 
 
-def _apply_generator_model(model: dict) -> list[str]:
-    """Make the base the network as loaded with `model` applied; refresh what
-    is derived from it; re-check the proposals. Returns the proposals that no
+def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
+    """Make the base the network as loaded with `model` applied, then the
+    operator's names (`names`, default the current ones); refresh what is
+    derived from it; re-check the proposals. Returns the proposals that no
     longer apply (dropped, with the reason). Raises gm.ModelError."""
     loaded = app_data.get("net_loaded")
     if loaded is None:
         raise gm.ModelError("No network is loaded.")
-    new = gm.apply(loaded, model)
+    names = (app_data.get("element_names") or {}) if names is None else names
+    new = naming.apply(gm.apply(loaded, model), names)
     app_data["net"] = new
     app_data["generator_model"] = model
+    app_data["element_names"] = names
     PG_MAX_DATA.clear()
     PG_MAX_DATA.update(get_pg_max_data(new))
     # The admittances do not depend on which units control voltage; rebuilt
@@ -851,15 +860,19 @@ def _save_assumptions() -> None:
     default is not stored (no file means the default)."""
     value = app_data.get("load_power_factor")
     model = app_data.get("generator_model") or {}
+    unit_costs = app_data.get("unit_costs") or {}
+    names = app_data.get("element_names") or {}
     # Keyed to the network as loaded: the generator model changes the base's own
     # fingerprint, the network it applies to does not change.
     store = _read_store(_ASSUMPTIONS_FILE)
     fp = app_data.get("loaded_fingerprint")
-    if value is None and not model:
+    if value is None and not model and not unit_costs and not names:
         store.pop(fp, None)
     else:
-        store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model}
+        store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model,
+                     "unit_costs": unit_costs, "element_names": names}
     _write_store(_ASSUMPTIONS_FILE, store)
+    _note_where_changes_are_kept()
 
 
 def _forget_saved_assumptions() -> None:
@@ -891,6 +904,24 @@ def _restore_assumptions() -> None:
             print(f"[assumptions] Generator model restored for {len(model)} unit(s).")
         except gm.ModelError as exc:
             print(f"[assumptions] Generator model no longer applies ({exc}) — not restored.")
+    saved_names = saved.get("element_names") or {}
+    if saved_names:
+        try:
+            changes = [{"element_type": t, "element": int(k), "name": v}
+                       for t, entries in saved_names.items() for k, v in entries.items()]
+            names = naming.normalise(_net_for(None), changes, {})
+            _apply_generator_model(app_data.get("generator_model") or {}, names)
+            print(f"[assumptions] Names restored for {len(changes)} element(s).")
+        except (naming.RenameError, gm.ModelError) as exc:
+            print(f"[assumptions] Saved names no longer apply ({exc}) — not restored.")
+    saved_costs = saved.get("unit_costs") or {}
+    if saved_costs:
+        try:
+            changes = [{"unit": name, **diff} for name, diff in saved_costs.items()]
+            app_data["unit_costs"] = uc.merge({}, uc.normalise(app_data["net_loaded"], changes))
+            print(f"[assumptions] Costs restored for {len(saved_costs)} unit(s).")
+        except uc.CostError as exc:
+            print(f"[assumptions] Saved costs no longer apply ({exc}) — not restored.")
 
 
 def _forget_saved_proposals() -> None:
@@ -1079,6 +1110,9 @@ def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | N
     what it injects at this tick, empty on the base.
     """
     subs = substations if subs is None else subs
+    # Moved loads and units back on their measured bus, scaled ones unscaled:
+    # the assignment below then gives them their own values.
+    sb.before_tick(net)
     if ts == nom.NOMINAL:
         # The case's own values, per element and exactly — not spread per
         # substation at a 0.95 power factor as a tick is.
@@ -1096,6 +1130,9 @@ def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | N
         if share:
             seen = getattr(_study, "q_share", None) or (share, share)
             _study.q_share = (min(seen[0], share), max(seen[1], share))
+    # What a proposal changed on existing loads and units (set_parameter,
+    # scale, move_element) wins over the measurements, at every tick.
+    sb.apply_overrides(net)
     # Units the operator set to a fixed power factor: Q for this tick's P.
     gm.set_reactive(net)
     if not (lg._proposed_mask(net.load).any() or lg._proposed_mask(net.sgen).any()
@@ -1175,7 +1212,7 @@ def _nominal_measurements() -> pd.DataFrame:
     names = list(substations)
 
     def key(bus: int) -> str:
-        return sb.measurement_key_for_bus(net, bus, names) or _bus_display_name(net, bus)
+        return sb.measurement_key_for_bus(net, bus, names) or measurement_name(net, bus)
 
     return nom.as_measurements(net, snap, key)
 
@@ -1964,7 +2001,7 @@ def _voltage_substations() -> set:
     out = set()
     for idx in net.gen.index[~lg._proposed_mask(net.gen)] if len(net.gen) else []:
         bus = int(net.gen.at[idx, "bus"])
-        out.add(sb.measurement_key_for_bus(net, bus, names) or _bus_display_name(net, bus))
+        out.add(sb.measurement_key_for_bus(net, bus, names) or measurement_name(net, bus))
     return out
 
 
@@ -2373,6 +2410,8 @@ def _prepare_runtime_reload() -> None:
     app_data["nominal"] = None
     app_data["load_power_factor"] = None
     app_data["generator_model"] = {}
+    app_data["unit_costs"] = {}
+    app_data["element_names"] = {}
     app_data["_parse_notes"] = {}
     app_data["_quality_cache"] = {}
     _discard_proposals()
@@ -2620,13 +2659,50 @@ def _saved_scenario() -> str | None:
     return name if name in scn.SCENARIOS else None
 
 
-def _save_scenario(name: str) -> None:
+def _save_scenario(name: str, record: dict | None = None) -> None:
+    """The scenario chosen, and (`record`) where each scenario's network keeps
+    its saved changes — kept from earlier writes."""
+    data = _read_json(_SCENARIO_FILE) if os.path.isfile(_SCENARIO_FILE) else None
+    data = data if isinstance(data, dict) else {}
+    networks = dict(data.get("networks") or {})
+    networks.update(record or {})
     try:
         os.makedirs(os.path.dirname(_SCENARIO_FILE), exist_ok=True)
         with open(_SCENARIO_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"scenario": name}, fh)
+            json.dump({"scenario": name, "networks": networks}, fh)
     except OSError as exc:
         print(f"[scenario] Could not save the choice: {exc}")
+
+
+def _note_where_changes_are_kept() -> None:
+    """Remember, for the scenario loaded now, the keys its saved assumptions
+    and proposals are filed under — so the launcher can say what is kept for a
+    scenario that is not loaded, and Start fresh can clear it."""
+    name, base = app_data.get("scenario"), app_data.get("net")
+    if not name or base is None or not app_data.get("loaded_fingerprint"):
+        return
+    keys = {"fingerprint": app_data["loaded_fingerprint"], "proposals_fingerprint": sb.network_fingerprint(base)}
+    # Demos on one network share what is kept: say so for each of them.
+    profile = scn.SCENARIOS.get(name, {}).get("profile")
+    same = [k for k, spec in scn.SCENARIOS.items() if profile and spec.get("profile") == profile] or [name]
+    _save_scenario(_saved_scenario() or name, {k: keys for k in same})
+
+
+def _kept_changes(keys: dict | None) -> dict:
+    """What is saved for a network: renames, cost changes, units modelled
+    differently, a load power factor, proposals (only the non-zero ones)."""
+    if not keys:
+        return {}
+    saved = _read_store(_ASSUMPTIONS_FILE).get(keys.get("fingerprint")) or {}
+    proposals = (_read_store(_PROPOSALS_FILE).get(keys.get("proposals_fingerprint")) or {}).get("proposals") or {}
+    counts = {
+        "renames": sum(len(v or {}) for v in (saved.get("element_names") or {}).values()),
+        "costs": len(saved.get("unit_costs") or {}),
+        "generators": len(saved.get("generator_model") or {}),
+        "load_power_factor": int(saved.get("load_power_factor") is not None),
+        "proposals": len(proposals),
+    }
+    return {k: v for k, v in counts.items() if v}
 
 
 def _has_uploads() -> bool:
@@ -2666,8 +2742,12 @@ def _scenario_payload() -> dict:
     resume = scn.resume_detail(_read_json(_LAST_UPLOAD_SENTINEL), _read_json(_LAST_TIMESERIES_SENTINEL))
     current = app_data.get("scenario") or ("resume" if _has_uploads() else "ieee14")
     options = []
+    networks = ((_read_json(_SCENARIO_FILE) if os.path.isfile(_SCENARIO_FILE) else None) or {}).get("networks") or {}
     for key, spec in scn.SCENARIOS.items():
         option = {"name": key, "label": spec["label"], "description": spec["description"], "available": True}
+        kept = _kept_changes(networks.get(key))
+        if kept:
+            option["kept"] = kept
         if key == "resume":
             option["available"] = resume["available"]
             parts = [p for p in (resume["network"] and f"network {resume['network']}",
@@ -2792,7 +2872,10 @@ def _echo_power_factor(result):
     if model and "generator_model" not in result:
         # Units modelled differently from the network as loaded: said in every
         # result, so a figure under a changed model is never read as the default.
-        result["generator_model"] = {"changed_units": model,
+        result["generator_model"] = {"changed_units": _by_name_now(model),
+                                     # Keyed as the settings are (names as loaded): a later
+                                     # rename must not read as a change of model.
+                                     "changed_units_as_loaded": model,
                                      "note": "These units are modelled differently from the network "
                                              "as loaded (System tab / set_generator_model)."}
     return result
@@ -3004,10 +3087,19 @@ async def get_grid_constants_endpoint():
     return {
         "name": profile.get("name", "Unknown Grid"),
         "scenario": scn.SCENARIOS.get(app_data.get("scenario") or "", {}).get("label"),
+        # Buses are every node; substations are the buses with at least one
+        # load, plus the bus of any named generator (get_substation_names) —
+        # what the data and most tools are keyed by. Both are reported: with
+        # only the second, "how many buses?" was answered with 11, not 14.
+        "n_buses": len(net.bus),
         "n_substations": len(subs),
         "n_lines": len(net.line),
         "n_trafos": len(net.trafo),
         "substation_names": subs,
+        # The network as loaded: the same after the operator renames elements
+        # (the agent keys its conversation on it, and must not reset on a rename).
+        "network_id": app_data.get("loaded_fingerprint"),
+        "names_key": _names_key(),
         "measurements": measurements_info,
         "forecasts": forecast_info,
         "vm_lower": profile.get("vm_lower", 0.9),
@@ -3092,7 +3184,7 @@ async def follow_measured_reactive(request: FollowMeasuredRequest):
         changes, skipped = [], []
         for idx in base.gen.index[~lg._proposed_mask(base.gen)] if len(base.gen) else []:
             bus = int(base.gen.at[idx, "bus"])
-            sub = sb.measurement_key_for_bus(base, bus, names) or _bus_display_name(base, bus)
+            sub = sb.measurement_key_for_bus(base, bus, names) or measurement_name(base, bus)
             if sub not in wanted:
                 continue
             name = gm.unit_name(base, "gen", idx)
@@ -3100,7 +3192,9 @@ async def follow_measured_reactive(request: FollowMeasuredRequest):
                 skipped.append(f"{name} (a condenser: it stays on voltage control)")
                 continue
             q = median.get(sub)
-            changes.append({"unit": name, "control": "fixed_q", "q_mvar": float(q) if pd.notna(q) else 0.0})
+            # The model is keyed by the unit's name as loaded (a renamed unit keeps its model).
+            changes.append({"unit": gm.unit_key(base, "gen", idx), "control": "fixed_q",
+                            "q_mvar": float(q) if pd.notna(q) else 0.0})
         if not changes:
             raise HTTPException(status_code=400, detail="No voltage-controlled generator at those substations"
                                 + (f" ({'; '.join(skipped)})" if skipped else "") + ".")
@@ -3112,7 +3206,9 @@ async def follow_measured_reactive(request: FollowMeasuredRequest):
             raise HTTPException(status_code=400, detail=str(exc))
         _save_assumptions()
         out = _generators_payload()
-    out.update({"switched": [c["unit"] for c in changes], "skipped": skipped, "proposals_dropped": dropped})
+    shown = naming.unit_renames(_net_for(None))
+    out.update({"switched": [shown.get(c["unit"], c["unit"]) for c in changes], "skipped": skipped,
+                "proposals_dropped": dropped})
     return out
 
 
@@ -3192,6 +3288,34 @@ async def set_scenario(request: ScenarioRequest):
         _restore_assumptions()
         _restore_proposals()
         _save_scenario(app_data["scenario"])
+        _note_where_changes_are_kept()
+        return _scenario_payload()
+
+
+class ForgetRequest(BaseModel):
+    """Clear what is saved for a scenario's network: renames, costs, unit
+    models, the load power factor and its proposals."""
+    name: str
+
+
+@app.post("/api/scenario/forget")
+async def forget_scenario_changes(request: ForgetRequest):
+    """Start fresh on a scenario's network. When it is the one loaded, the
+    session goes back to the network as loaded too."""
+    networks = ((_read_json(_SCENARIO_FILE) if os.path.isfile(_SCENARIO_FILE) else None) or {}).get("networks") or {}
+    keys = networks.get((request.name or "").strip())
+    if not keys:
+        raise HTTPException(status_code=400, detail=f"Nothing is saved for {request.name!r}.")
+    with _STATE_LOCK:
+        if keys.get("fingerprint") == app_data.get("loaded_fingerprint"):
+            app_data["load_power_factor"] = None
+            app_data["unit_costs"] = {}
+            _apply_generator_model({}, {})
+            _discard_proposals()
+        for path, key in ((_ASSUMPTIONS_FILE, "fingerprint"), (_PROPOSALS_FILE, "proposals_fingerprint")):
+            store = _read_store(path)
+            if store.pop(keys.get(key), None) is not None:
+                _write_store(path, store)
         return _scenario_payload()
 
 
@@ -3211,7 +3335,8 @@ class AssumptionsRequest(BaseModel):
 def _assumptions_key() -> str:
     """Changes whenever an assumption does: the UI keys its caches on it, so a
     map drawn before a change is never shown after it."""
-    payload = {"pf": app_data.get("load_power_factor"), "gm": app_data.get("generator_model") or {}}
+    payload = {"pf": app_data.get("load_power_factor"), "gm": app_data.get("generator_model") or {},
+               "costs": app_data.get("unit_costs") or {}, "names": app_data.get("element_names") or {}}
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
@@ -3241,11 +3366,32 @@ def _data_key() -> str:
     return cached[1]
 
 
+def _renamed_measurement_rows() -> dict:
+    """{measurement row name: the bus's name now}, for every renamed bus."""
+    if app_data.get("net") is None:
+        return {}
+    base = _net_for(None)
+    if "loaded_name" not in base.bus.columns:
+        return {}
+    return {measurement_name(base, b): _bus_display_name(base, b) for b in base.bus.index
+            if isinstance(base.bus.at[b, "loaded_name"], str)}
+
+
+def _names_key() -> str:
+    """Changes whenever the operator renames an element: an answer stamped
+    with an older key shows the names it ran with."""
+    return hashlib.sha1(json.dumps(app_data.get("element_names") or {}, sort_keys=True)
+                        .encode()).hexdigest()[:8]
+
+
 def _assumptions_payload() -> dict:
     value, source = _load_pf_setting()
-    return {"key": _assumptions_key(), "data_key": _data_key(),
+    return {"key": _assumptions_key(), "data_key": _data_key(), "names_key": _names_key(),
             "scenario": app_data.get("scenario"),
             "generator_model": app_data.get("generator_model") or {},
+            "unit_costs": app_data.get("unit_costs") or {},
+            "element_names": (naming.describe(_net_for(None), app_data.get("element_names") or {})
+                              if app_data.get("net") is not None else []),
             "reactive_measured": {"measurements": dq.has_reactive(app_data.get("measurements") or {}),
                                   "forecasts": dq.has_reactive(app_data.get("forecasts") or {})},
             "load_power_factor": {
@@ -3283,13 +3429,32 @@ class GeneratorModelRequest(BaseModel):
     reset: bool = False
 
 
+def _by_name_now(keyed: dict) -> dict:
+    """A {unit name as loaded: …} table under the units' names now."""
+    now = naming.unit_renames(_net_for(None)) if app_data.get("net") is not None else {}
+    return {now.get(k, k): v for k, v in keyed.items()}
+
+
+def _by_name_loaded(changes: list) -> list:
+    """Unit changes named as the operator sees the units now, keyed back to
+    their names as loaded (what the model and costs are kept under)."""
+    now = naming.unit_renames(_net_for(None)) if app_data.get("net") is not None else {}
+    back = {v.casefold(): k for k, v in now.items()}
+    out = []
+    for c in changes or []:
+        if isinstance(c, dict) and isinstance(c.get("unit"), str) and c["unit"].strip().casefold() in back:
+            c = {**c, "unit": back[c["unit"].strip().casefold()]}
+        out.append(c)
+    return out
+
+
 def _generators_payload() -> dict:
     base = _net_for(None)
     ok, why = gm.editable(app_data.get("net_loaded") if app_data.get("net_loaded") is not None else base)
     return {
         "editable": ok, "reason": why,
         "units": [{**u, "bus_name": _bus_display_name(base, u["bus"])} for u in gm.describe(base)],
-        "changed": app_data.get("generator_model") or {},
+        "changed": _by_name_now(app_data.get("generator_model") or {}),
         "meaning": {
             "voltage": "holds its voltage set-point; its reactive power is what that takes (within "
                        "q_min/q_max in the OPF; power flows do not enforce the limits)",
@@ -3321,13 +3486,125 @@ async def set_generators(request: GeneratorModelRequest):
                 if not request.changes:
                     raise gm.ModelError("Give at least one unit change, or reset=true.")
                 current = app_data.get("generator_model") or {}
-                model = gm.merge(current, gm.normalise(loaded, request.changes, current))
+                model = gm.merge(current, gm.normalise(loaded, _by_name_loaded(request.changes), current))
             dropped = _apply_generator_model(model)
         except gm.ModelError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         _save_assumptions()
         out = _generators_payload()
     out["proposals_dropped"] = dropped
+    return out
+
+
+class CostsRequest(BaseModel):
+    """Change what units cost (costs.py). `changes`: one object per unit —
+    unit, and any of cost_eur_per_h, cost_eur_per_mwh, cost_eur_per_mw2h,
+    up_eur_per_mwh, down_eur_per_mwh, q_eur_per_mvarh (units), q_band_tan_phi,
+    q_penalty_eur_per_mvarh (the external grid) — null = back to the default.
+    `reset` takes every unit back to its default."""
+    changes: list[dict] = []
+    reset: bool = False
+
+
+def _costs_payload() -> dict:
+    loaded = app_data.get("net_loaded")
+    if loaded is None:
+        raise HTTPException(status_code=503, detail="No network loaded yet.")
+    rows = uc.table(loaded, app_data.get("unit_costs") or {})
+    base = _net_for(None)
+    now = naming.unit_renames(base)
+    for r in rows:
+        r["unit"] = now.get(r["unit"], r["unit"])
+        r["bus_name"] = _bus_display_name(base, r["bus"])
+        for k in ("table", "index", "proposed"):
+            r.pop(k, None)
+    return {
+        "units": rows, "changed": _by_name_now(app_data.get("unit_costs") or {}), "currency": "EUR",
+        "synthetic_rule": uc.RULE,
+        "used_by": "Kept for the flexibility OPF's economic objective; today's OPFs minimise the change in "
+                   "dispatch itself, so these costs do not change any result yet.",
+        "meaning": {
+            "cost_eur_per_h / cost_eur_per_mwh / cost_eur_per_mw2h": "production cost c0 + c1·P + c2·P² "
+                                                                    "(for the external grid, c1 is the import price)",
+            "up_eur_per_mwh": "what each MWh of upward redispatch costs the operator",
+            "down_eur_per_mwh": "what each MWh of downward redispatch (curtailment, for renewables) costs",
+            "q_eur_per_mvarh": "a unit's price per Mvarh of reactive power it is asked to change, injecting or "
+                               "absorbing",
+            "q_band_tan_phi / q_penalty_eur_per_mvarh": "external grid: reactive exchange within |Q| ≤ tan φ·|P| "
+                                                        "is free; each Mvarh beyond costs the penalty",
+            "source": "per figure: 'case' (the network file's gencost), 'synthetic' (the rule) or 'operator'",
+        },
+    }
+
+
+@app.get("/api/costs")
+async def get_costs():
+    """Every unit's production and redispatch costs, and where each comes from."""
+    return _costs_payload()
+
+
+@app.post("/api/costs")
+async def set_costs(request: CostsRequest):
+    """Change units' costs (or reset them all). Kept for this network across a restart."""
+    with _STATE_LOCK:
+        loaded = app_data.get("net_loaded")
+        if loaded is None:
+            raise HTTPException(status_code=503, detail="No network loaded yet.")
+        try:
+            if request.reset:
+                model = {}
+            else:
+                current = app_data.get("unit_costs") or {}
+                model = uc.merge(current, uc.normalise(loaded, _by_name_loaded(request.changes), current))
+        except uc.CostError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        app_data["unit_costs"] = model
+        _save_assumptions()
+        return _costs_payload()
+
+
+class NamesRequest(BaseModel):
+    """Rename elements (naming.py). `changes`: one object per element —
+    element_type (bus, line, trafo, load, gen, sgen), element (any label
+    results show, or its index) and name (empty: back to the name as loaded).
+    `reset` restores every name as loaded."""
+    changes: list[dict] = []
+    reset: bool = False
+
+
+def _names_payload() -> dict:
+    base = _net_for(None)
+    return {"elements": naming.elements(base),
+            "renamed": naming.describe(base, app_data.get("element_names") or {}),
+            "meaning": "A rename changes how every result names the element from the next study on. "
+                       "Measurements stay matched to the name as loaded; a bus's lines and transformers are "
+                       "relabelled with it. Kept for this network across restarts."}
+
+
+@app.get("/api/names")
+async def get_names():
+    """Every nameable element: its name now and whether it was renamed."""
+    return _names_payload()
+
+
+@app.post("/api/names")
+async def set_names(request: NamesRequest):
+    """Rename elements (or restore every name as loaded)."""
+    with _STATE_LOCK:
+        if app_data.get("net_loaded") is None:
+            raise HTTPException(status_code=503, detail="No network loaded yet.")
+        before = {(r["element_type"], r["index"]): r["name"]
+                  for r in naming.describe(_net_for(None), app_data.get("element_names") or {})}
+        try:
+            names = {} if request.reset else naming.normalise(
+                _net_for(None), request.changes, app_data.get("element_names") or {})
+            dropped = _apply_generator_model(app_data.get("generator_model") or {}, names)
+        except (naming.RenameError, gm.ModelError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        _save_assumptions()
+        out = _names_payload()
+    out["proposals_dropped"] = dropped
+    out["previous"] = [{"element_type": t, "index": i, "name": n} for (t, i), n in before.items()]
     return out
 
 
@@ -3386,6 +3663,8 @@ async def data_series(request: DataSeriesRequest):
         "n_total": len(timestamps),
         "stride": stride,
         "available_substations": sorted(available),
+        # {name the data are filed under: the bus's name now} for renamed buses.
+        "renamed": _renamed_measurement_rows(),
         "totals": {"consumption": totals_c, "production": totals_p,
                    **({"consumption_q": totals_qc} if totals_qc else {}),
                    **({"production_q": totals_qp} if totals_qp else {})},
@@ -9450,9 +9729,18 @@ class CompareNetworksRequest(GridRequest):
     step_size : int | None
         scan: every Nth tick. By default every tick, thinned only when the
         window holds more than `_SCAN_MAX_TICKS`, and the result says so.
+    against : str | None
+        Compare with this proposal instead of the base ("is B better than A?").
+        In the result, "base" is then that proposal; `compared_with` says so.
+    proposals : list[str] | None
+        Several proposals, each compared with the base (or `against`) in the
+        same study at the same operating point, plus a ranking table. Takes
+        the place of `proposal`.
     """
-    proposal: str
+    proposal: str = ""
     study: str = "rsa"
+    against: str | None = None
+    proposals: list[str] | None = None
     start_timestamp: str | None = None
     end_timestamp: str | None = None
     step_size: int | None = None
@@ -9508,10 +9796,11 @@ async def edit_proposal(request: ProposalEditRequest):
         raise HTTPException(status_code=503, detail="No network loaded yet.")
     existing = _proposals().get(name)
     previous = [] if (existing is None or request.replace) else list(existing["edits"])
-    if not request.edits and not previous:
+    incoming = _include_proposals(name, list(request.edits))
+    if not incoming and not previous:
         raise HTTPException(status_code=400, detail="A proposal needs at least one edit.")
     try:
-        net, canonical = sb.materialise(base, sb.upgrade_stored(previous) + list(request.edits))
+        net, canonical = sb.materialise(base, sb.upgrade_stored(previous) + incoming)
     except sb.EditQuestion as exc:
         # Not an error to report: a decision to put to the operator.
         raise HTTPException(status_code=400, detail={
@@ -9522,7 +9811,7 @@ async def edit_proposal(request: ProposalEditRequest):
     except sb.EditError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     checked = _check_profiles_now(net, name)
-    assumed = _assumed_defaults(net, request.edits, canonical[len(previous):])
+    assumed = _assumed_defaults(net, incoming, canonical[len(previous):])
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     _proposals()[name] = {
@@ -9535,6 +9824,25 @@ async def edit_proposal(request: ProposalEditRequest):
     return {**_proposal_view(name), "status": "created" if existing is None else "updated",
             "profiles_checked": checked,
             **({"assumed": assumed} if assumed else {})}
+
+
+def _include_proposals(name: str, edits: list) -> list:
+    """Expand each `include_proposal` edit into that proposal's stored edits,
+    in place — "A + B" is a proposal of A's edits followed by B's. The copies
+    are independent: a later change to A does not change this proposal."""
+    out = []
+    for raw in edits:
+        if not (isinstance(raw, dict) and raw.get("op") == "include_proposal"):
+            out.append(raw)
+            continue
+        other = str(raw.get("proposal") or "").strip()
+        if other == name:
+            raise HTTPException(status_code=400, detail="include_proposal: a proposal cannot include itself.")
+        if other not in _proposals():
+            raise HTTPException(status_code=400, detail=(
+                f"include_proposal: no proposal {other!r}. Proposals: {sorted(_proposals()) or 'none'}."))
+        out.extend(sb.upgrade_stored(copy.deepcopy(_proposals()[other]["edits"])))
+    return out
 
 
 def _assumed_defaults(net, raw_edits: list, canonical: list) -> list[dict]:
@@ -9621,11 +9929,18 @@ async def compare_networks(request: CompareNetworksRequest):
     study = (request.study or "rsa").strip().lower()
     if study not in ("rsa", "n1", "opf", "scan"):
         raise HTTPException(status_code=400, detail="study must be 'rsa', 'n1', 'opf' or 'scan'.")
+    ref = _reference(request)
+    if ref != BASE_NETWORK and ref not in _proposals():
+        raise HTTPException(status_code=400, detail=f"against: no proposal {ref!r}. Existing: {sorted(_proposals())}.")
+    if request.proposals:
+        return await _compare_several(request, study)
     name = (request.proposal or "").strip()
     if name in ("", BASE_NETWORK):
         raise HTTPException(status_code=400, detail="Name a proposal to compare with the base.")
     if name not in _proposals():
         raise HTTPException(status_code=400, detail=f"No proposal {name!r}. Existing: {sorted(_proposals())}.")
+    if name == ref:
+        raise HTTPException(status_code=400, detail=f"{name!r} cannot be compared with itself.")
     if study == "scan":
         return _compare_over_time(request, name)
     if study == "opf":
@@ -9634,9 +9949,9 @@ async def compare_networks(request: CompareNetworksRequest):
     runner = run_security_assessment if study == "rsa" else simulate_all_contingencies
 
     results = {}
-    for label, network in (("base", BASE_NETWORK), ("proposal", name)):
-        req = GridRequest(**request.model_dump(exclude={"proposal", "study", "network",
-                                                        "timestamp", "data_source"}),
+    for label, network in (("base", _reference(request)), ("proposal", name)):
+        req = GridRequest(**request.model_dump(exclude={"proposal", "study", "network", "against",
+                                                        "proposals", "timestamp", "data_source"}),
                           network=network, timestamp=ts, data_source=request.data_source)
         _tick_report.first = None
         results[label] = await runner(req)
@@ -9646,7 +9961,7 @@ async def compare_networks(request: CompareNetworksRequest):
     out = {"study": study, "timestamp": ts, "data_source": _dataset_label(request),
            "thresholds_used": _thresholds_used(request),
            "load_scaling_factor": request.load_scaling_factor,
-           "network": {**_proposal_card(name), "compared_with": BASE_NETWORK}}
+           "network": {**_proposal_card(name), "compared_with": _reference(request)}}
     if results["proposal_added"]:
         out["network"]["added_elements_at_tick"] = results["proposal_added"]
     if study == "rsa":
@@ -9690,6 +10005,57 @@ async def compare_networks(request: CompareNetworksRequest):
     return out
 
 
+def _reference(request: CompareNetworksRequest) -> str:
+    """The network a proposal is compared with: the base, or `against`."""
+    return (request.against or "").strip() or BASE_NETWORK
+
+
+_COMPARE_MAX_PROPOSALS = 6
+# Per study, the figures a ranking of several proposals puts side by side.
+_RANK_FIELDS = {
+    "rsa": ("total_load_mw", "slack_import_mw", "min_vm_pu", "max_vm_pu", "max_line_loading_pct",
+            "max_trafo_loading_pct", "secure", "total_violations"),
+    "n1": ("system_n1_secure", "total_outages_causing_violations", "total_violations",
+           "n_non_converged_outages"),
+}
+
+
+async def _compare_several(request: CompareNetworksRequest, study: str) -> dict:
+    """Each proposal against the same reference, one study, one operating
+    point; the full comparison of each plus a table to rank them by."""
+    names = list(dict.fromkeys(n.strip() for n in request.proposals if n and n.strip()))
+    unknown = [n for n in names if n not in _proposals()]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"No proposal {unknown}. Existing: {sorted(_proposals())}.")
+    names = [n for n in names if n != _reference(request)]
+    if not names:
+        raise HTTPException(status_code=400, detail="Name at least one proposal other than the reference.")
+    if len(names) > _COMPARE_MAX_PROPOSALS:
+        raise HTTPException(status_code=400, detail=(
+            f"Compare up to {_COMPARE_MAX_PROPOSALS} proposals at once ({len(names)} given)."))
+    if study != "scan" and request.timestamp is None:
+        # One tick for all: "latest" must not move between the comparisons.
+        request = request.model_copy(update={"timestamp": _resolve_tick(request.data_source, None)})
+    comparisons = []
+    for n in names:
+        comparisons.append(await compare_networks(request.model_copy(update={"proposal": n, "proposals": None})))
+    first = comparisons[0]
+    table = [{"network": _reference(request), "role": "reference",
+              **{k: first["base"].get(k) for k in _RANK_FIELDS.get(study, first["base"].keys())}}]
+    for n, c in zip(names, comparisons):
+        row = {"network": n, "role": "proposal",
+               **{k: c["proposal"].get(k) for k in _RANK_FIELDS.get(study, c["proposal"].keys())}}
+        if "new_violations" in c:
+            row["new_violations"] = len(c["new_violations"]) if isinstance(c["new_violations"], list) \
+                else c["new_violations"]
+            row["resolved_violations"] = len(c["resolved_violations"]) \
+                if isinstance(c["resolved_violations"], list) else c["resolved_violations"]
+        table.append(row)
+    return {"study": study, "several": True, "compared_with": _reference(request),
+            "timestamp": first.get("timestamp"), "data_source": first.get("data_source"),
+            "proposals": names, "table": table, "comparisons": comparisons}
+
+
 def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
     """The security assessment on the base and on proposal `name` at every
     tick of one window, with the same dataset, limits and stress factors.
@@ -9714,10 +10080,11 @@ def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
     ticks = [timestamps[i] for i in range(start, end, step)]
 
     common = request.model_dump(exclude={"proposal", "study", "network", "timestamp", "data_source",
-                                         "start_timestamp", "end_timestamp", "step_size"})
+                                         "start_timestamp", "end_timestamp", "step_size", "against",
+                                         "proposals"})
     requests = {label_: GridRequest(**common, network=network, timestamp=None,
                                     data_source=request.data_source)
-                for label_, network in (("base", BASE_NETWORK), ("proposal", name))}
+                for label_, network in (("base", _reference(request)), ("proposal", name))}
 
     def keys(rows):
         return {(v.get("violation_type"), str(v.get("element"))): v.get("value") for v in rows}
@@ -9806,7 +10173,7 @@ def _compare_over_time(request: CompareNetworksRequest, name: str) -> dict:
                    **({"note": f"every {step}th tick: the window holds {span} ticks; narrow it or "
                                "set step_size to scan every tick"} if step > 1 and not request.step_size
                       else {})},
-        "network": {**_proposal_card(name), "compared_with": BASE_NETWORK},
+        "network": {**_proposal_card(name), "compared_with": _reference(request)},
         "base": digest("base"), "proposal": proposal_digest,
         "ticks_violating_only_on_proposal": only("base", "proposal"),
         "ticks_violating_only_on_base": only("proposal", "base"),
@@ -9864,7 +10231,7 @@ async def _compare_opf(request: CompareNetworksRequest, name: str) -> dict:
     last = (app_data.get("last_dispatch_result"), app_data.get("last_dispatch_timestamp"))
     results = {}
     try:
-        for label, network in (("base", BASE_NETWORK), ("proposal", name)):
+        for label, network in (("base", _reference(request)), ("proposal", name)):
             req = FlexibilityRequest(
                 timestamp=ts, data_source=request.data_source, network=network,
                 load_scaling_factor=request.load_scaling_factor,
@@ -9900,7 +10267,7 @@ async def _compare_opf(request: CompareNetworksRequest, name: str) -> dict:
     out = {
         "study": "opf", "timestamp": ts, "data_source": _dataset_label(request),
         "thresholds_used": _thresholds_used(request), "load_scaling_factor": request.load_scaling_factor,
-        "network": {**_proposal_card(name), "compared_with": BASE_NETWORK},
+        "network": {**_proposal_card(name), "compared_with": _reference(request)},
         "base": base, "proposal": prop,
         "changes": {k: round(prop[k] - base[k], 4) for k in numeric
                     if isinstance(prop.get(k), (int, float)) and isinstance(base.get(k), (int, float))},

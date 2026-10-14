@@ -1,0 +1,68 @@
+{
+ "_source": "GET https://integrate.api.nvidia.com/v1/models (public, no key)",
+ "_fetched": "2026-10-14",
+ "_note": "Trimmed to 10 of 80 entries; fields as returned (id, object, created, owned_by).",
+ "object": "list",
+ "data": [
+  {
+   "id": "deepseek-ai/deepseek-coder-6.7b-instruct",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "deepseek-ai"
+  },
+  {
+   "id": "deepseek-ai/deepseek-v4.1-flash",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "deepseek-ai"
+  },
+  {
+   "id": "z-ai/glm-5.3",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "z-ai/glm-5.3-flash",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "01-ai/yi-large",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "01-ai"
+  },
+  {
+   "id": "adept/fuyu-8b",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "adept"
+  },
+  {
+   "id": "ai21labs/jamba-1.5-large-instruct",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "ai21labs"
+  },
+  {
+   "id": "aisingapore/sea-lion-7b-instruct",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "aisingapore"
+  },
+  {
+   "id": "bigcode/starcoder2-15b",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "bigcode"
+  },
+  {
+   "id": "databricks/dbrx-instruct",
+   "object": "model",
+   "created": 735790403,
+   "owned_by": "databricks"
+  }
+ ]
+}

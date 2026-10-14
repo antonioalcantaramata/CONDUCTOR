@@ -418,8 +418,21 @@ class OpenAIProvider:
             payload["tools"] = to_json_schema_tools(tools)
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
+        payload.update(self._extra_payload())
         data = self._post_with_retry(payload, "/chat/completions", on_event=on_event)
         return self._to_model_response(data)
+
+    # -- hooks for OpenAI-compatible presets (openai_compat.py) --------------
+
+    timeout_retries: int | None = None      # None: the same as other retries
+
+    def _extra_payload(self) -> dict:
+        """Provider-specific request fields (OpenRouter's fallbacks and data
+        policy). None for OpenAI itself."""
+        return {}
+
+    def _extra_headers(self) -> dict:
+        return {}
 
     # -- transport and retry -----------------------------------------------
 
@@ -435,26 +448,28 @@ class OpenAIProvider:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            **self._extra_headers(),
         }
+        timeout_retries = retries if self.timeout_retries is None else min(retries, self.timeout_retries)
+        timeouts = 0
 
         for attempt in range(retries + 1):
+            self._attempt = attempt
             try:
                 resp = httpx.post(
                     url, json=payload, headers=headers, timeout=self.timeout_s
                 )
             except httpx.TimeoutException as exc:
-                if attempt < retries:
+                timeouts += 1
+                if timeouts <= timeout_retries and attempt < retries:
                     self._announce_retry(
                         attempt, retries, 30,
                         f"Request timed out after {self.timeout_s:.0f}s", on_event,
                     )
                     time.sleep(30)
                     continue
-                raise RuntimeError(
-                    f"⚠️ **OpenAI timed out after {self.timeout_s:.0f}s.**\n\n"
-                    "Raise `OPENAI_TIMEOUT_S` in your `.env`, or start a new "
-                    "conversation to shorten the prompt."
-                ) from exc
+                self._timeouts = timeouts
+                raise RuntimeError(self._timeout_message()) from exc
             except httpx.HTTPError as exc:
                 if attempt < retries:
                     self._announce_retry(attempt, retries, 10,
@@ -498,6 +513,11 @@ class OpenAIProvider:
             time.sleep(wait)
 
         raise RuntimeError("Unexpected exit from retry loop")  # pragma: no cover
+
+    def _timeout_message(self) -> str:
+        return (f"⚠️ **OpenAI timed out after {self.timeout_s:.0f}s.**\n\n"
+                "Raise `OPENAI_TIMEOUT_S` in your `.env`, or start a new "
+                "conversation to shorten the prompt.")
 
     @staticmethod
     def _announce_retry(attempt, retries, wait, reason, on_event) -> None:

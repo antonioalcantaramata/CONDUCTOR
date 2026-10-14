@@ -1,0 +1,71 @@
+{
+ "_source": "GET https://openrouter.ai/api/v1/models/thinkingmachines/inkling-small:free/endpoints (public)",
+ "_fetched": "2026-10-14",
+ "data": {
+  "id": "thinkingmachines/inkling-small:free",
+  "name": "Thinking Machines: Inkling Small (free)",
+  "created": 1785443117,
+  "description": "Inkling Small is an open-weight multimodal mixture-of-experts model from Thinking Machines Lab, with 12B active parameters out of 276B total. It is positioned as the smaller, more efficient member of...",
+  "architecture": {
+   "tokenizer": "Other",
+   "instruct_type": null,
+   "modality": "text+image+audio->text",
+   "input_modalities": [
+    "text",
+    "image",
+    "audio"
+   ],
+   "output_modalities": [
+    "text"
+   ]
+  },
+  "endpoints": [
+   {
+    "name": "Thinking Machines | thinkingmachines/inkling-small-20260730:free",
+    "model_id": "thinkingmachines/inkling-small:free",
+    "model_name": "Thinking Machines: Inkling Small",
+    "context_length": 1048576,
+    "pricing": {
+     "prompt": "0",
+     "completion": "0",
+     "discount": 0
+    },
+    "provider_name": "Thinking Machines",
+    "tag": "thinkingmachines/nvfp4",
+    "quantization": "nvfp4",
+    "max_completion_tokens": 262144,
+    "max_prompt_tokens": null,
+    "supported_parameters": [
+     "reasoning",
+     "include_reasoning",
+     "temperature",
+     "top_p",
+     "max_tokens",
+     "stop",
+     "frequency_penalty",
+     "presence_penalty",
+     "seed",
+     "tools",
+     "reasoning_effort"
+    ],
+    "supports_tool_choice": {
+     "none": false,
+     "auto": false,
+     "required": false,
+     "function": false
+    },
+    "status": 0,
+    "uptime_last_30m": 100,
+    "uptime_last_5m": 100,
+    "uptime_last_1d": 100,
+    "supports_implicit_caching": false,
+    "native_tools": {},
+    "supports_voice_cloning": false,
+    "supports_multiple_audio_references": false,
+    "supports_image_reference": false,
+    "latency_last_30m": null,
+    "throughput_last_30m": null
+   }
+  ]
+ }
+}

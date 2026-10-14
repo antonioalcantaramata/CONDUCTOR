@@ -13,6 +13,7 @@ import difflib
 import html
 import pandas as pd
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -62,6 +63,7 @@ from agent import recommender as _recommender
 from agent import update_check as _update_check
 from agent import timeline as _tl
 from agent import generator_table as _gen_table
+from agent import system_tables as _sys_table
 from agent import data_view as _dv
 from agent import trace as _trace
 from agent import staleness as _staleness
@@ -79,6 +81,8 @@ from agent.providers.openai import OpenAIProvider as _OpenAIProvider
 from agent.providers.openai import probe as openai_probe
 from agent import network_map as _network_map
 from agent.renderers import RENDERER_MAP, render_network_diff, render_network_map
+from agent import catalog as _catalog
+import launch_ui as _lui
 from agent import tools as _tools_module
 from agent.tools import get_current_timestamp
 
@@ -99,6 +103,9 @@ _PROVIDER_LABELS = {
     "openai": "OpenAI API (or compatible)",
     "anthropic": "Anthropic API (Claude)",
     "ollama": "Ollama (local)",
+    "openrouter": "OpenRouter",
+    "nvidia": "NVIDIA Build",
+    "deepseek": "DeepSeek API",
 }
 
 
@@ -1604,22 +1611,33 @@ def _provider_configured(provider: str) -> bool:
         return bool(os.environ.get("OPENAI_API_KEY", "").strip())
     if provider == "anthropic":
         return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if provider in _lui.COMPAT:
+        key_env = next(o for o in _catalog.options() if o.provider == provider)["key_env"]
+        return bool(os.environ.get(key_env, "").strip())
     return _has_api_key()
 
 
+def _launch_env() -> dict:
+    """What the launch screen's tier, option and model choice set on Start:
+    LLM_PROVIDER plus the tier variable and the chosen model."""
+    return dict(st.session_state.get("_launch_env") or {})
+
+
+def _launch_option_for(provider: str):
+    """The launch screen's chosen option when it is this provider's, else
+    this provider's first option — for its "Get started" steps."""
+    chosen = st.session_state.get("_launch_option")
+    try:
+        option = _catalog.option(chosen) if chosen else None
+    except KeyError:
+        option = None
+    if option is None or option.provider != provider:
+        option = next(o for o in _catalog.options() if o.provider == provider)
+    return option
+
+
 def _render_google_setup() -> None:
-    st.markdown(
-        """
-        #### Google Gemini API
-
-        The **free tier** at Google AI Studio is sufficient — no payment needed.
-
-        1. Go to [https://aistudio.google.com/](https://aistudio.google.com/)
-        2. Sign in with any Google account
-        3. Click **Get API key** → **Create API key**
-        4. Copy the key and paste it below
-        """
-    )
+    _lui.setup_steps(_launch_option_for("google"))
     with st.form("api_key_setup"):
         key_input = st.text_input(
             "Gemini API Key",
@@ -1642,6 +1660,7 @@ def _render_google_setup() -> None:
         else:
             _write_env({
                 "LLM_PROVIDER": "google",
+                **_launch_env(),
                 "GEMINI_API_KEY": key,
                 "GEMINI_THINKING_LEVEL": thinking,
             })
@@ -1716,19 +1735,7 @@ def _anthropic_effort_picker(*, key: str) -> str:
 
 
 def _render_anthropic_setup() -> None:
-    st.markdown(
-        """
-        #### Anthropic API (Claude)
-
-        Paid per token — there is no free tier — so an account with credit is
-        needed. If you would rather not pay, **Ollama** runs the same agent
-        locally at no cost.
-
-        1. Go to [console.anthropic.com](https://console.anthropic.com/settings/keys)
-        2. Click **Create Key** and copy it
-        3. Paste it below
-        """
-    )
+    _lui.setup_steps(_launch_option_for("anthropic"))
     with st.form("anthropic_setup"):
         key_input = st.text_input(
             "Anthropic API key",
@@ -1818,25 +1825,7 @@ def _render_anthropic_settings(*, key_prefix: str) -> bool:
 
 
 def _render_openai_setup() -> None:
-    st.markdown(
-        """
-        #### OpenAI API
-
-        Paid per token — there is no free tier — so an account with credit is
-        needed. If you would rather not pay, **Ollama** runs the same agent
-        locally at no cost.
-
-        1. Go to [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
-        2. Click **Create new secret key** and copy it
-        3. Paste it below
-
-        **Using a different provider?** This option also drives anything
-        speaking the OpenAI chat-completions dialect — Kimi, DeepSeek, Qwen,
-        Groq, Mistral, OpenRouter, Azure OpenAI, a self-hosted vLLM server.
-        Paste that provider's key here, name its model, and set its **Base
-        URL** below. The model must support tool calling.
-        """
-    )
+    _lui.setup_steps(_launch_option_for("openai"))
     with st.form("openai_setup"):
         key_input = st.text_input(
             "OpenAI API key",
@@ -1958,16 +1947,9 @@ def _render_openai_settings(*, key_prefix: str) -> bool:
 
 
 def _prompt_token_estimate() -> int:
-    """Roughly how many tokens the system prompt and tool schemas occupy."""
-    try:
-        from agent.providers.schema import to_json_schema_tools
-        from agent.system_prompt import get_system_prompt
-        from agent.tool_schemas import TOOLS
-
-        blob = json.dumps(to_json_schema_tools(TOOLS)) + get_system_prompt()
-        return len(blob) // 4
-    except Exception:  # noqa: BLE001
-        return 25_000
+    """Roughly how many tokens the system prompt and tool schemas occupy —
+    the same figure the launch screen's cards use (launch_ui.overhead_tokens)."""
+    return _lui.overhead_tokens()
 
 
 def _render_ollama_settings(*, key_prefix: str) -> bool:
@@ -2072,6 +2054,12 @@ def _render_ollama_settings(*, key_prefix: str) -> bool:
 def _render_google_settings(*, key_prefix: str) -> bool:
     """Gemini options, editable at any time. Returns True if saved."""
     with st.form(f"{key_prefix}_google_settings"):
+        tiers = ("free", "paid")
+        current_tier = (os.environ.get("GEMINI_TIER") or "free").strip().lower()
+        tier = st.radio("Tier", tiers, index=tiers.index(current_tier) if current_tier in tiers else 0,
+                        horizontal=True, key=f"{key_prefix}_gemini_tier",
+                        help="Free: per-model daily quotas, with the fallback chain when one is spent. "
+                             "Paid: limited by your plan.")
         model = st.text_input(
             "Model",
             value=os.environ.get("GEMINI_MODEL") or GEMINI_MODEL,
@@ -2086,6 +2074,7 @@ def _render_google_settings(*, key_prefix: str) -> bool:
         if st.form_submit_button("Save settings", type="primary", width="stretch"):
             updates = {
                 "LLM_PROVIDER": "google",
+                "GEMINI_TIER": tier,
                 "GEMINI_MODEL": model.strip(),
                 "GEMINI_THINKING_LEVEL": thinking,
             }
@@ -2215,7 +2204,7 @@ def _render_ollama_setup() -> None:
             value=int(os.environ.get("OLLAMA_NUM_CTX", OLLAMA_NUM_CTX)),
             step=8192,
             help=(
-                "This agent's system prompt and tool schemas are ~25k tokens before "
+                "This agent's system prompt and tool schemas are ~28k tokens before "
                 "any conversation. Ollama defaults to ~4096 and silently discards "
                 "anything beyond the window, so this must be set generously. Larger "
                 "windows use more memory."
@@ -2247,6 +2236,9 @@ _SETTINGS_RENDERERS = {
     "openai": _render_openai_settings,
     "anthropic": _render_anthropic_settings,
     "ollama": _render_ollama_settings,
+    # OpenRouter, NVIDIA Build, DeepSeek: tier, model, key (launch_ui.py).
+    **{p: (lambda p: lambda *, key_prefix: _lui.compat_settings(p, key_prefix, _write_env))(p)
+       for p in _lui.COMPAT},
 }
 
 
@@ -2265,15 +2257,15 @@ _CHECKED_PROVIDERS = ("openai", "anthropic", "google")
 def _model_check_key(provider: str) -> tuple:
     """What a check result depends on, so a changed setting is re-checked."""
     if provider == "openai":
-        model = os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
+        model = _launch_env().get("OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
         key = os.environ.get("OPENAI_API_KEY", "")
         where = os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL
     elif provider == "anthropic":
-        model = os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
+        model = _launch_env().get("ANTHROPIC_MODEL") or os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         where = os.environ.get("ANTHROPIC_BASE_URL", "")
     else:
-        model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+        model = _launch_env().get("GEMINI_MODEL") or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
         key = os.environ.get("GEMINI_API_KEY", "")
         where = ""
     return (provider, model, key[-6:], where)
@@ -2285,7 +2277,7 @@ def _cached_model_check(provider: str):
     key = _model_check_key(provider)
     if key not in cache:
         with st.spinner("Checking the model with the provider…"):
-            cache[key] = _model_check.check(provider)
+            cache[key] = _model_check.check(provider, key[1])
     return cache[key]
 
 
@@ -2322,6 +2314,29 @@ def _fetch_scenarios() -> dict | None:
         return None
 
 
+def _privacy_reminder() -> None:
+    """A one-time reminder when the operator's own network (Resume) is studied
+    on a free or trial cloud option: those tiers are meant for sample networks."""
+    try:
+        option = _catalog.option(_catalog.active_option_id())
+    except Exception:  # noqa: BLE001
+        return
+    if not option.is_cloud_free:
+        return
+    scenario = _fetch_scenarios() or {}
+    if scenario.get("current") != "resume":
+        return
+    ack = f"{option.id}|resume"
+    if st.session_state.get("_privacy_ack") == ack:
+        return
+    with st.container(border=True, key="privacy_reminder"):
+        st.warning(f"**Your own network on a free tier ({option['display_name']}).** "
+                   f"{option['data_policy_summary']} {_catalog.catalog()['free_tier_notice']}")
+        if st.button("Got it", key="privacy_ack"):
+            st.session_state._privacy_ack = ack
+            st.rerun()
+
+
 def _switch_scenario(name: str) -> None:
     """Load a scenario; the caches and the conversation start afresh (they
     described the previous one). Errors are kept for the picker to show."""
@@ -2338,6 +2353,18 @@ def _switch_scenario(name: str) -> None:
     if st.session_state.get("_launched"):
         _reset_conversation_state()
         st.session_state._scenario_note = f"Loaded **{r.json().get('label')}** — a new conversation has started."
+
+
+def _forget_scenario(name: str) -> None:
+    """Clear what is saved for a scenario's network (POST /api/scenario/forget)."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.post(f"{BASE_URL}/api/scenario/forget", json={"name": name})
+        if r.status_code >= 400:
+            st.session_state._scenario_error = r.json().get("detail", r.text)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state._scenario_error = str(exc)
+    st.rerun()
 
 
 def _render_scenario_picker(*, key: str, immediate: bool) -> None:
@@ -2364,8 +2391,22 @@ def _render_scenario_picker(*, key: str, immediate: bool) -> None:
         elif immediate and chosen != data["current"]:
             _switch_scenario(chosen)
 
+    def _caption(n: str) -> str:
+        kept = _sys_table.kept_line(options[n].get("kept"))
+        return options[n]["description"] + (f"  \n🗂 {kept}." if kept else "")
+
     st.radio("Scenario", names, key=widget, format_func=lambda n: options[n]["label"], label_visibility="collapsed",
-             captions=[options[n]["description"] for n in names], on_change=_on_change)
+             captions=[_caption(n) for n in names], on_change=_on_change)
+    chosen_now = st.session_state[widget]
+    if options.get(chosen_now, {}).get("kept"):
+        with st.popover("Start fresh", icon=":material/restart_alt:", type="tertiary"):
+            st.markdown(f"Clear what is saved for **{options[chosen_now]['label']}**: "
+                        f"{_sys_table.kept_line(options[chosen_now]['kept']).split(': ', 1)[-1]}.")
+            st.caption("Names, costs, unit models and the load power factor go back to the network as loaded, "
+                       "and its proposals are discarded. Networks shared by two scenarios (the two demos) are "
+                       "cleared for both. This cannot be undone.")
+            if st.button("Clear and start fresh", key=f"{widget}_forget", type="primary"):
+                _forget_scenario(chosen_now)
     if not immediate:
         chosen = st.session_state[widget]
         st.button("Load", key=f"{widget}_load", type="primary", width="stretch",
@@ -2388,7 +2429,7 @@ def _render_ready_to_start(provider: str) -> None:
             st.rerun()
         with st.expander("Change settings", expanded=True):
             if _SETTINGS_RENDERERS[provider](key_prefix="launch"):
-                st.success("Saved.")
+                _lui.ready_line("Saved.")
                 st.rerun()
         return
 
@@ -2397,13 +2438,14 @@ def _render_ready_to_start(provider: str) -> None:
         raw = os.environ.get("GEMINI_THINKING_LEVEL")
         level = (GEMINI_THINKING_LEVEL if raw is None else raw).strip().lower()
         reasoning = f"`{level}`" if level in GEMINI_THINKING_LEVELS else "model default"
-        st.success(
-            f"Ready — model `{os.environ.get('GEMINI_MODEL') or GEMINI_MODEL}`, "
+        model = _launch_env().get("GEMINI_MODEL") or os.environ.get("GEMINI_MODEL") or GEMINI_MODEL
+        _lui.ready_line(
+            f"Ready — model `{model}`, "
             f"reasoning {reasoning}, key `…{key[-4:]}` loaded from `.env`."
         )
     elif provider == "openai":
         key = os.environ.get("OPENAI_API_KEY", "")
-        model = os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
+        model = _launch_env().get("OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or OPENAI_MODEL
         base = os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL
         where = "" if base == OPENAI_BASE_URL else f" via `{base}`"
         effort = os.environ.get("OPENAI_REASONING_EFFORT") or OPENAI_REASONING_EFFORT
@@ -2417,13 +2459,13 @@ def _render_ready_to_start(provider: str) -> None:
         # no client, no request.
         endpoint = ("/v1/responses" if _OpenAIProvider().uses_responses
                     else "/v1/chat/completions")
-        st.success(
+        _lui.ready_line(
             f"Ready — model `{model}`{reasoning} via `{endpoint}`, "
             f"key `…{key[-4:]}` loaded from `.env`{where}."
         )
     elif provider == "anthropic":
         key = os.environ.get("ANTHROPIC_API_KEY", "")
-        model = os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
+        model = _launch_env().get("ANTHROPIC_MODEL") or os.environ.get("ANTHROPIC_MODEL") or ANTHROPIC_MODEL
         effort = os.environ.get("ANTHROPIC_EFFORT") or ANTHROPIC_EFFORT
         thinking = (os.environ.get("ANTHROPIC_THINKING", "1").strip().lower()
                     not in ("0", "false", "no"))
@@ -2432,10 +2474,20 @@ def _render_ready_to_start(provider: str) -> None:
         depth = (f"effort `{effort}`" if effort else "default effort")
         if not thinking:
             depth += ", thinking off"
-        st.success(
+        _lui.ready_line(
             f"Ready — model `{model}`, {depth}, "
             f"key `…{key[-4:]}` loaded from `.env`."
         )
+    elif provider in _lui.COMPAT:
+        env = _launch_env()
+        option = _catalog.option(st.session_state.get("_launch_option") or _catalog.active_option_id())
+        key = os.environ.get(option["key_env"], "")
+        model = env.get(option["model_env"]) or os.environ.get(option["model_env"], "")
+        if not model:
+            st.warning("Choose a model above.")
+            return
+        _lui.ready_line(f"Ready — {option['display_name']}, model `{model}`, key `…{key[-4:]}` loaded from `.env`.")
+        _lui.smoke_test_button(option, model, "ready")
     else:
         model = os.environ.get("OLLAMA_MODEL", "")
         info = ollama_probe()
@@ -2448,7 +2500,7 @@ def _render_ready_to_start(provider: str) -> None:
             st.error(f"Model `{model}` is no longer installed. Pull it or pick another below.")
             _render_ollama_setup()
             return
-        st.success(
+        _lui.ready_line(
             f"Ready — `{model}` on Ollama {info['version']}, "
             f"context {int(os.environ.get('OLLAMA_NUM_CTX') or OLLAMA_NUM_CTX):,} tokens."
         )
@@ -2467,8 +2519,9 @@ def _render_ready_to_start(provider: str) -> None:
             "answered, so a switch is always your decision."
         )
 
-    if st.button("Start CONDUCTOR", type="primary", width="stretch"):
-        _write_env({"LLM_PROVIDER": provider})
+    if st.button("Start CONDUCTOR", type="primary", width="stretch",
+                 disabled=bool(st.session_state.get("_launch_blocked"))):
+        _write_env({"LLM_PROVIDER": provider, **_launch_env()})
         _warm_up_if_needed()
         st.session_state._launched = True
         st.rerun()
@@ -2498,37 +2551,33 @@ if not st.session_state.get("_launched"):
         st.caption("Switch any time from the sidebar (**Settings → Scenario**). To work on your own grid, "
                    "start with any option and use **Upload Network** / **Upload Data** in the header — "
                    "they become what *Resume* loads. Demos never replace your uploads.")
-    _col_model.markdown("### 2 · Choose how to run the assistant")
-
-    _CHOICES = {
-        "Google Gemini API": "google",
-        "OpenAI API (or compatible)": "openai",
-        "Anthropic API": "anthropic",
-        "Local model (Ollama)": "ollama",
-    }
-    _labels = list(_CHOICES)
-    _current = active_provider_name()
-    _index = next((i for i, l in enumerate(_labels) if _CHOICES[l] == _current), 0)
-
-    _picked = _CHOICES[
-        _col_model.radio(
-            "Backend",
-            _labels,
-            index=_index,
-            captions=[
-                "Hosted, needs a free API key, fastest to set up.",
-                "Hosted, paid per token — also Kimi, DeepSeek, Groq and any "
-                "other OpenAI-compatible endpoint.",
-                "Hosted, paid per token, Claude models.",
-                "Fully local and private, needs a tool-capable model.",
-            ],
-            label_visibility="collapsed",
-        )
-    ]
-
     with _col_model:
+        st.markdown("### 2 · Choose how to run the assistant")
+        # Tier, option and model, then everything worth knowing before Start —
+        # all from the provider catalog and live discovery (launch_ui.py).
+        _option = _lui.tier_picker("launch")
+        _model, _choices = _lui.model_picker(_option, "launch")
+        _usable = _lui.info_card(_option, _model, _choices)
+        _blocked = next((m.get("blocked") for m in _choices.get("models") or [] if m["id"] == _model), None)
+        _env = _lui.option_env(_option, _model)
+        if _option.id == "openai_paid":
+            _env["OPENAI_BASE_URL"] = _option["base_url"]
+        st.session_state._launch_option = _option.id
+        st.session_state._launch_env = _env
+        st.session_state._launch_blocked = (not _usable) or bool(_blocked) or \
+            (_option["discovery"] != "static" and not _model)
+        _picked = _option.provider
+        if _picked not in _lui.COMPAT and _model is not None and _provider_configured(_picked):
+            _lui.smoke_test_button(_option, _model, "launch")
         st.divider()
-        if _provider_configured(_picked):
+        if _picked in _lui.COMPAT and not _provider_configured(_picked):
+            _blocked_now = st.session_state._launch_blocked
+            if _lui.compat_form(_option, _model, "launch", _write_env, choices=_choices,
+                                submit="Save key" if _blocked_now else "Save & Start"):
+                if not _blocked_now:
+                    st.session_state._launched = True
+                st.rerun()
+        elif _provider_configured(_picked):
             _render_ready_to_start(_picked)
         else:
             _SETUP_RENDERERS[_picked]()
@@ -2936,17 +2985,118 @@ def _non_converged_note(result: dict) -> str | None:
             f"often the most stressed moments{': ' + shown + more if shown else ''}.")
 
 
-def _chart_caption(tool_name: str, result: dict) -> str:
-    """Which analysis these charts come from, and which moment they describe."""
+# How a differing argument reads on a chart caption. Keys shown elsewhere in
+# the caption (the moment, the dataset, the proposal, the power factor) are
+# not repeated; anything not listed is shown by its name.
+_ARG_SHOWN_ELSEWHERE = {"timestamp", "data_source", "network", "load_power_factor"}
+
+
+def _arg_bit(key: str, value, args: dict) -> str | None:
+    def num(v):
+        try:
+            return f"{float(v):g}"
+        except (TypeError, ValueError):
+            return str(v)
+    if value is None:
+        return f"{key.replace('_', ' ')} default"
+    if key == "load_scaling_factor":
+        return f"load ×{num(value)}"
+    if key in ("vm_lower_pu", "vm_upper_pu"):
+        lo, hi = args.get("vm_lower_pu"), args.get("vm_upper_pu")
+        return f"V limits {num(lo) if lo is not None else 'default'}–{num(hi) if hi is not None else 'default'}"
+    if key == "max_line_loading_pct":
+        return f"line limit {num(value)} %"
+    if key == "max_trafo_loading_pct":
+        return f"trafo limit {num(value)} %"
+    if key in ("element_type", "element_index", "element_name"):
+        label = args.get("element_name") or f"{args.get('element_type', 'element')} {args.get('element_index', '')}".strip()
+        return f"outage {label}"
+    if key == "n_samples":
+        return f"{num(value)} samples"
+    if key == "n_scenarios":
+        return f"{num(value)} scenarios"
+    if key == "n_steps":
+        return f"{num(value)} steps"
+    if key == "step_size":
+        return f"step {num(value)}"
+    if key == "metric":
+        return f"metric: {value}"
+    if key == "sgen_sigma":
+        return f"σ generation {num(value)}"
+    if key == "load_sigma":
+        return f"σ load {num(value)}"
+    text = value if isinstance(value, (str, int, float)) else json.dumps(value, default=str)
+    return f"{key.replace('_', ' ')} {str(text)[:40]}"
+
+
+def _varying_args(tool_results: list) -> dict:
+    """{tool name: argument names whose values differ} between runs of the
+    same tool in one answer."""
+    by_tool: dict[str, list[dict]] = {}
+    for name, result in tool_results or []:
+        if isinstance(result, dict) and isinstance(result.get("_call_args"), dict):
+            by_tool.setdefault(name, []).append(result["_call_args"])
+    varying = {}
+    for name, calls in by_tool.items():
+        if len(calls) < 2:
+            continue
+        keys = {k for c in calls for k in c} - _ARG_SHOWN_ELSEWHERE
+        diff = sorted(k for k in keys
+                      if len({json.dumps(c.get(k), sort_keys=True, default=str) for c in calls}) > 1)
+        if diff:
+            varying[name] = diff
+    return varying
+
+
+def _arg_bits(tool_name: str, result: dict, varying: dict) -> list[str]:
+    args = result.get("_call_args") if isinstance(result, dict) else None
+    if not isinstance(args, dict):
+        return []
+    bits: list[str] = []
+    for key in varying.get(tool_name, []):
+        bit = _arg_bit(key, args.get(key), args)
+        if bit and bit not in bits:
+            bits.append(bit)
+    return bits[:4]
+
+
+def _non_default_pf(result: dict) -> bool:
+    block = result.get("load_power_factor") if isinstance(result, dict) else None
+    return isinstance(block, dict) and block.get("source") not in (None, "default")
+
+
+def _chart_caption(tool_name: str, result: dict, show_pf: bool | None = None,
+                   extra: list[str] | None = None) -> str:
+    """Which analysis these charts come from and under which conditions: the
+    moment, the dataset, the network (a proposal), and — when it is not the
+    default, or when charts in one answer differ in it — the load power factor.
+    Two charts of the same study must never look alike while describing
+    different conditions."""
     parts = [f"**{_TOOL_LABELS.get(tool_name, tool_name.replace('_', ' '))}**"]
     when = result.get("timestamp") or result.get("worst_timestamp")
     start, end = result.get("window_start"), result.get("window_end")
-    if when:
+    source = str(result.get("data_source", ""))
+    if source == "nominal" or str(when) == "nominal":
+        parts.append("nominal operating point")
+    elif when:
         parts.append(str(when)[:16])
     elif start and end:
         parts.append(f"{str(start)[:16]} → {str(end)[:16]}")
-    if str(result.get("data_source", "")).startswith("forecast"):
+    if source.startswith("forecast"):
         parts.append("forecast")
+    network = result.get("network")
+    if isinstance(network, dict) and network.get("id"):
+        parts.append(f"proposal `{network['id']}`")
+    block = result.get("load_power_factor")
+    if isinstance(block, dict) and (show_pf if show_pf is not None else _non_default_pf(result)):
+        measured = (block.get("measured_reactive_power") or {}).get("share_of_load")
+        if measured == 1 or measured == 1.0:
+            parts.append("reactive demand as measured")
+        elif block.get("value") is not None:
+            parts.append(f"loads at pf {float(block['value']):.2f}")
+    if isinstance(result.get("generator_model"), dict):
+        parts.append("generator model changed")
+    parts.extend(extra or [])
     return " · ".join(parts)
 
 
@@ -2988,6 +3138,12 @@ def render_charts(tool_results: list) -> None:
     charts wrap at two per row, and only the first rows are shown — the rest
     wait under "More charts" instead of pushing the conversation off screen.
     """
+    # If any chart of this answer used a non-default load power factor, every
+    # chart says which one it used: three runs at 0.90 / 0.95 / 1.00 must not
+    # be told apart only by the table in the text.
+    show_pf = any(_non_default_pf(r) for _, r in tool_results)
+    # Likewise any other parameter that differs between runs of one study.
+    varying = _varying_args(tool_results)
     for chart_idx, (tool_name, result) in enumerate(tool_results):
         renderer = RENDERER_MAP.get(tool_name)
         if renderer is None or not isinstance(result, dict) or "error" in result:
@@ -3011,7 +3167,8 @@ def render_charts(tool_results: list) -> None:
         if not flat:
             continue
 
-        st.caption(_chart_caption(tool_name, result))
+        st.caption(_chart_caption(tool_name, result, show_pf=show_pf,
+                                  extra=_arg_bits(tool_name, result, varying)))
         note = _non_converged_note(result)
         if note:
             st.warning(note)
@@ -3285,6 +3442,10 @@ def _render_staleness(msg: dict, idx: int) -> None:
     way to run it again."""
     why = _staleness.reasons(msg.get("context"), _settings_now())
     if not why:
+        # A rename changes no figure: a quiet note, no rerun offered.
+        for note in _staleness.notes(msg.get("context"), _settings_now()):
+            st.markdown(f"<span class='conductor-stale'>🏷 {html.escape(note.capitalize())}</span>",
+                        unsafe_allow_html=True)
         return
     question = next((m["text"] for m in reversed(st.session_state.messages[:idx]) if m["role"] == "user"), None)
     with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"stale_{idx}"):
@@ -3301,6 +3462,8 @@ def _report_charts_html(tool_results: list) -> str:
     """One answer's charts for the report, as `render_charts` draws them:
     caption, status lines, tables, then the figures (interactive)."""
     out = []
+    show_pf = any(_non_default_pf(r) for _, r in tool_results or [])
+    varying = _varying_args(tool_results)
     for tool_name, result in tool_results or []:
         renderer = RENDERER_MAP.get(tool_name)
         if renderer is None or not isinstance(result, dict) or "error" in result:
@@ -3313,7 +3476,8 @@ def _report_charts_html(tool_results: list) -> str:
         flat = [f for row in figs for f in (row if isinstance(row, list) else [row]) if f is not None]
         if not flat:
             continue
-        out.append(f"<div class='chart-caption'>{_report.markdown(_chart_caption(tool_name, result))}</div>")
+        caption = _chart_caption(tool_name, result, show_pf=show_pf, extra=_arg_bits(tool_name, result, varying))
+        out.append(f"<div class='chart-caption'>{_report.markdown(caption)}</div>")
         note = _non_converged_note(result)
         if note:
             out.append(f"<div class='status error'>{html.escape(note)}</div>")
@@ -3374,7 +3538,8 @@ def _session_report(messages: list, model_label: str) -> bytes:
         "assumptions": assumptions, "quality": quality, "proposals": _list_proposals(),
     }
     page = _report.build(messages, meta, charts_html=_report_charts_html, plotly_js=get_plotlyjs(),
-                         stale=lambda m: _staleness.reasons(m.get("context"), now))
+                         stale=lambda m: (_staleness.reasons(m.get("context"), now)
+                                          + _staleness.notes(m.get("context"), now)))
     return page.encode("utf-8")
 
 
@@ -3506,16 +3671,19 @@ with st.sidebar:
     # a local model's context should not require a restart or a .env edit.
     _active = active_provider_name()
     # The header names the model in use, so it is visible without opening.
+    try:
+        _usage_note = _lui.usage_line()
+    except Exception:  # noqa: BLE001 — a convenience, never worth the sidebar
+        _usage_note = None
     with st.expander(f"Model · {_active_model_label()}", icon=":material/smart_toy:",
                      key="sb_model"):
         st.caption(_PROVIDER_LABELS.get(_active, _active))
         _backends = list(available_providers())
-        _switch_to = st.radio(
+        _switch_to = st.selectbox(
             "Backend",
             _backends,
             index=_backends.index(_active) if _active in _backends else 0,
             format_func=lambda p: _PROVIDER_LABELS.get(p, p),
-            horizontal=True,
             key="sidebar_provider",
         )
         st.divider()
@@ -3525,6 +3693,8 @@ with st.sidebar:
         if _saved:
             st.success("Saved — applies to your next message.")
             st.rerun()
+    if _usage_note:
+        st.caption(_usage_note)
 
     # Answer checks. Every answer is checked by deterministic rules — each
     # figure traced to the tool result that produced it, described as its own
@@ -3774,9 +3944,13 @@ def _render_system_view() -> None:
         )
         return
 
-    fingerprint = st.session_state.get("_network_fingerprint") or "unknown"
     assumptions = _fetch_assumptions() or {}
     st.session_state._assumptions_key = assumptions.get("key", "")
+    # The topology carries the elements' names: a rename must not serve the
+    # cached drawing (the network's identity does not change with it).
+    names_key = hashlib.sha1(json.dumps(assumptions.get("element_names") or [], sort_keys=True,
+                                        default=str).encode()).hexdigest()[:8]
+    fingerprint = f"{st.session_state.get('_network_fingerprint') or 'unknown'}|{names_key}"
 
     # Which grid the picture is of: the base, or one of the proposals.
     proposals = {p["id"]: p for p in (_list_proposals() or [])}
@@ -3794,11 +3968,15 @@ def _render_system_view() -> None:
     _render_system_header(payload, assumptions)
     st.session_state.setdefault("system_pane", "map")
     pane = st.segmented_control(
-        "System view", ["map", "assumptions"], key="system_pane", label_visibility="collapsed",
-        format_func={"map": "🗺️ Network map", "assumptions": "⚙️ Model assumptions"}.get,
+        "System view", ["map", "assumptions", "names"], key="system_pane", label_visibility="collapsed",
+        format_func={"map": "🗺️ Network map", "assumptions": "⚙️ Model assumptions",
+                     "names": "🏷️ Names"}.get,
         selection_mode="single") or "map"
     if pane == "assumptions":
         _render_model_assumptions(assumptions)
+        return
+    if pane == "names":
+        _render_names()
         return
 
     if proposals:
@@ -3996,12 +4174,193 @@ def _edit_unit_dialog(unit: dict) -> None:
         st.rerun()
 
 
+def _api_request(method: str, path: str, body: dict | None = None, error_key: str = "_api_error") -> dict | None:
+    """GET or POST a backend path; an error is kept under `error_key` for the panel to show."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = (client.get(f"{BASE_URL}{path}") if method == "get"
+                 else client.post(f"{BASE_URL}{path}", json=body or {}))
+        if r.status_code >= 400:
+            st.session_state[error_key] = r.json().get("detail", r.text)
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        st.session_state[error_key] = str(exc)
+        return None
+
+
+def _render_plain_table(key: str, title: str, caption: str, columns: list[str], rows: list[dict],
+                        on_edit, *, mark: str = "changed", flag: str = "changed", ident: str = "unit",
+                        widths: list[float] | None = None) -> None:
+    """A plain-text table (crisp at any zoom), each row with its Edit button —
+    the generator panel's look, for costs and names alike."""
+    if title:
+        st.markdown(f"**{title}** · {len(rows)}")
+    if caption:
+        st.caption(caption)
+    widths = (widths or [1.0] * len(columns)) + [0.85 if len(columns) > 7 else 0.6]
+    with st.container(border=True, key=f"gentable_{key}", gap="small"):
+        head = st.columns(widths, vertical_alignment="center")
+        for col, name in zip(head, columns):
+            col.markdown(f"<span class='gen-head'>{html.escape(name)}</span>", unsafe_allow_html=True)
+        for n, row in enumerate(rows):
+            with st.container(key=f"genrow_{key}_{n}"):
+                cols = st.columns(widths, vertical_alignment="center")
+                for k, (col, text) in enumerate(zip(cols, row["cells"])):
+                    tag = f" <span class='gen-changed'>{mark}</span>" if k == 0 and row.get(flag) else ""
+                    col.markdown(f"<span class='gen-cell'>{html.escape(str(text))}</span>{tag}",
+                                 unsafe_allow_html=True)
+                cols[-1].button("Edit", key=f"edit_{key}_{n}", type="tertiary", icon=":material/edit:",
+                                on_click=on_edit, args=(row[ident],))
+
+
+def _render_unit_costs() -> None:
+    """Each unit's production, redispatch and reactive costs — the case's, the
+    synthetic rule's, or the operator's (CONDUCTOR can change them too)."""
+    data = _api_request("get", "/api/costs", error_key="_cost_error")
+    error = st.session_state.pop("_cost_error", None)
+    n_changed = len((data or {}).get("changed") or {})
+    st.markdown("##### Costs — production, redispatch, reactive" + (f" · {n_changed} changed" if n_changed else ""))
+    with st.container(key="sys_costs"):
+        if error:
+            st.warning(error)
+        if data is None:
+            st.caption("Could not read the costs from the backend.")
+            return
+        units = {u["unit"]: u for u in data.get("units") or []}
+        if not units:
+            st.caption("This network has no units to cost.")
+            return
+        st.caption("Each figure comes from the network file, a synthetic rule (below) or a change you made. "
+                   + str(data.get("used_by") or ""))
+        groups = _sys_table.cost_rows(list(units.values()))
+        for group, rows in groups.items():
+            spec = _sys_table.GROUPS[group]
+            _render_plain_table(f"cost_{group}", spec["title"], spec["caption"], spec["columns"], rows,
+                                lambda name: st.session_state.update(_cost_editing=name),
+                                widths=spec["widths"])
+        if st.button("Reset all to defaults", key="cost_reset", disabled=not n_changed):
+            _api_request("post", "/api/costs", {"reset": True}, error_key="_cost_error")
+            st.rerun()
+        st.caption(f"{data.get('synthetic_rule', '')} Kept for this network across restarts.")
+        editing = st.session_state.pop("_cost_editing", None)
+        if editing in units:
+            _edit_cost_dialog(units[editing])
+
+
+@st.dialog("Edit costs", width="medium")
+def _edit_cost_dialog(unit: dict) -> None:
+    """One unit's costs, by section; an emptied field goes back to its default."""
+    where = unit.get("bus_name") or unit.get("bus")
+    cap = f" · Pmax {unit['p_max_mw']:g} MW" if unit.get("p_max_mw") is not None else ""
+    st.markdown(f"**{unit['unit']}** · {where}{cap}")
+    values: dict = {}
+    sources = unit.get("source") or {}
+    for section, fields in _sys_table.fields_of(unit).items():
+        st.markdown(f"<span class='gen-head'>{html.escape(section)}</span>", unsafe_allow_html=True)
+        cols = st.columns(min(len(fields), 3))
+        for n, (key, (label, _, _fmt)) in enumerate(fields.items()):
+            src = _sys_table.SOURCE_LABELS.get(sources.get(key), "")
+            fine = "mw2h" in key or "tan" in key
+            values[key] = cols[n % len(cols)].number_input(
+                label, value=unit.get(key), min_value=None,
+                step=0.001 if "mw2h" in key else 0.05 if "tan" in key else 1.0,
+                format="%.4f" if fine else "%.2f",
+                placeholder="not priced", help=f"Now from: {src}." if src else None,
+                key=f"dlg_cost_{key}_{unit['unit']}")
+    change = _sys_table.cost_changes(unit, values)
+    back = _sys_table.defaults_change(unit)
+    error = st.session_state.pop("_cost_error", None)
+    if error:
+        st.warning(error)
+    c_apply, c_default, c_cancel = st.columns(3)
+    if c_apply.button("Apply", type="primary", disabled=change is None, width="stretch", key="cost_apply"):
+        if _api_request("post", "/api/costs", {"changes": [change]}, error_key="_cost_error") is not None:
+            st.rerun()
+        st.rerun(scope="fragment")              # keep the dialog open to show why
+    if c_default.button("Back to defaults", disabled=back is None, width="stretch", key="cost_default",
+                        help="Every figure you changed for this unit goes back to the case file's or the rule's."):
+        if _api_request("post", "/api/costs", {"changes": [back]}, error_key="_cost_error") is not None:
+            st.rerun()
+        st.rerun(scope="fragment")
+    if c_cancel.button("Cancel", width="stretch", key="cost_cancel"):
+        st.rerun()
+
+
+def _render_names() -> None:
+    """Rename buses, lines, transformers, loads and units — every result uses
+    the new names from the next study on; measurements stay matched."""
+    data = _api_request("get", "/api/names", error_key="_names_error")
+    error = st.session_state.pop("_names_error", None)
+    if error:
+        st.warning(error)
+    if data is None:
+        st.caption("Could not read the element names from the backend.")
+        return
+    renamed = data.get("renamed") or []
+    st.caption("Give elements the names your team uses. Every chart, table and answer uses them from the next "
+               "study on; the data stay matched to the names the network was loaded with, and a bus's lines and "
+               "transformers are relabelled with it. Kept for this network across restarts; CONDUCTOR can rename "
+               "too, when you ask.")
+    elements = data.get("elements") or {}
+    kinds = [k for k in _sys_table.NAME_KINDS if elements.get(k)]
+    if not kinds:
+        st.caption("Nothing to name.")
+        return
+    rows_by_kind = {k: _sys_table.name_rows(k, elements[k]) for k in kinds}
+    tabs = st.tabs([f"{_sys_table.NAME_KINDS[k]} · {len(rows_by_kind[k])}"
+                    + (f" · {sum(r['renamed'] for r in rows_by_kind[k])} renamed"
+                       if any(r["renamed"] for r in rows_by_kind[k]) else "") for k in kinds])
+    for kind, tab in zip(kinds, tabs):
+        with tab:
+            _render_plain_table(f"names_{kind}", "", "", _sys_table.NAME_COLUMNS[kind], rows_by_kind[kind],
+                                lambda idx, kind=kind: st.session_state.update(_name_editing=(kind, idx)),
+                                mark="renamed", flag="renamed", ident="index")
+    if st.button("Restore every name", key="names_reset", disabled=not renamed):
+        _api_request("post", "/api/names", {"reset": True}, error_key="_names_error")
+        st.rerun()
+    editing = st.session_state.pop("_name_editing", None)
+    if editing:
+        kind, idx = editing
+        row = next((r for r in rows_by_kind.get(kind, []) if r["index"] == idx), None)
+        if row is not None:
+            _edit_name_dialog(kind, row)
+
+
+@st.dialog("Rename", width="small")
+def _edit_name_dialog(kind: str, row: dict) -> None:
+    """One element's name; empty (or Restore) gives back the name it was loaded with."""
+    st.markdown(f"**{html.escape(row['shown'])}**")
+    st.caption(f"{_sys_table.NAME_SINGULAR[kind]} {row['index']}" + (" · renamed" if row["renamed"] else ""))
+    new = st.text_input("Name", value=row["name"], max_chars=64, key=f"dlg_name_{kind}_{row['index']}",
+                        placeholder="the name it was loaded with").strip()
+    error = st.session_state.pop("_names_error", None)
+    if error:
+        st.warning(error)
+    c_apply, c_restore, c_cancel = st.columns(3)
+    if c_apply.button("Apply", type="primary", disabled=new == row["name"], width="stretch", key="name_apply"):
+        body = {"changes": [{"element_type": kind, "element": row["index"], "name": new}]}
+        if _api_request("post", "/api/names", body, error_key="_names_error") is not None:
+            st.rerun()
+        st.rerun(scope="fragment")
+    if c_restore.button("Restore", disabled=not row["renamed"], width="stretch", key="name_restore",
+                        help="Back to the name it was loaded with."):
+        body = {"changes": [{"element_type": kind, "element": row["index"], "name": ""}]}
+        if _api_request("post", "/api/names", body, error_key="_names_error") is not None:
+            st.rerun()
+        st.rerun(scope="fragment")
+    if c_cancel.button("Cancel", width="stretch", key="name_cancel"):
+        st.rerun()
+
+
 def _render_model_assumptions(assumptions: dict) -> None:
     """The assumptions every study is built on: how loads draw reactive power
     and how each unit is modelled."""
     st.caption("What every study assumes beyond the data. Changes take effect from the next study; "
                "nothing needs to be regenerated.")
     _render_generator_models()
+    st.divider()
+    _render_unit_costs()
     st.divider()
     _render_load_pf(assumptions)
 
@@ -4051,6 +4410,11 @@ def _render_system_header(payload: dict, assumptions: dict) -> None:
         st.button("Generators · " + (f"{n_changed} changed" if n_changed else "as loaded"),
                   key="chip_gen", type="primary" if n_changed else "secondary",
                   help="How each unit is modelled — open the model assumptions", on_click=_open_assumptions)
+        n_costs = len(assumptions.get("unit_costs") or {})
+        st.button("Costs · " + (f"{n_costs} changed" if n_costs else "defaults"),
+                  key="chip_costs", type="primary" if n_costs else "secondary",
+                  help="What each unit costs to produce and to redispatch — open the model assumptions",
+                  on_click=_open_assumptions)
         st.button("Nominal point · " + ("on" if nominal_on else "off"), key="chip_nominal",
                   type="primary" if nominal_on else "secondary", disabled=not timeline.nominal_available,
                   help=("Studies use the network's own operating point instead of a moment of the data — "
@@ -4131,6 +4495,8 @@ _TOOL_LABELS = {
     "set_load_power_factor": "Load power factor setting",
     "get_data_quality": "Data quality report",
     "set_generator_model": "Generator model",
+    "set_unit_costs": "Unit costs",
+    "rename_elements": "Renaming",
     "compare_networks": "Base vs proposal",
     "run_probabilistic_rsa": "Probabilistic security assessment",
     "scan_scenarios": "Renewable scenario scan",
@@ -4387,7 +4753,7 @@ def _render_suggestion_round(rnd: dict, idx: int, r_i: int, expanded: bool = Tru
     # Collapsible, so suggestions the operator has read or does not want can
     # be folded away. Unframed inside "Earlier in this conversation", where an
     # expander of its own could not be nested.
-    frame = (st.expander(":violet[**✨ Suggestions**]", expanded=expanded) if framed
+    frame = (st.expander(":violet[**✨ Next steps**]", expanded=expanded) if framed
              else st.container())
     with frame:
         st.caption(_AI_SUGGESTION_CAPTION)
@@ -4810,7 +5176,7 @@ def _panel_history(last_idx: int) -> None:
         return
     with st.expander("Earlier in this conversation", expanded=False):
         for i, m in earlier:
-            st.markdown(f"**Suggestions after {_turn_label(i, 50)}**".replace("$", "\\$"))
+            st.markdown(f"**Next steps after {_turn_label(i, 50)}**".replace("$", "\\$"))
             for r_i, rnd in enumerate(m["suggestion_rounds"]):
                 _render_suggestion_round(rnd, i, r_i, framed=False)
         for k, d in closed:
@@ -4843,11 +5209,11 @@ def _render_agent_panel() -> None:
         return
     idx = answers[-1]
     st.markdown(f"**About the latest answer** — {_turn_label(idx)}".replace("$", "\\$"))
-    st.session_state.setdefault("agent_mode", "discuss" if _active_discussion() else "suggest")
+    st.session_state.setdefault("agent_mode", "discuss")
     mode = st.segmented_control(
-        "Advisor", ["suggest", "discuss"], key="agent_mode", label_visibility="collapsed",
-        format_func={"suggest": "✨ Suggestions", "discuss": "💬 Discuss"}.get,
-        selection_mode="single", disabled=_ui_busy()) or "suggest"
+        "Advisor", ["discuss", "suggest"], key="agent_mode", label_visibility="collapsed",
+        format_func={"discuss": "💬 Discuss", "suggest": "✨ Next steps"}.get,
+        selection_mode="single", disabled=_ui_busy()) or "discuss"
     if mode == "discuss":
         _panel_discussion(idx)
     else:
@@ -4933,8 +5299,10 @@ def _render_data_view() -> None:
     if not timeline.modes():
         st.warning("No data to show — the backend is not responding.")
         return
+    # The names key: a rename relabels the series (the network's identity stays).
     signature = "|".join(str(x) for x in (
-        st.session_state.get("_network_fingerprint"), timeline.measured_source, timeline.forecast_source,
+        st.session_state.get("_network_fingerprint"), (_fetch_assumptions() or {}).get("names_key"),
+        timeline.measured_source, timeline.forecast_source,
         len(timeline.measured), timeline.measured[:1], timeline.measured[-1:],
         len(timeline.forecast), timeline.forecast[:1], timeline.forecast[-1:]))
 
@@ -4946,8 +5314,11 @@ def _render_data_view() -> None:
 
     c_ds, c_items, c_qty = st.columns([2, 4, 3])
     choice = c_ds.radio("Dataset", datasets, index=len(datasets) - 1, horizontal=True, key="dv_dataset")
+    renamed = (base or {}).get("renamed") or {}
     picked = c_items.multiselect("Substations", names, key="dv_items", placeholder="System total",
-                                 help="Leave empty for the system total.")
+                                 format_func=lambda n: _dv.label(n, renamed),
+                                 help="Leave empty for the system total. A renamed bus shows its name now, "
+                                      "with the name its data are filed under.")
     offered = _dv.quantities(base)
     if st.session_state.get("dv_quantity") not in offered:
         st.session_state.dv_quantity = "consumption"
@@ -4967,7 +5338,7 @@ def _render_data_view() -> None:
                      if choice in ("Forecast", "Both") and timeline.forecast else None),
     }
     view = st.session_state.get("op_view") or {}
-    st.plotly_chart(_polish(_dv.figure(series, items, quantity, marker=view.get("ts"))),
+    st.plotly_chart(_polish(_dv.figure(series, items, quantity, marker=view.get("ts"), renamed=renamed)),
                     width="stretch", theme=None, key="dv_chart")
 
     facts = []
@@ -4985,7 +5356,7 @@ def _render_data_view() -> None:
             err = _dv.forecast_error(series["measured"], series["forecast"], item, quantity)
             if err:
                 st.caption(
-                    f"Forecast error, {item}, {_dv.QUANTITIES[quantity].lower()}, over the {err['n']} "
+                    f"Forecast error, {_dv.label(item, renamed)}, {_dv.QUANTITIES[quantity].lower()}, over the {err['n']} "
                     f"shared ticks ({err['first'][5:16]} → {err['last'][5:16]}): "
                     f"bias {err['bias']:+.2f} MW · MAE {err['mae']:.2f} MW"
                     + (f" · MAPE {err['mape_pct']:.1f} %" if err["mape_pct"] is not None else ""))
@@ -4998,7 +5369,8 @@ def _render_data_view() -> None:
             for item in items:
                 ys = _dv.values(payload, item, quantity)
                 if ys:
-                    columns[f"{item} — {dataset} (MW)"] = pd.Series(ys, index=payload["timestamps"])
+                    columns[f"{_dv.label(item, renamed)} — {dataset} (MW)"] = pd.Series(
+                        ys, index=payload["timestamps"])
         if columns:
             frame = pd.DataFrame(columns)
             frame.index.name = "timestamp"
@@ -5015,6 +5387,10 @@ with _chat_tab:
     # agent is something the operator opens (its launcher is flagged when an
     # answer has concerns). Its column is there from the start, so it can be
     # opened to plan before the first question.
+    _privacy_reminder()
+    _switch_note = st.session_state.pop("_model_switch_note", None)
+    if _switch_note:
+        st.info(_switch_note, icon=":material/swap_horiz:")
     _panel_open = st.session_state.get("agent_panel_open", False)
     with st.container(key="chat_layout"):
         _col_chat, _col_agent = st.columns([0.63, 0.37] if _panel_open else [0.955, 0.045],
@@ -5282,6 +5658,15 @@ def _process_turn(effective_input: str, work) -> None:
                         attempt = data.get("attempt", "?")
                         total = data.get("total", "?")
                         st.write(f"⚠️ {reason} — waiting {wait}s before retry {attempt}/{total}…")
+                    elif event == "model_switch":
+                        # The fallback chain or a model that is gone: say so,
+                        # so an answer is never read as the model that was chosen.
+                        how = "answered by" if data.get("temporary") else "switched to"
+                        st.write(f"🔁 {data.get('reason', 'Model unavailable')} — {how} "
+                                 f"`{data.get('to')}` (was `{data.get('from')}`).")
+                        if not data.get("temporary"):
+                            st.session_state._model_switch_note = (
+                                f"Now using `{data.get('to')}`: {data.get('reason')}.")
 
             try:
                 final_text, updated_history = run_agent_turn(

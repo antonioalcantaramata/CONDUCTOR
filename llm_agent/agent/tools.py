@@ -1645,6 +1645,49 @@ def set_generator_model(changes: list | None = None, reset: bool = False, **kwar
                    _post("/api/generators", {"changes": list(changes or []), "reset": bool(reset)}))
 
 
+def set_unit_costs(changes: list | None = None, reset: bool = False, **kwargs) -> dict:
+    """
+    GET / POST /api/costs
+
+    Each unit's production cost (c0 + c1·P + c2·P²) and redispatch costs
+    up/down, from the case, the synthetic rule or the operator. With no
+    arguments, returns them; with `changes`, applies them; reset=True restores
+    every default.
+    """
+    unsupported = _unsupported_kwargs_result("set_unit_costs", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    if not changes and not reset:
+        return _record("set_unit_costs", _get("/api/costs"))
+    if changes and reset:
+        return {"error": "Give either changes or reset=true, not both."}
+    return _record("set_unit_costs", _post("/api/costs", {"changes": list(changes or []), "reset": bool(reset)}))
+
+
+def rename_elements(changes: list | None = None, reset: bool = False, **kwargs) -> dict:
+    """
+    GET / POST /api/names
+
+    Rename buses, lines, transformers, loads or units of the loaded network.
+    With no arguments, returns every renamed element; reset=True restores
+    every name as loaded.
+    """
+    unsupported = _unsupported_kwargs_result("rename_elements", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    if not changes and not reset:
+        result = _get("/api/names")
+        if isinstance(result, dict) and "elements" in result:
+            result = {k: v for k, v in result.items() if k != "elements"}   # the renamed ones suffice
+        return _record("rename_elements", result)
+    if changes and reset:
+        return {"error": "Give either changes or reset=true, not both."}
+    result = _post("/api/names", {"changes": list(changes or []), "reset": bool(reset)})
+    if isinstance(result, dict):
+        result.pop("elements", None)
+    return _record("rename_elements", result)
+
+
 # ---------------------------------------------------------------------------
 # Network proposals (sandbox)
 # ---------------------------------------------------------------------------
@@ -1664,7 +1707,7 @@ def edit_proposal(proposal: str, edits: list | None = None, replace: bool = Fals
 
 
 def compare_networks(
-    proposal: str,
+    proposal: str = "",
     study: str = "rsa",
     load_scaling_factor: float = 1.0,
     vm_upper_pu: float | None = None,
@@ -1681,7 +1724,7 @@ def compare_networks(
     """
     unsupported = _unsupported_kwargs_result(
         "compare_networks", kwargs,
-        supported_extra={"data_source", "timestamp", "sgen_scaling_factor",
+        supported_extra={"data_source", "timestamp", "sgen_scaling_factor", "against", "proposals",
                          "start_timestamp", "end_timestamp", "step_size", "load_power_factor"})
     if unsupported is not None:
         return unsupported

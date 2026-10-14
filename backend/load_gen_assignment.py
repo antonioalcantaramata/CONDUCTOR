@@ -10,6 +10,8 @@ import numpy as np
 import os
 import unicodedata
 
+from element_names import measurement_name
+
 
 # In[2]:
 
@@ -243,13 +245,8 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
         net.load = net.load[~net.load['name'].isin(names_to_drop)].copy()
 
     # -------- Step 3: Map bus index to bus name (Bus_{idx} fallback for empty/missing names) --------
-    if 'name' in net.bus.columns:
-        bus_name_map = {
-            int(idx): (str(row['name']).strip() if pd.notna(row['name']) and str(row['name']).strip() else f"Bus_{idx}")
-            for idx, row in net.bus.iterrows()
-        }
-    else:
-        bus_name_map = {int(idx): f"Bus_{idx}" for idx in net.bus.index}
+    # The name as loaded: a bus the operator renamed keeps its measurements.
+    bus_name_map = {int(idx): measurement_name(net, idx) for idx in net.bus.index}
     net.load['bus_name'] = net.load['bus'].map(bus_name_map)
 
     # -------- Step 4: Assign substation names using helper function --------
@@ -484,12 +481,7 @@ def assign_generators_values_from_measurements(net, measurement_prod_cons, subst
         # --- Generic / IEEE / MATPOWER path ---
         # Build bus_id → production from measurement rows (keyed by bus name)
         prod_map = measurement_prod_cons.set_index('substation_name')['production']
-        bus_name_map_local = {
-            int(idx): (str(row['name']).strip()
-                       if 'name' in net.bus.columns and pd.notna(row['name']) and str(row['name']).strip()
-                       else f"Bus_{idx}")
-            for idx, row in net.bus.iterrows()
-        }
+        bus_name_map_local = {int(idx): measurement_name(net, idx) for idx in net.bus.index}
         bus_id_to_prod = {
             bus_id: float(prod_map[bname])
             for bus_id, bname in bus_name_map_local.items()

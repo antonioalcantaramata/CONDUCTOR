@@ -210,3 +210,13 @@ def test_a_network_with_numbered_buses_gives_text_names(client):
     from agent.system_prompt import build_system_prompt
     gc = dict(grid, substation_names=[1, 2, 3])                     # tolerant of numbers, too
     assert "1, 2, 3" in build_system_prompt(gc)
+
+
+def test_buses_and_substations_are_reported_apart(client):
+    grid = client.get("/api/grid_constants").json()
+    assert grid["n_buses"] == 14 and grid["n_substations"] == 11 and grid["n_lines"] == 17 and grid["n_trafos"] == 3
+    import sys
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "llm_agent"))
+    from agent.system_prompt import build_system_prompt
+    prompt = build_system_prompt(grid)
+    assert "14 buses, 17 power lines" in prompt and "11 of the 14 buses are substations" in prompt

@@ -16,15 +16,21 @@ without touching the loaded network, every figure in an answer is traced to the
 solver that produced it, and an advisor — a second agent that runs no studies —
 suggests next steps and discusses results with the operator.
 
-The agent runs on a **hosted model** — Google Gemini, OpenAI, or Anthropic
-(Claude) — or a **local model via Ollama**. You pick which each time you start
-it, and no grid data leaves your machine in local mode.
+The agent runs on a **hosted model** or a **local model via Ollama**, picked
+on a launch screen grouped into tiers:
 
-The OpenAI option is not limited to OpenAI: point `OPENAI_BASE_URL` at any
-endpoint speaking the same chat-completions dialect — Kimi, DeepSeek, Qwen,
-Groq, Mistral, OpenRouter, Azure OpenAI, or a self-hosted vLLM server — and the
-same agent runs on it. The only hard requirement is **tool calling**, since
-CONDUCTOR drives the grid entirely through tools.
+- **Free** — Gemini API (free tier), NVIDIA Build (free endpoints), OpenRouter
+  (free models);
+- **Paid** — OpenAI, Anthropic (Claude), Gemini paid, OpenRouter paid, DeepSeek
+  (a reported one-time signup credit, then pay-as-you-go), or any
+  OpenAI-compatible endpoint (Azure, vLLM, …) via `OPENAI_BASE_URL`;
+- **Local** — Ollama: no grid data leaves your machine.
+
+Each option shows an info card before you start: context window, what the tier
+actually allows per request and per day, rate limits, sign-up needs and a data
+notice — see [Choosing a model](#choosing-a-model-tiers-limits-and-privacy).
+The only hard requirement is **tool calling**, since CONDUCTOR drives the grid
+entirely through tools.
 
 ## Overview
 
@@ -43,11 +49,12 @@ CONDUCTOR drives the grid entirely through tools.
   (lightweight, recommended) or full Anaconda. The only heavy prerequisite;
   the launcher builds the environment for you.
 - **One LLM backend**, any of:
-  - a Google Gemini API key (free tier works) — https://aistudio.google.com/apikey,
-  - an OpenAI API key (paid per token) — https://platform.openai.com/api-keys —
-    **or a key for any OpenAI-compatible provider** (Kimi, DeepSeek, Qwen,
-    Groq, OpenRouter, …), set with `OPENAI_BASE_URL`,
-  - an Anthropic API key (paid per token) — https://console.anthropic.com/settings/keys, or
+  - free: a Gemini API key — https://aistudio.google.com/apikey; an NVIDIA
+    Build key (`nvapi-…`, phone verification) — https://build.nvidia.com/settings/api-keys;
+    or an OpenRouter key — https://openrouter.ai/settings/keys,
+  - a DeepSeek key (signup credit, then paid) — https://platform.deepseek.com/api_keys,
+  - paid: an OpenAI, Anthropic, Gemini (billing) or OpenRouter key, or any
+    OpenAI-compatible endpoint, or
   - [Ollama](https://ollama.com/download) with a tool-capable model pulled
     (see [Running a local model](#running-a-local-model)).
 
@@ -71,16 +78,12 @@ python start.py     # any OS, including Windows
 ```
 
 When it's ready, the chat app opens at **http://localhost:8501** and shows a
-launch screen where you choose the backend:
-
-- **Google Gemini API** — paste a key once; it's saved to `llm_agent/.env`.
-- **OpenAI API** — paste a key and name a model; the key and model are checked
-  before the app starts rather than at your first question. Also the route to
-  every **OpenAI-compatible** provider (Kimi, DeepSeek, Qwen, Groq, OpenRouter,
-  Azure, vLLM): set the base URL under **Model settings**.
-- **Anthropic API** — paste a key and name a Claude model; effort is set on the
-  same screen.
-- **Local model (Ollama)** — pick from the tool-capable models you have pulled.
+launch screen in two columns: on the left what to load (Resume or a demo), on
+the right how to run the assistant — a tier (Free / Paid / Local),
+an option, a model, and the option's info card. Paste a key once; it's saved to
+`llm_agent/.env`, one variable per provider, so several keys can be stored at
+once. For OpenAI and Anthropic the key and model are checked before the app
+starts; for Ollama, pick from the tool-capable models you have pulled.
 
 The screen appears on every start, so switching backends is a restart and one
 click. Settings are also editable mid-session under **Model settings** in the
@@ -139,15 +142,17 @@ also filters to models that report it.
 
 ### What to expect
 
-The agent sends a large prompt — the system instructions plus 20 tool schemas
-come to roughly **25,000 tokens before any conversation**. Hosted models absorb
+The agent sends a large prompt — the system instructions plus 27 tool schemas
+come to roughly **28,000 tokens before any conversation** (measured with
+Gemini's token counter; CONDUCTOR estimates it at startup and refines it from
+the token counts providers report). Hosted models absorb
 that easily; local models process it at a few hundred tokens per second, so the
 first request after a model loads is slow. Measured on an Apple M3 Pro (18 GB)
 with a 12B model:
 
 | | time |
 | --- | --- |
-| First request after the model loads | ~3 min (processing the 25k-token prompt) |
+| First request after the model loads | ~3 min (processing the ~28k-token prompt) |
 | Every request after that | ~15 s |
 
 Ollama caches the processed prompt, which is why only the first one is
@@ -157,7 +162,7 @@ isn't the thing that waits. Keeping the model resident (`OLLAMA_KEEP_ALIVE`,
 default 60 min) is what keeps subsequent questions fast.
 
 A smaller model processes the prompt proportionally faster, at some cost to how
-reliably it picks the right tool among twenty.
+reliably it picks the right tool among twenty-seven.
 
 ### Context window
 
@@ -181,7 +186,10 @@ Key choices:
 
 | Variable | Purpose |
 | --- | --- |
-| `LLM_PROVIDER` | `google`, `openai`, `anthropic`, or `ollama` |
+| `LLM_PROVIDER` | `google`, `nvidia`, `openrouter`, `deepseek`, `openai`, `anthropic`, or `ollama` |
+| `GEMINI_TIER` / `OPENROUTER_TIER` | `free` by default; `paid` |
+| `NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY` | one key variable per preset |
+| `NVIDIA_MODEL`, `OPENROUTER_MODEL`, `DEEPSEEK_MODEL` | chosen on the launch screen from the live lists |
 | `GEMINI_MODEL` | default `gemini-3.5-flash-lite` |
 | `GEMINI_THINKING_LEVEL` | `minimal`, `low`, `medium`, `high`; empty (default) = model's own budget |
 | `OPENAI_MODEL` | default `gpt-6-luna` (cheapest current tier) — must support tool calling |
@@ -192,7 +200,7 @@ Key choices:
 | `ANTHROPIC_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
 | `ANTHROPIC_THINKING` | `1` (default) for adaptive thinking; `0` to disable |
 | `OLLAMA_MODEL` | any tool-capable model you have pulled |
-| `OLLAMA_NUM_CTX` | context window — must exceed the ~25k-token prompt |
+| `OLLAMA_NUM_CTX` | context window — must exceed the ~28k-token prompt |
 | `OLLAMA_KEEP_ALIVE` | how long the model and its prompt cache stay resident |
 
 The OpenAI provider drives two endpoints. Newer reasoning models **refuse
@@ -209,8 +217,122 @@ custom base URL stays on chat-completions unless you set `OPENAI_API=responses`.
 
 Avoid free-tier **Gemma models on the Gemini API**: their 16K
 input-tokens-per-minute cap is below this agent's per-call overhead, so requests
-fail immediately. This does not apply to Gemma run locally through Ollama, where
-no such quota exists.
+fail immediately (the launch screen does not offer them). This does not apply to
+Gemma run locally through Ollama, where no such quota exists.
+
+## Choosing a model: tiers, limits and privacy
+
+Everything the launch screen says about an option — limits, links, data
+notices — comes from **`llm_agent/provider_catalog.yaml`**, the single source of
+truth. Every number there carries its source URL, whether the provider states
+it (`official`), someone else reports it (`third_party`) or it could not be
+found in the provider's docs (`unverified`), and the date it was last checked.
+Limits change often: check your provider console, and update the catalog.
+
+**Why free tiers are tight.** Every model call carries the ~28k-token prompt,
+and one question takes several calls (CONDUCTOR measures its own average and
+keeps it locally; 4 until it has data). On free tiers the binding limit is
+usually requests per day or tokens per minute, not the advertised context
+window — so each card shows the *effective* size per request, an estimate of
+questions per day (or time per question, or questions left from a balance), and
+disables an option whose per-minute token or per-request cap is below one
+request.
+
+| Option | Setup | Limits (see the catalog for sources) |
+| --- | --- | --- |
+| **Gemini API · free** (recommended) | key at https://aistudio.google.com/apikey | per model; daily reset at midnight Pacific. Default `gemini-3.5-flash-lite`, falling back to `gemini-3.1-flash-lite` when its daily quota is spent. Gemini 3.x Flash models are offered as an "advanced, few questions a day" choice |
+| **NVIDIA Build · free endpoints** | a free NVIDIA Developer account **with phone verification** (not available in every country), then a key (`nvapi-…`) at https://build.nvidia.com/settings/api-keys | "Up to 40 rpm" and "10,000 requests per day" per the model cards. Allowlist, fastest first as measured on a 4-tool question (October 2026): `nvidia/nemotron-3-super-120b-a12b` (default, 56 s), `nvidia/nemotron-3-ultra-550b-a55b` (88 s), `nvidia/nemotron-3.5-lightning-30b-a3b` (83 s), `z-ai/glm-5.3` (657 s), `z-ai/glm-5.3-flash` (757 s), `deepseek-ai/deepseek-v4.1-flash` (did not finish within 30 min). Free endpoints can be slow: `NVIDIA_TIMEOUT_S` (default 180 s) |
+| **OpenRouter · free models** | key at https://openrouter.ai/settings/keys | 20 requests/min; 50 requests/day, or 1,000/day once $10 of credit has ever been bought |
+| **DeepSeek API** (paid) | key at https://platform.deepseek.com/api_keys | a one-time credit (reportedly ~5M tokens, ~30 days; not on the official pricing page), then pay-as-you-go. The card estimates questions left from your balance |
+| Paid options | your provider's console | limited by your plan |
+| Local (Ollama) | see [Running a local model](#running-a-local-model) | limited by your hardware |
+
+**Discovery, not hard-coded model names.** Free models are renamed and retired
+often. OpenRouter's list is read live from its public `/api/v1/models` and
+filtered to models that are free, call tools, take and return text, have at
+least `OPENROUTER_MIN_CONTEXT` tokens (default 131,072) and do not retire within
+`FREE_MODEL_EXPIRY_GRACE_DAYS` (default 14; the rest show a "retires on" badge).
+NVIDIA's model list carries no pricing or capability data, so the catalog keeps
+an allowlist and only models NVIDIA currently lists are offered. Lists are
+cached for `DISCOVERY_CACHE_TTL_H` hours (default 24); **Refresh** fetches them
+again. A "Test tool calling" button (opt-in, uses one request) checks a model
+actually calls tools.
+
+**Thinking.** OpenRouter and NVIDIA presets have a *Thinking* setting. On
+OpenRouter it is the documented `reasoning.effort` (none / low / medium / high),
+sent only to models that list support for it. On NVIDIA each model documents its
+own control on its card, and the catalog carries it: `enable_thinking` for the
+Nemotron models (Ultra also has a medium level), `reasoning_effort` low / high /
+max for GLM 5.3 (default `max`; `low` halved its response time when tested).
+*Model default* sends nothing (`NVIDIA_THINKING`, `OPENROUTER_THINKING`).
+
+**Newer model versions.** Providers rename and replace models often, so the
+launch screen also looks for versions newer than the catalog knows: an NVIDIA
+model of the same family with a higher version (e.g. `z-ai/glm-5.4` next to
+`z-ai/glm-5.3`), or a newer Gemini Flash / Flash-Lite in Google's model list
+(read with your key; it generates nothing). These are offered with a "newer ·
+unconfirmed" badge — never switched to — and can be chosen once a tool-calling
+test passes, since their free status and limits are unknown. Cards also warn
+when the catalog's figures for an option were last verified more than
+`CATALOG_STALE_DAYS` days ago (default 60).
+
+**When a limit is hit.** A per-minute limit backs off with a visible "waiting
+for the rate limit" status. A daily limit or spent credit stops, says which
+limit was hit and when it resets if known, and suggests the other free options
+or Local. A model that is gone (retired on Gemini, delisted on OpenRouter or
+NVIDIA) is replaced by the next one — Gemini's fallback chain, or the next
+qualifying model after refreshing the list — the answer says so, and the
+request is retried once. A timeout is retried once and reported as a timeout.
+On OpenRouter's free tier the next two qualifying models are also sent as
+server-side fallbacks (`OPENROUTER_FALLBACKS`). The sidebar shows calls made
+today against the daily limit (OpenRouter's own count when available), or the
+credit left on DeepSeek. On free tiers, older questions' tool results
+are shortened in what is sent, so long conversations fit per-minute token
+budgets (`CONDUCTOR_COMPACT_HISTORY`).
+
+**Privacy.** Each card states the option's data terms before Start, with the
+long form and sources under "Details and sources". In short:
+
+- *Gemini free:* Google may use free-tier prompts and responses to improve its
+  products, and human reviewers may read them; in the EEA, Switzerland and the
+  UK the paid-tier terms apply even on the free tier.
+- *NVIDIA Build:* for development and testing only; NVIDIA records inputs and
+  outputs for the trial and to improve its products, including AI models.
+- *OpenRouter free:* OpenRouter does not store prompts unless you opt in, but
+  each model's provider has its own policy, and some free-model hosts may train
+  on prompts. CONDUCTOR allows them by default and says so on the card:
+  asking for providers that do not collect data
+  (`OPENROUTER_DENY_DATA_COLLECTION=1`) currently leaves no free model working
+  (tested October 2026). Also review your
+  [privacy settings](https://openrouter.ai/settings/privacy), and consider
+  [Guardrails](https://openrouter.ai/docs/guides/features/guardrails) to restrict
+  a key to chosen models and block endpoints that train on or retain data. The
+  data-use badge on a model is a keyword heuristic, never a guarantee.
+- *DeepSeek:* data is stored in the People's Republic of China.
+- *All free options* are meant for testing with sample networks such
+  as the bundled IEEE case. For real or confidential grid data, use Local or a
+  paid tier with suitable terms; CONDUCTOR reminds you once if you load your own
+  network on a free tier.
+
+**Other models for free.** NVIDIA's own Nemotron models, GLM 5.3 and DeepSeek
+V4.1 Flash are free on NVIDIA Build (GLM 5.x on Z.ai's own API is paid), and many open models are reachable
+through OpenRouter's free list — so there are no separate Z.ai or Mistral
+presets.
+
+**Providers that are not presets, and why** (checked October 2026 against
+their own docs):
+
+- **Groq** — free models allow 8,000 tokens per minute, below one ~28k-token
+  request ([rate limits](https://console.groq.com/docs/rate-limits)).
+- **Hugging Face Inference Providers** — free users get no monthly credit
+  ([pricing](https://huggingface.co/docs/inference-providers/pricing)).
+- **GitHub Models** — retired on 30 July 2026.
+- **Cloudflare Workers AI** — its free 10,000 "neurons" a day do fit a request,
+  but only about 10–60 a day on its tool-calling models (a handful of
+  questions), so it is not offered as a preset
+  ([pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)).
+- Third-party "free LLM" gateways and resellers are deliberately not offered:
+  who operates them and what they log is unknown.
 
 ## Development
 

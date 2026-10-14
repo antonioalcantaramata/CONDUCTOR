@@ -192,3 +192,121 @@ def test_scans_with_skipped_ticks_carry_a_warning():
     assert "2 tick(s)" in note({"n_non_converged": 2, "non_converged_timestamps": ["a", "b"]})
     assert "1 tick(s)" in note({"scenarios": [{"n_non_converged": 1}]})
     assert note({"n_non_converged": 0}) is None
+
+
+def _caption_functions():
+    src = (pathlib.Path(__file__).resolve().parents[1] / "llm_agent" / "app.py").read_text()
+    ns: dict = {"_TOOL_LABELS": {"run_rsa": "Security assessment (RSA)"}}
+    exec(src[src.index("def _non_default_pf("):src.index("def _table_of(")], ns)
+    return ns["_chart_caption"], ns["_non_default_pf"]
+
+
+def test_charts_from_different_power_factors_say_which():
+    caption, non_default = _caption_functions()
+    runs = [{"timestamp": "2000-01-01 00:00:00", "load_power_factor": {"value": v, "source": "this study"}}
+            for v in (0.9, 0.95, 1.0)]
+    show = any(non_default(r) for r in runs)
+    assert [caption("run_rsa", r, show_pf=show) for r in runs] == [
+        f"**Security assessment (RSA)** · 2000-01-01 00:00 · loads at pf {v}" for v in ("0.90", "0.95", "1.00")]
+
+
+def test_the_default_power_factor_is_not_repeated_on_every_chart():
+    caption, _ = _caption_functions()
+    result = {"timestamp": "2000-01-01 00:00:00", "load_power_factor": {"value": 0.95, "source": "default"}}
+    assert caption("run_rsa", result) == "**Security assessment (RSA)** · 2000-01-01 00:00"
+
+
+def test_measured_reactive_demand_and_other_conditions_are_named():
+    caption, _ = _caption_functions()
+    measured = {"timestamp": "2000-01-01 00:00:00", "load_power_factor": {
+        "value": 0.9, "source": "this study", "measured_reactive_power": {"share_of_load": 1.0}}}
+    assert caption("run_rsa", measured).endswith("reactive demand as measured")
+    other = {"data_source": "nominal", "network": {"id": "pv9"}, "generator_model": {"changed_units": {}}}
+    assert caption("run_rsa", other) == ("**Security assessment (RSA)** · nominal operating point · proposal `pv9` · "
+                                         "generator model changed")
+
+
+def _arg_functions():
+    import json
+    src = (pathlib.Path(__file__).resolve().parents[1] / "llm_agent" / "app.py").read_text()
+    ns: dict = {"json": json, "_TOOL_LABELS": {"run_rsa": "Security assessment (RSA)"}}
+    exec(src[src.index("_ARG_SHOWN_ELSEWHERE = "):src.index("def _table_of(")], ns)
+    return ns
+
+
+def _run(**args):
+    return {"timestamp": "2000-01-01 00:00:00", "_call_args": args}
+
+
+def test_any_parameter_that_differs_between_runs_is_on_the_caption():
+    ns = _arg_functions()
+    runs = [("run_rsa", _run(load_scaling_factor=1.0, timestamp="2000-01-01 00")),
+            ("run_rsa", _run(load_scaling_factor=1.2, timestamp="2000-01-01 00"))]
+    varying = ns["_varying_args"](runs)
+    assert varying == {"run_rsa": ["load_scaling_factor"]}           # the shared timestamp is not repeated
+    captions = [ns["_chart_caption"](n, r, extra=ns["_arg_bits"](n, r, varying)) for n, r in runs]
+    assert captions == ["**Security assessment (RSA)** · 2000-01-01 00:00 · load ×1",
+                        "**Security assessment (RSA)** · 2000-01-01 00:00 · load ×1.2"]
+
+
+def test_readable_labels_for_common_parameters():
+    ns = _arg_functions()
+    bit = ns["_arg_bit"]
+    assert bit("vm_lower_pu", 0.95, {"vm_lower_pu": 0.95, "vm_upper_pu": 1.05}) == "V limits 0.95–1.05"
+    assert bit("element_index", 7, {"element_type": "line", "element_index": 7}) == "outage line 7"
+    assert bit("n_samples", 500, {}) == "500 samples"
+    assert bit("max_line_loading_pct", 80, {}) == "line limit 80 %"
+    assert bit("strategy", "unity", {}) == "strategy unity"                 # anything else, by name
+    assert bit("load_scaling_factor", None, {}) == "load scaling factor default"
+
+
+def test_a_single_run_or_identical_runs_add_nothing():
+    ns = _arg_functions()
+    assert ns["_varying_args"]([("run_rsa", _run(load_scaling_factor=1.2))]) == {}
+    assert ns["_varying_args"]([("run_rsa", _run(a=1)), ("run_rsa", _run(a=1))]) == {}
+    assert ns["_varying_args"]([("run_rsa", _run(a=1)), ("scan_rsa_over_time", _run(a=2))]) == {}
+
+
+def test_every_tool_with_charts_gets_the_same_captions():
+    ns = _arg_functions()
+    ns["_TOOL_LABELS"]["simulate_contingency"] = "Contingency (N-1)"
+    runs = [("simulate_contingency", _run(element_type="line", element_index=3)),
+            ("simulate_contingency", _run(element_type="line", element_index=7)),
+            ("run_probabilistic_rsa", _run(n_samples=200)), ("run_probabilistic_rsa", _run(n_samples=1000))]
+    varying = ns["_varying_args"](runs)
+    assert varying == {"simulate_contingency": ["element_index"], "run_probabilistic_rsa": ["n_samples"]}
+    bits = [ns["_arg_bits"](n, r, varying) for n, r in runs]
+    assert bits == [["outage line 3"], ["outage line 7"], ["200 samples"], ["1000 samples"]]
+
+
+class TestSeveralProposals:
+    """compare_networks(proposals=[...]): one chart per figure of the ranking
+    table, or every network's curve on one scan chart."""
+
+    TABLE = [{"network": "base", "role": "reference", "total_violations": 3, "min_vm_pu": 0.93,
+              "max_line_loading_pct": 88.0},
+             {"network": "A", "role": "proposal", "total_violations": 1, "min_vm_pu": 0.96,
+              "max_line_loading_pct": 70.0}]
+
+    def test_rsa_table(self):
+        figs = renderers.render_network_comparison({"several": True, "study": "rsa", "table": self.TABLE,
+                                                    "timestamp": "2000-01-01 00:00"})
+        assert len(figs) == 3 and "by network" in figs[0].layout.title.text
+
+    def test_scan_curves_and_the_model_copy_drops_them(self):
+        from agent.loop import _prepare_tool_result_for_model
+        result = {"several": True, "study": "scan", "compared_with": "A", "comparisons": [
+            {"network": {"id": "B"}, "series": {"timestamps": ["t1"], "base_min_vm": [1.0],
+                                               "proposal_min_vm": [0.9]}}]}
+        figs = renderers.render_network_comparison(result)
+        assert [t.name for t in figs[0].data] == ["A", "B"]
+        assert "series" not in str(_prepare_tool_result_for_model("compare_networks", result))
+
+    def test_empty(self):
+        assert len(renderers.render_network_comparison({"several": True, "study": "rsa", "table": []})) == 1
+
+    def test_a_proposal_against_another_is_titled_so(self):
+        figs = renderers.render_network_comparison({
+            "study": "rsa", "timestamp": "2000-01-01 00:00", "network": {"id": "B", "compared_with": "A"},
+            "largest_voltage_changes": [{"element": "Bus_3", "change": 0.01, "base": 1.0, "proposal": 1.01}]})
+        assert "B − A" in figs[0].layout.title.text

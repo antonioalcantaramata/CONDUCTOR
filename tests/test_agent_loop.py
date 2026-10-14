@@ -156,8 +156,19 @@ class TestTurnBound:
             tools={"t": lambda **k: {}},
         )
         text, _ = loop_module.run_agent_turn("loop forever", [])
+        assert len(provider.calls) == 4                  # 3 steps, then one call asking for an answer
+        assert "all 3 steps" in text                    # it kept asking for tools: the warning stands
+
+    def test_at_the_limit_it_answers_from_what_it_has(self, stub, monkeypatch):
+        monkeypatch.setattr(loop_module, "MAX_AGENT_TURNS", 2)
+        provider = stub(
+            [ModelResponse(tool_calls=[ToolCall("t")]), ModelResponse(tool_calls=[ToolCall("t")]),
+             ModelResponse(text="Partial answer: the grid is secure; the proposal could not be built.")],
+            tools={"t": lambda **k: {}},
+        )
+        text, _ = loop_module.run_agent_turn("loop", [])
         assert len(provider.calls) == 3
-        assert "maximum of 3 turns" in text
+        assert text.startswith("Partial answer") and "all 2 steps" in text
 
     def test_one_llm_call_per_turn(self, stub):
         provider = stub([

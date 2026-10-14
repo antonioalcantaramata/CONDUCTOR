@@ -90,8 +90,15 @@ def forecast_error(measured: dict | None, forecast: dict | None, item: str, quan
     }
 
 
+def label(item: str, renamed: dict | None) -> str:
+    """How the data tab names a measurement row: the bus's name now, with the
+    name the data are filed under when the operator renamed it."""
+    now = (renamed or {}).get(item)
+    return f"{now} (data: {item})" if now and now != item else item
+
+
 def figure(series: dict[str, dict | None], items: list[str], quantity: str,
-           marker: str | None = None):
+           marker: str | None = None, renamed: dict | None = None):
     """Lines per item, measured solid and forecast dashed.
 
     One item: blue measured, purple forecast — the operating-point card's
@@ -118,7 +125,7 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
                 continue
             fig.add_trace(go.Scatter(
                 x=payload["timestamps"], y=ys, mode="lines",
-                name=f"{item} — {_DATASET_LABELS[dataset]}",
+                name=f"{label(item, renamed)} — {_DATASET_LABELS[dataset]}",
                 line={"color": colour, "width": 1.6 if dataset == "measured" else 1.4,
                       "dash": "solid" if dataset == "measured" else "dash"},
                 hovertemplate="%{x}<br>%{y:.2f} " + unit(quantity) + "<extra>%{fullData.name}</extra>",
@@ -135,9 +142,9 @@ def figure(series: dict[str, dict | None], items: list[str], quantity: str,
                 xs = [min(xs[0], other["timestamps"][0]), max(xs[1], other["timestamps"][-1])]
         colour = _C.INK if len(items) == 1 else line_colours[k % len(line_colours)]
         fig.add_trace(go.Scatter(
-            x=xs, y=[level, level], mode="lines", name=f"{item} — nominal",
+            x=xs, y=[level, level], mode="lines", name=f"{label(item, renamed)} — nominal",
             line={"color": colour, "width": 1.2, "dash": "dot"}, opacity=0.75,
-            hovertemplate=f"nominal {level:.2f} MW<extra>{item}</extra>",
+            hovertemplate=f"nominal {level:.2f} MW<extra>{label(item, renamed)}</extra>",
         ))
 
     measured, forecast = series.get("measured"), series.get("forecast")

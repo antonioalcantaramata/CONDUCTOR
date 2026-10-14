@@ -157,7 +157,7 @@ in per unit, resized with `sn_mva` — or a pandapower catalogue type, or given
 explicitly: rating, vk/vkr, no-load losses, magnetising current, vector-group
 shift, rated voltages, tap changer and position; up to 4 units in `parallel`,
 one branch in the model), `add_shunt` (a capacitor bank or reactor, Mvar),
-`set_in_service`. `add_generator` takes the unit's model like the System tab:
+`set_in_service` (lines, transformers, loads, units, shunts, storage), and `set_parameter` — any setting of any existing element: the external grid's voltage set-point (`element_type: ext_grid`, `field: vm_pu`), a generator's set-point or limits, a transformer tap, a line rating or loading limit, a bus's voltage limits, a load's or unit's power (held at every tick instead of the measured value, via `sandbox.apply_overrides` in `_assign_tick`). Connection fields are refused there (use `move_element`); an unknown field is refused with the list of editable ones. `add_line` / `add_trafo` add a branch between two **existing** buses (same voltage for a line, different for a transformer, whose unit is given like `add_bus_with_transformer`'s). `move_element` reconnects a load, unit, shunt, storage or the external grid to another bus, or one end of a line; a measured load or unit keeps its own measurements (`sandbox.before_tick` puts it back on its measured bus for the assignment, `apply_overrides` moves it again). `scale` multiplies existing loads or units (by element, by bus, or `all`) at every tick, keeping their profile; `before_tick` restores the unscaled value first so a value the tick does not rewrite is never scaled twice. `include_proposal` (expanded by the endpoint, not stored) copies another proposal's edits in to build "A + B". `add_generator` takes the unit's model like the System tab:
 `control` (`voltage` — a `gen` row holding `vm_pu`, Q within `q_min/q_max_mvar`;
 `power_factor` — an `sgen` at `pf`, injecting or `absorbing`), `dispatchable`,
 `p_min_mw`; `add_load` takes `leading`. **Missing decisions are questions, not
@@ -269,6 +269,43 @@ limits (they used to get the power-factor cone whenever they had active power).
 Networks loaded without a `gen` table (measured substations, rebuilt every tick)
 are not editable.
 
+**Unit costs** (`costs.py`, `GET/POST /api/costs`): per unit and external grid,
+the production cost c0 + c1·P + c2·P² (`cost_eur_per_h`, `cost_eur_per_mwh`,
+`cost_eur_per_mw2h`; the grid's c1 is the import price), the redispatch costs
+`up_eur_per_mwh` / `down_eur_per_mwh`, a reactive price per unit
+(`q_eur_per_mvarh`, symmetric: injecting or absorbing) and, for the external grid
+only, the TSO–DSO reactive charge — exchange within `q_band_tan_phi`
+(|Q| ≤ tan φ·|P|) free, `q_penalty_eur_per_mvarh` beyond it (synthetic 3 €/Mvarh,
+tan φ 0.4, 10 €/Mvarh). Defaults come from the case's `poly_cost`
+(a MATPOWER/PGLib `gencost`), else a documented synthetic rule (`costs.RULE`);
+redispatch costs are synthetic until changed. Every figure carries its source
+(`case` / `synthetic` / `operator`). The operator's changes are a difference from
+the defaults, saved with the other assumptions. Read from the network as loaded,
+keyed by unit name. `gen_to_sgen` now moves a converted unit's `poly_cost` row with
+it and renumbers the generators kept (before, case14's 23.27 €/MWh sat on the
+bus-2 condenser). No OPF uses the costs yet: they are kept for the economic
+objective of the flexibility work (B.6 step 3).
+
+**Names** (`naming.py`, `GET/POST /api/names`): the operator renames buses, lines,
+transformers, loads and units; every result uses the new name. A layer over the
+network as loaded like the generator model (applied after it; saved with the
+assumptions). What must not follow a rename stays on the row: `loaded_name` (a
+bus's measurements are matched by it — `element_names.measurement_name` — and the
+network fingerprint reads it, so saved proposals and assumptions stay this
+network's) and `loaded_unit` (a unit's model, costs and nominal values are keyed by
+it — `generators.unit_key`; the generator and cost endpoints translate names both
+ways). Rebuilding the base refreshes the capacities (`PG_MAX_DATA`). Names are
+unique per kind; `|`, `[`, `]` are reserved (they structure branch labels). Units of
+a measured-substation network (rebuilt every tick) cannot be renamed.
+`/api/grid_constants` gives the agent `network_id` (the network as loaded), so a
+rename does not reset the conversation, and `names_key` (also in
+`/api/assumptions`). Results echo the generator model both ways
+(`changed_units` under the names now, `changed_units_as_loaded` as the settings
+are kept). `/api/data/series` adds `renamed` ({data row name: bus name now}); the
+measurement rows themselves keep the names they were filed under. A load's
+label is its own name, else its bus as named now (its `substation_name` is the
+measurement row it reads, not a name).
+
 ## Endpoints
 
 | Group | Endpoints |
@@ -280,7 +317,7 @@ are not editable.
 | **Contingency (N-1)** | `POST /api/contingency/simulate`, `POST /api/contingency/simulate_all`, `POST /api/contingency/optimize` |
 | **Flexibility / OPF** | `POST /api/flexibility/optimize`, `POST /api/flexibility/robust`, `POST /api/flexibility/envelope`, `POST /api/flexibility/hosting_capacity` |
 | **KPIs** | `POST /api/kpi/evaluate`, `POST /api/kpi/forecast` |
-| **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|opf\|scan` — `opf`: corrective dispatch on both; `scan`: both networks at every tick of a window) |
+| **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|opf\|scan` — `opf`: corrective dispatch on both; `scan`: both networks at every tick of a window; `against`: another proposal as the reference; `proposals`: up to 6 against one reference at one tick, with a ranking `table`) |
 | **External data** *(optional)* | `POST /api/eddk/fetch`, `POST /api/eddk/push` |
 
 Full request/response schemas are browsable at `/docs` while the server runs.

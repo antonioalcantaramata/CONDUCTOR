@@ -3066,8 +3066,11 @@ def render_network_comparison(result: dict) -> list[go.Figure]:
     purple; the title names the proposal and the timestamp, so a chart can
     never be read as the base on its own.
     """
+    if result.get("several"):
+        return _render_several_comparisons(result)
     net = result.get("network") or {}
-    where = f"{net.get('id', 'proposal')} − base at {str(result.get('timestamp', '?'))[:16]}"
+    ref = net.get("compared_with") or "base"
+    where = f"{net.get('id', 'proposal')} − {ref} at {str(result.get('timestamp', '?'))[:16]}"
     figures: list[go.Figure] = []
 
     def bars(rows, title, unit, fmt):
@@ -3095,12 +3098,12 @@ def render_network_comparison(result: dict) -> list[go.Figure]:
             return [_empty_figure(f"No ticks scanned ({where})")]
         limits = result.get("thresholds_used") or {}
         window = result.get("window") or {}
-        span = f"{net.get('id', 'proposal')} vs base · {window.get('start', '?')[:16]} → {window.get('end', '?')[:16]}"
+        span = f"{net.get('id', 'proposal')} vs {ref} · {window.get('start', '?')[:16]} → {window.get('end', '?')[:16]}"
         for key, title, unit, limit_key in (
                 ("min_vm", "Lowest bus voltage", "p.u.", "vm_lower_pu"),
                 ("max_line_loading", "Highest line loading", "%", "max_line_loading_pct")):
             fig = go.Figure([
-                go.Scatter(x=stamps, y=series.get(f"base_{key}"), name="base", mode="lines",
+                go.Scatter(x=stamps, y=series.get(f"base_{key}"), name=ref, mode="lines",
                            line=dict(color=_C.NEUTRAL, width=1.5)),
                 go.Scatter(x=stamps, y=series.get(f"proposal_{key}"), name=net.get("id", "proposal"),
                            mode="lines", line=dict(color=_C.PRIMARY, width=2)),
@@ -3123,7 +3126,7 @@ def render_network_comparison(result: dict) -> list[go.Figure]:
             return [_empty_figure(text)]
         names = _safe_labels([u["element"] for u in units], "Unit")
         fig = go.Figure([
-            go.Bar(name="base", y=names, x=[u["base_dP_mw"] for u in units], orientation="h",
+            go.Bar(name=ref, y=names, x=[u["base_dP_mw"] for u in units], orientation="h",
                    marker_color=_C.NEUTRAL),
             go.Bar(name=net.get("id", "proposal"), y=names, x=[u["proposal_dP_mw"] for u in units],
                    orientation="h", marker_color=_C.PRIMARY),
@@ -3160,6 +3163,66 @@ def render_network_comparison(result: dict) -> list[go.Figure]:
     bars((result.get("largest_line_loading_changes") or []) + (result.get("largest_trafo_loading_changes") or []),
          "Largest loading changes", "%", ".1f")
     return figures or [_empty_figure(f"No measurable change ({where})")]
+
+
+def _render_several_comparisons(result: dict) -> list[go.Figure]:
+    """compare_networks with several proposals: the ranking table as bars
+    (one chart per figure, every network side by side, the reference grey),
+    or — for a scan — every network's curve over the window on one chart."""
+    ref = result.get("compared_with") or "base"
+    comparisons = [c for c in result.get("comparisons") or [] if isinstance(c, dict)]
+    study = result.get("study")
+    when = str(result.get("timestamp") or "")[:16]
+    if study == "opf":
+        return [fig for c in comparisons for fig in render_network_comparison(c)]
+    if study == "scan":
+        if not comparisons:
+            return [_empty_figure("No proposals compared")]
+        first = comparisons[0].get("series") or {}
+        limits = comparisons[0].get("thresholds_used") or {}
+        figures = []
+        for key, title, unit, limit_key in (
+                ("min_vm", "Lowest bus voltage", "p.u.", "vm_lower_pu"),
+                ("max_line_loading", "Highest line loading", "%", "max_line_loading_pct")):
+            traces = [go.Scatter(x=first.get("timestamps"), y=first.get(f"base_{key}"), name=ref, mode="lines",
+                                 line=dict(color=_C.NEUTRAL, width=1.5))]
+            for c in comparisons:
+                series = c.get("series") or {}
+                traces.append(go.Scatter(x=series.get("timestamps"), y=series.get(f"proposal_{key}"),
+                                         name=(c.get("network") or {}).get("id", "proposal"), mode="lines"))
+            fig = go.Figure(traces)
+            limit = _float_or_none(limits.get(limit_key))
+            if limit is not None:
+                fig.add_hline(y=limit, line=dict(color=_C.VIOLATION, dash="dash", width=1),
+                              annotation_text="limit", annotation_position="top left")
+            fig.update_layout(**CHART_THEME, title=f"{title} over time (proposals vs {ref})",
+                              yaxis_title=unit, xaxis_title="", hovermode="x unified")
+            figures.append(fig)
+        return figures
+    rows = [r for r in result.get("table") or [] if isinstance(r, dict)]
+    if not rows:
+        return [_empty_figure("No proposals compared")]
+    names = _safe_labels([str(r.get("network")) for r in rows], "Network")
+    colours = [_C.NEUTRAL if r.get("role") == "reference" else _C.PRIMARY for r in rows]
+    metrics = (("total_outages_causing_violations", "Outages causing violations", ""),
+               ("total_violations", "Violations under single outages", "")) if study == "n1" else (
+               ("total_violations", "Violations", ""),
+               ("min_vm_pu", "Lowest bus voltage", "p.u."),
+               ("max_line_loading_pct", "Highest line loading", "%"))
+    figures = []
+    for key, title, unit in metrics:
+        values = [_float_or_none(r.get(key)) for r in rows]
+        if all(v is None for v in values):
+            continue
+        fig = go.Figure(go.Bar(x=names, y=values, marker_color=colours,
+                               hovertemplate="%{x}: %{y}" + (f" {unit}" if unit else "") + "<extra></extra>"))
+        fig.update_layout(**CHART_THEME, title=f"{title} by network ({study.upper()} at {when})",
+                          yaxis_title=unit or "count", xaxis_title="")
+        if key == "min_vm_pu":
+            fig.update_yaxes(range=[min(v for v in values if v is not None) - 0.02,
+                                    max(v for v in values if v is not None) + 0.01])
+        figures.append(fig)
+    return figures or [_empty_figure("No figures to compare")]
 
 
 RENDERER_MAP: dict[str, Callable] = {

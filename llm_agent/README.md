@@ -15,13 +15,21 @@ renders the matching charts.
 ```
 llm_agent/
 ├── app.py                 ← Streamlit UI: sidebar operating point, chat, charts
+├── launch_ui.py           ← launch screen: tiers, model picker, info cards, preset settings
+├── provider_catalog.yaml  ← every LLM option: tier, limits (with sources), links, data notes
 ├── agent/
+│   ├── catalog.py         ← loads and validates provider_catalog.yaml
+│   ├── usage.py           ← prompt overhead, calls per question, estimates, compatibility
+│   ├── ratelimit.py       ← per-minute vs per-day limits, models gone, backoff
+│   ├── smoke_test.py      ← opt-in "Test tool calling"
+│   ├── discovery/         ← live model lists: OpenRouter (filtered), NVIDIA (allowlist), cache
 │   ├── config.py          ← env vars + live grid-constants fetch
 │   ├── loop.py            ← the agentic turn loop, provider-agnostic
 │   ├── providers/         ← pluggable LLM backends
 │   │   ├── base.py        ←   neutral message format + LLMProvider protocol
 │   │   ├── gemini.py      ←   Google Generative AI
 │   │   ├── openai.py      ←   OpenAI + OpenAI-compatible endpoints
+│   │   ├── openai_compat.py ← OpenRouter, NVIDIA Build, DeepSeek presets (chat completions)
 │   │   ├── ollama.py      ←   local models, preflight + context guard
 │   │   └── schema.py      ←   tool schemas → JSON Schema for non-Gemini backends
 │   ├── hardware.py        ← RAM/platform detection for local-model sizing advice
@@ -48,8 +56,12 @@ active only*, or *Demo: IEEE 14 · with reactive measurements* — and on the ri
 how to run the assistant, with Start. A choice there loads at once. Later, the sidebar's
 *Scenario* expander switches with **Load**, which starts a new conversation (the
 old one described another grid). Demos never replace your uploads; each network
-keeps its own proposals and assumptions. Backend side: `backend/scenarios.py`,
-`GET/POST /api/scenario`.
+keeps its own proposals and assumptions (names, costs, unit models, load power
+factor), restored whenever it is loaded again. An option with saved changes says
+so ("Your changes are kept: 1 rename · 2 proposals"; the two demos share one
+network, so they share them), and **Start fresh** clears them. They live in the
+git-ignored `systems/` files, never in the repository. Backend side:
+`backend/scenarios.py`, `GET/POST /api/scenario`, `POST /api/scenario/forget`.
 
 ## Working aids
 
@@ -78,7 +90,7 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 
 | Variable                  | Required            | Default                   | Description                                        |
 | ------------------------- | ------------------- | ------------------------- | -------------------------------------------------- |
-| `LLM_PROVIDER`            | No                  | `google`                  | Backend: `google`, `openai`, or `ollama`            |
+| `LLM_PROVIDER`            | No                  | `google`                  | Backend: `google`, `nvidia`, `openrouter`, `deepseek`, `openai`, `anthropic`, or `ollama` (see the root README's "Choosing a model" and `.env.example`) |
 | `GEMINI_API_KEY`          | If provider=google  | —                         | Google Gemini API key                               |
 | `GEMINI_MODEL`            | No                  | gemini-3.5-flash-lite     | Model id to use                                     |
 | `GEMINI_THINKING_LEVEL`   | No                  | *(empty)*                 | `minimal`/`low`/`medium`/`high`; empty = the model's own budget |
@@ -90,14 +102,14 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 | `OPENAI_TIMEOUT_S`        | No                  | `180`                     | Request timeout (s)                                 |
 | `OLLAMA_MODEL`            | If provider=ollama  | gemma4:12b-mlx            | Local model; must support tool calling              |
 | `OLLAMA_HOST`             | No                  | `http://localhost:11434`  | Ollama server URL                                   |
-| `OLLAMA_NUM_CTX`          | No                  | `32768`                   | Context window; must exceed the ~25k-token prompt   |
+| `OLLAMA_NUM_CTX`          | No                  | `32768`                   | Context window; must exceed the ~28k-token prompt   |
 | `OLLAMA_OUTPUT_RESERVE`   | No                  | `4096`                    | Tokens held back from the window for the reply      |
 | `OLLAMA_KEEP_ALIVE`       | No                  | `60m`                     | How long the model + prompt cache stay resident     |
 | `OLLAMA_THINK`            | No                  | `true`                    | Let the model reason first (off trades quality for speed) |
 | `OLLAMA_TIMEOUT_S`        | No                  | `600`                     | Request timeout; local generation is slow           |
 | `DT_BACKEND_URL`          | No                  | `http://localhost:8000`   | FastAPI backend base URL                            |
 | `DT_HTTP_TIMEOUT`         | No                  | `120.0`                   | Per-request HTTP timeout (s)                        |
-| `DT_MAX_AGENT_TURNS`      | No                  | `8`                       | Max tool-calling iterations per user message        |
+| `DT_MAX_AGENT_TURNS`      | No                  | `16`                      | Max model calls per question (a ceiling against loops; at it, one more call answers from the results so far) |
 
 All of these are editable in the app under **Model settings** in the sidebar,
 which writes them back to `.env` and applies them to your next message.
@@ -134,7 +146,7 @@ level is set and the base URL is OpenAI's own.
 
 Steps 1 and 2 are separate requests, and **each one carries the whole system
 prompt and all tool schemas** — the APIs are stateless, so nothing is retained
-between calls. That fixed prefix measures ~20k tokens, dwarfing the
+between calls. That fixed prefix measures ~28k tokens, dwarfing the
 conversation itself, which is why `OLLAMA_NUM_CTX` has to be generous and why
 keeping the prompt cache warm matters so much locally.
 
@@ -186,6 +198,22 @@ arguments: read). Changes apply to every later study and are kept for the
 network; "Reset to as loaded" undoes them. The upload dialog's checkbox only sets
 the starting model.
 
+**Costs.** Below the generators, a table (each row with its Edit form, like the
+generators) of every unit's production
+cost (fixed €/h, €/MWh, quadratic €/MW²h), redispatch costs up and down
+(€/MWh) and reactive price (€/Mvarh), plus the external grid's free reactive band
+(tan φ) and the charge beyond it, each marked as from the case file, the
+synthetic rule or the operator;
+`set_unit_costs` reads and changes them. Kept for the flexibility OPF's economic
+objective; no study uses them yet, and CONDUCTOR says so.
+
+**Names.** The System tab's 🏷️ Names view lists buses, lines, transformers,
+loads and units, each with an Edit form to rename it (`rename_elements` does the same on request). Every later result
+uses the new names; the data stay matched to the names the network was loaded
+with; the conversation is not reset. Earlier answers keep the names they ran
+with and say so in a quiet note (a rename changes no figure, so no rerun is
+offered); the Data tab shows a renamed bus as "North (data: Bus_3)".
+
 ## Network proposals (sandbox)
 
 When a what-if leaves a real decision open — what kind of unit, whether a
@@ -198,10 +226,15 @@ in the answer, so the operator can change it.
 `edit_proposal` builds a proposal — the loaded network plus edits (add a load or
 a generator, reinforce a line, upgrade a transformer, add a new bus joined by a
 line or, at another voltage, by a new transformer, switch an element in or out of
-service); the base
+service, change any setting of an existing element, add a line or transformer
+between two existing buses, move an element or a line end to another bus, scale
+existing loads or units keeping their profile, or copy in another proposal's
+edits to build "A + B"); the base
 is never modified. Every analysis tool accepts `network` (`"base"` or a proposal
 id), and `compare_networks` runs one study on the base and a proposal at the
-same operating point — or, with `study="scan"`, at every tick of a window. The guards carry `network` through a turn like
+same operating point — or, with `study="scan"`, at every tick of a window. With
+`against` it compares a proposal with another one, and with `proposals` it ranks
+up to six against the same reference in one call. The guards carry `network` through a turn like
 `timestamp`, flag a turn that mixes base and proposal unless the question
 compares them, and append a note to any answer that uses a proposal without
 naming it. The advisor's suggestions flag a proposal judged at one moment or
