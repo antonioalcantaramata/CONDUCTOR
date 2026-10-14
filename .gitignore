@@ -50,8 +50,8 @@ evaluation/runner.py
 evaluation/catalog/
 evaluation/runs/
 
-# ── Design docs — kept locally, not published with the repo ───────────────
-docs/
+# Design notes live outside the repository (../internal_docs/); docs/ is the
+# published operator and researcher guide.
 
 # Real datastream map — operational metadata, never committed.
 backend/datastream_map.local.json
@@ -61,3 +61,6 @@ evaluation_runs/
 
 # Local LLM state: usage counts, discovery caches, tool-calling test results.
 llm_agent/.cache/
+
+# MkDocs build output (published by .github/workflows/docs.yml)
+site/

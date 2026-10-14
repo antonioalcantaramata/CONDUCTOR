@@ -1,0 +1,64 @@
+# The documentation site, published to GitHub Pages by .github/workflows/docs.yml.
+# Preview locally:  pip install -r docs/requirements.txt && mkdocs serve
+site_name: CONDUCTOR
+site_description: A solver-grounded AI assistant for distribution grids — user guide and reference
+site_url: https://antonioalcantaramata.github.io/CONDUCTOR/
+repo_url: https://github.com/antonioalcantaramata/CONDUCTOR
+repo_name: antonioalcantaramata/CONDUCTOR
+edit_uri: edit/main/docs/
+docs_dir: docs
+exclude_docs: |
+  requirements.txt
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: indigo
+      toggle: {icon: material/weather-night, name: Dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue
+      accent: indigo
+      toggle: {icon: material/weather-sunny, name: Light mode}
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+nav:
+  - Home: README.md
+  - Guide:
+      - Getting started: guide/getting-started.md
+      - Choosing a model: guide/choosing-a-model.md
+      - Data and the operating point: guide/data-and-operating-point.md
+      - Asking questions: guide/asking-questions.md
+      - Reading an answer: guide/reading-an-answer.md
+      - What-if proposals: guide/what-if-proposals.md
+      - The System tab: guide/system-tab.md
+      - The advisor: guide/advisor.md
+      - Sessions and scenarios: guide/sessions-and-scenarios.md
+      - Troubleshooting: guide/troubleshooting.md
+  - Research:
+      - Using CONDUCTOR in research: research/using-conductor-in-research.md
+  - Reference:
+      - Tools: reference/tools.md
+      - Model options: reference/providers.md
+
+markdown_extensions:
+  - tables
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences

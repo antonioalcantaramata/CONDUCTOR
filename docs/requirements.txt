@@ -1,0 +1,4 @@
+# Builds the documentation site (mkdocs.yml); used by .github/workflows/docs.yml.
+# MkDocs is pinned to 1.x: the Material theme does not support MkDocs 2.
+mkdocs==1.6.1
+mkdocs-material==9.7.7
