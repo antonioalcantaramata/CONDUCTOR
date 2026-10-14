@@ -375,6 +375,11 @@ cutting a release.
 
 ## Citation
 
+CONDUCTOR is developed and maintained by
+[Antonio Alcántara](https://antonioalcantara.com) (main developer). Questions and collaborations are welcome — see the website for contact details.
+Aysegül Kahraman, Anosh Arshad Sundhu and Spyros Chatzivasileiadis contributed to
+CONDUCTOR and co-authored the paper.
+
 If you use CONDUCTOR in your work, please cite the paper
 [CONDUCTOR: An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations](https://arxiv.org/abs/2606.24609)
 (arXiv:2606.24609, June 2026):
