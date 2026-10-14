@@ -32,6 +32,23 @@ notice — see [Choosing a model](#choosing-a-model-tiers-limits-and-privacy).
 The only hard requirement is **tool calling**, since CONDUCTOR drives the grid
 entirely through tools.
 
+## Documentation
+
+The **[user guide](docs/README.md)** — also published at
+<https://antonioalcantaramata.github.io/CONDUCTOR/> — covers everything you can
+do once it is running: [getting started](docs/guide/getting-started.md),
+[choosing a model](docs/guide/choosing-a-model.md),
+[data and the operating point](docs/guide/data-and-operating-point.md),
+[asking questions](docs/guide/asking-questions.md),
+[reading an answer](docs/guide/reading-an-answer.md),
+[what-if proposals](docs/guide/what-if-proposals.md),
+[the System tab](docs/guide/system-tab.md), [the advisor](docs/guide/advisor.md),
+[sessions and scenarios](docs/guide/sessions-and-scenarios.md) and
+[troubleshooting](docs/guide/troubleshooting.md). Researchers: see
+[using CONDUCTOR in research](docs/research/using-conductor-in-research.md). The
+[tool reference](docs/reference/tools.md) and
+[model options](docs/reference/providers.md) are generated from the code.
+
 ## Overview
 
 - **`backend/`** — FastAPI service with the power-system engines (pandapower +
@@ -355,6 +372,32 @@ user end-to-end: bare miniconda → `python start.py` builds the conda env
 (including IPOPT) → both services boot → a real OPF solve succeeds. Run it
 from the Actions tab (or `gh workflow run windows-first-run.yml`) before
 cutting a release.
+
+## Citation
+
+If you use CONDUCTOR in your work, please cite the paper
+[CONDUCTOR: An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations](https://arxiv.org/abs/2606.24609)
+(arXiv:2606.24609, June 2026):
+
+```bibtex
+@misc{alcantara2026conductor,
+  title         = {{CONDUCTOR}: An {LLM}-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations},
+  author        = {Alc{\'a}ntara, Antonio and Kahraman, Ayseg{\"u}l and Sundhu, Anosh Arshad and Chatzivasileiadis, Spyros},
+  year          = {2026},
+  eprint        = {2606.24609},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.SY},
+  doi           = {10.48550/arXiv.2606.24609},
+  url           = {https://arxiv.org/abs/2606.24609}
+}
+```
+
+The paper describes an earlier version of CONDUCTOR. It has changed a great deal
+since — network proposals and their comparison, the advisor, free, paid and local
+model options, measured reactive power and data quality, generator models, unit
+costs, renaming and more — so please also name the version you used (the git
+commit) and its settings, as described in
+[Using CONDUCTOR in research](docs/research/using-conductor-in-research.md#citing).
 
 ## License
 
