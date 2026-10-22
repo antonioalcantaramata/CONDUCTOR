@@ -43,6 +43,7 @@ from .provenance import (
     IMPRECISE,
     MISATTRIBUTED,
     UNGROUNDED,
+    is_clarifying_question,
     check_turn as _check_provenance,
 )
 
@@ -79,6 +80,11 @@ class ToolStep(NamedTuple):
     error: str | None
     # Integrity findings the backend attached to this result.
     warnings: list[str]
+    # Set when this step repeated an earlier one (same tool and arguments) and
+    # was answered from it instead of running again: that step's number.
+    reused_from: int | None = None
+    # How long the study took, in seconds (None when it did not run).
+    duration_s: float | None = None
 
     @property
     def inherited_summary(self) -> str:
@@ -114,6 +120,21 @@ class FigureTrace(NamedTuple):
         return self.status in (GROUNDED, IMPRECISE)
 
 
+def _seconds_or_none(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+
+def seconds(value: float) -> str:
+    """A duration as an operator reads it: "0.4 s", "12 s", "2 min 5 s"."""
+    if value < 0.1:
+        return "<0.1 s"
+    if value < 10:
+        return f"{value:.1f} s"
+    if value < 120:
+        return f"{value:.0f} s"
+    return f"{int(value // 60)} min {int(round(value % 60))} s"
+
+
 class Trace(NamedTuple):
     """Everything needed to audit one answer."""
 
@@ -121,6 +142,33 @@ class Trace(NamedTuple):
     figures: tuple[FigureTrace, ...]
     concerns: tuple[str, ...]
     limits: tuple[str, ...]
+    # Where the answer's time went (the turn record's `timing`), when recorded.
+    timing: dict | None = None
+
+    def timing_line(self) -> str | None:
+        """"14 s — model 9.8 s (4 calls), studies 3.9 s, checks 0.1 s"; None
+        for a record from before timing was kept."""
+        t = self.timing or {}
+        total = _seconds_or_none(t.get("total_s"))
+        if total is None:
+            return None
+        parts = []
+        model = _seconds_or_none(t.get("model_s"))
+        if model is not None:
+            calls = t.get("model_calls")
+            parts.append(f"model {seconds(model)}"
+                         + (f" ({calls} call{'s' if calls != 1 else ''})" if isinstance(calls, int) else ""))
+        for key, label in (("studies_s", "studies"), ("checks_s", "checks")):
+            value = _seconds_or_none(t.get(key))
+            if value is not None:
+                parts.append(f"{label} {seconds(value)}")
+        other = total - sum(_seconds_or_none(t.get(k)) or 0.0 for k in ("model_s", "studies_s", "checks_s"))
+        if other >= 0.5:
+            parts.append(f"other {seconds(other)}")
+        line = f"{seconds(total)} — " + ", ".join(parts) if parts else seconds(total)
+        if t.get("waited_for_rate_limit"):
+            line += " (the model time includes waiting for a rate limit)"
+        return line
 
     @property
     def n_traced(self) -> int:
@@ -137,9 +185,10 @@ class Trace(NamedTuple):
         flagged is counted here — in the one line the operator always sees.
         """
         parts = []
-        if self.steps:
-            ok = sum(1 for s in self.steps if s.ok)
-            total = len(self.steps)
+        ran = [s for s in self.steps if s.reused_from is None]    # a reused step ran nothing
+        if ran:
+            ok = sum(1 for s in ran if s.ok)
+            total = len(ran)
             # "0 tools" after a failed call is indistinguishable from a turn
             # that ran nothing, which is the opposite reading. Show the
             # denominator whenever anything failed.
@@ -150,6 +199,9 @@ class Trace(NamedTuple):
         if self.concerns:
             n = len(self.concerns)
             parts.append(f"⚠ {n} to check")
+        total = _seconds_or_none((self.timing or {}).get("total_s"))
+        if total is not None:
+            parts.append(seconds(total))
         return " · ".join(parts) if parts else "no tools used"
 
 
@@ -200,6 +252,8 @@ def _steps(record: dict) -> tuple[ToolStep, ...]:
             ok=not failed,
             error=str(result.get("error")) if failed else None,
             warnings=_warnings_of(result),
+            reused_from=call.get("reused_from") if isinstance(call.get("reused_from"), int) else None,
+            duration_s=_seconds_or_none(call.get("duration_s")),
         ))
     return tuple(steps)
 
@@ -258,7 +312,8 @@ def _concerns(record: dict, steps: tuple[ToolStep, ...],
         out.append(f"The answer reads as reassuring, but {conflict.detail} "
                    f"({conflict.path}).")
 
-    for gap in _check_completeness(record.get("user") or "", answer):
+    asking = is_clarifying_question(answer, record.get("tool_calls") or ())
+    for gap in () if asking else _check_completeness(record.get("user") or "", answer):
         out.append(gap.render() + ". This may be correct if the figure was unavailable.")
 
     reflection = record.get("reflection")
@@ -320,4 +375,5 @@ def build(record: dict) -> Trace:
         figures=figures,
         concerns=concerns,
         limits=_limits(figures, concerns),
+        timing=record.get("timing") if isinstance(record.get("timing"), dict) else None,
     )

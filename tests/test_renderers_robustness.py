@@ -18,6 +18,7 @@ pytest.importorskip("plotly")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "llm_agent"))
 
 from agent import renderers  # noqa: E402
+from agent import tool_registry  # noqa: E402
 from agent.renderers import RENDERER_MAP  # noqa: E402
 
 RSA = {
@@ -66,7 +67,7 @@ def test_render_charts_survives_empty_and_failing_renderers(monkeypatch):
         import sys
         sys.path.insert(0, "llm_agent")
         import streamlit as st
-        from agent import renderers
+        from agent import renderers, tool_registry
 
         def broken(result):
             raise ValueError("boom")
@@ -78,7 +79,7 @@ def test_render_charts_survives_empty_and_failing_renderers(monkeypatch):
         start = src.index("_CHARTS_PER_ROW = ")
         end = src.index("# Chart injection helper")
         namespace = {"st": st, "RENDERER_MAP": renderers.RENDERER_MAP,
-                     "logging": __import__("logging"), "_TOOL_LABELS": {},
+                     "logging": __import__("logging"), "_tools_reg": tool_registry,
                      "re": __import__("re"), "pd": __import__("pandas")}
         exec(src[start:end].rsplit("# ----", 1)[0], namespace)
         namespace["render_charts"]([
@@ -139,12 +140,12 @@ class TestN1Table:
             import sys
             sys.path.insert(0, "llm_agent")
             import streamlit as st
-            from agent import renderers
+            from agent import renderers, tool_registry
             src = open("llm_agent/app.py", encoding="utf-8").read()
             start = src.index("_CHARTS_PER_ROW = ")
             end = src.index("# Chart injection helper")
             namespace = {"st": st, "RENDERER_MAP": renderers.RENDERER_MAP,
-                         "logging": __import__("logging"), "_TOOL_LABELS": {},
+                         "logging": __import__("logging"), "_tools_reg": tool_registry,
                          "re": __import__("re"), "pd": __import__("pandas")}
             exec(src[start:end].rsplit("# ----", 1)[0], namespace)
             namespace["render_charts"]([("simulate_all_contingencies", {
@@ -196,7 +197,7 @@ def test_scans_with_skipped_ticks_carry_a_warning():
 
 def _caption_functions():
     src = (pathlib.Path(__file__).resolve().parents[1] / "llm_agent" / "app.py").read_text()
-    ns: dict = {"_TOOL_LABELS": {"run_rsa": "Security assessment (RSA)"}}
+    ns: dict = {"_tools_reg": tool_registry}
     exec(src[src.index("def _non_default_pf("):src.index("def _table_of(")], ns)
     return ns["_chart_caption"], ns["_non_default_pf"]
 
@@ -229,7 +230,7 @@ def test_measured_reactive_demand_and_other_conditions_are_named():
 def _arg_functions():
     import json
     src = (pathlib.Path(__file__).resolve().parents[1] / "llm_agent" / "app.py").read_text()
-    ns: dict = {"json": json, "_TOOL_LABELS": {"run_rsa": "Security assessment (RSA)"}}
+    ns: dict = {"json": json, "_tools_reg": tool_registry}
     exec(src[src.index("_ARG_SHOWN_ELSEWHERE = "):src.index("def _table_of(")], ns)
     return ns
 
@@ -269,7 +270,6 @@ def test_a_single_run_or_identical_runs_add_nothing():
 
 def test_every_tool_with_charts_gets_the_same_captions():
     ns = _arg_functions()
-    ns["_TOOL_LABELS"]["simulate_contingency"] = "Contingency (N-1)"
     runs = [("simulate_contingency", _run(element_type="line", element_index=3)),
             ("simulate_contingency", _run(element_type="line", element_index=7)),
             ("run_probabilistic_rsa", _run(n_samples=200)), ("run_probabilistic_rsa", _run(n_samples=1000))]
@@ -310,3 +310,132 @@ class TestSeveralProposals:
             "study": "rsa", "timestamp": "2000-01-01 00:00", "network": {"id": "B", "compared_with": "A"},
             "largest_voltage_changes": [{"element": "Bus_3", "change": 0.01, "base": 1.0, "proposal": 1.01}]})
         assert "B − A" in figs[0].layout.title.text
+
+
+class TestFlexibilityOptions:
+    @staticmethod
+    def option(sid, label, dp, dq=0.0, also=()):
+        return {"id": sid, "label": label, "how": "…", "also": list(also), "n_units_called": 1,
+                "moved_mw": abs(dp), "moved_mvar": abs(dq), "import_mw": 250.0, "cost_eur_per_h": 30.0,
+                "above_cheapest_eur_per_h": 0.0, "min_vm_pu": 0.94, "max_loading_pct": 60.0,
+                "dispatch": [{"unit": "Gen_bus1", "dp_mw": dp, "dq_mvar": dq},
+                             {"unit": "External grid", "dp_mw": -dp, "dq_mvar": -dq}]}
+
+    def test_a_table_and_one_bar_chart_per_quantity_moved(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-03 18:00",
+                  "costs": {"prices_from": {"synthetic": 5, "case": 1}},
+                  "options": [self.option("least_disturbance", "Least disturbance", 15.0, 5.0, also=["Cheapest"]),
+                              self.option("least_import", "Least import", 44.0)]}
+        figs = RENDERER_MAP["optimize_flexibility"](result)
+        names = figs[0].data[0].cells.values[0]
+        assert names[0] == "Least disturbance (also Cheapest)" and names[1] == "Least import"
+        assert len(figs) == 3                       # the table, active power, reactive power
+        assert "with" not in figs[0].layout.title.text.split("<br>")[1].split("·")[0]
+        assert list(figs[0].data[0].cells.values[-1]) == ["—", "—"]           # no check in this result
+        assert [t.name for t in figs[1].data] == ["Least disturbance", "Least import"]
+
+    def test_the_operators_conditions_are_in_the_subtitle(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00",
+                  "held_units": {"Gen_bus1": 48.8}, "options": [self.option("least_disturbance", "Least disturbance", 5.0)]}
+        title = RENDERER_MAP["optimize_flexibility"](result)[0].layout.title.text
+        assert "Each meets every limit with Gen_bus1 at its schedule" in title
+
+    def test_after_an_outage_the_title_names_it(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-03 12:00",
+                  "outage": {"element": "Bus_26 -> Bus_28 [L36]"},
+                  "options": [self.option("cheapest", "Cheapest", 5.0)]}
+        title = RENDERER_MAP["optimize_contingency"](result)[0].layout.title.text
+        assert title.startswith("Corrective options after the outage of Bus_26 -> Bus_28 [L36] at 2000-01-03 12:00")
+
+    def test_the_power_flow_column(self):
+        ok = {**self.option("cheapest", "Cheapest", 5.0), "power_flow_check": {"confirmed": True}}
+        bad = {**self.option("least_import", "Least import", 6.0),
+               "power_flow_check": {"confirmed": False, "violations": ["Bus_0 -> Bus_1 [L0] at 101.3 %"]}}
+        figs = RENDERER_MAP["optimize_flexibility"]({"mode": "options", "status": "options",
+                                                     "timestamp": "t", "options": [ok, bad]})
+        assert list(figs[0].data[0].cells.values[-1]) == ["✓ confirmed", "✗ Bus_0 -> Bus_1 [L0] at 101.3 %"]
+
+    def test_a_near_optimal_set_says_its_margin(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00", "set": "near_optimal",
+                  "near_optimal_pct": 10, "budget_eur_per_h": 29.13,
+                  "options": [self.option("cheapest", "Cheapest", 5.0), self.option("near_optimal_1", "Near-optimal 1", 6.0)]}
+        figs = RENDERER_MAP["optimize_flexibility"](result)
+        assert figs[0].layout.title.text.startswith("Near-optimal alternatives at 2000-01-06 20:00")
+        assert "costs at most 29.13 €/h (10 % above the cheapest)" in figs[0].layout.title.text
+        assert [t.marker.color for t in figs[1].data] == [renderers.OPTION_COLOURS["cheapest"],
+                                                           renderers.OPTION_COLOURS["near_optimal_1"]]
+
+    def test_branch_caps_are_in_the_subtitle(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00",
+                  "held_units": {"Gen_bus1": 48.8}, "branch_limits": {"Bus_21 -> Bus_23 [L30]": 80.0},
+                  "options": [self.option("least_disturbance", "Least disturbance", 5.0)]}
+        title = RENDERER_MAP["optimize_flexibility"](result)[0].layout.title.text
+        assert "with Gen_bus1 at its schedule and L30 at most 80 %" in title
+
+    def test_every_strategy_has_its_own_colour(self):
+        default = [s for s in renderers.OPTION_COLOURS if not s.startswith(("near_optimal", "n1_"))]
+        assert len({renderers.OPTION_COLOURS[s] for s in default}) == len(default) == 6
+        n1 = ["least_disturbance", "cheapest", "n1_preventive", "n1_corrective"]
+        assert len({renderers.OPTION_COLOURS[s] for s in n1}) == 4
+
+    N1_STUDY = {"modes": ["preventive", "corrective"], "outages_studied": ["Bus_0 -> Bus_1 [L0]", "Bus_9 -> Bus_19 [L24]"],
+                "skipped": [], "emergency_loading_pct": 100.0, "post_outage_band_pu": [0.95, 1.05], "reach_pct": 20.0}
+
+    def n1_result(self):
+        screen = {"outages_tested": 41, "outages_with_violations": 29, "violations": 57, "not_converged": 0}
+        plan = [{"outage": "Bus_0 -> Bus_1 [L0]", "no_action_needed": False, "checked_by_power_flow": True,
+                 "after_action": [], "actions": [{"unit": "Gen_bus4", "dp_mw": 3.8},
+                                                 {"unit": "Gen_bus10", "dp_mw": 0.0, "setpoint_vm_pu_before": 1.041,
+                                                  "setpoint_vm_pu_after": 1.05}]},
+                {"outage": "Bus_9 -> Bus_19 [L24]", "no_action_needed": True, "checked_by_power_flow": True,
+                 "after_action": [], "actions": []}]
+        return {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00", "set": "n1",
+                "n1_study": self.N1_STUDY,
+                "options": [{**self.option("least_disturbance", "Least disturbance", 5.0), "n1": {"screen": screen}},
+                            {**self.option("n1_preventive", "N-1 preventive", 9.0),
+                             "n1": {"screen": {**screen, "outages_with_violations": 16}, "studied": self.N1_STUDY[
+                                 "outages_studied"], "secured": 1,
+                                    "not_secured": [{"outage": "Bus_9 -> Bus_19 [L24]", "remaining": ["x"]}]}},
+                            {**self.option("n1_corrective", "N-1 corrective", 7.0),
+                             "n1": {"screen": {**screen, "outages_with_violations": 17}, "studied": self.N1_STUDY[
+                                 "outages_studied"], "secured": 2, "not_secured": [], "corrective_plan": plan,
+                                    "screen_is": "before any corrective action"}}]}
+
+    def test_an_n1_set_shows_each_options_screen_and_the_corrective_plan(self):
+        figs = RENDERER_MAP["optimize_flexibility"](self.n1_result())
+        assert figs[0].layout.title.text.startswith("Options for N-1 security at 2000-01-06 20:00<br><sup>2 critical "
+                                                    "outage(s) studied (preventive and corrective)")
+        screen = figs[1].data[0].cells.values
+        assert figs[1].layout.title.text.startswith("N-1 screen of each option")
+        assert list(screen[1]) == ["29 of 41", "16 of 41", "17 of 41 before its action"]
+        assert list(screen[3]) == ["not studied", "1 of 2", "2 of 2"]
+        assert list(screen[4]) == ["—", "L24", "none"]
+        plan = figs[2]
+        assert plan.layout.title.text.startswith("Corrective plan of N-1 corrective")
+        headers = [h.replace("<b>", "").replace("</b>", "") for h in plan.data[0].header.values]
+        assert headers == ["After the outage of", "Gen_bus4", "Gen_bus10", "Power flow"]     # Gen_bus4 first
+        rows = list(zip(*plan.data[0].cells.values))
+        assert rows[0] == ("Bus_0 -> Bus_1 [L0]", "+3.80 MW", "V 1.041→1.050", "✓ confirmed")
+        assert rows[1] == ("Bus_9 -> Bus_19 [L24]", "—", "—", "✓ no action needed")
+        assert len(figs) == 4                     # and the active-power bars
+
+    def test_no_action_needed_is_one_message(self):
+        figs = RENDERER_MAP["optimize_flexibility"]({"mode": "options", "status": "no_action_needed",
+                                                     "timestamp": "2000-01-03 18:00", "options": []})
+        assert len(figs) == 1 and "No corrective action needed" in figs[0].layout.title.text
+
+
+class TestScreenOfAnOption:
+    def test_the_title_says_what_was_screened(self):
+        result = {"total_outages_tested": 41, "total_outages_causing_violations": 31, "system_n1_secure": False,
+                  "thresholds_used": {"max_line_loading_pct": 90},
+                  "violations": [{"violation_type": "line_loading", "value": 95.0, "element_name": "L0",
+                                  "outage_cause": "L1"}],
+                  "option": {"ref": "S1:cheapest", "label": "Cheapest", "screen": "N-1"}}
+        figs = RENDERER_MAP["simulate_all_contingencies"](result)
+        fig = figs if not isinstance(figs, list) else figs[-1]
+        assert fig.layout.title.text.startswith("N-1 screen with option S1:cheapest (Cheapest) applied — 31 of 41")
+        after = dict(result, option={**result["option"], "after_outage": "L36", "screen": "N-1-1"})
+        fig = RENDERER_MAP["simulate_all_contingencies"](after)
+        fig = fig if not isinstance(fig, list) else fig[-1]
+        assert fig.layout.title.text.startswith("N-1-1 screen after the outage of L36, with option S1:cheapest")

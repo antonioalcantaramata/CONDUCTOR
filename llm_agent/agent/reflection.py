@@ -82,8 +82,10 @@ from .provenance import (
     UNGROUNDED,
     ClaimVerdict,
     ProvenanceReport,
+    answer_to_check,
     check_answer,
     collect_sources,
+    is_clarifying_question,
     is_plausible_nearest,
     subject_names,
 )
@@ -211,7 +213,7 @@ def check_draft(draft: str, record: dict) -> tuple[tuple[ClaimVerdict, ...], Pro
     the only difference is that this runs before the answer is delivered.
     """
     report = check_answer(
-        draft or "",
+        answer_to_check(draft or "", record.get("tool_calls") or ()),
         collect_sources(record),
         subjects=subject_names(record),
     )
@@ -231,7 +233,8 @@ def check_all(draft: str, record: dict) -> tuple[tuple[ClaimVerdict, ...],
     """
     findings, report = check_draft(draft, record)
     conflicts = tuple(check_characterisation(draft or "", record))
-    gaps = tuple(check_completeness(record.get("user") or "", draft or ""))
+    gaps = () if is_clarifying_question(draft or "", record.get("tool_calls") or ()) else \
+        tuple(check_completeness(record.get("user") or "", draft or ""))
     return findings, report, conflicts, gaps
 
 

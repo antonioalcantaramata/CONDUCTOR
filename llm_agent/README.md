@@ -34,7 +34,8 @@ llm_agent/
 │   │   └── schema.py      ←   tool schemas → JSON Schema for non-Gemini backends
 │   ├── hardware.py        ← RAM/platform detection for local-model sizing advice
 │   ├── tools.py           ← Python functions that call the backend over HTTP
-│   ├── tool_schemas.py    ← function declarations (TOOLS) — single source of truth
+│   ├── tool_schemas.py    ← function declarations (TOOLS) — what the model may send
+│   ├── tool_registry.py   ← one row per tool: label, docs section, effect, shared arguments
 │   ├── renderers.py       ← Plotly renderers, keyed by tool name (RENDERER_MAP)
 │   ├── system_prompt.py   ← system instruction, built from live grid constants
 │   ├── recommender.py     ← the advisor: suggestions and side discussions, no tools
@@ -51,8 +52,9 @@ llm_agent/
 ## Starting scenarios
 
 The launch screen has two columns: on the left **what to load** — *Resume* (your last uploaded
-network and data; offered once something has been uploaded), *Demo: IEEE 14 ·
-active only*, or *Demo: IEEE 14 · with reactive measurements* — and on the right
+network and data; offered once something has been uploaded), *Demo: IEEE 30 ·
+active only* (the default), *Demo: IEEE 30 · with reactive measurements*, or *Demo:
+IEEE 14 · smaller* — and on the right
 how to run the assistant, with Start. A choice there loads at once. Later, the sidebar's
 *Scenario* expander switches with **Load**, which starts a new conversation (the
 old one described another grid). Demos never replace your uploads; each network
@@ -77,7 +79,22 @@ git-ignored `systems/` files, never in the repository. Backend side:
   assumptions, data quality and proposals, then every question and answer with
   its interactive charts, its evidence (tools and arguments, where each figure
   came from, what to check, what the checks cannot see) and any stale-settings
-  note. Built only when clicked. `agent/report.py`.
+  note. Built only when clicked. `agent/report.py`. Beside it, a *tailored* report
+  written by the model from the record (`agent/tailored_report.py`, one call): summary,
+  context, findings by theme, decisions, open questions, citing turns; the session's own
+  charts placed by `{{chart T3}}`; its figures checked against the results and the
+  untraced ones listed on the page.
+- **Session context.** *Session context → Save* (sidebar) writes a Markdown file
+  of what the session asked, found and decided — from the turn records (turn
+  digests, decision notes with the chosen option's solver figures, settings,
+  studies proposed and not run), with an optional model-written summary on top
+  whose figures are checked. Kept per network in `llm_agent/session_contexts/`
+  (`CONDUCTOR_CONTEXT_DIR`); the launch screen asks whether to continue from one
+  (never chosen by default), and a file can be loaded. Both agents then get it
+  as a framed block after their prompts — background, not evidence
+  (`session_context.prompt_block`); each turn record notes it
+  (`earlier_context`). Capped at 12,000 characters, newest turns kept.
+  `agent/session_context.py`.
 - **Example queries for the scenario.** The sidebar's examples start with
   questions that fit what is loaded (Resume, either demo), then the general ones.
 - **Data template.** The data-upload pop-up links to `GET /api/data/template`: a
@@ -102,14 +119,15 @@ Set these in `llm_agent/.env` (copy from `.env.example`) or as shell vars.
 | `OPENAI_TIMEOUT_S`        | No                  | `180`                     | Request timeout (s)                                 |
 | `OLLAMA_MODEL`            | If provider=ollama  | gemma4:12b-mlx            | Local model; must support tool calling              |
 | `OLLAMA_HOST`             | No                  | `http://localhost:11434`  | Ollama server URL                                   |
-| `OLLAMA_NUM_CTX`          | No                  | `32768`                   | Context window; must exceed the ~28k-token prompt   |
+| `OLLAMA_NUM_CTX`          | No                  | `65536`                   | Context window; must exceed the ~28k-token prompt   |
 | `OLLAMA_OUTPUT_RESERVE`   | No                  | `4096`                    | Tokens held back from the window for the reply      |
 | `OLLAMA_KEEP_ALIVE`       | No                  | `60m`                     | How long the model + prompt cache stay resident     |
 | `OLLAMA_THINK`            | No                  | `true`                    | Let the model reason first (off trades quality for speed) |
 | `OLLAMA_TIMEOUT_S`        | No                  | `600`                     | Request timeout; local generation is slow           |
 | `DT_BACKEND_URL`          | No                  | `http://localhost:8000`   | FastAPI backend base URL                            |
 | `DT_HTTP_TIMEOUT`         | No                  | `120.0`                   | Per-request HTTP timeout (s)                        |
-| `DT_MAX_AGENT_TURNS`      | No                  | `16`                      | Max model calls per question (a ceiling against loops; at it, one more call answers from the results so far) |
+| `CONDUCTOR_CONTEXT_DIR`   | No                  | `llm_agent/session_contexts` | Where session contexts are kept (one folder per network) |
+| `DT_MAX_AGENT_TURNS`      | No                  | `16`                      | Max model calls per question (a ceiling against loops; at it, one more call answers from the results so far). A failed call repeated after the model was told it would fail again stops the question the same way, earlier |
 
 All of these are editable in the app under **Model settings** in the sidebar,
 which writes them back to `.env` and applies them to your next message.
@@ -204,8 +222,9 @@ cost (fixed €/h, €/MWh, quadratic €/MW²h), redispatch costs up and down
 (€/MWh) and reactive price (€/Mvarh), plus the external grid's free reactive band
 (tan φ) and the charge beyond it, each marked as from the case file, the
 synthetic rule or the operator;
-`set_unit_costs` reads and changes them. Kept for the flexibility OPF's economic
-objective; no study uses them yet, and CONDUCTOR says so.
+`set_unit_costs` reads and changes them. They price the flexibility options
+(`optimize_flexibility` with `options=true`) and define the cheapest one; the
+default corrective dispatch ignores them, and CONDUCTOR says so.
 
 **Names.** The System tab's 🏷️ Names view lists buses, lines, transformers,
 loads and units, each with an Edit form to rename it (`rename_elements` does the same on request). Every later result
@@ -299,7 +318,14 @@ To add a **new** tool:
    record the result, return `{"error": ...}` on failure).
 2. **`agent/tool_schemas.py`** — add a `genai.types.FunctionDeclaration` (every
    parameter needs a description with units/range/default) and append it to `TOOLS`.
-3. **`agent/renderers.py`** — add a renderer returning a `go.Figure` (or list);
+3. **`agent/tool_registry.py`** — add its row: the label operators see, its
+   documentation section, its effect (reads only, changes settings, changes a
+   proposal, moves the clock) and the shared arguments it takes (`data_source`,
+   `timestamp`, `network`, `load_pf`). The schema's shared arguments, the UI
+   labels, call deduplication and the docs reference all read this row.
+4. **`agent/renderers.py`** — add a renderer returning a `go.Figure` (or list);
    map the tool name in `RENDERER_MAP`. Handle empty data gracefully.
-4. **`agent/system_prompt.py`** *(optional)* — add a behavioral rule if the
+5. **`agent/system_prompt.py`** *(optional)* — add a behavioral rule if the
    tool's trigger isn't obvious from its name/description.
+6. Run `python scripts/generate_docs_reference.py`. `tests/test_tool_registry.py`
+   fails until the row, schema and function all exist.

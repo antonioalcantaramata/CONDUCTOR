@@ -141,8 +141,9 @@ def _script(agent, monkeypatch, *, freeze=None, reply="Reply.", studies=()):
             freeze[kind] -= 1
             st.stop()
 
-    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None):
+    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None):
         calls["turn"].append(user_message)
+        calls.setdefault("earlier", []).append(earlier_context)
         stop_if("turn")
         return ("Answer to: " + user_message, list(history))
 
@@ -421,12 +422,12 @@ def test_the_launch_screen_chooses_what_to_load(agent, monkeypatch, backend_url)
     assert any(m.value == "### 1 · Choose what to load" for m in at.markdown)
     picker = at.radio(key="scenario_launch")
     assert picker.value == "ieee14"
-    assert picker.options == ["Resume", "Demo: IEEE 14 · active only",
-                              "Demo: IEEE 14 · with reactive measurements"]
-    picker.set_value("ieee14_reactive").run()                   # loads at once
-    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee14_reactive"
+    assert picker.options == ["Resume", "Demo: IEEE 30 · active only",
+                              "Demo: IEEE 30 · with reactive measurements", "Demo: IEEE 14 · smaller"]
+    picker.set_value("ieee30_reactive").run()                   # loads at once
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee30_reactive"
     at.radio(key="scenario_launch").set_value("resume").run()   # nothing to resume: refused, kept
-    assert at.radio(key="scenario_launch").value == "ieee14_reactive"
+    assert at.radio(key="scenario_launch").value == "ieee30_reactive"
     assert any("Nothing uploaded yet" in w.value for w in at.warning)
     httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
     assert not at.exception
@@ -436,15 +437,15 @@ def test_the_sidebar_switches_the_scenario_and_starts_afresh(agent, monkeypatch,
     import httpx
     _script(agent, monkeypatch)
     at = _app()
-    assert "Scenario · Demo: IEEE 14 · active only" in [e.label for e in at.expander]
+    assert "Scenario · Demo: IEEE 14 · smaller" in [e.label for e in at.expander]
     load = _button(at, key_prefix="scenario_sidebar_load")
     assert load.disabled                                        # already loaded
-    at.radio(key="scenario_sidebar").set_value("ieee14_reactive").run()
+    at.radio(key="scenario_sidebar").set_value("ieee30_reactive").run()
     _button(at, key_prefix="scenario_sidebar_load").click().run()
-    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee14_reactive"
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee30_reactive"
     assert at.session_state["messages"] == []                    # a new conversation
     assert any("a new conversation has started" in s.value for s in at.success)
-    assert "Scenario · Demo: IEEE 14 · with reactive measurements" in [e.label for e in at.expander]
+    assert "Scenario · Demo: IEEE 30 · with reactive measurements" in [e.label for e in at.expander]
     httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
     assert not at.exception
 
@@ -480,10 +481,10 @@ def test_an_answer_under_the_current_settings_has_no_badge(agent, monkeypatch):
 def test_the_session_report_can_be_exported(agent, monkeypatch):
     _script(agent, monkeypatch)
     at = _app()
-    export = [d for d in at.get("download_button") if d.proto.label == "Export session report"]
+    export = [d for d in at.get("download_button") if d.proto.label == "Download the raw report"]
     assert export and not export[0].proto.disabled
     empty = _app(messages=[])
-    assert [d.proto.disabled for d in empty.get("download_button") if d.proto.label == "Export session report"] == [True]
+    assert [d.proto.disabled for d in empty.get("download_button") if d.proto.label == "Download the raw report"] == [True]
 
 
 def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
@@ -492,7 +493,7 @@ def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
     at = _app()
     assert any("conductor-eq-group'>For this scenario" in m.value for m in at.markdown)
     assert "load power factor" in _button(at, key_prefix="eq_s0").label
-    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14_reactive"})
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30_reactive"})
     try:
         at = _app()
         labels = [b.label for b in at.button if str(b.key).startswith("eq_s")]
@@ -574,4 +575,141 @@ def test_an_incompatible_option_cannot_start(agent, monkeypatch, backend_url, tm
     at.run()
     assert any("No free OpenRouter model qualifies" in w.value for w in at.warning)
     assert not [b for b in at.button if b.label == "Start CONDUCTOR" and not b.disabled]
+    assert not at.exception
+
+
+def _options_rec():
+    def option(sid, label, units, mw, cost):
+        return {"id": sid, "label": label, "also": [], "units_called": units, "units_changing_p": units,
+                "moved_mw": mw, "moved_mvar": 10.0, "import_mw": 150.0, "cost_eur_per_h": cost,
+                "above_cheapest_eur_per_h": round(cost - 26.48, 2), "min_vm_pu": 0.95, "max_loading_pct": 90.0,
+                "dispatch": []}
+    result = {"timestamp": "2000-01-06 20:00:00", "mode": "options", "status": "options",
+              "options": [option("least_disturbance", "Least disturbance", ["Gen_bus1", "Gen_bus4"], 30.7, 111.99),
+                          {**option("cheapest", "Cheapest", ["Gen_bus1", "Gen_bus7"], 34.4, 26.48),
+                           "n1": {"screen": {"outages_tested": 41, "outages_with_violations": 29, "violations": 55}}}],
+              "not_offered": [], "costs": {"prices_from": {"case": 1}}}
+    return {**REC, "user": "Give me options at 20:00.",
+            "tool_calls": [{"name": "optimize_flexibility", "args": {"options": True}}],
+            "tool_results": [{"name": "optimize_flexibility", "result": result}]}
+
+
+def test_discussing_corrective_options_from_opening_to_decision(agent, monkeypatch):
+    calls = _script(agent, monkeypatch)
+    R = agent["recommender"]
+    asked = []
+
+    def discuss(q, thread, messages, latest, records, context, provider=None):
+        asked.append(q)
+        return R.AdvisorReply("Both meet every limit; T1·cheapest costs 26.48 €/h. How far do you trust Gen_bus1?",
+                              (R.Study("Options without Gen_bus1", "Give me corrective options at 2000-01-06 20:00 "
+                                       "with Gen_bus1 held at its schedule (hold_units).", "untrusted"),),
+                              criteria=("Gen_bus1 untrusted today",))
+
+    def note(thread, messages, latest, records, context, provider=None):
+        calls["note"] += 1
+        return R.DecisionNote("Take the cheapest.", criteria=("lowest cost",),
+                              chosen_option=R.resolve_option("T1·cheapest", records))
+
+    monkeypatch.setattr(R, "discuss", discuss)
+    monkeypatch.setattr(R, "decision_note", note)
+    at = _app(messages=[{"role": "user", "text": "Give me options at 20:00.", "charts": None},
+                        {"role": "assistant", "text": "Two options.", "charts": None, "trace": None,
+                         "record": _options_rec(), "attention": []}])
+    at.session_state["agent_panel_open"] = False
+    at.run()
+    labels = [b.label for b in at.button]
+    assert "💬 Discuss these options" in labels and "💬 Discuss with the advisor" not in labels   # one way in
+    _button(at, "💬 Discuss these options").click().run()
+    assert asked == ["Discuss these options with me (T1)."]
+    assert "💬 Discuss these options" not in [b.label for b in at.button]                        # opened once
+    assert at.session_state["agent_panel_open"] and at.session_state["agent_mode"] == "discuss"
+    assert any("Noted as what matters to you: Gen_bus1 untrusted today" in m.value for m in at.markdown)
+    _button(at, key_prefix="adv_use_").click().run()
+    assert "hold_units" in at.session_state["_box_value"]
+    _button(at, "📝 Close and record a decision").click().run()
+    shown = " ".join(m.value for m in at.markdown)
+    assert "**Option chosen:** T1·cheapest — Cheapest" in shown and "26.48 €/h" in shown
+    assert "N-1: 29 of 41 outages with violations" in shown              # its screen, when the set has one
+    assert "**What mattered:** lowest cost" in shown
+    assert any("copied from the solver result of turn 1" in c.value for c in at.caption)
+    assert not at.exception
+
+
+def test_no_options_button_without_options(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    at = _app()
+    assert not [b for b in at.button if b.label == "💬 Discuss these options"]
+
+
+def test_saving_the_session_context_with_and_without_a_summary(agent, monkeypatch, tmp_path):
+    _script(agent, monkeypatch)
+    import agent.session_context as sc
+    monkeypatch.setattr(sc, "CONTEXT_DIR", str(tmp_path))
+    summaries = []
+    monkeypatch.setattr(sc, "summarize", lambda text, records, provider=None: (
+        summaries.append(text) or ("- One question about security.", (), "")))
+    at = _app()
+    at.toggle(key="ctx_summary").set_value(False).run()
+    _button(at, "Save").click().run()
+    saved = at.session_state["_context_saved"]
+    assert summaries == [] and "## Summary" not in saved["text"] and "T1 · Q: q" in saved["text"]
+    assert any(d.proto.label == "Download the file" for d in at.get("download_button"))
+    at.toggle(key="ctx_summary").set_value(True).run()
+    _button(at, "Save").click().run()
+    assert len(summaries) == 1 and "- One question about security." in at.session_state["_context_saved"]["text"]
+    assert len(list(tmp_path.rglob("context-*.md"))) >= 1          # kept for the network
+    assert not at.exception
+
+
+def test_the_next_start_asks_and_the_agent_gets_what_was_chosen(agent, monkeypatch, tmp_path):
+    calls = _script(agent, monkeypatch)
+    import agent.config as config
+    import agent.session_context as sc
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.setattr(sc, "CONTEXT_DIR", str(tmp_path))
+    fingerprint = config.network_fingerprint(config.fetch_grid_constants().values)
+    text = sc.build([{"user": "Options at 20:00?", "tool_calls": [], "tool_results": []}], ["Four options."],
+                    meta={"saved": "2026-10-22 18:40 UTC", "network": "Grid", "fingerprint": fingerprint},
+                    notes=[{"decision": "Rule out Gen_bus1."}])
+    sc.save(text, fingerprint)
+    launch = AppTest.from_file(APP, default_timeout=120)
+    launch.run()
+    picker = launch.radio(key="ctx_pick_launch")
+    assert picker.value == "" and picker.label.startswith("Continue from an earlier session")   # asked, not chosen
+    picker.set_value(sc.saved_for(fingerprint)[0].path).run()
+    assert launch.session_state["session_context"]["decisions"] == 1
+    # In the conversation, the agent receives it with the question.
+    at = _app(extra={"session_context": launch.session_state["session_context"]})
+    _send(at, "And now?")
+    assert calls["earlier"][-1].startswith("## Earlier session") and "Rule out Gen_bus1." in calls["earlier"][-1]
+    assert not at.exception
+
+
+def test_the_n1_screen_of_an_option_goes_to_conductors_box(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    rec = _options_rec()
+    for o, ref in zip(rec["tool_results"][0]["result"]["options"], ("S1:least_disturbance", "S1:cheapest")):
+        o["ref"] = ref
+    at = _app(messages=[{"role": "user", "text": "Give me options at 20:00.", "charts": None},
+                        {"role": "assistant", "text": "Two options.", "charts": None, "trace": None,
+                         "record": rec, "attention": []}])
+    at.radio(key="n1_pick_1").set_value("S1:cheapest").run()
+    _button(at, key_prefix="n1_send_1").click().run()
+    assert at.session_state["_box_value"] == "Run the N-1 screen with option S1:cheapest (Cheapest) applied."
+    assert not at.exception
+
+
+def test_the_tailored_report_is_written_on_request(agent, monkeypatch):
+    _script(agent, monkeypatch)
+    import agent.tailored_report as tailored
+    calls = []
+    monkeypatch.setattr(tailored, "write", lambda text, provider=None: (
+        calls.append(text) or ("## Summary\nOne question about security (T1).", "")))
+    at = _app()
+    assert not [d for d in at.get("download_button") if d.proto.label == "Download the tailored report"]
+    _button(at, "Write it").click().run()
+    assert len(calls) == 1 and "## T1" in calls[0]
+    assert [d for d in at.get("download_button") if d.proto.label == "Download the tailored report"]
+    assert b"One question about security (T1)." in at.session_state["_tailored_report"]["bytes"]
     assert not at.exception

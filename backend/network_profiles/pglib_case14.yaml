@@ -4,7 +4,9 @@ matpower_path: "systems/pglib_opf_case14_ieee.m"
 measurement_source: synthetic
 synthetic_n_days: 7
 synthetic_resolution_min: 15
-synthetic_load_profile: "residential"
+# The demand shape this week was calibrated on (peaks ~2–3 h and ~14–15 h);
+# kept so the week, and the evaluation written for it, stay as they were.
+synthetic_load_profile: "twin_peak"
 synthetic_generation_profile: "wind"
 # Usual daily peak as a multiple of the case's own load (its design point);
 # the 2-hour stress windows go about 15 % above it.

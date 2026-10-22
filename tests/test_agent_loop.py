@@ -394,3 +394,192 @@ class TestCrossToolConsistency:
              tools={"a": lambda **k: {"timestamp": "2022-03-01 08:00:00"}})
         _, history2 = loop_module.run_agent_turn("second", history)
         assert "_integrity_warnings" not in history2[-2]["content"]
+
+
+class TestRepeatedCalls:
+    """An identical call later in the same question is answered from the
+    earlier one instead of running again — unless something changed since, or
+    the earlier one failed for a reason a retry might fix."""
+
+    @staticmethod
+    def counting(result=None):
+        calls = []
+
+        def tool(**kwargs):
+            calls.append(kwargs)
+            return dict(result if result is not None else {"value": len(calls)})
+        return tool, calls
+
+    def test_an_identical_call_is_reused(self, stub):
+        tool, calls = self.counting()
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        _, history = loop_module.run_agent_turn("go", [])
+        assert len(calls) == 1
+        reused = [m for m in history if m["role"] == "tool"][1]["content"]
+        assert reused["reused_from"] == 1 and "not run again" in reused["note"]
+        assert "value" not in reused                     # a pointer, not the payload again
+
+    def test_other_arguments_run_again(self, stub):
+        tool, calls = self.counting()
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 2})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        loop_module.run_agent_turn("go", [])
+        assert len(calls) == 2
+
+    def test_two_identical_calls_in_one_reply(self, stub):
+        tool, calls = self.counting()
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1}), ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        _, history = loop_module.run_agent_turn("go", [])
+        assert len(calls) == 1 and [m for m in history if m["role"] == "tool"][1]["content"]["reused_from"] == 1
+
+    def test_a_state_change_in_between_runs_it_again(self, stub):
+        read, reads = self.counting()
+        move, moves = self.counting({"current_timestamp": "t"})
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("advance_timestamp", {"steps": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("advance_timestamp", {"steps": 1})]),
+              ModelResponse(text="done")], tools={"read": read, "advance_timestamp": move})
+        loop_module.run_agent_turn("go", [])
+        assert len(reads) == 2                           # the clock moved: the read is not reused
+        assert len(moves) == 2                           # and moving the clock twice moves it twice
+
+    def test_reading_settings_is_reused_changing_them_is_not(self, stub):
+        gm, gm_calls = self.counting({"units": []})
+        change = {"changes": [{"unit": "Gen_bus1", "dispatchable": False}]}
+        stub([ModelResponse(tool_calls=[ToolCall("set_generator_model", {})]),
+              ModelResponse(tool_calls=[ToolCall("set_generator_model", {})]),
+              ModelResponse(tool_calls=[ToolCall("set_generator_model", change)]),
+              ModelResponse(tool_calls=[ToolCall("set_generator_model", {})]),
+              ModelResponse(text="done")], tools={"set_generator_model": gm})
+        loop_module.run_agent_turn("go", [])
+        assert gm_calls == [{}, change, {}]              # read, (reused read), change, read again
+
+    def test_a_repeated_failure_is_not_retried(self, stub):
+        tool, calls = self.counting({"error": "refused", "status_code": 400, "endpoint": "/api/x"})
+        stub([ModelResponse(tool_calls=[ToolCall("edit", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("edit", {"x": 1})]),
+              ModelResponse(text="done")], tools={"edit": tool})
+        _, history = loop_module.run_agent_turn("go", [])
+        assert len(calls) == 1
+        second = [m for m in history if m["role"] == "tool"][1]["content"]
+        assert second["error"] == "refused" and "already failed" in second["note"]
+
+    def test_repeating_a_failure_after_being_told_stops_the_question(self, stub, monkeypatch):
+        # Seen live: a model resent the same refused call twelve times.
+        records = []
+        tool, calls = self.counting({"error": "refused", "status_code": 400, "endpoint": "/api/x"})
+        provider = stub([ModelResponse(tool_calls=[ToolCall("edit", {"x": 1})]) for _ in range(3)]
+                        + [ModelResponse(text="The change was refused; nothing was changed.")],
+                        tools={"edit": tool})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        text, _ = loop_module.run_agent_turn("go", [])
+        assert len(calls) == 1
+        assert len(provider.calls) == 4         # ran, told it would fail again, repeated: then an answer
+        assert "Do not call any more tools" in provider.calls[-1]["messages"][-1]["content"]
+        assert text.startswith("The change was refused") and "kept repeating a call that had already failed" in text
+        assert "\n\n*CONDUCTOR stopped" in text            # italic, not a bullet: no space after the asterisk
+        assert records[-1]["status"] == "repeated_failure_summarised"
+
+    def test_being_told_once_is_not_stopping(self, stub):
+        tool, _ = self.counting({"error": "refused", "status_code": 400, "endpoint": "/api/x"})
+        stub([ModelResponse(tool_calls=[ToolCall("edit", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("edit", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("edit", {"x": 2})]),
+              ModelResponse(text="done")], tools={"edit": tool})
+        text, _ = loop_module.run_agent_turn("go", [])
+        assert text == "done"
+
+    def test_a_failure_with_no_answer_from_the_backend_is_retried(self, stub):
+        tool, calls = self.counting({"error": "timed out", "status_code": None, "endpoint": "/api/x"})
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        loop_module.run_agent_turn("go", [])
+        assert len(calls) == 2
+
+    def test_reuse_is_per_question(self, stub):
+        tool, calls = self.counting()
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]), ModelResponse(text="one"),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]), ModelResponse(text="two")],
+             tools={"read": tool})
+        _, history = loop_module.run_agent_turn("first", [])
+        loop_module.run_agent_turn("second", history)
+        assert len(calls) == 2
+
+    def test_the_operator_sees_it(self, stub):
+        tool, _ = self.counting()
+        events = []
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append((e, d)))
+        assert ("tool_reused", {"name": "read", "same_as": 1, "failed": False}) in events
+
+    def test_the_record_and_the_audit_panel_mark_it(self, stub, monkeypatch):
+        records = []
+        tool, _ = self.counting()
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": tool})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("go", [])
+        record = records[-1]
+        assert [c.get("reused_from") for c in record["tool_calls"]] == [None, 1]
+        from llm_agent.agent import trace
+        steps = trace._steps(record)
+        assert steps[1].reused_from == 1 and steps[1].ok
+        headline = trace.Trace(steps=steps, figures=(), concerns=(), limits=()).headline()
+        assert headline.startswith("1 tool")                 # a reused step ran nothing
+
+
+class TestTiming:
+    """Each answer records where its time went: the model, the studies, the checks."""
+
+    def test_the_record_breaks_the_time_down(self, stub, monkeypatch):
+        import time as _time
+        records = []
+
+        def slow(**kwargs):
+            _time.sleep(0.05)
+            return {"value": 1}
+
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(text="done")], tools={"read": slow})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        events = []
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append((e, d)))
+        timing = records[-1]["timing"]
+        assert set(timing) == {"total_s", "model_s", "studies_s", "checks_s", "model_calls",
+                               "waited_for_rate_limit"}
+        assert timing["model_calls"] == 2 and timing["studies_s"] >= 0.05
+        assert timing["total_s"] >= timing["studies_s"] + timing["model_s"]
+        assert records[-1]["tool_calls"][0]["duration_s"] >= 0.05
+        done = [d for e, d in events if e == "tool_done"][0]
+        assert done["duration_s"] >= 0.05
+
+    def test_a_reused_or_refused_call_has_no_duration(self, stub, monkeypatch):
+        records = []
+        stub([ModelResponse(tool_calls=[ToolCall("read", {"x": 1})]),
+              ModelResponse(tool_calls=[ToolCall("read", {"x": 1}), ToolCall("nope")]),
+              ModelResponse(text="done")], tools={"read": lambda **k: {"v": 1}})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("go", [])
+        calls = records[-1]["tool_calls"]
+        assert "duration_s" in calls[0] and "duration_s" not in calls[1] and "duration_s" not in calls[2]
+
+
+def test_a_scan_moves_the_clock_so_a_later_read_runs_again(stub):
+    reads = []
+    stub([ModelResponse(tool_calls=[ToolCall("get_current_conditions", {"x": 1})]),
+          ModelResponse(tool_calls=[ToolCall("scan_rsa_over_time", {"n_steps": 2})]),
+          ModelResponse(tool_calls=[ToolCall("get_current_conditions", {"x": 1})]),
+          ModelResponse(text="done")],
+         tools={"get_current_conditions": lambda **k: reads.append(k) or {"v": len(reads)},
+                "scan_rsa_over_time": lambda **k: {"timestamps": ["a", "b"]}})
+    loop_module.run_agent_turn("go", [])
+    assert len(reads) == 2

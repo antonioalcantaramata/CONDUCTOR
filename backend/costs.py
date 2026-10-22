@@ -17,8 +17,9 @@ Per unit (and per external-grid connection):
   ``q_band_tan_phi`` (|Q| ≤ tan φ · |P|) is free, each Mvarh beyond it costs
   ``q_penalty_eur_per_mvarh``.
 
-All kept for the flexibility OPF's economic objective; today's OPFs still
-minimise the change in dispatch itself.
+They price the flexibility options (flex_options.py) and define the cheapest
+one; the default corrective dispatch still minimises the change in dispatch
+itself.
 
 Defaults, in order: the case's own cost table (pandapower ``poly_cost``,
 from a MATPOWER/PGLib ``gencost``), else the **synthetic** rule below —
@@ -190,10 +191,10 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
         grid = row["kind"] == "external_grid"
         misplaced = [k for k in given if (k in INTERFACE) != grid and (k in INTERFACE or k in REACTIVE)]
         if misplaced:
-            raise CostError(f"{name}: {', '.join(misplaced)} " + (
-                "applies to units; the external grid's reactive charge is q_band_tan_phi and "
+            raise CostError(f"{name}: leave out {', '.join(misplaced)} " + (
+                "(units only); the external grid's reactive charge is q_band_tan_phi and "
                 "q_penalty_eur_per_mvarh." if grid else
-                "applies to the external grid only; a unit's reactive price is q_eur_per_mvarh."))
+                "(external grid only); a unit's reactive price is q_eur_per_mvarh."))
         diff = dict(current.get(name) or {})
         for key, value in given.items():
             if value is None or value == "":

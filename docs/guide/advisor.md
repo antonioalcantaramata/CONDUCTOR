@@ -36,6 +36,45 @@ the grid's state (there are no results yet).
 You can also start a discussion from an answer with **💬 Discuss with the
 advisor**.
 
+### Discussing corrective options
+
+Under an answer with [corrective options](asking-questions.md#corrective-options),
+**💬 Discuss these options** opens the advisor on them. The options exist because
+the solver cannot see everything you weigh: how far you trust a unit today, how
+quickly someone answers, contracts, the cost of each instruction. The advisor
+helps with those; the solver made and scored every option.
+
+- It opens with a neutral reading of the trade-offs, in the solver's figures,
+  and two or three questions about these options — for example, when several
+  lean on the same unit, how far you trust that unit today. It does not
+  recommend one yet.
+- It never picks an option on its own. Asked for its view, it gives it as its
+  view, against what you said matters, quoting each option's figures.
+- What you say matters is noted under its reply (*Noted as what matters to you*)
+  and goes into the decision note.
+- A condition the solver can act on becomes a study at once — "I don't trust
+  Gen_bus1 today" becomes **Options without Gen_bus1**: the same question with
+  that unit held at its schedule, run by CONDUCTOR and back in the discussion
+  as a new set of options.
+- Before you settle on one, it can propose the N-1 screen of that option
+  (*Run the N-1 screen with option S2:cheapest applied*) — the plain N-1
+  screen covers only the schedule.
+- When cost matters but a unit is doubted, it can propose the
+  [near-optimal alternatives](asking-questions.md#near-optimal-alternatives):
+  almost as cheap, changing other units.
+- When a loading worries you, it can propose the same options with that line
+  [held below a share of its rating](asking-questions.md#keeping-a-line-below-a-share-of-its-rating);
+  when security after an outage matters, the
+  [N-1 secure options](asking-questions.md#options-secure-after-an-outage-n-1).
+  Discussing those, it compares their N-1 screens and what security costs
+  against the cheapest, says which outages each secures, and asks whether a
+  corrective plan can be carried out in time — a corrective option relies on it.
+- Options are named by turn and strategy, *T3·cheapest*, so a name keeps its
+  meaning after a re-solve adds more.
+- When you close with a decision, the note records the option chosen with its
+  figures **copied from the solver result**, not written by the advisor; an
+  option name the conversation does not have is flagged.
+
 ## ✨ Next steps
 
 **✨ Suggest next steps** gives a short comment on the latest answer and three or

@@ -15,7 +15,8 @@ came back stamped with.
 
 from __future__ import annotations
 
-from llm_agent.agent.tool_schemas import _POINT_IN_TIME_TOOLS
+from llm_agent.agent.provenance import is_clarifying_question
+from llm_agent.agent.tool_registry import POINT_IN_TIME as _POINT_IN_TIME_TOOLS
 from llm_agent.agent.validators import (
     PROPOSAL_NOTE_PREFIX,
     TurnConsistency,
@@ -161,7 +162,8 @@ def grade_composition(record: dict) -> list[Finding]:
     # 7. An answer with no tool behind it. The agent is allowed to decline and
     #    to answer questions about itself, so this is a flag to look at, not a
     #    verdict — an unsupported request correctly refused lands here too.
-    if not results and (record.get("assistant") or "").strip():
+    if not results and (record.get("assistant") or "").strip() and not is_clarifying_question(
+            record.get("assistant") or "", record.get("tool_calls") or ()):
         findings.append(Finding(
             turn, INTERPRETATION, WARN, "no_tool_evidence",
             "The turn answered without calling any tool.",

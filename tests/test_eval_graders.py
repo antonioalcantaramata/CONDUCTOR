@@ -192,6 +192,14 @@ class TestCompositionIntegrity:
                          assistant="I cannot run that analysis.")
         assert "no_tool_evidence" in _codes(grade_composition(record))
 
+    def test_a_clarifying_question_is_not_an_answer_without_evidence(self):
+        """Asking before running is the rule (system prompt, rule 32): the
+        question and its proposed figures are not flagged."""
+        question = "What should “comfortably below” mean for L30?\n1. **80%** (suggested)\n2. 90%"
+        record = _record(tool_calls=[], tool_results=[], assistant=question)
+        codes = _codes(grade_record(record).findings)
+        assert "no_tool_evidence" not in codes and "ungrounded_figure" not in codes
+
 
 class TestProvenanceGrading:
     def test_grounded_answer_produces_no_findings(self):

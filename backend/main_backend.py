@@ -47,7 +47,9 @@ import copy
 import pandas as pd
 import numpy as np
 import requests
-from pydantic import BaseModel, field_validator, model_validator
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 import anyio
 from pyomo.environ import value
 from pyomo.opt import TerminationCondition
@@ -72,6 +74,8 @@ from element_names import (
 import ca_engine as ca
 
 import flex_engine as fe
+import flex_options as fo
+import scopf
 import network_loader as nl
 import data_quality as dq
 import scenarios as scn
@@ -93,7 +97,7 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(BACKEND_DIR, ".."))
 DATA_FILES_DIR = os.path.join(REPO_ROOT, "data_files")
 SYSTEMS_DIR = os.path.join(REPO_ROOT, "systems")
-DEFAULT_GRID_PROFILE = "pglib_case14"
+DEFAULT_GRID_PROFILE = "pglib_case30"
 _LAST_UPLOAD_SENTINEL      = os.path.join(SYSTEMS_DIR,    "last_uploaded.json")
 _LAST_TIMESERIES_SENTINEL  = os.path.join(DATA_FILES_DIR, "last_uploaded_timeseries.json")
 _LAST_FORECAST_SENTINEL    = os.path.join(DATA_FILES_DIR, "last_uploaded_forecast.json")
@@ -810,6 +814,7 @@ def _remember_loaded(net) -> None:
     app_data["generator_model"] = {}
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
+    app_data["option_sets"] = {}        # options of another network mean nothing on this one
 
 
 def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
@@ -1269,8 +1274,34 @@ def _dispatch_rows_from_overrides(dispatch_overrides):
     return rows
 
 
+def _voltage_unit_as_injection(net, requested: str) -> str | None:
+    """If `requested` names a voltage-controlled unit (net.gen) and no static
+    generator, replace it in `net` (solved) by a static generator injecting
+    what it injects now; returns a note saying so, else None."""
+    if net.gen.empty or not str(requested or "").strip():
+        return None
+    want = str(requested).strip().casefold()
+    sgen_names = set(net.sgen["name"].astype(str).str.casefold()) if len(net.sgen) else set()
+    if want in sgen_names:
+        return None
+    for idx, row in net.gen.iterrows():
+        name = str(row.get("name") or "").strip() or f"Gen_bus{int(row['bus'])}"
+        if want not in (name.casefold(), f"gen_bus{int(row['bus'])}"):
+            continue
+        p, q = float(net.res_gen.at[idx, "p_mw"]), float(net.res_gen.at[idx, "q_mvar"])
+        pp.create_sgen(net, bus=int(row["bus"]), p_mw=p, q_mvar=q, name=name,
+                       max_p_mw=row.get("max_p_mw"), min_p_mw=row.get("min_p_mw"), controllable=True)
+        net.gen.drop(index=idx, inplace=True)
+        pp.runpp(net, algorithm="nr", numba=False)
+        return (f"{name} holds a voltage set-point in operation; for this envelope it is an injection of "
+                f"active and reactive power, from where it runs now ({p:.2f} MW, {q:.2f} Mvar).")
+    return None
+
+
 def _apply_dispatch_to_net(net, dispatch_rows):
-    """Apply dispatch rows (element, Pg_new, Qg_new) to sgen/ext_grid setpoints.
+    """Apply dispatch rows (element, Pg_new, Qg_new) to sgen/gen/ext_grid
+    setpoints. A voltage-controlled unit (net.gen) takes the active power; its
+    reactive power follows its set-point.
 
     Returns a summary dict with applied/skipped element names.
     """
@@ -1297,6 +1328,15 @@ def _apply_dispatch_to_net(net, dispatch_rows):
                 pass
             for label in labels:
                 sgen_lookup[_norm_name(label)] = int(idx)
+
+    gen_lookup = {}
+    if hasattr(net, "gen") and not net.gen.empty:
+        for idx, row in net.gen.iterrows():
+            raw = row.get("name", None)
+            labels = [str(raw).strip()] if pd.notna(raw) and str(raw).strip() else []
+            labels.append(f"Gen_bus{int(row['bus'])}")
+            for label in labels:
+                gen_lookup.setdefault(_norm_name(label), int(idx))
 
     ext_lookup = {}
     if hasattr(net, "ext_grid") and not net.ext_grid.empty:
@@ -1330,6 +1370,11 @@ def _apply_dispatch_to_net(net, dispatch_rows):
             except Exception:
                 skipped.append(elem)
                 continue
+
+        if key in gen_lookup and p_new is not None:
+            net.gen.at[gen_lookup[key], "p_mw"] = float(p_new)
+            applied.append(elem)
+            continue
 
         if key in ext_lookup:
             eidx = ext_lookup[key]
@@ -1548,6 +1593,14 @@ class ContingencyRequest(_TimeseriesRequest):
     # island_mode: bool = False was meant to be added without the swedish slack bus as a contingency event
 
 
+class ContingencySweepRequest(GridRequest):
+    """Request body for ``POST /api/contingency/simulate_all``. ``option``: a
+    corrective option's reference from an options result ("S3:cheapest") —
+    the sweep then runs at that option's moment, network and load level, with
+    its dispatch applied (and, for an option after an outage, that outage)."""
+    option: str | None = None
+
+
 class ContingencyOptimizeRequest(_TimeseriesRequest):
     """Request body for ``POST /api/contingency/optimize``.
 
@@ -1566,6 +1619,13 @@ class ContingencyOptimizeRequest(_TimeseriesRequest):
     fixed_setpoints: dict[str, float] = {}
     opf_min_power_factor: float = 0.95
     opf_current_safety_margin: float = 0.9
+    # As for the flexibility OPF: the operator's conditions, and several
+    # corrective options (or near-optimal alternatives) after the outage.
+    hold_units: list[str] = []
+    options: bool = False
+    near_optimal: bool = False
+    near_optimal_pct: float = Field(default=10.0, gt=0, le=100)
+    branch_limits: dict[str, float] = {}
 
 
 class FlexibilityRequest(_TimeseriesRequest):
@@ -1613,6 +1673,33 @@ class FlexibilityRequest(_TimeseriesRequest):
     opf_current_safety_margin: float = 0.9
     vm_upper_per_bus: dict[str, float] = {}
     vm_lower_per_bus: dict[str, float] = {}
+    # Units that keep their active power at the schedule (the operator's
+    # conditions: "without Gen 2", "don't call the battery"); pinned at their
+    # MW at this moment, in the one dispatch and in every option.
+    hold_units: list[str] = []
+    # Lines or transformers held below a share of their rating, % ("L30": 80):
+    # to avoid violations on chosen branches, or to keep headroom on one that
+    # overloads after outages. Replaces the safety margin on those branches.
+    branch_limits: dict[str, float] = {}
+    # With options: instead of the named strategies, the cheapest option and
+    # near-optimal alternatives (Hop-Skip-Jump), each within `near_optimal_pct`
+    # of its cost and changing other units.
+    near_optimal: bool = False
+    near_optimal_pct: float = Field(default=10.0, gt=0, le=100)
+    # An N-1 security study (scopf.py): the dispatch that stays within limits
+    # after each critical outage — "preventive" (no action needed), "corrective"
+    # (an action within each unit's reach exists), or "both" — compared with the
+    # least-disturbance and cheapest options by their N-1 screens.
+    n1: Literal["preventive", "corrective", "both"] | None = None
+    n1_outages: list[str] = []                       # outages to study; default: the critical ones
+    # Loading allowed after an outage; None = the network's own limit, the one
+    # every N-1 screen uses (100 % on the bundled networks), so they agree.
+    n1_emergency_loading_pct: float | None = Field(default=None, ge=50, le=150)
+    n1_reach_pct: float = Field(default=20.0, gt=0, le=100)
+    # True: several corrective dispatches (flex_options.py), each the solution
+    # of a strategy, scored the same way — instead of the one least-disturbance
+    # dispatch. The default dispatch is unchanged either way.
+    options: bool = False
 
 
 class KPIRequest(_TimeseriesRequest):
@@ -1884,8 +1971,8 @@ class PushDataRequest(BaseModel):
 
 
 class ResetActiveNetworkRequest(BaseModel):
-    """Request body for ``POST /api/network/reset_active``."""
-    profile_name: str = DEFAULT_GRID_PROFILE
+    """Request body for ``POST /api/network/reset_active``; no profile: the default."""
+    profile_name: str | None = DEFAULT_GRID_PROFILE
 
 
 def _build_and_store_ybus(net) -> None:
@@ -2412,6 +2499,7 @@ def _prepare_runtime_reload() -> None:
     app_data["generator_model"] = {}
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
+    app_data["option_sets"] = {}
     app_data["_parse_notes"] = {}
     app_data["_quality_cache"] = {}
     _discard_proposals()
@@ -2440,8 +2528,7 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     print(f"[lifespan] Restoring previously uploaded network: {network_path!r} (format: {ext})")
     try:
         if ext == ".m":
-            from pandapower.converter.matpower import from_mpc
-            net = from_mpc(network_path, f_hz=50, validate_conversion=False)
+            net = nl.read_matpower(network_path)
         elif ext == ".json":
             net = pp.from_json(network_path)
         elif ext == ".xlsx":
@@ -2548,6 +2635,16 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
                 "[lifespan] gen->sgen conversion: "
                 f"created={created_names}, kept_condensers={kept_condensers}"
             )
+
+    # A profile can load its units under another control than power factor
+    # 1.0 — synchronous machines holding a voltage, as the case describes
+    # them. Applied by the generator model itself, before the network is
+    # recorded as loaded, so it is how these units were loaded: "reset to as
+    # loaded" comes back to it.
+    if profile.get("unit_model"):
+        changes = [{"unit": unit, **settings} for unit, settings in profile["unit_model"].items()]
+        net = gm.apply(net, gm.normalise(net, changes))
+        print(f"[lifespan] Unit model from the profile: {sorted(profile['unit_model'])}")
 
     applied = nl.apply_voltage_setpoints(net, profile)
     if applied:
@@ -2731,16 +2828,16 @@ def _load_resume() -> bool:
     loaded instead)."""
     sentinel = _read_json(_LAST_UPLOAD_SENTINEL) if os.path.isfile(_LAST_UPLOAD_SENTINEL) else None
     ok = bool(sentinel) and _lifespan_from_uploaded(sentinel)
+    profile_name = os.environ.get("GRID_PROFILE", DEFAULT_GRID_PROFILE).lower().strip()
     if not ok:
-        profile_name = os.environ.get("GRID_PROFILE", DEFAULT_GRID_PROFILE).lower().strip()
         _lifespan_generic(profile_name, BACKEND_DIR)
-    app_data["scenario"] = "resume" if _has_uploads() else "ieee14"
+    app_data["scenario"] = "resume" if _has_uploads() else scn.demo_for_profile(profile_name)
     return ok
 
 
 def _scenario_payload() -> dict:
     resume = scn.resume_detail(_read_json(_LAST_UPLOAD_SENTINEL), _read_json(_LAST_TIMESERIES_SENTINEL))
-    current = app_data.get("scenario") or ("resume" if _has_uploads() else "ieee14")
+    current = app_data.get("scenario") or ("resume" if _has_uploads() else scn.DEFAULT_DEMO)
     options = []
     networks = ((_read_json(_SCENARIO_FILE) if os.path.isfile(_SCENARIO_FILE) else None) or {}).get("networks") or {}
     for key, spec in scn.SCENARIOS.items():
@@ -2819,7 +2916,7 @@ async def lifespan(app: FastAPI):
     print(f"[lifespan] GRID_PROFILE={profile_name!r}")
 
     _lifespan_generic(profile_name, BACKEND_DIR)
-    app_data["scenario"] = "resume" if _has_uploads() else "ieee14"
+    app_data["scenario"] = "resume" if _has_uploads() else scn.demo_for_profile(profile_name)
     _restore_assumptions()
     _restore_proposals()
 
@@ -3521,8 +3618,8 @@ def _costs_payload() -> dict:
     return {
         "units": rows, "changed": _by_name_now(app_data.get("unit_costs") or {}), "currency": "EUR",
         "synthetic_rule": uc.RULE,
-        "used_by": "Kept for the flexibility OPF's economic objective; today's OPFs minimise the change in "
-                   "dispatch itself, so these costs do not change any result yet.",
+        "used_by": "They price the flexibility options and find the cheapest one; the default corrective "
+                   "dispatch (least disturbance) does not use them.",
         "meaning": {
             "cost_eur_per_h / cost_eur_per_mwh / cost_eur_per_mw2h": "production cost c0 + c1·P + c2·P² "
                                                                     "(for the external grid, c1 is the import price)",
@@ -3606,6 +3703,119 @@ async def set_names(request: NamesRequest):
     out["proposals_dropped"] = dropped
     out["previous"] = [{"element_type": t, "index": i, "name": n} for (t, i), n in before.items()]
     return out
+
+
+def _settings_snapshot() -> dict:
+    """The session's settings as stored — what an answer could change and
+    Undo puts back — plus how to name their subjects now."""
+    base = _net_for(None) if app_data.get("net") is not None else None
+    return {
+        "load_power_factor": app_data.get("load_power_factor"),
+        "generator_model": copy.deepcopy(app_data.get("generator_model") or {}),
+        "unit_costs": copy.deepcopy(app_data.get("unit_costs") or {}),
+        "element_names": copy.deepcopy(app_data.get("element_names") or {}),
+        # For the note only: units by their names now, renamed elements' names as loaded.
+        "unit_names_now": naming.unit_renames(base) if base is not None else {},
+        "names_as_loaded": ({f"{r['element_type']}:{r['index']}": r["loaded_name"]
+                             for r in naming.describe(base, app_data.get("element_names") or {})}
+                            if base is not None else {}),
+        "default_load_power_factor": lg.DEFAULT_LOAD_POWER_FACTOR,
+    }
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """The session's settings (load power factor, generator models, unit
+    costs, names) as stored: the app compares them before and after an answer."""
+    return _settings_snapshot()
+
+
+class SettingsRevertRequest(BaseModel):
+    """Undo what one answer changed: the settings before it and after it.
+    Only the items that differ between the two are put back."""
+    before: dict
+    after: dict
+
+
+def _flat_names(model: dict | None) -> dict:
+    return {f"{table}:{key}": name for table, names in (model or {}).items() for key, name in (names or {}).items()}
+
+
+@app.post("/api/settings/revert")
+async def revert_settings(request: SettingsRevertRequest):
+    """Put back what an answer changed — only if each of those settings is
+    still as the answer left it; otherwise nothing changes (409), so a later
+    change made by hand is never overwritten."""
+    before, after = request.before or {}, request.after or {}
+    with _STATE_LOCK:
+        if app_data.get("net_loaded") is None:
+            raise HTTPException(status_code=503, detail="No network loaded yet.")
+        now = _settings_snapshot()
+        changed_since, reverted = [], []
+
+        new_pf = now["load_power_factor"]
+        if before.get("load_power_factor") != after.get("load_power_factor") \
+                and now["load_power_factor"] != before.get("load_power_factor"):    # not already back
+            if now["load_power_factor"] != after.get("load_power_factor"):
+                changed_since.append("the load power factor")
+            else:
+                new_pf = before.get("load_power_factor")
+                reverted.append("load power factor")
+
+        units_now = now["unit_names_now"]
+
+        def revert_map(key: str, what: str, flat=lambda m: dict(m or {}),
+                       shown=lambda item: units_now.get(item, item)) -> dict:
+            b, a, cur = flat(before.get(key)), flat(after.get(key)), flat(now[key])
+            for item in sorted(set(b) | set(a)):
+                if b.get(item) == a.get(item) or cur.get(item) == b.get(item):    # unchanged, or already back
+                    continue
+                if cur.get(item) != a.get(item):
+                    changed_since.append(f"{what} {shown(item)}")
+                    continue
+                if b.get(item) is None:
+                    cur.pop(item, None)
+                else:
+                    cur[item] = b[item]
+                reverted.append(f"{what} {shown(item)}")
+            return cur
+
+        new_gm = revert_map("generator_model", "the generator model of")
+        new_costs = revert_map("unit_costs", "the costs of")
+        new_names_flat = revert_map("element_names", "the name of", flat=_flat_names,
+                                    shown=lambda item: item.replace(":", " "))
+        if changed_since:
+            raise HTTPException(status_code=409, detail=(
+                "Not undone: changed again since — " + ", ".join(changed_since)
+                + ". Change it in the System tab instead."))
+        if not reverted:
+            return {"reverted": [], "settings": now, "proposals_dropped": []}
+
+        loaded = app_data["net_loaded"]
+        old = {"pf": app_data.get("load_power_factor"), "gm": app_data.get("generator_model"),
+               "costs": app_data.get("unit_costs"), "names": app_data.get("element_names")}
+        try:
+            # Validated as if entered by hand, then applied together.
+            model = gm.merge({}, gm.normalise(loaded, [{"unit": u, **d} for u, d in new_gm.items()])) \
+                if new_gm else {}
+            costs = uc.merge({}, uc.normalise(loaded, [{"unit": u, **d} for u, d in new_costs.items()])) \
+                if new_costs else {}
+            current_names = _flat_names(app_data.get("element_names"))
+            renames = [{"element_type": k.split(":")[0], "element": int(k.split(":")[1]),
+                        "name": new_names_flat.get(k) or ""}
+                       for k in sorted(set(current_names) | set(new_names_flat))
+                       if current_names.get(k) != new_names_flat.get(k)]
+            names = (naming.normalise(_net_for(None), renames, app_data.get("element_names") or {})
+                     if renames else (app_data.get("element_names") or {}))
+            app_data["load_power_factor"] = new_pf
+            app_data["unit_costs"] = costs
+            dropped = _apply_generator_model(model, names)
+        except (gm.ModelError, uc.CostError, naming.RenameError) as exc:
+            app_data.update({"load_power_factor": old["pf"], "unit_costs": old["costs"]})
+            _apply_generator_model(old["gm"] or {}, old["names"] or {})
+            raise HTTPException(status_code=400, detail=f"Could not undo: {exc}")
+        _save_assumptions()
+        return {"reverted": reverted, "settings": _settings_snapshot(), "proposals_dropped": dropped}
 
 
 class DataSeriesRequest(BaseModel):
@@ -3930,8 +4140,7 @@ async def upload_network(
             fh.write(content)
         try:
             if ext == ".m":
-                from pandapower.converter.matpower import from_mpc
-                net = from_mpc(probe_path, f_hz=50, validate_conversion=False)
+                net = nl.read_matpower(probe_path)
             elif ext == ".json":
                 net = pp.from_json(probe_path)
             elif ext == ".xlsx":
@@ -4231,7 +4440,7 @@ async def reset_active_network(request: ResetActiveNetworkRequest = ResetActiveN
         raise HTTPException(status_code=500, detail=f"Failed to reset active network: {exc}")
     _forget_saved_proposals()
     _forget_saved_assumptions()
-    app_data["scenario"] = "ieee14"
+    app_data["scenario"] = scn.demo_for_profile(profile_name)
 
     net = app_data.get("net")
     if net is None:
@@ -6309,63 +6518,15 @@ async def simulate_contingency(request: ContingencyRequest):
             **_supply_lost(net_copy, request.element_type, request.element_index)}
 
 
-@app.post("/api/contingency/simulate_all")
-@_off_event_loop
-async def simulate_all_contingencies(request: GridRequest):
-    """Full N-1 sweep in a single backend call.
+_SCREEN_VM_TOL, _SCREEN_LOADING_TOL = 1e-4, 0.01      # p.u., % — solver precision, not a violation
 
-    Equivalent to calling ``/api/contingency/simulate`` once per line and
-    once per transformer, but condensed into one HTTP round-trip and
-    one ``deepcopy`` of the base net. This replaces the frontend's
-    40-iteration Python loop, which previously caused a ~6-second stall
-    on the UI every time the user clicked *Simulate All Contingencies*.
 
-    Pipeline
-    --------
-    1. Deep-copy the base net and apply measurements + load scaling **once**.
-    2. For each ``idx`` in ``net.line.index``:
-         * flip ``in_service = False``,
-         * call ``ca.contingency_assessment_single(net, "line", idx, ts)``,
-         * flip ``in_service = True`` (restore for next iteration),
-         * tag every returned violation row with ``outage_cause`` so the
-           UI table can show which outage caused which cascade violation.
-    3. Same for ``net.trafo.index``.
-    4. Collect everything into one flat list of violation rows.
-
-    Response shape
-    --------------
-    ``{
-        timestamp: str,
-        total_outages_tested: int,
-        total_outages_causing_violations: int,
-        total_violations: int,
-        system_n1_secure: bool,
-        violations: [ {..., outage_cause: "LINE 3", element_name, value, ...} ]
-     }``.
-
-    Notes
-    -----
-    * Uses one shared ``net_copy`` and toggles ``in_service`` rather than
-      re-copying per iteration. The CA engine is read-only w.r.t.
-      anything else on the net, so this is safe.
-    * A single CA iteration may itself crash (e.g. ``LoadflowNotConverged``
-      on a truly islanded topology). We swallow per-iteration exceptions
-      and keep going so one bad outage doesn't abort the whole sweep.
-      The aggregated response will still be accurate for the other
-      iterations; the failed indices simply contribute zero violations.
-    """
-    current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_copy = copy.deepcopy(_net_for(request))
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
-
-    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
-    _scale_loads(net_copy, request.load_scaling_factor)
-    # Accepted by the request and the agent's wrapper, but never applied: the
-    # sweep ran at measured renewable output whatever was asked.
-    if request.sgen_scaling_factor != 1.0:
-        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
-        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
-
+def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
+              max_line_loading_pct: float, max_trafo_loading_pct: float) -> dict:
+    """Every single outage of an in-service line or transformer, one power
+    flow each, on `net_copy` as prepared (an operating point, maybe a dispatch
+    applied, maybe a branch already out). Returns the counts, the violation
+    rows (each with its `outage_cause`), and the outages that did not converge."""
     all_violations: list[dict] = []
     outages_with_violations = 0
     total_tested = 0
@@ -6380,12 +6541,14 @@ async def simulate_all_contingencies(request: GridRequest):
             total_tested += 1
             table.at[idx, "in_service"] = False
             try:
+                # Beyond solver precision only: a unit holding exactly the band's
+                # edge read as "1.05 p.u. above 1.05" after every outage.
                 df_results_ca, _ = ca.contingency_assessment_single(
                     net_copy, el_type, idx, current_ts,
-                    vm_lower=request.vm_lower_pu,
-                    vm_upper=request.vm_upper_pu,
-                    max_line_loading_pct=request.max_line_loading_pct,
-                    max_trafo_loading_pct=request.max_trafo_loading_pct,
+                    vm_lower=vm_lower - _SCREEN_VM_TOL,
+                    vm_upper=vm_upper + _SCREEN_VM_TOL,
+                    max_line_loading_pct=max_line_loading_pct + _SCREEN_LOADING_TOL,
+                    max_trafo_loading_pct=max_trafo_loading_pct + _SCREEN_LOADING_TOL,
                 )
             except Exception:
                 # One bad outage must not abort the sweep — but it is reported.
@@ -6431,6 +6594,115 @@ async def simulate_all_contingencies(request: GridRequest):
                 df_results_ca["value"] = df_results_ca["value"].round(3)
             all_violations.extend(df_results_ca.to_dict(orient="records"))
 
+    return {"total_outages_tested": total_tested, "total_outages_causing_violations": outages_with_violations,
+            "total_violations": len(all_violations), "violations": all_violations,
+            "non_converged_outages": non_converged_outages}
+
+
+@app.post("/api/contingency/simulate_all")
+@_off_event_loop
+async def simulate_all_contingencies(request: ContingencySweepRequest):
+    """Full N-1 sweep in a single backend call.
+
+    Equivalent to calling ``/api/contingency/simulate`` once per line and
+    once per transformer, but condensed into one HTTP round-trip and
+    one ``deepcopy`` of the base net. This replaces the frontend's
+    40-iteration Python loop, which previously caused a ~6-second stall
+    on the UI every time the user clicked *Simulate All Contingencies*.
+
+    Pipeline
+    --------
+    1. Deep-copy the base net and apply measurements + load scaling **once**.
+    2. For each ``idx`` in ``net.line.index``:
+         * flip ``in_service = False``,
+         * call ``ca.contingency_assessment_single(net, "line", idx, ts)``,
+         * flip ``in_service = True`` (restore for next iteration),
+         * tag every returned violation row with ``outage_cause`` so the
+           UI table can show which outage caused which cascade violation.
+    3. Same for ``net.trafo.index``.
+    4. Collect everything into one flat list of violation rows.
+
+    Response shape
+    --------------
+    ``{
+        timestamp: str,
+        total_outages_tested: int,
+        total_outages_causing_violations: int,
+        total_violations: int,
+        system_n1_secure: bool,
+        violations: [ {..., outage_cause: "LINE 3", element_name, value, ...} ]
+     }``.
+
+    Notes
+    -----
+    * Uses one shared ``net_copy`` and toggles ``in_service`` rather than
+      re-copying per iteration. The CA engine is read-only w.r.t.
+      anything else on the net, so this is safe.
+    * A single CA iteration may itself crash (e.g. ``LoadflowNotConverged``
+      on a truly islanded topology). We swallow per-iteration exceptions
+      and keep going so one bad outage doesn't abort the whole sweep.
+      The aggregated response will still be accurate for the other
+      iterations; the failed indices simply contribute zero violations.
+    """
+    chosen = None
+    # Network comparisons call this with a plain GridRequest: no option there.
+    if getattr(request, "option", None):
+        stored, option = _resolve_option(request.option)
+        # The option's own moment, network and load level: a dispatch is a
+        # solution for one operating point, and means nothing at another.
+        asked_ts = _resolve_tick(request.data_source, request.timestamp) if request.timestamp else None
+        clashes = [what for what, asked, own in (
+            ("moment", asked_ts, stored["timestamp"]),
+            ("network", request.network, stored["network"] if request.network else None),
+            ("load scaling", request.load_scaling_factor if request.load_scaling_factor != 1.0 else None,
+             stored["load_scaling_factor"] if request.load_scaling_factor != 1.0 else None))
+            if asked is not None and asked != own]
+        if clashes:
+            raise HTTPException(status_code=400, detail=(
+                f"option: {stored['id']}:{option.id} was computed at {stored['timestamp']} on "
+                f"{stored['network']} with loads ×{stored['load_scaling_factor']:g}; this screen asked for another "
+                f"{' and '.join(clashes)}. Screen it at its own, or compute options for this one."))
+        request = request.model_copy(update={
+            "timestamp": stored["timestamp"], "data_source": stored["data_source"],
+            "network": None if stored["network"] == "base" else stored["network"],
+            "load_scaling_factor": stored["load_scaling_factor"]})
+        chosen = (stored, option)
+
+    current_ts = _resolve_tick(request.data_source, request.timestamp)
+    net_copy = copy.deepcopy(_net_for(request))
+    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
+
+    net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
+    _scale_loads(net_copy, request.load_scaling_factor)
+    screened_with = None
+    if chosen:
+        stored, option = chosen
+        outage = stored.get("outage")
+        if outage:
+            # The option was computed after this outage: it stays out, and the
+            # sweep screens every further one (N-1-1).
+            table = net_copy.line if outage["element_type"] == "line" else net_copy.trafo
+            table.at[outage["element_index"], "in_service"] = False
+            islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(net_copy))
+            if islanded:
+                net_copy.bus.loc[islanded, "in_service"] = False
+        _apply_option_dispatch(net_copy, option)
+        screened_with = {"ref": f"{stored['id']}:{option.id}", "label": option.label, "timestamp": stored["timestamp"],
+                         "network": stored["network"], "load_scaling_factor": stored["load_scaling_factor"],
+                         "held_units": stored.get("held_units") or {},
+                         "after_outage": outage["element"] if outage else None,
+                         "screen": "N-1-1" if outage else "N-1"}
+    # Accepted by the request and the agent's wrapper, but never applied: the
+    # sweep ran at measured renewable output whatever was asked.
+    if request.sgen_scaling_factor != 1.0:
+        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
+        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
+
+    sweep = _n1_sweep(net_copy, current_ts, request.vm_lower_pu, request.vm_upper_pu,
+                      request.max_line_loading_pct, request.max_trafo_loading_pct)
+    all_violations, non_converged_outages = sweep["violations"], sweep["non_converged_outages"]
+    total_tested, outages_with_violations = sweep["total_outages_tested"], sweep["total_outages_causing_violations"]
+
     return {
         "timestamp": current_ts,
         "total_outages_tested": total_tested,
@@ -6442,6 +6714,8 @@ async def simulate_all_contingencies(request: GridRequest):
         "violations": all_violations,
         "data_source": _dataset_label(request),
         "thresholds_used": _thresholds_used(request),
+        # The corrective option this screen ran with, applied — not the schedule.
+        **({"option": screened_with} if screened_with else {}),
     }
 
 
@@ -6521,6 +6795,8 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     trafo_defaults, branch_to_trafo = adm["trafo_defaults"], adm["branch_to_trafo"]
     islanding = {"islanded_buses": [_bus_display_name(net_copy, b) for b in islanded],
                  "load_not_supplied_mw": lost_load}
+    fixed_setpoints, held = _held_at_schedule(net_base, request)
+    caps, caps_shown = _branch_caps(net_base, request.branch_limits)
 
     try:
         results_opt, model_opt = fe.optimization_model_base(
@@ -6532,7 +6808,8 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
             pg_min_overrides=request.pg_min_overrides or None,
             min_power_factor=request.opf_min_power_factor,
             current_safety_margin=request.opf_current_safety_margin,
-            fixed_setpoints=request.fixed_setpoints or None,
+            fixed_setpoints=fixed_setpoints or None,
+            branch_limits=caps or None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Solver crashed: {str(e)}")
@@ -6540,6 +6817,17 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     if results_opt is None: raise HTTPException(status_code=500)
 
     tc = getattr(results_opt.solver, "termination_condition", None)
+    outage = {"element_type": request.element_type, "element_index": request.element_index,
+              "element": (_line_display_name if request.element_type == "line" else _trafo_display_name)(
+                  net_copy, request.element_index)}
+    if tc == TerminationCondition.optimal and request.options:
+        # Options for the corrective action after the outage: priced against
+        # the post-outage schedule, each checked by a power flow of the network
+        # without the outaged element.
+        result = _flexibility_options(request, current_ts, model_opt, modified_net, net_base,
+                                      float(app_data.get("slack_max_mw", 999.0)), held, outage=outage,
+                                      caps_shown=caps_shown)
+        return {**result, "outage": outage, **islanding}
     if tc == TerminationCondition.optimal:
         # Base values from the post-outage power flow (before redispatch), the
         # state the OPF starts from. `net_base` carries no results of its own
@@ -6556,14 +6844,16 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         # termination strings count as success.
         result = {"timestamp": current_ts, "status": "optimal", "message": "Optimization successful.",
                   "feasible": True, "converged": True,
-                  "activated_resources": regulation_data, **islanding}
+                  "activated_resources": regulation_data, "outage": outage, **islanding,
+                  **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         result.update(voltage_data)
         app_data["last_dispatch_result"] = regulation_data
         app_data["last_dispatch_timestamp"] = current_ts
         return result
     else:
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
-                  "feasible": False, "converged": False, "activated_resources": [], **islanding}
+                  "feasible": False, "converged": False, "activated_resources": [], "outage": outage, **islanding,
+                  **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         return _with_infeasibility_diagnosis(failed, model_opt, modified_net)
 
 
@@ -7854,6 +8144,11 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Base power flow failed: {e}")
 
+    # A voltage-controlled unit (net.gen) is studied as what the envelope
+    # sweeps: an injection of active and reactive power, from where it runs
+    # now. Only this study's copy changes; the note says so.
+    as_injection = _voltage_unit_as_injection(net_base, request.gen_name)
+
     # Find target sgen by canonical label with robust fallbacks for uploaded nets.
     # Some imported MATPOWER networks do not populate ``substation_name`` and
     # only have ``name`` (e.g., Gen_bus1), while users may ask for "Bus 1".
@@ -7976,6 +8271,7 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
         "timestamp": ts,
         "gen_name": request.gen_name,
         "resolved_gen_name": resolved_gen_name,
+        **({"unit_studied_as_injection": as_injection} if as_injection else {}),
         "reference_state_requested": reference_state_requested,
         "reference_state_used": reference_state_used,
         "reference_dispatch_applied": reference_dispatch_applied,
@@ -8846,6 +9142,598 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
     }
 
 
+def _flex_prices(net, model) -> tuple[fo.Prices, dict]:
+    """The cost table's prices for the units and external grid in `model`, and
+    where each came from. Units a proposal added get the default for their kind."""
+    loaded = app_data.get("net_loaded")
+    rows = {r["unit"]: r for r in uc.table(loaded, app_data.get("unit_costs") or {})} if loaded is not None else {}
+    added = {r["unit"]: r for r in uc.defaults(net) if r.get("proposed")}
+    key_of = {gm.unit_name(net, t, i): gm.unit_key(net, t, i) for t in ("gen", "sgen") for i in net[t].index}
+    up, down, q, sources = {}, {}, {}, {}
+    for g in model.G:
+        row = rows.get(key_of.get(g, g)) or added.get(g)
+        if row is None:
+            continue
+        up[g], down[g], q[g] = row.get("up_eur_per_mwh"), row.get("down_eur_per_mwh"), row.get("q_eur_per_mvarh")
+        sources[g] = sorted({(row.get("source") or {}).get(k, "synthetic")
+                             for k in ("up_eur_per_mwh", "down_eur_per_mwh", "q_eur_per_mvarh")})
+    imp, band, penalty = {}, {}, {}
+    for position, e in enumerate(model.Ext):
+        idx = net.ext_grid.index[position] if position < len(net.ext_grid) else None
+        row = rows.get(uc.ext_grid_name(net, idx)) if idx is not None else None
+        if row is None:
+            continue
+        imp[e], band[e], penalty[e] = (row.get("cost_eur_per_mwh"), row.get("q_band_tan_phi"),
+                                       row.get("q_penalty_eur_per_mvarh"))
+        sources[str(e)] = sorted({(row.get("source") or {}).get(k, "synthetic")
+                                  for k in ("cost_eur_per_mwh", "q_band_tan_phi", "q_penalty_eur_per_mvarh")})
+    return fo.Prices(up, down, q, imp, band, penalty), sources
+
+
+def _finite_exchange(net) -> bool:
+    res = getattr(net, "res_ext_grid", None)
+    return (res is not None and len(res) == len(net.ext_grid) and len(res) > 0
+            and bool(np.isfinite(res["p_mw"].to_numpy(dtype=float)).all()))
+
+
+# An option the power flow confirms: within the band (this close), at most 100 %
+# of every rating (this close: an option at its rating is within it), every
+# unit within its reactive limits (this close).
+_PF_VM_TOL, _PF_LOADING_MAX, _PF_LOADING_TOL, _PF_Q_TOL = 0.002, 100.0, 0.1, 0.5
+
+
+def _apply_option_dispatch(net, option) -> None:
+    """An option's dispatch onto `net` (in place): every unit's active power,
+    the set-point of a unit that holds a voltage, the reactive output of one
+    that does not. The external grid takes the balance, as in the OPF."""
+    where = {gm.unit_name(net, table, idx): (table, idx) for table in ("gen", "sgen") for idx in net[table].index}
+    for unit, p in option.p.items():
+        if unit not in where:
+            continue
+        table, idx = where[unit]
+        net[table].at[idx, "p_mw"] = p
+        bus = (option.vc_bus or {}).get(unit)
+        if table == "gen" and bus is not None and option.v.get(bus) is not None:
+            net.gen.at[idx, "vm_pu"] = option.v[bus]          # the set-point the option gives it
+        elif table == "sgen":
+            net.sgen.at[idx, "q_mvar"] = option.q.get(unit, net.sgen.at[idx, "q_mvar"])
+
+
+def _conditions_key() -> str:
+    """What an option's dispatch depends on besides its moment: how the units
+    are modelled and named, and the load power factor."""
+    return json.dumps({"gm": app_data.get("generator_model") or {}, "names": app_data.get("element_names") or {},
+                       "pf": app_data.get("load_power_factor")}, sort_keys=True, default=str)
+
+
+_MAX_OPTION_SETS = 20
+
+
+def _remember_options(request, ts: str, kept: list, outage: dict | None, held: dict | None) -> str:
+    """Keep a set of options in memory so a later study can apply one of them
+    (the N-1 screen): its moment, network, load level, outage, conditions and
+    each option's dispatch. Returns the set's id ("S3")."""
+    sets = app_data.setdefault("option_sets", {})
+    app_data["option_set_counter"] = app_data.get("option_set_counter", 0) + 1
+    set_id = f"S{app_data['option_set_counter']}"
+    sets[set_id] = {"id": set_id, "timestamp": ts, "network": request.network or "base",
+                    "data_source": request.data_source, "load_scaling_factor": request.load_scaling_factor,
+                    "outage": outage, "held_units": held or {}, "conditions": _conditions_key(),
+                    "options": {o.id: o for o, _ in kept}}
+    for old in list(sets)[:-_MAX_OPTION_SETS]:
+        sets.pop(old)
+    return set_id
+
+
+def _resolve_option(ref: str) -> tuple[dict, object]:
+    """A stored option by its reference: "S3:cheapest", or "cheapest" (the
+    newest set that has one). Refuses, with the reason, an unknown one and one
+    computed under other unit models, names or load power factor."""
+    sets = app_data.get("option_sets") or {}
+    text = str(ref or "").strip().replace("·", ":")
+    set_id, _, oid = text.rpartition(":")
+    oid = oid.strip()
+    candidates = [sets[set_id.strip()]] if set_id.strip() in sets else (
+        [] if set_id.strip() else [s for s in reversed(sets.values()) if oid in s["options"]])
+    found = next((s for s in candidates if oid in s["options"]), None)
+    if found is None:
+        known = [f"{s['id']}:{o}" for s in list(sets.values())[-3:] for o in s["options"]]
+        raise HTTPException(status_code=400, detail=(
+            f"option: there is no option {ref!r}" + (f". Options kept now: {', '.join(known)}." if known else
+            ". No options are kept (none computed since the backend started, or another network was loaded): "
+            "compute the options first.")))
+    if found["conditions"] != _conditions_key():
+        raise HTTPException(status_code=400, detail=(
+            f"option: {found['id']}:{oid} was computed before the unit models, names or load power factor "
+            "changed; compute the options again."))
+    return found, found["options"][oid]
+
+
+def _power_flow_check(net, option, vm_lower: float, vm_upper: float, caps: dict | None = None,
+                      max_loading_pct: float = _PF_LOADING_MAX) -> dict:
+    """The option's dispatch applied to the network and solved by an ordinary
+    AC power flow — its own voltages, loadings and reactive outputs, not the
+    OPF's. Independent of the OPF model (its taps, its current limits), so an
+    option it does not confirm is reported as such."""
+    n = copy.deepcopy(net)
+    _apply_option_dispatch(n, option)
+    try:
+        pp.runpp(n, algorithm="nr", calculate_voltage_angles=True, numba=False)
+    except Exception:  # noqa: BLE001 — not converging is the finding
+        return {"converged": False, "confirmed": False, "violations": ["the power flow did not converge"]}
+    live = n.bus.index[n.bus["in_service"]] if "in_service" in n.bus.columns else n.bus.index
+    vm = n.res_bus.vm_pu.reindex(live).dropna()
+    violations = []
+    for b, v in vm.items():
+        if v < vm_lower - _PF_VM_TOL or v > vm_upper + _PF_VM_TOL:
+            violations.append(f"{_bus_display_name(n, b)} at {v:.3f} p.u.")
+    worst = (None, None)
+    for table, label in (("line", _line_display_name), ("trafo", _trafo_display_name)):
+        res = n.get(f"res_{table}")
+        if res is None or not len(res):
+            continue
+        for idx, pct in res["loading_percent"].dropna().items():
+            name = label(n, idx)
+            if worst[0] is None or pct > worst[0]:
+                worst = (float(pct), name)
+            cap = (caps or {}).get(name)
+            if pct > max_loading_pct + _PF_LOADING_TOL:
+                violations.append(f"{name} at {pct:.1f} %")
+            elif cap is not None and pct > cap + _PF_LOADING_TOL:
+                violations.append(f"{name} at {pct:.1f} %, above its {cap:g} % cap")
+    for idx in n.gen.index:
+        q = float(n.res_gen.at[idx, "q_mvar"])
+        lo, hi = n.gen.at[idx, "min_q_mvar"], n.gen.at[idx, "max_q_mvar"]
+        if pd.notna(hi) and q > float(hi) + _PF_Q_TOL or pd.notna(lo) and q < float(lo) - _PF_Q_TOL:
+            violations.append(f"{gm.unit_name(n, 'gen', idx)} needs {q:.1f} Mvar, beyond its "
+                              f"{float(lo):.1f}…{float(hi):.1f} Mvar")
+    return {"converged": True, "confirmed": not violations,
+            "min_vm_pu": round(float(vm.min()), 4), "max_vm_pu": round(float(vm.max()), 4),
+            "max_loading_pct": round(worst[0], 2) if worst[0] is not None else None,
+            "max_loading_element": worst[1],
+            "import_mw": round(float(n.res_ext_grid["p_mw"].sum()), 4),
+            "violations": violations[:6]}
+
+
+_N1_MAX_OUTAGES = 8            # outages a study takes on at once (the most severe first)
+_PLAN_MW, _PLAN_VM = 0.1, 0.002   # the smallest corrective instruction worth issuing
+_N1_ROUNDS = 2                 # solve, screen, add what newly fails, solve again
+
+
+def _outage_net(net, table: str, idx: int):
+    """`net` without one branch, and the buses that leaves without supply."""
+    n = copy.deepcopy(net)
+    n[table].at[idx, "in_service"] = False
+    islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(n))
+    return n, islanded
+
+
+def _critical_outages(sweep: dict, limit_pct: float) -> list[tuple]:
+    """The outages a screen found violations after, most severe first:
+    (name, table, index, severity) — severity the summed excess, loading in %
+    and voltage in hundredths of a p.u."""
+    by: dict[tuple, float] = {}
+    for v in sweep.get("violations") or []:
+        key = (v.get("outage_cause"), v.get("outage_type"), v.get("outage_element_index"))
+        value_ = float(v.get("value") or 0.0)
+        excess = (value_ - limit_pct) if v.get("violation_type") in ("line_loading", "trafo_loading") else \
+            100 * max(value_ - 1.0, 1.0 - value_, 0.0)
+        by[key] = by.get(key, 0.0) + max(excess, 0.01)
+    return [(k[0], k[1], int(k[2]), round(s, 3)) for k, s in sorted(by.items(), key=lambda kv: -kv[1])
+            if k[0] and k[1] in ("line", "trafo") and k[2] is not None]
+
+
+def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0: dict, held: dict | None) -> dict:
+    """An N-1 security study (scopf.py): the least-disturbance and cheapest
+    options for reference, and the dispatch secure after each critical outage
+    — preventive, corrective, or both — every one screened under N-1 the same
+    way. Returns {"kept": [(option, cost)], "info": per option id, "study": …}."""
+    modes = [scopf.PREVENTIVE, scopf.CORRECTIVE] if request.n1 == "both" else [request.n1]
+    lo, hi = request.opf_vm_lower, request.opf_vm_upper
+    emergency = float(request.n1_emergency_loading_pct or _network_limits()["max_line_loading_pct"])
+    first = fo.capture(model, "least_disturbance")
+    cheapest = fo.cheapest(model, first, prices, pext0, qext0)
+
+    def screen(option, base_net=None):
+        n = copy.deepcopy(base_net if base_net is not None else net)
+        _apply_option_dispatch(n, option)
+        return _n1_sweep(n, ts, lo, hi, emergency, emergency)
+
+    def summary(sweep):
+        return {"outages_tested": sweep["total_outages_tested"],
+                "outages_with_violations": sweep["total_outages_causing_violations"],
+                "violations": sweep["total_violations"], "not_converged": len(sweep["non_converged_outages"])}
+
+    reference = screen(first)
+    # Which outages: the operator's, or the critical ones after the least-disturbance option.
+    if request.n1_outages:
+        index = _branch_index(net)
+        wanted, unknown = [], []
+        for raw in request.n1_outages:
+            hit = index.get(str(raw).strip().replace("→", "->").casefold())
+            (wanted.append((hit[0], hit[2], hit[3], None)) if hit else unknown.append(str(raw)))
+        if unknown:
+            raise HTTPException(status_code=400, detail=(
+                f"n1_outages: there is no line or transformer {', '.join(map(repr, unknown))}."))
+        candidates = list(dict.fromkeys(wanted))
+    else:
+        candidates = _critical_outages(reference, emergency)
+    skipped, usable = [], []
+    for name, table, idx, _sev in candidates:
+        _, islanded = _outage_net(net, table, idx)
+        if islanded:
+            skipped.append({"outage": name, "reason": (
+                f"it leaves {', '.join(_bus_display_name(net, b) for b in islanded[:4])} without supply: no "
+                "dispatch keeps them supplied")})
+        else:
+            usable.append((name, table, idx))
+    if len(usable) > _N1_MAX_OUTAGES:
+        skipped += [{"outage": u[0], "reason": f"beyond the {_N1_MAX_OUTAGES} most severe outages studied at once; "
+                                               "the screen still checks it"} for u in usable[_N1_MAX_OUTAGES:]]
+        usable = usable[:_N1_MAX_OUTAGES]
+
+    db = _db_for("full", request)
+    fixed, held_now = _held_at_schedule(net_base, request)
+    engine_kwargs = dict(opf_vm_lower=lo, opf_vm_upper=hi, lambda_p=request.opf_lambda_p,
+                         lambda_q=request.opf_lambda_q, pg_max_overrides=request.pg_max_overrides or None,
+                         pg_min_overrides=request.pg_min_overrides or None,
+                         min_power_factor=request.opf_min_power_factor,
+                         current_safety_margin=request.opf_current_safety_margin,
+                         fixed_setpoints=fixed or None)
+    keep = set(held or {}) | set(held_now)
+    reach = {g: float(request.n1_reach_pct) / 100.0 * max(float(value(model.Pg_max[g])), 0.0) for g in model.G}
+
+    def solve_mode(mode, outages):
+        base = model.clone()
+        scopf.release(base, keep)
+        states, built = {}, []
+        for name, table, idx in outages:
+            net_k, _ = _outage_net(net, table, idx)
+            try:
+                pp.runpp(net_k)
+            except Exception:  # noqa: BLE001 — the OPF starts from wherever it can
+                pass
+            try:
+                _, m_k = fe.optimization_model_base(net_k, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"],
+                                                    db["TAPS"], db["trafo_ranges"], db["trafo_defaults"],
+                                                    db["branch_to_trafo"], **engine_kwargs)
+            except Exception:  # noqa: BLE001 — an outage the model cannot be built for is reported
+                skipped.append({"outage": name, "reason": "the post-outage model could not be built"})
+                continue
+            scopf.release(m_k, keep)
+            scopf.soften(m_k, emergency / 100.0, lo, hi)
+            for e in m_k.Ext:                                   # the same grid-connection limits after the outage
+                if e in base.Ext:
+                    m_k.Pext[e].setlb(base.Pext[e].lb)
+                    m_k.Pext[e].setub(base.Pext[e].ub)
+            states[name] = m_k
+            built.append((name, table, idx))
+        top = scopf.build(base, states, mode, reach, request.opf_lambda_p, request.opf_lambda_q)
+        if not fo.solve(top):
+            return None, built
+        scopf.secure_first(top)
+        fo.solve(top)              # if stage 2 fails, stage 1's solution stands (load_solutions=False)
+        return top, built
+
+    # A branch in a finding is named as everywhere else ("Bus_21 -> Bus_23 [L30]"),
+    # whichever end the model measured it at.
+    by_pair: dict[frozenset, list] = {}
+    for name, pair, _t, _i in _branch_index(net).values():
+        if name not in by_pair.setdefault(frozenset(pair), []):
+            by_pair[frozenset(pair)].append(name)
+
+    def branch_name(i, j) -> str:
+        return " / ".join(by_pair.get(frozenset((i, j))) or
+                          [f"{_bus_display_name(net, i)} -> {_bus_display_name(net, j)}"])
+
+    info, kept, study_outages = {}, [(first, fo.action_cost(first, prices, pext0, qext0))], []
+    info["least_disturbance"] = {"screen": summary(reference)}
+    if cheapest is not None:
+        kept.append((cheapest, fo.action_cost(cheapest, prices, pext0, qext0)))
+        info["cheapest"] = {"screen": summary(screen(cheapest))}
+    for mode in modes:
+        outages, rounds = list(usable), 0
+        top = built = None
+        while outages and rounds < _N1_ROUNDS:
+            rounds += 1
+            top, built = solve_mode(mode, outages)
+            if top is None:
+                break
+            if request.n1_outages:
+                break                          # the operator's outages, and only those
+            # Outages the new dispatch fails that were not studied: added.
+            sweep = screen(fo.capture(top.base, f"n1_{mode}"))
+            names = {o[0] for o in outages}
+            new = [(n, t, i) for n, t, i, _ in _critical_outages(sweep, emergency)
+                   if n not in names and not _outage_net(net, t, i)[1]]
+            if not new or len(outages) >= _N1_MAX_OUTAGES:
+                break
+            outages += new[:_N1_MAX_OUTAGES - len(outages)]
+        sid = f"n1_{mode}"
+        if not usable:
+            info[sid] = {"not_offered": "no outage to study: the screen found none with violations"}
+            continue
+        if top is None:
+            info[sid] = {"not_offered": "the security-constrained OPF found no solution"}
+            continue
+        option = fo.capture(top.base, sid)
+        kept.append((option, fo.action_cost(option, prices, pext0, qext0)))
+        studied = [n for n, _, _ in built]
+        study_outages = list(dict.fromkeys(study_outages + studied))
+        detail = {"screen": summary(screen(option)), "studied": studied, "rounds": rounds}
+        not_secured, plan = [], []
+        for k, (name, table, idx) in enumerate(built):
+            block = getattr(top, f"c{k}")
+            remaining = scopf.residuals(block, branch_name, lambda b, n=net: _bus_display_name(n, b))
+            if remaining:
+                not_secured.append({"outage": name, "remaining": remaining[:4]})
+            if mode == scopf.CORRECTIVE:
+                net_k, _ = _outage_net(net, table, idx)
+                # First the dispatch alone: an outage it already survives needs no plan.
+                alone = _power_flow_check(net_k, option, lo, hi, max_loading_pct=emergency)
+                if alone.get("confirmed"):
+                    plan.append({"outage": name, "actions": [], "no_action_needed": True,
+                                 "checked_by_power_flow": True, "after_action": []})
+                    continue
+                after = fo.capture(block, sid)
+                check = _power_flow_check(net_k, after, lo, hi, max_loading_pct=emergency)
+                actions = []
+                # Gen_bus4 before Gen_bus10.
+                for g in sorted(after.p, key=lambda u: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", u)]):
+                    dp = round(after.p[g] - option.p[g], 2) + 0.0
+                    bus = (option.vc_bus or {}).get(g)
+                    dv = abs(after.v.get(bus, 0) - option.v.get(bus, 0)) if bus is not None else 0.0
+                    if abs(dp) < _PLAN_MW and dv < _PLAN_VM:
+                        continue                      # solver residue, not an instruction anyone would issue
+                    actions.append({"unit": g, "dp_mw": dp,
+                                    **({"setpoint_vm_pu_before": round(option.v.get(bus, 0), 3),
+                                        "setpoint_vm_pu_after": round(after.v.get(bus, 0), 3)}
+                                       if bus is not None and dv >= _PLAN_VM else {})})
+                plan.append({"outage": name, "actions": actions, "no_action_needed": False,
+                             "checked_by_power_flow": check.get("confirmed"),
+                             "after_action": check.get("violations") or []})
+        detail["secured"] = len(built) - len(not_secured)
+        detail["not_secured"] = not_secured
+        if plan:
+            detail["corrective_plan"] = plan
+            detail["screen_is"] = "before any corrective action"
+        info[sid] = detail
+    study = {"modes": modes, "outages_studied": study_outages, "skipped": skipped,
+             "emergency_loading_pct": emergency, "post_outage_band_pu": [lo, hi],
+             **({"reach_pct": request.n1_reach_pct} if scopf.CORRECTIVE in modes else {}),
+             "outages_tested_by_screen": reference["total_outages_tested"]}
+    return {"kept": kept, "info": info, "study": study}
+
+
+def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: float, held: dict | None = None,
+                         outage: dict | None = None, caps_shown: dict | None = None) -> dict:
+    """Several corrective dispatches from the solved, capped least-disturbance
+    model, scored the same way. The operator chooses; nothing here ranks them."""
+    # The exchange at the studied point (its loads, generation at schedule) —
+    # not the unscaled network's, or a load-scaling study would count the extra
+    # load itself as a cost of the corrective action.
+    ref = net if _finite_exchange(net) else net_base
+    pext0 = {e: float(ref.res_ext_grid["p_mw"].values[i]) for i, e in enumerate(model.Ext)}
+    qext0 = {e: float(ref.res_ext_grid["q_mvar"].values[i]) for i, e in enumerate(model.Ext)}
+    common = {"timestamp": ts, "mode": "options", "slack_max_mw": slack_cap,
+              "opf_vm_lower_used": request.opf_vm_lower, "opf_vm_upper_used": request.opf_vm_upper,
+              "current_safety_margin": request.opf_current_safety_margin,
+              # The operator's conditions: units kept at their schedule in every option,
+              # branches held below a share of their rating.
+              **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
+    # A held unit gets no instruction at all: its set-point is kept too, not
+    # only its active power (pinned already).
+    model, kept_too = fo.with_setpoints_kept(model, [g for g in (held or {}) if g in model.G])
+    if held and not kept_too:
+        common["held_note"] = ("Their active power is held; keeping their voltage set-points as well has no "
+                               "feasible dispatch, so those may change.")
+    first = fo.capture(model, "least_disturbance")
+    # No action: the schedule itself (active and reactive output as scheduled)
+    # meets every limit. Not "no instruction": a condenser past its reactive
+    # limit cannot hold its set-point, and its bus voltage differs untouched.
+    n1 = getattr(request, "n1", None)
+    # An N-1 study goes on even then: secure now is not secure after an outage.
+    if not n1 and not first.moved and all(abs(first.q[g] - first.q0[g]) < fo.MOVE_MVAR for g in first.q):
+        return {**common, "status": "no_action_needed", "feasible": True, "converged": True, "options": [],
+                "message": "The schedule already meets every limit: no corrective action is needed, so there "
+                           "are no options to compare."}
+    prices, sources = _flex_prices(net, model)
+    budget = None
+    n1_info = {}
+    if n1:
+        study = _n1_study(request, ts, model, net, net_base, prices, pext0, qext0, held)
+        kept, n1_info = study["kept"], study["info"]
+        not_offered = [{"id": sid, "label": fo.STRATEGIES[sid][0], "reason": entry["not_offered"]}
+                       for sid, entry in n1_info.items() if entry.get("not_offered")]
+        cheapest_total = next((c["total"] for o, c in kept if o.id == "cheapest"), None)
+        common.update({"set": "n1", "n1_study": study["study"]})
+    elif request.near_optimal:
+        kept, not_offered, cheapest_total, budget = fo.generate_near_optimal(
+            model, prices, pext0, qext0, request.near_optimal_pct)
+        common.update({"set": "near_optimal", "near_optimal_pct": request.near_optimal_pct,
+                       "budget_eur_per_h": budget})
+    else:
+        kept, not_offered, cheapest_total = fo.generate(model, prices, pext0, qext0)
+    best = next((o for o, _ in kept if o.id == "cheapest"), None)
+    set_id = _remember_options(request, ts, kept, outage, held) if kept else None
+    if set_id:
+        common["set_id"] = set_id
+
+    def bus(b: int) -> str:
+        return _bus_display_name(net, b) if b in net.bus.index else f"Bus_{b}"
+
+    options = []
+    for option, cost in kept:
+        moved_q = {g: option.q[g] - option.q0[g] for g in option.q if abs(option.q[g] - option.q0[g]) >= fo.MOVE_MVAR}
+        told = option.instructions
+
+        def row(g):
+            out = {"unit": g, "p_mw_before": round(option.p0[g], 4), "p_mw_after": round(option.p[g], 4),
+                   "dp_mw": round(option.p[g] - option.p0[g], 4), "q_mvar_before": round(option.q0[g], 4),
+                   "q_mvar_after": round(option.q[g], 4), "dq_mvar": round(option.q[g] - option.q0[g], 4),
+                   "instruction": told.get(g)}
+            b = (option.vc_bus or {}).get(g)
+            if b is not None and option.v0 and b in option.v0:
+                # A unit that holds a voltage: its instruction is the set-point;
+                # its reactive output follows from it.
+                out["setpoint_vm_pu_before"] = round(option.v0[b], 4)
+                out["setpoint_vm_pu_after"] = round(option.v.get(b, option.v0[b]), 4)
+            return out
+        rows = [row(g) for g in option.p if g in told or g in moved_q]
+        for position, e in enumerate(option.pext):
+            grid = uc.ext_grid_name(net, net.ext_grid.index[position]) if position < len(net.ext_grid) else str(e)
+            rows.append({"unit": grid, "p_mw_before": round(pext0[e], 4),
+                         "p_mw_after": round(option.pext[e], 4), "dp_mw": round(option.pext[e] - pext0[e], 4),
+                         "q_mvar_before": round(qext0[e], 4), "q_mvar_after": round(option.qext[e], 4),
+                         "dq_mvar": round(option.qext[e] - qext0[e], 4)})
+        volts = [v for v in option.v.values() if v is not None]
+        entry = {
+            "id": option.id, "label": option.label, "how": option.how,
+            # Its reference: a later study applies this option by it (the N-1 screen).
+            "ref": f"{set_id}:{option.id}",
+            # Strategies that came out as this same dispatch: "least disturbance
+            # is also the cheapest" is an answer in itself.
+            "also": [d["label"] for d in not_offered if d.get("same_as") == option.id],
+            # Units given an instruction: active power, and the voltage set-point
+            # of a unit that holds one (or the reactive output of one that does
+            # not). A held voltage moves reactive output with no instruction.
+            "units_called": sorted(told),
+            "n_units_called": len(told),
+            "instructions": dict(sorted(told.items())),
+            "units_changing_p": sorted(option.moved),
+            "moved_mw": round(sum(abs(v) for v in option.moved.values()), 4),
+            "moved_mvar": round(sum(abs(v) for v in moved_q.values()), 4),
+            "import_mw": round(sum(option.pext.values()), 4),
+            "cost_eur_per_h": cost["total"],
+            "cost_breakdown_eur_per_h": {k: v for k, v in cost.items() if k != "total"},
+            "min_vm_pu": round(min(volts), 4) if volts else None,
+            "max_vm_pu": round(max(volts), 4) if volts else None,
+            "max_loading_pct": round(option.max_loading_pct, 2) if option.max_loading_pct is not None else None,
+            "max_loading_branch": (f"{bus(option.max_loading_branch[0])} – {bus(option.max_loading_branch[1])}"
+                                   if option.max_loading_branch else None),
+            "dispatch": rows,
+            # The same dispatch, re-solved by an ordinary AC power flow.
+            "power_flow_check": _power_flow_check(net, option, request.opf_vm_lower, request.opf_vm_upper,
+                                                  caps_shown),
+            # In an N-1 study: its N-1 screen, and for a secure option what it
+            # studied, what it could not secure and (corrective) its plan.
+            **({"n1": {k: v for k, v in n1_info[option.id].items() if k != "not_offered"}}
+               if option.id in n1_info else {}),
+        }
+        if cheapest_total is not None:
+            gap = cost["total"] - cheapest_total
+            entry["above_cheapest_eur_per_h"] = round(gap, 2)
+            if cheapest_total > 0.01:
+                entry["above_cheapest_pct"] = round(100.0 * gap / cheapest_total, 1)
+        if option.id.startswith("near_optimal") and best is not None:
+            # What this alternative does without: the units the cheapest changes
+            # and it does not — the reason to look at it.
+            avoids = sorted(set(best.moved) - set(option.moved))
+            adds = sorted(set(option.moved) - set(best.moved))
+            entry["avoids"], entry["adds"] = avoids, adds
+            gap_text = (f"{entry['above_cheapest_pct']:.1f} % above the cheapest" if "above_cheapest_pct" in entry
+                        else f"{entry.get('above_cheapest_eur_per_h', 0):+.2f} €/h against the cheapest")
+            changes = ([f"avoids {', '.join(avoids)}"] if avoids else []) + ([f"adds {', '.join(adds)}"] if adds else [])
+            entry["how"] = gap_text + "; " + ("; ".join(changes) or "the same units, moved differently")
+        options.append(entry)
+    counts: dict = {}
+    for kinds in sources.values():
+        for k in kinds:
+            counts[k] = counts.get(k, 0) + 1
+    return {**common, "status": "options", "feasible": True, "converged": True,
+            "message": ((f"N-1 security study: {len(common['n1_study']['outages_studied'])} critical outage(s) "
+                         "studied; the options are compared by their N-1 screens, each meets every limit with "
+                         "everything in service; the operator chooses." if n1 else
+                         f"The cheapest option and {len(options) - 1} near-optimal alternative(s), each costing at "
+                         f"most {budget:.2f} €/h ({request.near_optimal_pct:g} % above the cheapest) and changing "
+                         "other units; each meets every limit; the operator chooses." if request.near_optimal else
+                         f"{len(options)} corrective option(s), each meeting every limit; the operator chooses.")
+                        + " Costs are of the corrective action (doing nothing costs 0)."),
+            "options": options, "not_offered": not_offered,
+            "costs": {"currency": "EUR", "prices_from": counts,
+                      "meaning": "Prices from the cost table (System tab): the case file, a synthetic rule, or "
+                                 "the operator's changes. Say which when quoting a cost.",
+                      "prices": {"up_eur_per_mwh": prices.up, "down_eur_per_mwh": prices.down,
+                                 "reactive_eur_per_mvarh": prices.q, "import_eur_per_mwh": prices.import_,
+                                 "reactive_band_tan_phi": prices.band,
+                                 "beyond_band_eur_per_mvarh": prices.penalty}}}
+
+
+def _branch_index(net) -> dict:
+    """Every line and transformer under each name an operator may use: the
+    results' name ("Bus_21 -> Bus_23 [L30]"), its tag ("L30") and its buses
+    ("Bus_21 -> Bus_23"). alias (casefolded) -> (name, pair of buses, table, index)."""
+    names: dict[str, tuple] = {}
+    for table, label in (("line", _line_display_name), ("trafo", _trafo_display_name)):
+        frame = net.get(table)
+        if frame is None or not len(frame):
+            continue
+        a, b = ("from_bus", "to_bus") if table == "line" else ("hv_bus", "lv_bus")
+        for idx in frame.index:
+            name = label(net, idx)
+            pair = (int(frame.at[idx, a]), int(frame.at[idx, b]))
+            for alias in {name, name.split(" [")[0], name.rsplit("[", 1)[-1].rstrip("]") if "[" in name else name}:
+                names.setdefault(alias.casefold(), (name, pair, table, int(idx)))
+    return names
+
+
+def _branch_caps(net, raw: dict | None) -> tuple[dict, dict]:
+    """`branch_limits` as the engine takes them — {(from bus, to bus): fraction
+    of the rating} — and as results show them: {branch name: %}. A branch is
+    named as the results name it ("Bus_21 -> Bus_23 [L30]"), by its tag ("L30",
+    "T1") or by its buses ("Bus_21 -> Bus_23"). Refuses an unknown branch or a
+    share outside 10–100 %, with the reason."""
+    if not raw:
+        return {}, {}
+    names = _branch_index(net)
+    engine, shown, unknown = {}, {}, []
+    for key, pct in raw.items():
+        found = names.get(str(key).strip().replace("→", "->").casefold())
+        if found is None:
+            unknown.append(str(key))
+            continue
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            pct = -1.0
+        if not 10.0 <= pct <= 100.0:
+            raise HTTPException(status_code=400, detail=(
+                f"branch_limits: {found[0]} at {pct:g} % — a cap is a share of the rating, 10–100 %."))
+        engine[found[1]] = pct / 100.0
+        shown[found[0]] = pct
+    if unknown:
+        examples = sorted({v[0] for v in names.values()})[:6]
+        raise HTTPException(status_code=400, detail=(
+            f"branch_limits: there is no line or transformer {', '.join(map(repr, unknown))}. Name one as the results "
+            f"do, by its tag or by its buses — e.g. {', '.join(examples)}."))
+    return engine, shown
+
+
+def _held_at_schedule(net, request) -> tuple[dict, dict]:
+    """`hold_units` as set-points at their schedule (MW at this moment), merged
+    into `fixed_setpoints` (an explicit set-point wins). Returns (set-points,
+    the units held with their MW). An unknown unit is refused by name: the
+    engine would ignore it, and the dispatch would move the unit after all."""
+    fixed = dict(request.fixed_setpoints or {})
+    if not request.hold_units:
+        return fixed, {}
+    schedule = {gm.unit_name(net, table, idx): float(net[table].at[idx, "p_mw"])
+                for table in ("sgen", "gen") for idx in net[table].index}
+    by_fold = {name.casefold(): name for name in schedule}
+    held, unknown = {}, []
+    for raw in request.hold_units:
+        name = by_fold.get(str(raw).strip().casefold())
+        if name is None:
+            unknown.append(str(raw))
+            continue
+        held[name] = round(schedule[name], 4)
+        fixed.setdefault(name, held[name])
+    if unknown:
+        raise HTTPException(status_code=400, detail=(
+            f"hold_units: there is no unit {', '.join(map(repr, unknown))}. Units: {', '.join(sorted(schedule))}."))
+    return fixed, held
+
+
 @app.post("/api/flexibility/optimize")
 @_off_event_loop
 async def optimise_flexibility(request: FlexibilityRequest):
@@ -8881,6 +9769,10 @@ async def optimise_flexibility(request: FlexibilityRequest):
       * Fold 2 unfixes them and minimizes ``|Pg_new - Pg_base|``.
     """
     if _db_for("full", request) is None: raise HTTPException(status_code=503)
+    if request.n1 and request.near_optimal:
+        raise HTTPException(status_code=400, detail=(
+            "n1 and near_optimal are two different option sets: ask for the N-1 secure options, or for "
+            "near-optimal alternatives, one at a time."))
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_base = copy.deepcopy(_net_for(request))
@@ -8915,6 +9807,8 @@ async def optimise_flexibility(request: FlexibilityRequest):
         pp.runpp(net_base)
     except Exception:
         pass
+    fixed_setpoints, held = _held_at_schedule(net_base, request)
+    caps, caps_shown = _branch_caps(net_base, request.branch_limits)
 
     net = copy.deepcopy(net_base)
     _scale_loads(net, request.load_scaling_factor)
@@ -8937,9 +9831,10 @@ async def optimise_flexibility(request: FlexibilityRequest):
             pg_min_overrides=request.pg_min_overrides or None,
             min_power_factor=request.opf_min_power_factor,
             current_safety_margin=request.opf_current_safety_margin,
-            fixed_setpoints=request.fixed_setpoints or None,
+            fixed_setpoints=fixed_setpoints or None,
             vm_upper_per_bus=request.vm_upper_per_bus or None,
             vm_lower_per_bus=request.vm_lower_per_bus or None,
+            branch_limits=caps or None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -8952,7 +9847,8 @@ async def optimise_flexibility(request: FlexibilityRequest):
         _reported_cap = float(_phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap))
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
                   "feasible": False, "converged": False,
-                  "activated_resources": [], "slack_max_mw": _reported_cap}
+                  "activated_resources": [], "slack_max_mw": _reported_cap,
+                  **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         return _with_infeasibility_diagnosis(failed, model_opt, net)
 
     # Constrained-slack re-solve so the dispatch respects the global
@@ -8976,7 +9872,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
     cap_respected = True
     cap_failure = ""
     try:
-        cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar, fixed_setpoints=request.fixed_setpoints or None)
+        cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar, fixed_setpoints=fixed_setpoints or None)
         cscen_tc = (getattr(cscen_results.solver, "termination_condition", None)
                     if cscen_results is not None else None)
         if cscen_tc == TerminationCondition.optimal:
@@ -9049,11 +9945,20 @@ async def optimise_flexibility(request: FlexibilityRequest):
             "feasible": False, "converged": True, "slack_cap_respected": False,
             "activated_resources": [], "slack_max_mw": slack_cap,
             "uncapped_reference_dispatch": regulation_data,
+            **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {}),
         }
+    if request.options or request.n1:          # an N-1 study is a set of options
+        app_data["last_dispatch_result"] = regulation_data
+        app_data["last_dispatch_timestamp"] = current_ts
+        return _flexibility_options(request, current_ts, cscen_model, net, net_base, slack_cap, held,
+                                    caps_shown=caps_shown)
     response = {
         "timestamp": current_ts, "status": "optimal", "message": msg,
         "feasible": True, "converged": True, "slack_cap_respected": True,
         "activated_resources": regulation_data, "slack_max_mw": slack_cap,
+        # The operator's conditions: units kept at their schedule, with the MW,
+        # and branches held below a share of their rating.
+        **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {}),
     }
     response.update(voltage_data)
     if bus_voltages_base:

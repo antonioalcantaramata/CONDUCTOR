@@ -158,3 +158,13 @@ def test_a_question_to_the_operator_is_asking_not_a_refusal():
     got = whatif.evaluate(_task("classical_generator"), [asked, built])
     assert got["asked how the unit is modelled before building it"]
     assert got["edit: 30 MW unit on voltage control at Bus_4"]
+
+
+def test_a_reused_refusal_is_counted_once():
+    refused = {"error": "400 Bad Request", "detail": "no bus 'Bus_99'", "status_code": 400}
+    record = {"turn": 1, "assistant": "", "tool_calls": [
+        {"name": "edit_proposal", "args": {"proposal": "p"}},
+        {"name": "edit_proposal", "args": {"proposal": "p"}, "reused_from": 1}],
+        "tool_results": [{"name": "edit_proposal", "result": refused},
+                         {"name": "edit_proposal", "result": {**refused, "reused_from": 1}}]}
+    assert [f.code for f in grade_sandbox(record)].count("invalid_edit") == 1

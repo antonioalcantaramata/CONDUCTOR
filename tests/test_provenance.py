@@ -82,6 +82,15 @@ class TestExtraction:
         assert extract_claims("") == []
 
 
+class TestSignedCurrency:
+    @pytest.mark.parametrize("text", ["-€24.27/h", "a saving of -€24.27/h", "- € 24.27 per hour", "€-24.27/h"])
+    def test_a_sign_before_the_currency_is_kept(self, text):
+        assert _values(text) == [-24.27]
+
+    def test_without_a_sign_it_stays_positive(self):
+        assert _values("costs €24.27, range 10–20 €") == [24.27, 10, 20]
+
+
 class TestSources:
     def test_collects_from_results_arguments_and_prompt(self):
         record = {
@@ -361,6 +370,24 @@ class TestMisattribution:
         assert report.misattributed == []
         assert len(report.grounded) == 1
 
+    @pytest.mark.parametrize("written", ["Bus_0 -> Bus_1 [L0]", "Bus_0–Bus_1 [L0]", "Bus_0 → Bus_1 [L0]",
+                                         "Bus_0 - Bus_1 [L0]", "Bus_0 to Bus_1 [L0]"])
+    def test_a_line_is_recognised_however_its_arrow_is_written(self, written):
+        # Observed live: "line Bus_0–Bus_1 [L0] at 114.7%" was read as written
+        # about Bus_29, the violated bus named just before it.
+        record = {"user": "q", "assistant": (
+            "Two violations: **Bus_29 at 0.943 p.u.** (below 0.950) and line "
+            f"**{written} at 114.7%** loading."),
+            "tool_calls": [{"name": "run_rsa", "args": {}}],
+            "tool_results": [{"name": "run_rsa", "result": {"violations": [
+                {"element": "Bus_29", "violation_type": "bus_vm_pu", "value": 0.94327, "violated": True},
+                {"element": "Bus_0 -> Bus_1 [L0]", "violation_type": "line_loading", "value": 114.6644,
+                 "violated": True}]}}]}
+        report = check_turn(record)
+        assert report.misattributed == []
+        line = next(v for v in report.verdicts if v.claim.value == 114.7)
+        assert line.status == GROUNDED and line.subject == "Bus_0 -> Bus_1 [L0]"
+
     def test_misattributed_does_not_count_as_traceable(self):
         record = _attribution_record(
             "### Attribution\nThe worst violation is at Alpha 10.5 kV, "
@@ -369,3 +396,24 @@ class TestMisattribution:
         report = check_turn(record)
         assert report.rate < 1.0
         assert MISATTRIBUTED in {v.status for v in report.verdicts}
+
+
+class TestClarifyingQuestions:
+    from llm_agent.agent import provenance as _p
+
+    @pytest.mark.parametrize("answer, calls, asking", [
+        ("Which line?\n1. L30\n2. L31", [], True),
+        ("Which line?\n\n- **1.** L30\n- **2.** L31", [{"name": "locate_network_element"}], True),
+        ("Which line?\n1. L30\n2. L31", [{"name": "run_rsa"}], False),            # a study ran: an answer
+        ("1. Cheapest 26.48 €/h\n2. Least import\nWhich do you prefer?", [], False),  # results, then a question
+        ("Which line do you mean?", [], False),                                      # no choices to exempt
+        ("I can't run that.", [], False),
+    ])
+    def test_what_counts_as_asking(self, answer, calls, asking):
+        assert self._p.is_clarifying_question(answer, calls) is asking
+
+    def test_only_the_choices_are_left_out(self):
+        text = "L30 is at 77.9 %. How far below?\n1. 70 %\n2. 60 %"
+        assert self._p.answer_to_check(text) == "L30 is at 77.9 %. How far below?"
+        assert self._p.answer_to_check(text, [{"name": "run_rsa"}]) == text
+

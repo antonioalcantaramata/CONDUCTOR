@@ -85,6 +85,8 @@ _NUMBER_RE = re.compile(
     r"(?![A-Za-z0-9_])"
 )
 
+_SIGNED_CURRENCY_RE = re.compile(r"-\s?[€$£]\s?$")
+
 # Digit groups anywhere, used to mine numerals out of *strings* in tool
 # results. Element names carry them ("Oscar 10kV", "Foxtrot Trf 1") and the
 # answer quotes them back, so without this every such mention reads as
@@ -243,6 +245,10 @@ def extract_claims(answer: str) -> list[Claim]:
             value = float(integer.replace(",", "") + ("." + fraction if fraction else ""))
         except ValueError:  # pragma: no cover — regex guarantees the shape
             continue
+        # A sign written before the currency symbol: "-€24.27/h" is a saving
+        # of 24.27, not a cost (seen live, flagged as invented).
+        if value > 0 and _SIGNED_CURRENCY_RE.search(cleaned, max(0, match.start() - 4), match.start()):
+            value = -value
 
         unit_match = _UNIT_RE.match(cleaned, match.end())
         unit = unit_match.group(1).strip() if unit_match else None
@@ -695,20 +701,33 @@ def _subject_at(cleaned: str, position: int, occurrences: list[tuple[int, str]])
     return subject
 
 
+# The arrow of a branch label as prose rewrites it: "Bus_0 -> Bus_1 [L0]" came
+# back as "Bus_0–Bus_1 [L0]", was not recognised, and its loading was reported
+# as written about the bus named before it (seen live, then repeated by the
+# advisor as a mistake in a correct answer).
+_ARROW_RE = r"\s*(?:->|→|–|—|-|\bto\b)\s*"
+
+
+def _name_pattern(name: str) -> re.Pattern:
+    """An element name as the prose may write it."""
+    if " -> " not in name:
+        return re.compile(re.escape(name))
+    left, right = name.split(" -> ", 1)
+    return re.compile(re.escape(left) + _ARROW_RE + re.escape(right))
+
+
 def _occurrences(cleaned: str, names: Iterable[str]) -> list[tuple[int, str]]:
     """Where each element name appears, longest names first.
 
     Longest-first so "Echo 10kV" is not shadowed by a shorter name it
     contains; overlapping shorter hits at the same offset are dropped.
     """
-    found: dict[int, str] = {}
+    spans: list[tuple[int, int, str]] = []
     for name in sorted(names, key=len, reverse=True):
-        start = cleaned.find(name)
-        while start != -1:
-            if not any(o <= start < o + len(n) for o, n in found.items()):
-                found[start] = name
-            start = cleaned.find(name, start + 1)
-    return sorted(found.items())
+        for match in _name_pattern(name).finditer(cleaned):
+            if not any(start <= match.start() < end for start, end, _ in spans):
+                spans.append((match.start(), match.end(), name))
+    return sorted((start, name) for start, _, name in spans)
 
 
 def check_answer(answer: str, sources: list[Any],
@@ -738,10 +757,47 @@ def check_answer(answer: str, sources: list[Any],
     return ProvenanceReport(verdicts=tuple(verdicts), n_sources=len(sources))
 
 
+# ---------------------------------------------------------------------------
+# A question put to the operator
+# ---------------------------------------------------------------------------
+
+# Tools that only look something up. A turn that called nothing else and asks
+# the operator to choose has not answered yet: the figures in its choices are
+# proposals ("1. 80 % (suggested)  2. 90 %"), not results, and flagging them
+# would put a false "not in any tool output" under every clarifying question.
+LOOKUP_TOOLS = frozenset({"locate_network_element", "get_current_timestamp", "get_current_conditions",
+                          "get_element_timeseries", "get_data_quality"})
+_CHOICE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\*\*)?\(?[1-9][.)]")
+
+
+def is_clarifying_question(answer: str, calls: Iterable[dict] = ()) -> bool:
+    """Whether a turn asks the operator to choose before anything ran: only
+    lookups were called, and a question comes before a numbered list of
+    choices. The order is the test — a list of results followed by "which do
+    you prefer?" is an answer, and its figures stay checked."""
+    if not isinstance(calls, (list, tuple)) or any(
+            not isinstance(c, dict) or c.get("name") not in LOOKUP_TOOLS for c in calls):
+        return False                      # a malformed record is never exempt
+    asked = False
+    for line in (answer or "").splitlines():
+        if _CHOICE_LINE.match(line):
+            return asked
+        asked = asked or line.rstrip(" *_").endswith("?")
+    return False
+
+
+def answer_to_check(answer: str, calls: Iterable[dict] = ()) -> str:
+    """The text whose figures are checked: a clarifying question without its
+    choices (the question's own sentences are still checked)."""
+    if not is_clarifying_question(answer, calls):
+        return answer or ""
+    return "\n".join(line for line in (answer or "").splitlines() if not _CHOICE_LINE.match(line))
+
+
 def check_turn(record: dict) -> ProvenanceReport:
     """Grade one session-log turn record."""
     return check_answer(
-        record.get("assistant") or "",
+        answer_to_check(record.get("assistant") or "", record.get("tool_calls") or ()),
         collect_sources(record),
         subjects=subject_names(record),
     )

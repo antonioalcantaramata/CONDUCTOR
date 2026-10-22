@@ -183,13 +183,16 @@ OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:12b-mlx")
 
 # Ollama defaults num_ctx to ~4096 REGARDLESS of what the model supports, and
 # silently truncates the *front* of an over-long prompt — which drops the system
-# prompt first, with no error. This agent's system prompt plus 27 tool schemas
+# prompt first, with no error. This agent's system prompt plus 29 tool schemas
 # measures ~28k tokens before any conversation, so a generous window is required.
 #
-# 32768 rather than 65536: measured on an M3 Pro, quadrupling the window made no
-# difference to prompt-processing speed (139 tok/s either way) while reserving
-# several GB more KV cache. Pay for headroom you use, not headroom you don't.
-OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
+# 65536: at 32768 the fixed prefix (~28k) plus the 4096 reply reserve left under
+# a thousand tokens of conversation — one options result is ~6k — so a session
+# hit "prompt too large" within a turn or two. Measured on an M3 Pro, a larger
+# window made no difference to prompt-processing speed (139 tok/s either way);
+# it reserves more KV cache memory. On a small machine set it lower in `.env`
+# and expect shorter conversations (the launcher suggests one per machine).
+OLLAMA_NUM_CTX: int = int(os.environ.get("OLLAMA_NUM_CTX", "65536"))
 
 # How long Ollama keeps the model — and crucially its prompt cache — resident.
 #

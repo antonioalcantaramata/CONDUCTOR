@@ -24,7 +24,7 @@ import inspect
 import pytest
 
 from llm_agent.agent import tools
-from llm_agent.agent.tool_schemas import _POINT_IN_TIME_TOOLS
+from llm_agent.agent.tool_registry import POINT_IN_TIME as _POINT_IN_TIME_TOOLS
 
 TIMESTAMP = "2022-01-02 21:45"
 DATA_SOURCE = "forecasts"

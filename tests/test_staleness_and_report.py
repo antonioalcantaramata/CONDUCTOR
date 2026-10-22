@@ -140,3 +140,11 @@ class TestReport:
     def test_an_empty_session_still_builds(self):
         page = report.build([], {})
         assert "No questions yet." in page and "Not available" in page and "None —" in page
+
+
+def test_a_settings_tool_is_not_a_study():
+    """An answer that only set the power factor ran no study under any setting."""
+    setting = ("set_load_power_factor", {"load_power_factor": {"value": 0.9, "source": "session setting"}})
+    assert staleness.stamp([setting], ASSUMPTIONS) is None
+    study = ("run_rsa", _result(0.9, "session setting"))
+    assert staleness.stamp([setting, study], ASSUMPTIONS)["pf"] == 0.9

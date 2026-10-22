@@ -377,7 +377,7 @@ def simulate_all_contingencies(
         "simulate_all_contingencies",
         kwargs,
         supported_extra={"sgen_scaling_factor", "data_source", "timestamp", "network",
-                         "load_power_factor"},
+                         "load_power_factor", "option"},
     )
     if unsupported is not None:
         return unsupported
@@ -1624,15 +1624,53 @@ def set_load_power_factor(value: float | None = None, reset: bool = False, **kwa
                    _post("/api/assumptions", {"load_power_factor": None if reset else value}))
 
 
+# The settings /api/generators takes (backend/generators.py FIELDS), by the
+# slot the model gives each one's value in.
+GENERATOR_CONTROLS = ("voltage", "power_factor", "fixed_q")
+_GENERATOR_SLOTS = {"control": "control", "vm_pu": "value", "pf": "value", "q_mvar": "value",
+                    "q_min_mvar": "value", "q_max_mvar": "value", "absorbing": "on", "dispatchable": "on"}
+GENERATOR_SETTINGS = tuple(_GENERATOR_SLOTS)
+
+
+def _generator_changes(items: list) -> list[dict] | str:
+    """One item per setting (unit, setting, and its value in the slot that
+    setting uses) → one change per unit, as /api/generators takes them.
+
+    Only the named setting's slot is read, so a model that fills in every
+    slot changes nothing else: given one object per unit with every setting,
+    such a model would also have set the reactive limits to 0 and the unit
+    not dispatchable."""
+    by_unit: dict[str, dict] = {}
+    for n, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or not item.get("unit") or not item.get("setting"):
+            return f"Change {n}: give unit, setting (one) and its value."
+        unit, setting = str(item["unit"]).strip(), item["setting"]
+        slot = _GENERATOR_SLOTS.get(setting)
+        if slot is None:
+            return f"Change {n}: setting is one of {', '.join(GENERATOR_SETTINGS)}."
+        value = item.get(slot)
+        if slot == "control" and value not in GENERATOR_CONTROLS:
+            return f"Change {n} ({unit}): give control as one of {', '.join(GENERATOR_CONTROLS)}."
+        if slot == "value" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+            return f"Change {n} ({unit}, {setting}): give the number in value."
+        if slot == "on" and not isinstance(value, bool):
+            return f"Change {n} ({unit}, {setting}): give true or false in on."
+        change = by_unit.setdefault(unit.casefold(), {"unit": unit})
+        if setting in change:
+            return f"Change {n}: {unit} {setting} is given twice."
+        change[setting] = value
+    return list(by_unit.values())
+
+
 def set_generator_model(changes: list | None = None, reset: bool = False, **kwargs) -> dict:
     """
     GET / POST /api/generators
 
     How each generating unit is modelled — voltage control or a fixed power
     factor, its set-point and reactive limits, whether the OPF may dispatch it.
-    With no arguments, returns every unit and its model; with `changes`, applies
-    them (kept for this network, visible in the System tab); reset=True takes
-    every unit back to how it was loaded.
+    With no arguments, returns every unit and its model; with `changes` (one
+    item per setting), applies them (kept for this network, visible in the
+    System tab); reset=True takes every unit back to how it was loaded.
     """
     unsupported = _unsupported_kwargs_result("set_generator_model", kwargs, supported_extra=set())
     if unsupported is not None:
@@ -1641,18 +1679,52 @@ def set_generator_model(changes: list | None = None, reset: bool = False, **kwar
         return _record("set_generator_model", _get("/api/generators"))
     if changes and reset:
         return {"error": "Give either changes or reset=true, not both."}
-    return _record("set_generator_model",
-                   _post("/api/generators", {"changes": list(changes or []), "reset": bool(reset)}))
+    grouped = _generator_changes(list(changes or []))
+    if isinstance(grouped, str):
+        return {"error": grouped}
+    return _record("set_generator_model", _post("/api/generators", {"changes": grouped, "reset": bool(reset)}))
+
+
+# The prices /api/costs takes (backend/costs.py FIELDS).
+COST_FIELDS = ("cost_eur_per_mwh", "cost_eur_per_mw2h", "cost_eur_per_h", "up_eur_per_mwh",
+               "down_eur_per_mwh", "q_eur_per_mvarh", "q_band_tan_phi", "q_penalty_eur_per_mvarh")
+
+
+def _cost_changes(items: list) -> list[dict] | str:
+    """One item per price (unit, field, value) → one change per unit, as
+    /api/costs takes them; a message when an item is incomplete.
+
+    The model is given one price per item, not a unit with every price: a
+    model that fills in every property it is shown turned "reactive price to
+    0" into all eight prices at 0."""
+    by_unit: dict[str, dict] = {}
+    for n, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or not item.get("unit") or not item.get("field"):
+            return f"Change {n}: give unit, field (one price) and value, or to_default=true."
+        unit, field, value = str(item["unit"]).strip(), item["field"], item.get("value")
+        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if not item.get("to_default") and not number:
+            return f"Change {n} ({unit}, {field}): give a value, or to_default=true."
+        # A value of 0 beside to_default=true is a filled-in blank; any other
+        # value says two things at once.
+        if item.get("to_default") and number and value != 0:
+            return f"Change {n} ({unit}, {field}): give either a value or to_default=true, not both."
+        change = by_unit.setdefault(unit.casefold(), {"unit": unit})
+        if field in change:
+            return f"Change {n}: {unit} {field} is given twice."
+        change[field] = None if item.get("to_default") else value
+    return list(by_unit.values())
 
 
 def set_unit_costs(changes: list | None = None, reset: bool = False, **kwargs) -> dict:
     """
     GET / POST /api/costs
 
-    Each unit's production cost (c0 + c1·P + c2·P²) and redispatch costs
-    up/down, from the case, the synthetic rule or the operator. With no
-    arguments, returns them; with `changes`, applies them; reset=True restores
-    every default.
+    Each unit's production cost (c0 + c1·P + c2·P²), redispatch costs up/down
+    and reactive price, and the external grid's reactive band, from the case,
+    the synthetic rule or the operator. With no arguments, returns them; with
+    `changes` (one item per price), applies them; reset=True restores every
+    default.
     """
     unsupported = _unsupported_kwargs_result("set_unit_costs", kwargs, supported_extra=set())
     if unsupported is not None:
@@ -1661,7 +1733,10 @@ def set_unit_costs(changes: list | None = None, reset: bool = False, **kwargs) -
         return _record("set_unit_costs", _get("/api/costs"))
     if changes and reset:
         return {"error": "Give either changes or reset=true, not both."}
-    return _record("set_unit_costs", _post("/api/costs", {"changes": list(changes or []), "reset": bool(reset)}))
+    grouped = _cost_changes(list(changes or []))
+    if isinstance(grouped, str):
+        return {"error": grouped}
+    return _record("set_unit_costs", _post("/api/costs", {"changes": grouped, "reset": bool(reset)}))
 
 
 def rename_elements(changes: list | None = None, reset: bool = False, **kwargs) -> dict:

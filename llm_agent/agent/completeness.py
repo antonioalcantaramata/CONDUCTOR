@@ -156,7 +156,11 @@ def check_answer(question: str, answer: str) -> list[Gap]:
 
 
 def check_turn(record: dict) -> list[Gap]:
-    """Grade one session-log turn record."""
+    """Grade one session-log turn record. A clarifying question has not
+    answered yet, so nothing can be missing from it."""
+    from .provenance import is_clarifying_question
+    if is_clarifying_question(record.get("assistant") or "", record.get("tool_calls") or ()):
+        return []
     return check_answer(record.get("user") or "", record.get("assistant") or "")
 
 

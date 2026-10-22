@@ -12,13 +12,23 @@ Every start shows a launch screen in two columns.
 
 - **Resume** — your last uploaded network and data. Greyed out until you have
   uploaded something.
-- **Demo: IEEE 14 · active only** — the PGLib IEEE 14-bus network with a
-  synthetic week of active power. Loads take their reactive power from the load
-  power factor. The network's own operating point (the *nominal point*) is
-  included.
-- **Demo: IEEE 14 · with reactive measurements** — the same network and week,
+- **Demo: IEEE 30 · active only** (the default) — PGLib's IEEE 30-bus network
+  (Alsac–Stott) with a synthetic week of active power. Its five units can all
+  move their active power, each with its own cost from the case, and hold their
+  voltage as the case describes them. The line from the external grid congests
+  at the evening peaks, so the flexibility studies have real choices to show.
+  Loads take their reactive power from the load power factor. The network's own
+  operating point (the *nominal point*) is included.
+- **Demo: IEEE 30 · with reactive measurements** — the same network and week,
   with measured reactive demand and generation. A few values are left out on
   purpose, so the data-quality report has gaps to show.
+- **Demo: IEEE 14 · smaller** — PGLib's IEEE 14-bus network and its week: one
+  unit can move its active power and three condensers hold voltages. The
+  what-if evaluation is written for it.
+
+When a session was saved for the network loaded, the launch screen also asks
+whether to **continue from it** — see
+[Session context](sessions-and-scenarios.md#session-context-continuing-another-day).
 
 The demos are the same every time, so they are a good place to learn and to
 compare results. An option you have worked on before says so ("Your changes are

@@ -16,7 +16,7 @@ all existing main_backend.py endpoints work unchanged:
 
 Profile options
 ---------------
-load_profile  : "residential" | "industrial" | "flat"
+load_profile  : "residential" | "twin_peak" | "industrial" | "flat"
 generation_profile : "wind" | "solar" | "flat"
 
 Stress events
@@ -65,7 +65,17 @@ def _load_shape(hours: np.ndarray, dow: np.ndarray, profile: str) -> np.ndarray:
     """The noise-free load shape of a profile."""
     n = len(hours)
     if profile == "residential":
-        # Morning peak ~8 h, evening peak ~19 h
+        # Night trough ~3–4 h, morning peak ~8 h, a higher evening peak ~19 h.
+        # (Until October 2026 it drew what is now `twin_peak`.)
+        def bump(centre, width):
+            d = (hours - centre + 12.0) % 24.0 - 12.0          # wraps around midnight
+            return np.exp(-0.5 * (d / width) ** 2)
+        alpha = 0.55 + 0.25 * bump(8.0, 1.6) + 0.15 * bump(13.0, 3.0) + 0.42 * bump(19.0, 2.0)
+        return alpha * (1.0 - 0.15 * (dow >= 5).astype(float))
+    if profile == "twin_peak":
+        # Peaks ~2–3 h and ~14–15 h — what "residential" drew until October
+        # 2026. The PGLib 14-bus profile keeps it, so its demo week (and the
+        # evaluation written for it) stays exactly as it was.
         alpha = (0.6
                  + 0.4 * np.sin(np.pi * (hours - 7.0) / 12.0) ** 2
                  + 0.3 * np.sin(np.pi * (hours - 18.0) / 6.0) ** 2)
@@ -78,7 +88,7 @@ def _load_shape(hours: np.ndarray, dow: np.ndarray, profile: str) -> np.ndarray:
     return np.ones(n)  # "flat"
 
 
-_NOISE = {"residential": 0.05, "industrial": 0.03}
+_NOISE = {"residential": 0.05, "twin_peak": 0.05, "industrial": 0.03}
 
 
 def _load_scale(hours: np.ndarray, dow: np.ndarray,

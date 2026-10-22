@@ -51,6 +51,18 @@ class TestLoadScale:
         assert (alpha >= 0.05).all() and (alpha <= 1.5).all()
 
 
+class TestResidentialShape:
+    def test_peaks_in_the_evening_with_a_morning_peak_and_a_night_trough(self):
+        hours = np.arange(0.0, 24.0, 0.25)
+        alpha = st._load_shape(hours, np.zeros_like(hours), "residential")
+        by_hour = lambda lo, hi: alpha[(hours >= lo) & (hours < hi)]   # noqa: E731
+        assert 18.0 <= hours[alpha.argmax()] <= 20.0                     # the evening peak
+        assert by_hour(7, 9).max() > by_hour(10, 12).min()              # a morning peak before the midday dip
+        assert 2.0 <= hours[alpha.argmin()] <= 5.0                       # the night trough
+        weekend = st._load_shape(hours, np.full_like(hours, 6), "residential")
+        assert np.allclose(weekend, 0.85 * alpha)
+
+
 class TestGenScale:
     @pytest.mark.parametrize("profile", ["wind", "solar", "flat"])
     def test_stays_within_bounds(self, profile):
@@ -103,8 +115,9 @@ class TestGenerate:
 
 class TestPeakLoadFactor:
     """The network's own load is its design point; the usual daily peak sits
-    there, not at the profile shape's ~1.22× (which ran PGLib case14 past its
-    reactive capability every afternoon)."""
+    there, not at whatever the profile shape's own peak is (an earlier shape
+    peaked at ~1.22×, which ran PGLib case14 past its reactive capability every
+    afternoon)."""
 
     def _ratio(self, net, **kw):
         base = net.load.groupby("bus")["p_mw"].sum()
@@ -122,7 +135,7 @@ class TestPeakLoadFactor:
 
     def test_none_keeps_the_raw_shape(self, case14_net):
         high, _ = self._ratio(case14_net, peak_load_factor=None)
-        assert high > 1.15
+        assert abs(high - st._shape_peak("residential")) < 0.06          # unscaled: the shape's own peak, ± noise
 
     def test_same_seed_same_series_up_to_scale(self, case14_net):
         _, a = st.generate(case14_net, n_days=1, resolution_min=60, seed=5, peak_load_factor=None)

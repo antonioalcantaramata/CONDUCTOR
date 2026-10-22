@@ -24,11 +24,19 @@ image.
 ## How this answer was produced
 
 The panel under each answer, collapsed by default. Its label always shows the
-counts (tools run, figures traced) and any concern, so you see a warning
-without opening it. Inside:
+counts (tools run, figures traced), any concern and how long the answer took,
+so you see a warning without opening it. Inside:
 
 - **Worth checking** — anything the checks flagged.
-- **What ran** — each study, its arguments, and whether it succeeded.
+- **What ran** — where the time went (for example *14 s — model 9.8 s (4 calls),
+  studies 3.2 s, checks <0.1 s*), then each study with its arguments, whether it
+  succeeded and how long it took. Most of the wait is usually the model; a long
+  study shows up here. A step
+  marked **↺ same call as step 2, not run again** repeated an earlier study with
+  the same arguments, and was answered from it: nothing had changed in between.
+  If the model repeats a call that failed after being told it would fail the
+  same way, CONDUCTOR stops the question there and answers from what is known,
+  with a note saying so.
 - **Where the numbers came from** — each figure in the text, traced to the
   study result it came from.
 - **What this does not tell you** — what the checks cannot see.
@@ -48,6 +56,19 @@ In the sidebar, **Answer checks** has one switch: **Let the agent review its
 answer**. Off (the default), findings are shown to you only. On, CONDUCTOR sees
 them before the answer is delivered and may keep, revise or extend it — one
 more model call when something is found.
+
+## Answers that changed a setting
+
+Most answers change nothing. When one changes a session setting (the load power
+factor, a generator's model, a unit's costs, an element's name), a line under it
+says exactly what changed, whatever the answer's text says:
+
+> ⚙ Changed the session's settings: load power factor 0.95 (default) → 0.9 · ↶ Undo
+
+**↶ Undo** puts back exactly what that answer changed and nothing else. If you
+have changed one of those settings again since, Undo does nothing and says which,
+so a change you made by hand is never overwritten. Every later study uses the
+restored settings.
 
 ## Answers computed under other settings
 

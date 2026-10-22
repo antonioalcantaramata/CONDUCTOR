@@ -55,6 +55,18 @@ class TestTheModel:
         assert "Gen_bus1" in set(again.sgen.name) and len(again.gen) == len(loaded.gen)
         assert gm.apply(loaded, {}).gen.equals(loaded.gen)                    # nothing changed: as loaded
 
+    def test_the_case_cost_follows_the_unit_to_its_table(self, loaded):
+        import costs as uc
+        case_cost = {r["unit"]: r for r in uc.defaults(loaded)}["Gen_bus1"]
+        assert case_cost["source"]["cost_eur_per_mwh"] == "case"
+        model = gm.merge({}, gm.normalise(loaded, [{"unit": "Gen_bus1", "control": "voltage", "vm_pu": 1.02}]))
+        there = gm.apply(loaded, model)
+        back = gm.apply(there, gm.normalise(there, [{"unit": "Gen_bus1", "control": "power_factor"}]))
+        for net in (there, back):
+            row = {r["unit"]: r for r in uc.defaults(net)}["Gen_bus1"]
+            assert (row["cost_eur_per_mwh"], row["source"]["cost_eur_per_mwh"]) == \
+                   (case_cost["cost_eur_per_mwh"], "case")
+
     def test_a_fixed_power_factor_injecting_or_absorbing(self, loaded):
         for absorbing, sign in ((False, 1), (True, -1)):
             model = gm.merge({}, gm.normalise(loaded, [{"unit": "Gen_bus1", "pf": 0.9, "absorbing": absorbing}]))
@@ -127,6 +139,21 @@ class TestThroughTheBackend:
         assert g1["Qg_mvar"] == pytest.approx(g1["Pg_mw"] * 0.484322, abs=1e-3)
         nominal = client.post("/api/network/snapshot", json={"data_source": "nominal"}).json()
         assert nominal["totals"]["total_generation_mw"] == pytest.approx(29.5, abs=1e-3)   # by name, any table
+
+    def test_voltage_control_at_1_02_through_the_tool(self, client, monkeypatch):
+        """Through the tool to the backend, with every slot filled in: only the
+        mode and the set-point change, not the limits or dispatchability."""
+        from llm_agent.agent import tools
+        monkeypatch.setattr(tools, "_post", lambda path, body: client.post(path, json=body).json())
+        before = {u["unit"]: u for u in client.get("/api/generators").json()["units"]}["Gen_bus1"]
+        filled = {"control": "voltage", "value": 0, "on": False}
+        out = tools.set_generator_model(changes=[
+            {"unit": "Gen_bus1", "setting": "control", **filled},
+            {"unit": "Gen_bus1", "setting": "vm_pu", **filled, "value": 1.02}])
+        assert out["changed"] == {"Gen_bus1": {"control": "voltage", "vm_pu": 1.02}}
+        after = {u["unit"]: u for u in client.get("/api/generators").json()["units"]}["Gen_bus1"]
+        assert {k: after[k] for k in ("q_min_mvar", "q_max_mvar", "dispatchable")} == \
+               {k: before[k] for k in ("q_min_mvar", "q_max_mvar", "dispatchable")}
 
     def test_refusals_say_why(self, client):
         r = client.post("/api/generators", json={"changes": [{"unit": "Gen_bus2", "control": "power_factor"}]})
@@ -235,7 +262,7 @@ def test_the_tool_reads_and_changes_the_model(monkeypatch):
     monkeypatch.setattr(tools, "_get", lambda path: calls.append(("get", path)) or {"units": []})
     monkeypatch.setattr(tools, "_post", lambda path, body: calls.append(("post", path, body)) or {"ok": True})
     tools.set_generator_model()
-    tools.set_generator_model(changes=[{"unit": "Gen_bus1", "control": "voltage"}])
+    tools.set_generator_model(changes=[{"unit": "Gen_bus1", "setting": "control", "control": "voltage"}])
     tools.set_generator_model(reset=True)
     assert calls == [("get", "/api/generators"),
                      ("post", "/api/generators", {"changes": [{"unit": "Gen_bus1", "control": "voltage"}],
@@ -245,6 +272,48 @@ def test_the_tool_reads_and_changes_the_model(monkeypatch):
     decl = {fd.name: fd for t in ts.TOOLS for fd in t.function_declarations}
     props = decl["set_generator_model"].parameters.properties
     assert set(props) == {"changes", "reset"} and "set_generator_model" in ts.TOOL_DISPATCH
+    item = props["changes"].items
+    assert set(item.properties) == {"unit", "setting", "control", "value", "on"}
+    assert set(item.properties["setting"].enum) == set(gm.FIELDS)          # every setting the backend takes
+
+
+class TestTheTool:
+    """The model changes one setting per item, its value in the slot that
+    setting uses; only that slot is read."""
+
+    @pytest.fixture
+    def posted(self, monkeypatch):
+        from llm_agent.agent import tools
+        sent = []
+        monkeypatch.setattr(tools, "_post", lambda path, body: sent.append(body) or {"ok": True})
+        return tools, sent
+
+    def test_a_filled_in_item_changes_only_its_setting(self, posted):
+        # Seen live with the cost tool: a model that fills in every property.
+        tools, sent = posted
+        filled = {"control": "voltage", "value": 0, "on": False}
+        tools.set_generator_model(changes=[{"unit": "Gen_bus1", "setting": "control", **filled,
+                                            "control": "voltage"},
+                                           {"unit": "Gen_bus1", "setting": "vm_pu", **filled, "value": 1.02},
+                                           {"unit": "Gen_bus3", "setting": "dispatchable", **filled}])
+        assert sent[0]["changes"] == [{"unit": "Gen_bus1", "control": "voltage", "vm_pu": 1.02},
+                                      {"unit": "Gen_bus3", "dispatchable": False}]
+
+    @pytest.mark.parametrize("item, says", [
+        ({"unit": "Gen_bus1", "control": "voltage"}, "give unit, setting"),     # the old one-object-per-unit shape
+        ({"unit": "Gen_bus1", "setting": "speed", "value": 1}, "setting is one of"),
+        ({"unit": "Gen_bus1", "setting": "control", "control": "droop"}, "give control as one of"),
+        ({"unit": "Gen_bus1", "setting": "vm_pu", "on": True}, "give the number in value"),
+        ({"unit": "Gen_bus1", "setting": "dispatchable", "value": 0}, "give true or false in on"),
+    ])
+    def test_an_incomplete_item_is_refused_before_the_backend(self, posted, item, says):
+        tools, sent = posted
+        assert says in tools.set_generator_model(changes=[item])["error"] and sent == []
+
+    def test_the_same_setting_twice_is_refused(self, posted):
+        tools, sent = posted
+        twice = [{"unit": "Gen_bus1", "setting": "vm_pu", "value": v} for v in (1.0, 1.02)]
+        assert "given twice" in tools.set_generator_model(changes=twice)["error"] and sent == []
 
 
 def test_fixed_q_holds_its_reactive_output_whatever_its_power(loaded):

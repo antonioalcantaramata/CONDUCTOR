@@ -4,12 +4,16 @@ Starting scenarios: what CONDUCTOR loads — the operator's own work, or a demo.
 - ``resume`` — the last uploaded network and data (whatever the "last
   uploaded" records restore). Demos never touch those records, so it stays
   available whatever is tried in between.
-- ``ieee14`` — PGLib's IEEE 14-bus case with a synthetic week of active power
-  only; loads take their reactive power from the load power factor. Its
-  nominal operating point is included.
-- ``ieee14_reactive`` — the same network and week, with measured reactive
+- ``ieee30`` (the default) — PGLib's IEEE 30-bus case (Alsac–Stott): five
+  dispatchable units with their own costs, on voltage control, and line
+  ratings; a synthetic week of active power in which the line from the
+  external grid congests at the evening peaks. Loads take their reactive
+  power from the load power factor. Its nominal operating point is included.
+- ``ieee30_reactive`` — the same network and week, with measured reactive
   demand and generation (`demo_reactive_csv`), a few values left out on
   purpose so the data-quality report shows how gaps are handled.
+- ``ieee14`` — the smaller PGLib IEEE 14-bus case and its week; one unit can
+  move its active power. The what-if evaluation is written for it.
 
 The demo data are generated deterministically (fixed seeds), so a demo is the
 same starting point every time — evaluation runs can name one.
@@ -23,26 +27,43 @@ import math
 
 import numpy as np
 
-DEMO_PROFILE = "pglib_case14"
+DEMO_PROFILE = "pglib_case30"
+SMALL_DEMO_PROFILE = "pglib_case14"
+DEFAULT_DEMO = "ieee30"
 SCENARIOS = {
     "resume": {
         "label": "Resume",
         "description": "Your last uploaded network and data.",
     },
-    "ieee14": {
-        "label": "Demo: IEEE 14 · active only",
-        "description": "PGLib IEEE 14-bus with a synthetic week of active power. No reactive measurements: "
-                       "loads use the power factor setting. Its nominal operating point is included.",
+    "ieee30": {
+        "label": "Demo: IEEE 30 · active only",
+        "description": "PGLib IEEE 30-bus: five dispatchable units with their own costs, and a synthetic week of "
+                       "active power in which the line from the external grid congests at the evening peaks. "
+                       "No reactive measurements: loads use the power factor setting. Its nominal operating "
+                       "point is included.",
         "profile": DEMO_PROFILE, "reactive": False,
     },
-    "ieee14_reactive": {
-        "label": "Demo: IEEE 14 · with reactive measurements",
+    "ieee30_reactive": {
+        "label": "Demo: IEEE 30 · with reactive measurements",
         "description": "The same network and week, with measured reactive demand and generation — a few values "
                        "left out on purpose, so the data-quality report shows how gaps are handled.",
         "profile": DEMO_PROFILE, "reactive": True,
     },
+    "ieee14": {
+        "label": "Demo: IEEE 14 · smaller",
+        "description": "PGLib IEEE 14-bus with a synthetic week of active power: one unit can move its active "
+                       "power, three condensers hold voltages. The what-if evaluation is written for it.",
+        "profile": SMALL_DEMO_PROFILE, "reactive": False,
+    },
 }
 DEMOS = tuple(k for k, v in SCENARIOS.items() if "profile" in v)
+
+
+def demo_for_profile(profile: str) -> str:
+    """The demo a profile loads as (its active-power one); the default demo
+    for a profile no demo uses."""
+    return next((k for k, v in SCENARIOS.items() if v.get("profile") == profile and not v.get("reactive")),
+                DEFAULT_DEMO)
 
 
 def demo_reactive_csv(measurements: dict, seed: int = 7) -> bytes:

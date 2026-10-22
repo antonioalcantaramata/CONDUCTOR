@@ -606,3 +606,110 @@ def test_both_modes_know_the_comparison_over_time_needs_no_timestamp():
     00:00", and another was withheld for want of a timestamp."""
     for prompt in (recommender.build_system_prompt([]), recommender.build_discussion_prompt([])):
         assert 'study "scan"' in prompt and "needs no timestamp" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Discussing corrective options
+# ---------------------------------------------------------------------------
+
+def _options_record(held=None, ts="2000-01-06 20:00:00"):
+    def option(sid, label, units, mw, cost):
+        return {"id": sid, "label": label, "also": [], "units_called": units, "units_changing_p": units,
+                "moved_mw": mw, "moved_mvar": 10.0, "import_mw": 150.0, "cost_eur_per_h": cost,
+                "above_cheapest_eur_per_h": round(cost - 26.48, 2), "min_vm_pu": 0.95, "max_loading_pct": 90.0,
+                "dispatch": [{"unit": u, "dp_mw": 1.0} for u in units]}
+    result = {"timestamp": ts, "mode": "options", "status": "options",
+              "options": [option("least_disturbance", "Least disturbance", ["Gen_bus1", "Gen_bus4"], 30.7, 111.99),
+                          option("cheapest", "Cheapest", ["Gen_bus1", "Gen_bus7"], 34.4, 26.48)],
+              "not_offered": [{"id": "fewest_units", "label": "Fewest units", "reason": "no feasible dispatch"}],
+              "costs": {"prices_from": {"case": 1, "synthetic": 6}}}
+    if held:
+        result["held_units"] = held
+    return _record([("optimize_flexibility", result)], user="Give me options at 20:00.")
+
+
+class TestDiscussingOptions:
+    def test_options_are_named_by_turn_and_strategy(self):
+        sets = recommender.option_sets([RSA_VIOLATED, _options_record(), _options_record({"Gen_bus1": 48.8})])
+        assert [s["turn"] for s in sets] == [2, 3]
+        assert list(sets[0]["options"]) == ["T2·least_disturbance", "T2·cheapest"]
+        assert sets[1]["held_units"] == {"Gen_bus1": 48.8}
+        assert "dispatch" not in sets[0]["options"]["T2·cheapest"]           # the scores, not the payload
+
+    def test_a_clarifying_question_raises_no_answer_concern(self):
+        """Its proposed figures are choices, not claims (system prompt rule 32)."""
+        record = {"user": "Options at 20:00 that keep L30 comfortably below its rating, in %?",
+                  "assistant": "How far below should L30 stay?\n1. **80%** (suggested)\n2. 90%",
+                  "tool_calls": [{"name": "locate_network_element", "args": {"element": "L30"}}],
+                  "tool_results": [{"name": "locate_network_element", "result": {"name": "L30"}}]}
+        assert recommender.answer_concerns(record) == [] and recommender.needs_attention(record) == []
+
+    def test_an_n1_set_carries_its_study_and_each_options_security_compactly(self):
+        record = _options_record()
+        result = record["tool_results"][0]["result"]
+        screen = {"outages_tested": 41, "outages_with_violations": 17, "violations": 35, "not_converged": 0}
+        result.update({"set": "n1", "branch_limits": {"Bus_21 -> Bus_23 [L30]": 80.0},
+                       "n1_study": {"modes": ["corrective"], "outages_studied": ["L0", "L24"], "reach_pct": 20.0,
+                                    "skipped": [{"outage": "L15", "reason": "islands"}], "emergency_loading_pct": 100.0}})
+        result["options"].append({
+            "id": "n1_corrective", "label": "N-1 corrective", "units_called": ["Gen_bus1"], "cost_eur_per_h": 281.25,
+            "n1": {"screen": screen, "studied": ["L0", "L24"], "secured": 1, "screen_is": "before any corrective action",
+                   "not_secured": [{"outage": "L24", "remaining": ["L21 at 109.4 %"]}],
+                   "corrective_plan": [{"outage": "L0", "actions": [{"unit": "Gen_bus4", "dp_mw": 3.8}],
+                                        "no_action_needed": False, "checked_by_power_flow": True},
+                                       {"outage": "L24", "actions": [], "no_action_needed": True,
+                                        "checked_by_power_flow": True}]}})
+        found = recommender.option_sets([record])[0]
+        assert found["branch_limits"] == {"Bus_21 -> Bus_23 [L30]": 80.0}
+        assert found["n1_study"] == {"modes": ["corrective"], "outages_studied": ["L0", "L24"], "skipped": 1,
+                                     "emergency_loading_pct": 100.0, "reach_pct": 20.0}
+        assert found["options"]["T1·n1_corrective"]["n1"] == {
+            "screen": screen, "secured": 1, "not_secured": ["L24"], "outages_needing_action": 1,
+            "plans_confirmed_by_power_flow": 2, "screen_is": "before any corrective action"}
+        assert "n1" not in found["options"]["T1·cheapest"]
+        assert "N-1 secure options (n1_preventive, n1_corrective)" in recommender.build_discussion_prompt(
+            options=True)
+
+    def test_the_rules_and_the_table_come_only_with_options(self):
+        with_options = FakeProvider(text=json.dumps({"reply": "Two options.", "studies": []}))
+        recommender.discuss("Discuss these options", [], [], _options_record(), [_options_record()], {},
+                            provider=with_options)
+        call = with_options.calls[0]
+        assert "Rules for options" in call["system"] and "Never pick a winner" in call["system"]
+        assert "## Corrective options" in call["messages"][0]["content"] and "T1·cheapest" in call["messages"][0]["content"]
+        without = FakeProvider(text=json.dumps({"reply": "Fine.", "studies": []}))
+        recommender.discuss("Is it secure?", [], [], RSA_VIOLATED, [RSA_VIOLATED], {}, provider=without)
+        assert "Rules for options" not in without.calls[0]["system"]
+        assert "## Corrective options" not in without.calls[0]["messages"][0]["content"]
+
+    def test_criteria_are_kept_as_structure(self):
+        provider = FakeProvider(text=json.dumps({
+            "reply": "Noted.", "criteria": ["Gen_bus1 untrusted today", "few instructions", "Gen_bus1 untrusted today"],
+            "studies": [{"title": "Options without Gen_bus1",
+                         "prompt": "Give me corrective options at 2000-01-06 20:00 with Gen_bus1 held at its "
+                                   "schedule (hold_units).", "why": "Gen_bus1 is untrusted."}]}))
+        reply = recommender.discuss("I don't trust Gen_bus1 today.", [], [], _options_record(), [_options_record()],
+                                    {}, provider=provider)
+        assert reply.criteria == ("Gen_bus1 untrusted today", "few instructions")
+        assert "hold_units" in reply.studies[0].prompt
+
+    def test_the_chosen_option_carries_the_solver_figures_not_the_models(self):
+        provider = FakeProvider(text=json.dumps({
+            "decision": "Take the cheapest option.", "chosen_option": "T1 · Cheapest",
+            "criteria": ["lowest cost"], "evidence": ["T1·cheapest costs 26.48 €/h"], "open_risks": [],
+            "studies_run": []}))
+        note = recommender.decision_note([], [], _options_record(), [_options_record()], {}, provider=provider)
+        assert note.chosen_option["ref"] == "T1·cheapest" and note.chosen_option["cost_eur_per_h"] == 26.48
+        assert note.chosen_option["units_changing_p"] == ["Gen_bus1", "Gen_bus7"]
+        assert note.criteria == ("lowest cost",) and not note.chosen_unresolved
+        assert note.as_record()["chosen_option"]["moved_mw"] == 34.4
+
+    def test_an_option_the_session_does_not_have_is_flagged(self):
+        provider = FakeProvider(text=json.dumps({"decision": "Take option 7.", "chosen_option": "T1·option_7"}))
+        note = recommender.decision_note([], [], _options_record(), [_options_record()], {}, provider=provider)
+        assert note.chosen_option is None and note.chosen_unresolved == "T1·option_7"
+
+    def test_no_option_chosen(self):
+        provider = FakeProvider(text=json.dumps({"decision": "No decision recorded", "chosen_option": "null"}))
+        note = recommender.decision_note([], [], _options_record(), [_options_record()], {}, provider=provider)
+        assert note.chosen_option is None and note.chosen_unresolved == ""
