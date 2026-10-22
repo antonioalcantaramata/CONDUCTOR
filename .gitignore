@@ -25,11 +25,13 @@ capabilities.md
 backend.log
 streamlit.log
 llm_agent/session_logs/*.jsonl
+llm_agent/session_contexts/
 
 # ── Runtime state & user uploads (keep only the bundled default network) ───
 systems/*
 !systems/.gitkeep
 !systems/pglib_opf_case14_ieee.m
+!systems/pglib_opf_case30_as.m
 
 data_files/*
 !data_files/.gitkeep

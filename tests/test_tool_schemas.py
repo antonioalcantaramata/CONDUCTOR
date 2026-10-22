@@ -25,8 +25,8 @@ class TestSharedParameterRegistration:
     """Point-in-time tools must declare the parameters that select an operating
     point.
 
-    A tool registered in the dispatch table but omitted from
-    `_POINT_IN_TIME_TOOLS` never has `timestamp` / `data_source` injected into
+    A tool registered in the dispatch table but not marked `timestamp` in the
+    tool registry never has `timestamp` / `data_source` injected into
     its schema. The model then cannot reliably target an operating point, and
     the tool silently analyses the simulation clock instead — observed live as
     answers about the wrong day in 4 of 10 runs, with every figure correct.
@@ -41,20 +41,20 @@ class TestSharedParameterRegistration:
         }
 
     def test_point_in_time_tools_declare_timestamp_and_data_source(self):
-        from llm_agent.agent import tool_schemas
+        from llm_agent.agent import tool_registry, tool_schemas
 
         props = self._properties(tool_schemas.TOOLS)
-        for name in tool_schemas._POINT_IN_TIME_TOOLS:
+        for name in tool_registry.POINT_IN_TIME:
             assert "timestamp" in props[name], f"{name} lacks timestamp"
             assert "data_source" in props[name], f"{name} lacks data_source"
 
     def test_every_analysis_tool_can_select_a_dataset(self):
         """Only clock control and pure post-processing may omit data_source."""
-        from llm_agent.agent import tool_schemas
+        from llm_agent.agent import tool_registry, tool_schemas
 
         props = self._properties(tool_schemas.TOOLS)
         for name in props:
-            if name in tool_schemas._NO_DATA_SOURCE_TOOLS:
+            if not tool_registry.REGISTRY[name].data_source:
                 continue
             assert "data_source" in props[name], f"{name} lacks data_source"
 

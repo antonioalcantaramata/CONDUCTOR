@@ -77,9 +77,7 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
         return pp.from_excel(str(path))
 
     if source == "matpower":
-        from pandapower.converter.matpower import from_mpc
-        path = base.parent / profile["matpower_path"]
-        return from_mpc(str(path), f_hz=50)
+        return read_matpower(str(base.parent / profile["matpower_path"]))
 
     if source == "ieee":
         case = profile.get("case", "case14")
@@ -132,6 +130,37 @@ def _move_cost(net, et: str, idx, new_et: str, new_idx) -> None:
     rows = (net.poly_cost["et"] == et) & (net.poly_cost["element"] == idx)
     net.poly_cost.loc[rows, "et"] = new_et
     net.poly_cost.loc[rows, "element"] = new_idx
+
+
+def read_matpower(path: str) -> pp.pandapowerNet:
+    """A MATPOWER case as a pandapower network, every generator a generator.
+
+    pandapower makes a generator at a load (PQ) bus a static generator, with
+    no name and the case's dispatch reactive power as if it were a power
+    factor; the case's other generators stay generators. MATPOWER has no static
+    generators, so each one pandapower created here is one of the case's
+    generators: it is put back, and `gen_to_sgen` then treats every unit the
+    same way (name, power factor 1.0, reactive limits kept). PGLib's
+    Alsac–Stott 30-bus case has three units at load buses.
+    """
+    from pandapower.converter.matpower import from_mpc
+
+    net = from_mpc(path, f_hz=50, validate_conversion=False)
+    for idx in list(net.sgen.index):
+        row = net.sgen.loc[idx]
+
+        def value(col, default):
+            v = row.get(col)
+            return float(v) if v is not None and pd.notna(v) else default
+
+        new = pp.create_gen(net, bus=int(row["bus"]), p_mw=value("p_mw", 0.0), vm_pu=1.0,
+                            min_p_mw=value("min_p_mw", 0.0), max_p_mw=value("max_p_mw", value("p_mw", 0.0)),
+                            min_q_mvar=value("min_q_mvar", np.nan), max_q_mvar=value("max_q_mvar", np.nan),
+                            controllable=True, in_service=bool(row.get("in_service", True)))
+        _move_cost(net, "sgen", idx, "gen", new)
+        net.sgen.drop(index=idx, inplace=True)
+    net.sgen.reset_index(drop=True, inplace=True)
+    return net
 
 
 def gen_to_sgen(net: pp.pandapowerNet) -> tuple:

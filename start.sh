@@ -2,8 +2,8 @@
 # start.sh — thin wrapper around the cross-platform launcher (start.py).
 #
 # Usage:
-#   ./start.sh                            # bundled PGLib IEEE 14-bus profile (default)
-#   GRID_PROFILE=ieee14 ./start.sh        # pandapower IEEE 14-bus synthetic profile
+#   ./start.sh                            # bundled PGLib IEEE 30-bus profile (default)
+#   GRID_PROFILE=pglib_case14 ./start.sh  # the smaller PGLib IEEE 14-bus profile
 #   BACKEND_PORT=8010 ./start.sh          # override ports if the defaults are taken
 #
 # All logic lives in start.py so macOS, Linux, and Windows share one launcher.

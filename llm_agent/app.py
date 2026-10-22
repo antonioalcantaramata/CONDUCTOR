@@ -65,6 +65,10 @@ from agent import timeline as _tl
 from agent import generator_table as _gen_table
 from agent import system_tables as _sys_table
 from agent import data_view as _dv
+from agent import settings_change as _settings_change
+from agent import session_context as _sc
+from agent import tailored_report as _tailored
+from agent import tool_registry as _tools_reg
 from agent import trace as _trace
 from agent import staleness as _staleness
 from agent import report as _report
@@ -403,6 +407,58 @@ st.markdown(
         font-size: 0.8rem; color: #8a5a00; background: rgba(240, 170, 30, 0.12);
         border: 1px solid rgba(240, 170, 30, 0.35); border-radius: 999px; padding: 0.12rem 0.6rem;
     }
+    .conductor-criteria {
+        font-size: 0.8rem; color: #5b4a8a; background: rgba(142, 92, 217, 0.08);
+        border-radius: 0.5rem; padding: 0.3rem 0.6rem; margin: 0.1rem 0 0.4rem 0;
+    }
+    /* An answer that changed the session's settings: informative, not a warning. */
+    .conductor-settings {
+        font-size: 0.8rem; color: #1d4f9c; background: rgba(29, 111, 232, 0.08);
+        border: 1px solid rgba(29, 111, 232, 0.3); border-radius: 999px; padding: 0.12rem 0.6rem;
+    }
+    .conductor-settings.undone { color: #5b6472; background: rgba(120, 130, 145, 0.08);
+        border-color: rgba(120, 130, 145, 0.3); }
+    /* A note with its action (Undo, Rerun) is one chip: the keyed container
+       draws it, the action is its right-hand end, behind a hairline. */
+    [class*="st-key-setchg_"], [class*="st-key-setundone_"], [class*="st-key-stale_"] {
+        width: fit-content !important; max-width: 100%; flex: 0 1 auto; flex-wrap: nowrap !important;
+        gap: 0 !important; align-items: stretch !important;
+        border: 1px solid; border-radius: 0.9rem; overflow: hidden; margin: 0.15rem 0 0.4rem 0;
+    }
+    [class*="st-key-setchg_"] { background: rgba(29, 111, 232, 0.08); border-color: rgba(29, 111, 232, 0.3); }
+    [class*="st-key-setundone_"] { background: rgba(120, 130, 145, 0.08); border-color: rgba(120, 130, 145, 0.3); }
+    [class*="st-key-stale_"] { background: rgba(240, 170, 30, 0.12); border-color: rgba(240, 170, 30, 0.35); }
+    [class*="st-key-setchg_"] .conductor-settings, [class*="st-key-setundone_"] .conductor-settings,
+    [class*="st-key-stale_"] .conductor-stale {
+        display: block; background: none; border: none; border-radius: 0;
+        padding: 0.24rem 0.75rem; line-height: 1.45;
+    }
+    /* Streamlit pulls markdown up by 1rem; inside a chip that collapses it. */
+    [class*="st-key-setchg_"] [data-testid="stMarkdownContainer"],
+    [class*="st-key-setundone_"] [data-testid="stMarkdownContainer"],
+    [class*="st-key-stale_"] [data-testid="stMarkdownContainer"] { margin: 0 !important; }
+    [class*="st-key-setchg_"] [data-testid="stMarkdownContainer"] p,
+    [class*="st-key-setundone_"] [data-testid="stMarkdownContainer"] p,
+    [class*="st-key-stale_"] [data-testid="stMarkdownContainer"] p { margin: 0; }
+    /* The text takes the room and wraps; the action keeps its width. */
+    [class*="st-key-setchg_"] [data-testid="stElementContainer"]:not(:has(button)),
+    [class*="st-key-stale_"] [data-testid="stElementContainer"]:not(:has(button)) { flex: 0 1 auto; min-width: 0; }
+    [class*="st-key-setchg_"] [data-testid="stElementContainer"]:has(button),
+    [class*="st-key-stale_"] [data-testid="stElementContainer"]:has(button) { flex: none; align-self: stretch; }
+    [class*="st-key-setchg_"] .stButton, [class*="st-key-stale_"] .stButton { height: 100%; }
+    [class*="st-key-setchg_"] button, [class*="st-key-stale_"] button {
+        height: 100%; min-height: 0; padding: 0 0.85rem; border-radius: 0;
+        border-left: 1px solid rgba(29, 111, 232, 0.3); color: #1D6FE8;
+    }
+    [class*="st-key-stale_"] button { border-left-color: rgba(240, 170, 30, 0.35); color: #8a5a00; }
+    /* The label on the note's own line: same size, same line box. */
+    [class*="st-key-setchg_"] button [data-testid="stMarkdownContainer"],
+    [class*="st-key-stale_"] button [data-testid="stMarkdownContainer"],
+    [class*="st-key-setchg_"] button p, [class*="st-key-stale_"] button p {
+        display: block; font-size: 0.8rem; font-weight: 600; line-height: 1.45; white-space: nowrap;
+    }
+    [class*="st-key-setchg_"] button:hover:not(:disabled) { background: rgba(29, 111, 232, 0.12); }
+    [class*="st-key-stale_"] button:hover:not(:disabled) { background: rgba(240, 170, 30, 0.18); }
     .conductor-eq-group {
         font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 700;
         color: #9aa0b0; line-height: 1.4; padding: 0.45rem 0.45rem 0.15rem;
@@ -2367,6 +2423,72 @@ def _forget_scenario(name: str) -> None:
     st.rerun()
 
 
+def _current_fingerprint() -> str | None:
+    status = fetch_grid_constants()
+    return network_fingerprint(status.values) if status.live else None
+
+
+def _context_in_use() -> "_sc.Context | None":
+    data = st.session_state.get("session_context")
+    return _sc.Context(**data) if data else None
+
+
+def _earlier_context_block() -> str | None:
+    """What both agents receive from the earlier session in use, if any."""
+    ctx = _context_in_use()
+    return _sc.prompt_block(ctx, st.session_state.get("_network_fingerprint") or _current_fingerprint()) \
+        if ctx else None
+
+
+def _use_context(ctx: "_sc.Context | None", source: str = "") -> None:
+    st.session_state.session_context = ctx._asdict() if ctx else None
+    _loop_module.log_event({
+        "kind": "context_loaded" if ctx else "context_dropped",
+        "conversation": st.session_state.get("ui_conversation_id"),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        **({"saved": ctx.saved, "network": ctx.network, "turns": ctx.turns, "source": source} if ctx else {}),
+    })
+
+
+def _render_context_choice(key: str) -> None:
+    """Continue from an earlier session: the ones saved for this network,
+    newest first, or a file. Never chosen for the operator — "ask on load"."""
+    fingerprint = _current_fingerprint()
+    saved = _sc.saved_for(fingerprint) if fingerprint else []
+    in_use = _context_in_use()
+    if saved:
+        labels = {"": "Start without it", **{c.path: c.label() for c in saved}}
+        widget = f"ctx_pick_{key}"
+        if st.session_state.get(widget) not in labels:
+            st.session_state[widget] = in_use.path if in_use and in_use.path in labels else ""
+
+        def _picked() -> None:
+            chosen = st.session_state[widget]
+            _use_context(next((c for c in saved if c.path == chosen), None), "saved")
+
+        st.radio("Continue from an earlier session on this network?", list(labels), key=widget,
+                 format_func=labels.get, on_change=_picked,
+                 help="What that session asked, found and decided — written by CONDUCTOR, with the model's "
+                      "summary on top if one was asked for. Both agents get it as background; its figures "
+                      "are rerun before being stated as current.")
+    with st.expander("Load a context file", icon=":material/upload_file:"):
+        upload = st.file_uploader("A context file", type=["md"], key=f"ctx_file_{key}",
+                                  label_visibility="collapsed", help="A file saved with *Session context → Save*.")
+    if upload is not None and st.session_state.get(f"_ctx_file_seen_{key}") != upload.file_id:
+        st.session_state[f"_ctx_file_seen_{key}"] = upload.file_id
+        try:
+            ctx = _sc.parse(upload.getvalue().decode("utf-8", errors="replace"), path=upload.name)
+            _use_context(ctx, "file")
+            in_use = ctx
+        except _sc.ContextError as exc:
+            st.warning(str(exc))
+    if in_use is not None:
+        other = fingerprint and in_use.fingerprint and in_use.fingerprint != fingerprint
+        st.markdown(f"<div class='conductor-criteria'>📄 Continuing from the session of {html.escape(in_use.label())}"
+                    + (f" — written for <b>{html.escape(in_use.network or 'another network')}</b>, not the one "
+                       "loaded now" if other else "") + "</div>", unsafe_allow_html=True)
+
+
 def _render_scenario_picker(*, key: str, immediate: bool) -> None:
     """Resume or a demo. On the launch screen a choice loads at once; in the
     sidebar it waits for Load (it starts a new conversation)."""
@@ -2547,6 +2669,7 @@ if not st.session_state.get("_launched"):
     with _col_load:
         st.markdown("### 1 · Choose what to load")
         _render_scenario_picker(key="launch", immediate=True)
+        _render_context_choice("launch")
         st.divider()
         st.caption("Switch any time from the sidebar (**Settings → Scenario**). To work on your own grid, "
                    "start with any option and use **Upload Network** / **Upload Data** in the header — "
@@ -2658,13 +2781,21 @@ SCENARIO_QUERIES: dict[str, list[tuple[str, str]]] = {
         ("What does the data-quality report say about the uploaded data, and does any of it affect the "
          "studies?", ":material/fact_check:"),
     ],
+    "ieee30": [
+        ("When is the line from the external grid most loaded this week, and what are the options to "
+         "relieve it then?", ":material/alt_route:"),
+        ("Give me options to clear the violations at the worst hour of the week, and compare their cost.",
+         ":material/balance:"),
+        ("Is the network secure at its nominal operating point, and how do the synthetic data compare "
+         "with it?", ":material/push_pin:"),
+    ],
     "ieee14": [
         ("How sensitive are the voltages to the load power factor? Compare 0.90, 0.95 and 1.0 at the "
          "current timestamp.", ":material/tune:"),
         ("Is the network secure at its nominal operating point, and how do the synthetic data compare "
          "with it?", ":material/push_pin:"),
     ],
-    "ieee14_reactive": [
+    "ieee30_reactive": [
         ("What does the data-quality report say about the reactive measurements, and how are the gaps "
          "filled?", ":material/fact_check:"),
         ("Which loads have the lowest power factor right now, and does that matter for the voltages?",
@@ -2891,7 +3022,7 @@ def _delete_uploaded_artifacts(paths: list[pathlib.Path]) -> tuple[int, list[str
     return deleted, errors
 
 
-def _reset_active_backend_profile(profile_name: str = "pglib_case14") -> tuple[bool, str]:
+def _reset_active_backend_profile(profile_name: str | None = None) -> tuple[bool, str]:
     """Request backend to reload active in-memory state from a YAML profile."""
     import httpx
 
@@ -3072,7 +3203,7 @@ def _chart_caption(tool_name: str, result: dict, show_pf: bool | None = None,
     default, or when charts in one answer differ in it — the load power factor.
     Two charts of the same study must never look alike while describing
     different conditions."""
-    parts = [f"**{_TOOL_LABELS.get(tool_name, tool_name.replace('_', ' '))}**"]
+    parts = [f"**{_tools_reg.label(tool_name)}**"]
     when = result.get("timestamp") or result.get("worst_timestamp")
     start, end = result.get("window_start"), result.get("window_end")
     source = str(result.get("data_source", ""))
@@ -3112,7 +3243,10 @@ def _table_of(fig) -> tuple[str, str, "pd.DataFrame"] | None:
             return None
         table = fig.data[0]
         headers = [re.sub(r"<[^>]+>", "", str(h)) for h in table.header.values]
-        frame = pd.DataFrame({h: list(col) for h, col in zip(headers, table.cells.values)})
+        def text(cell):
+            return re.sub(r"<[^>]+>", "", re.sub(r"<br\s*/?>", " ", cell)) if isinstance(cell, str) else cell
+
+        frame = pd.DataFrame({h: [text(c) for c in col] for h, col in zip(headers, table.cells.values)})
         title, _, sub = (fig.layout.title.text or "").partition("<br>")
         return re.sub(r"<[^>]+>", "", title), re.sub(r"<[^>]+>", "", sub), frame
     except Exception:  # noqa: BLE001 — fall back to drawing the figure
@@ -3154,7 +3288,7 @@ def render_charts(tool_results: list) -> None:
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "Renderer for %s failed.", tool_name, exc_info=True)
-            label = _TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
+            label = _tools_reg.label(tool_name)
             st.caption(f"⚠️ The chart for {label} could not be drawn; the answer above is unaffected.")
             continue
 
@@ -3437,6 +3571,68 @@ def _rerun_answer(question: str, why: list[str]) -> None:
     st.session_state.pop("_attempts_turn", None)
 
 
+def _fetch_settings() -> dict | None:
+    """The session's settings as stored (GET /api/settings); None when unreachable."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.get(f"{BASE_URL}/api/settings")
+            r.raise_for_status()
+            return r.json()
+    except Exception:  # noqa: BLE001 — no note is better than a wrong one
+        return None
+
+
+def _settings_change_record(before: dict | None, after: dict | None) -> dict | None:
+    changes = _settings_change.lines(before, after)
+    return {"before": before, "after": after, "lines": changes} if changes else None
+
+
+def _undo_settings(idx: int) -> None:
+    """Put back what answer `idx` changed (POST /api/settings/revert)."""
+    change = st.session_state.messages[idx].get("settings_change") or {}
+    change.pop("error", None)
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            r = client.post(f"{BASE_URL}/api/settings/revert",
+                            json={"before": change.get("before"), "after": change.get("after")})
+        if r.status_code >= 400:
+            change["error"] = r.json().get("detail", r.text)
+            return
+        change["undone"] = True
+        dropped = r.json().get("proposals_dropped") or []
+        if dropped:
+            change["error"] = "Undone. These proposals no longer apply and were dropped: " + "; ".join(dropped)
+    except Exception as exc:  # noqa: BLE001
+        change["error"] = f"Could not undo: {exc}"
+    _RUN_MEMO.pop("settings", None)
+
+
+def _render_settings_change(msg: dict, idx: int) -> None:
+    """A line under an answer that changed the session's settings — written
+    by the app from the settings themselves, whatever the answer says — with
+    Undo."""
+    change = msg.get("settings_change")
+    if not change:
+        return
+    text = html.escape(_settings_change.summary(change.get("lines") or []))
+    undone = bool(change.get("undone"))
+    with st.container(horizontal=True, vertical_alignment="center", gap=None,
+                      key=f"{'setundone' if undone else 'setchg'}_{idx}"):
+        if undone:
+            st.markdown(f"<span class='conductor-settings undone'>↶ Undone — {text}</span>",
+                        unsafe_allow_html=True, width="content")
+        else:
+            st.markdown(f"<span class='conductor-settings'>⚙ Changed the session's settings: {text}</span>",
+                        unsafe_allow_html=True, width="content")
+            st.button("↶ Undo", key=f"undo_{idx}", type="tertiary", disabled=_ui_busy(),
+                      on_click=_undo_settings, args=(idx,),
+                      help="Puts back exactly what this answer changed — only if none of it has been changed "
+                           "again since. Every later study uses the restored settings; answers computed under "
+                           "other settings are marked.")
+    if change.get("error"):
+        st.caption(change["error"])
+
+
 def _render_staleness(msg: dict, idx: int) -> None:
     """A line under an answer whose studies ran under other settings, and a
     way to run it again."""
@@ -3448,7 +3644,9 @@ def _render_staleness(msg: dict, idx: int) -> None:
                         unsafe_allow_html=True)
         return
     question = next((m["text"] for m in reversed(st.session_state.messages[:idx]) if m["role"] == "user"), None)
-    with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"stale_{idx}"):
+    if (msg.get("settings_change") or {}).get("undone"):
+        question = None      # asking again would redo the change that was just undone
+    with st.container(horizontal=True, vertical_alignment="center", gap=None, key=f"stale_{idx}"):
         st.markdown(f"<span class='conductor-stale'>⏱ Computed under other settings: "
                     f"{html.escape('; '.join(why))}</span>", unsafe_allow_html=True, width="content")
         if question:
@@ -3642,13 +3840,10 @@ with st.sidebar:
                  type="secondary", key="new_conversation"):
         _reset_conversation_state()
         st.rerun()
-    st.download_button(
-        "Export session report", icon=":material/download:", width="stretch", key="export_report",
-        data=functools.partial(_session_report, list(st.session_state.messages), _active_model_label()),
-        file_name=f"conductor_session_{datetime.now():%Y%m%d_%H%M}.html", mime="text/html",
-        on_click="ignore", disabled=not st.session_state.messages,
-        help="One HTML file that opens anywhere, offline: the scenario, network, assumptions and proposals, "
-             "then each question and answer with its charts and evidence. For co-authors and appendices.")
+    # Filled once everything it uses is defined (below the conversation).
+    _export_slot = st.container()
+    # Filled once everything it uses is defined (below the conversation).
+    _context_slot = st.container()
 
     st.markdown("<div class='conductor-sidebar-label'>Operating point</div>", unsafe_allow_html=True)
     with st.container(border=True, key="op_card"):
@@ -3775,7 +3970,7 @@ with st.sidebar:
                         for err in errs:
                             st.warning(err)
                     if reset_active_now:
-                        ok, msg = _reset_active_backend_profile("pglib_case14")
+                        ok, msg = _reset_active_backend_profile()          # the default demo
                         if ok:
                             st.success(msg)
                         else:
@@ -4473,44 +4668,6 @@ _render_main_hero(compact=bool(st.session_state.messages))
 # The input box stays outside the tabs on purpose: `st.chat_input` pins itself
 # to the bottom of the viewport only at the top level, and inside a tab it
 # would render inline and appear on one pane only. Out here it stays pinned and
-# One label per tool the agent can call — shown in the live status box, the
-# audit panel and chart captions. Kept complete by
-# `tests/test_app_labels.py`: four entries here once named tools that do not
-# exist, and the deterministic OPF was labelled "Robust OPF", telling the
-# operator a dispatch carried a robustness guarantee it did not.
-_TOOL_LABELS = {
-    "locate_network_element": "Element lookup",
-    "get_current_timestamp": "Reading timestamp",
-    "advance_timestamp": "Advancing timestamp",
-    "get_current_conditions": "Current conditions",
-    "get_element_timeseries": "Element time series",
-    "run_rsa": "Security assessment (RSA)",
-    "simulate_contingency": "Single N-1 contingency",
-    "simulate_all_contingencies": "N-1 contingency screen",
-    "find_worst_case_timestamp": "Worst-case scan",
-    "scan_rsa_over_time": "Security scan over time",
-    "compute_violation_attribution": "Violation attribution",
-    "compare_results": "Result comparison",
-    "edit_proposal": "Network proposal",
-    "set_load_power_factor": "Load power factor setting",
-    "get_data_quality": "Data quality report",
-    "set_generator_model": "Generator model",
-    "set_unit_costs": "Unit costs",
-    "rename_elements": "Renaming",
-    "compare_networks": "Base vs proposal",
-    "run_probabilistic_rsa": "Probabilistic security assessment",
-    "scan_scenarios": "Renewable scenario scan",
-    "compute_historical_risk": "Historical risk",
-    "optimize_contingency": "Post-contingency OPF",
-    "optimize_flexibility": "Flexibility OPF (deterministic)",
-    "optimize_robust_flexibility": "Robust flexibility OPF",
-    "compute_flexibility_envelope": "Flexibility envelope",
-    "compute_hosting_capacity": "Hosting capacity",
-    "evaluate_kpis": "KPI evaluation",
-    "forecast_kpis": "KPI forecast",
-}
-
-
 def _render_trace(trace, key: str) -> None:
     """The audit panel under an answer: what ran, where the numbers came from,
     and what was not checked.
@@ -4543,9 +4700,16 @@ def _render_trace(trace, key: str) -> None:
 
         if trace.steps:
             st.markdown("**What ran**")
+            timing = trace.timing_line()
+            if timing:
+                st.caption(f"Time: {timing}")
             for step in trace.steps:
-                label = _TOOL_LABELS.get(step.name, step.name.replace("_", " ").title())
+                label = _tools_reg.label(step.name)
                 mark = "" if step.ok else " ❌"
+                if step.reused_from is not None:
+                    mark += f" ↺ *same call as step {step.reused_from}, not run again*"
+                elif step.duration_s is not None:
+                    mark += f" · {_trace.seconds(step.duration_s)}"
                 st.markdown(f"`{step.order}.` **{label}**{mark}")
                 if step.args:
                     # Each argument in its own code span. A bare "·" separator
@@ -4614,6 +4778,169 @@ _AI_SUGGESTION_CAPTION = ("Run in CONDUCTOR puts a suggestion in CONDUCTOR's cha
                           "you like, then press Run.")
 
 
+# ---------------------------------------------------------------------------
+# Session context — what this session asked, found and decided, as a Markdown
+# file kept for the network; a later start asks whether to continue from it.
+# (logic in agent/session_context.py)
+# ---------------------------------------------------------------------------
+
+def _pending_studies() -> list[dict]:
+    """Studies the advisor proposed that were never asked."""
+    asked = {(m.get("text") or "").strip() for m in st.session_state.messages if m.get("role") == "user"}
+    out, seen = [], set()
+    for disc in _discussions():
+        for item in disc.get("thread") or []:
+            for study in item.get("studies") or [] if item.get("role") == "advisor" else []:
+                prompt = (study.get("prompt") or "").strip()
+                if prompt and prompt not in asked and prompt not in seen:
+                    seen.add(prompt)
+                    out.append(study)
+    return out
+
+
+def _settings_in_force() -> list[str]:
+    """What differs from the network as loaded, in the note's own words."""
+    now = _fetch_settings()
+    if not now:
+        return []
+    as_loaded = {"load_power_factor": None, "generator_model": {}, "unit_costs": {}, "element_names": {},
+                 "unit_names_now": now.get("unit_names_now"), "names_as_loaded": now.get("names_as_loaded"),
+                 "default_load_power_factor": now.get("default_load_power_factor")}
+    return _settings_change.lines(as_loaded, now)
+
+
+def _build_session_context(with_summary: bool) -> dict:
+    """The file for this session: written from the records, the model's
+    summary on top when asked for. Saved for the network."""
+    pairs = [(m["record"], m.get("text") or "") for m in st.session_state.messages
+             if m.get("role") == "assistant" and m.get("record")]
+    records, answers = [r for r, _ in pairs], [a for _, a in pairs]
+    status = last_grid_constants_status()
+    gc = dict(status.values) if status is not None else {}
+    fingerprint = st.session_state.get("_network_fingerprint") or _current_fingerprint() or ""
+    meta = {"saved": _sc.now_label(), "network": gc.get("name"), "fingerprint": fingerprint,
+            "scenario": (_fetch_scenarios() or {}).get("label"),
+            "data": _suggestion_context().get("data_source"),
+            "settings": _settings_in_force(),
+            "proposals": [f"{p['id']} ({'; '.join((p.get('summary') or {}).get('edits') or []) or 'no edits'})"
+                          for p in (_list_proposals() or [])]}
+    notes = [d["note"] for d in _discussions() if d.get("note")]
+    pending = _pending_studies()
+    plain = _sc.build(records, answers, meta=meta, notes=notes, pending=pending)
+    summary, unverified, error = ("", (), "")
+    if with_summary and records:
+        summary, unverified, error = _sc.summarize(plain, records)
+    text = _sc.build(records, answers, meta=meta, notes=notes, pending=pending,
+                     summary=summary, summary_unverified=unverified) if summary else plain
+    path = _sc.save(text, fingerprint)
+    _loop_module.log_event({"kind": "context_saved", "conversation": st.session_state.get("ui_conversation_id"),
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "path": path, "chars": len(text), "summary": bool(summary),
+                            "summary_unverified": list(unverified), "error": error})
+    return {"text": text, "path": path, "error": error, "unverified": list(unverified),
+            "label": _sc.parse(text).label(), "file_name": f"conductor_context_{datetime.now():%Y%m%d_%H%M}.md"}
+
+
+def _tailored_session_report() -> dict:
+    """The session written up by the model (agent/tailored_report.py): one
+    model call; the charts are the session's own and the figures are checked."""
+    from plotly.offline import get_plotlyjs
+
+    messages = list(st.session_state.messages)
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            grid = client.get(f"{BASE_URL}/api/grid_constants").json()
+    except Exception:  # noqa: BLE001 — the report says less, it is still written
+        grid = {}
+    meta = {"title": f"CONDUCTOR session report — {grid.get('name') or 'grid study'}",
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "scenario": (_fetch_scenarios() or {}).get("label"), "network": grid.get("name"),
+            "model": _active_model_label(), "data": _data_line(grid), "settings": _settings_in_force(),
+            "proposals": [f"{p['id']} ({'; '.join((p.get('summary') or {}).get('edits') or []) or 'no edits'})"
+                          for p in (_list_proposals() or [])]}
+    notes = [d["note"] for d in _discussions() if d.get("note")]
+    body, error = _tailored.write(_tailored.request_text(messages, meta, notes))
+    if error:
+        return {"error": error}
+    turns = _tailored.turn_records(messages)
+    wanted = {int(n) for n in re.findall(r"\{\{\s*chart\s+T(\d+)", body, flags=re.IGNORECASE)}
+    charts = {n: _report_charts_html(msg["charts"]) for n, msg, _ in turns if n in wanted and msg.get("charts")}
+    unverified = _tailored.unverified_figures(body, [r for _, _, r in turns])
+    page = _tailored.render(body, meta, charts_by_turn=charts, plotly_js=get_plotlyjs(), unverified=unverified,
+                            questions=[(n, r.get("user") or "") for n, _, r in turns])
+    _loop_module.log_event({"kind": "tailored_report", "conversation": st.session_state.get("ui_conversation_id"),
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "chars": len(body), "charts": sorted(charts), "unverified": list(unverified)})
+    return {"bytes": page.encode("utf-8"), "unverified": list(unverified),
+            "file_name": f"conductor_report_{datetime.now():%Y%m%d_%H%M}.html"}
+
+
+def _render_export_menu() -> None:
+    """Two reports: the raw record, and the one the model writes from it."""
+    empty = not st.session_state.messages
+    with st.popover("Export session report", icon=":material/download:", width="stretch", disabled=empty):
+        st.markdown("**Raw** — the complete record")
+        st.caption("Every question and answer as given, with its charts and evidence, and the scenario, "
+                   "assumptions and proposals. One HTML file that opens offline.")
+        st.download_button(
+            "Download the raw report", icon=":material/download:", width="stretch", key="export_report",
+            data=functools.partial(_session_report, list(st.session_state.messages), _active_model_label()),
+            file_name=f"conductor_session_{datetime.now():%Y%m%d_%H%M}.html", mime="text/html",
+            on_click="ignore", disabled=empty)
+        st.divider()
+        st.markdown("**Tailored by the model** — for readers who were not there")
+        st.caption("A summary, the context, the findings by theme, the decisions and the open questions, each "
+                   "citing its turn; the session's own charts; every figure checked against the results. "
+                   "One model call.")
+        if st.button("Write it", key="export_tailored", type="primary", width="stretch",
+                     disabled=empty or _ui_busy()):
+            with st.spinner("The model is writing the report…"):
+                st.session_state._tailored_report = _tailored_session_report()
+        done = st.session_state.get("_tailored_report")
+        if done and done.get("error"):
+            st.caption(f"⚠️ {done['error']}")
+        elif done:
+            st.download_button("Download the tailored report", data=done["bytes"], icon=":material/download:",
+                               file_name=done["file_name"], mime="text/html", key="export_tailored_download",
+                               width="stretch", on_click="ignore")
+            if done.get("unverified"):
+                st.caption("⚠️ Figures not found in the session's results (flagged in the report too): "
+                           + ", ".join(done["unverified"]))
+
+
+def _render_session_context_menu() -> None:
+    """The sidebar entry: save this session; continue from an earlier one."""
+    in_use = _context_in_use()
+    with st.popover("Session context" + (" · in use" if in_use else ""), icon=":material/history_edu:",
+                    width="stretch"):
+        st.markdown("**Save this session**")
+        st.caption("A Markdown file of what this session asked, found and decided, kept for this network: "
+                   "the next start asks whether to continue from it.")
+        with_summary = st.toggle("Add a summary by the model (one model call)", value=True, key="ctx_summary",
+                                 disabled=not st.session_state.messages)
+        if st.button("Save", key="ctx_save", type="primary", width="stretch",
+                     disabled=not st.session_state.messages or _ui_busy()):
+            with st.spinner("Writing the session context…"):
+                st.session_state._context_saved = _build_session_context(with_summary)
+        done = st.session_state.get("_context_saved")
+        if done:
+            st.download_button("Download the file", data=done["text"].encode("utf-8"), icon=":material/download:",
+                               file_name=done["file_name"], mime="text/markdown", key="ctx_download",
+                               width="stretch", on_click="ignore")
+            st.caption(f"Saved for this network · {done['label']}.")
+            if done.get("error"):
+                st.caption(f"⚠️ {done['error']} The file has the record without a summary.")
+            if done.get("unverified"):
+                st.caption("⚠️ The summary has figures not found in this session's results: "
+                           + ", ".join(done["unverified"]))
+        st.divider()
+        st.markdown("**Continue from an earlier session**")
+        _render_context_choice("sidebar")
+        if in_use is not None and st.button("Stop using it", key="ctx_drop", type="tertiary"):
+            _use_context(None)
+            st.rerun()
+
+
 def _suggestion_context() -> dict:
     """Session facts the suggestion agent needs to write runnable prompts."""
     status = last_grid_constants_status()
@@ -4636,6 +4963,8 @@ def _suggestion_context() -> dict:
         # were fetched before the turn that may have created one.
         "proposals": [{"id": p["id"], "edits": (p.get("summary") or {}).get("edits") or []}
                       for p in (_list_proposals() or [])] or None,
+        # An earlier session the operator continues from: background, framed.
+        "earlier_session": _earlier_context_block(),
     }
     return {k: v for k, v in ctx.items() if v not in (None, [], [None, None])}
 
@@ -4911,10 +5240,46 @@ def _study_card_body(study: dict, key: str, disc: dict | None) -> None:
         st.caption("⚠️ Not found in this conversation's results: " + ", ".join(study["unverified"]))
 
 
+def _option_line(o: dict) -> str:
+    """One corrective option in a line, its figures as the solver gave them."""
+    def num(key, fmt, unit=""):
+        v = o.get(key)
+        return f"{v:{fmt}}{unit}" if isinstance(v, (int, float)) and not isinstance(v, bool) else "—"
+    held = o.get("held_units") or {}
+    parts = [f"{o.get('ref')} — {o.get('label')}",
+             f"{len(o.get('units_changing_p') or [])} unit(s) moving MW ({', '.join(o.get('units_changing_p') or []) or 'none'})",
+             f"{num('moved_mw', '.2f', ' MW')} moved", f"import {num('import_mw', '.1f', ' MW')}",
+             f"{num('cost_eur_per_h', '.2f', ' €/h')} ({num('above_cheapest_eur_per_h', '+.2f', ' €/h')} above the cheapest)",
+             f"lowest V {num('min_vm_pu', '.3f', ' p.u.')}", f"highest loading {num('max_loading_pct', '.1f', ' %')}"]
+    if held:
+        parts.append("held at schedule: " + ", ".join(held))
+    n1 = o.get("n1") or {}
+    screen = n1.get("screen") or {}
+    if screen:
+        parts.append(f"N-1: {screen.get('outages_with_violations')} of {screen.get('outages_tested')} outages with "
+                     "violations" + (" before its action" if n1.get("screen_is") else "")
+                     + (f", {n1['secured']} studied outage(s) secured" if "secured" in n1 else ""))
+    check = o.get("power_flow_check") or {}
+    if check:
+        parts.append("confirmed by a power flow" if check.get("confirmed") else
+                     "NOT confirmed by a power flow: " + "; ".join(check.get("violations") or []))
+    return " · ".join(parts)
+
+
 def _render_decision_note(note: dict) -> None:
     with st.container(border=True):
         st.markdown(":violet[**📝 Decision note**]")
         st.markdown(f"**Decision:** {note['decision']}".replace("$", "\\$"))
+        chosen = note.get("chosen_option")
+        if chosen:
+            st.markdown(f"**Option chosen:** {_option_line(chosen)}".replace("$", "\\$"))
+            st.caption(f"Figures copied from the solver result of turn {chosen.get('turn')}, not written by the "
+                       "advisor.")
+        elif note.get("chosen_unresolved"):
+            st.caption(f"⚠️ The advisor named an option this conversation does not have: "
+                       f"{note['chosen_unresolved']}.")
+        if note.get("criteria"):
+            st.markdown("**What mattered:** " + " · ".join(note["criteria"]).replace("$", "\\$"))
         for label, key in (("Evidence", "evidence"), ("Open risks", "open_risks"),
                            ("Studies run", "studies_run")):
             if note.get(key):
@@ -4943,6 +5308,10 @@ def _render_thread_item(disc: dict, k: int, t_i: int, item: dict, interactive: b
         _ai_box("Advisor", item.get("text") or "", key=f"t_{k}_{t_i}")
         if item.get("unverified"):
             st.caption("⚠️ Not found in this conversation's results: " + ", ".join(item["unverified"]))
+        if item.get("criteria"):
+            st.markdown("<div class='conductor-criteria'>Noted as what matters to you: "
+                        + " · ".join(html.escape(c) for c in item["criteria"]) + "</div>",
+                        unsafe_allow_html=True)
         for s_i, study in enumerate(item.get("studies") or []):
             _render_study_card(study, key=f"adv_use_{k}_{t_i}_{s_i}", disc=disc if interactive else None)
     elif role == "sent":
@@ -5051,10 +5420,59 @@ def _run_advisor(kind: str, text: str, idx: int) -> None:
     thread.append({"role": "operator", "text": text})
     thread.append({"role": "advisor", "text": result.text, "error": result.error,
                    "studies": [s.as_record() for s in result.studies],
-                   "unverified": list(result.unverified)})
+                   "unverified": list(result.unverified), "criteria": list(result.criteria)})
     _loop_module.log_event({"kind": "advisor_message", **base, "question": text,
                             "reply": result.text, "studies": [s.as_record() for s in result.studies],
-                            "unverified": list(result.unverified), "error": result.error})
+                            "unverified": list(result.unverified), "criteria": list(result.criteria),
+                            "error": result.error})
+
+
+# The opening request "Discuss these options" sends; the advisor's rules for
+# options say what it answers (recommender._OPTIONS_TASK).
+_OPTIONS_OPENING = "Discuss these options with me (T{turn})."
+
+
+def _options_turn(msg: dict, idx: int) -> int | None:
+    """The turn number (as the advisor names options, "T3·cheapest") of an
+    answer that offers two or more corrective options; None otherwise."""
+    record = msg.get("record") or {}
+    if not any(e.get("name") == "optimize_flexibility" and isinstance(e.get("result"), dict)
+               and e["result"].get("mode") == "options" and len(e["result"].get("options") or []) >= 2
+               for e in record.get("tool_results") or []):
+        return None
+    return sum(1 for m in st.session_state.messages[: idx + 1] if m.get("record"))
+
+
+def _screenable_options(msg: dict) -> list[dict]:
+    """The corrective options an answer offers, newest set last, each with its
+    reference — what the N-1 screen can apply."""
+    out = []
+    for entry in (msg.get("record") or {}).get("tool_results") or []:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if isinstance(result, dict) and result.get("mode") == "options":
+            # An N-1 set was screened at its post-outage limit: the same screen again.
+            limit = (result.get("n1_study") or {}).get("emergency_loading_pct")
+            out = [{**o, "screen_limit_pct": limit} if limit else o
+                   for o in result.get("options") or [] if isinstance(o, dict) and o.get("ref")]
+    return out
+
+
+def _render_screen_an_option(options: list[dict], idx: int) -> None:
+    """N-1 of one option, not of the schedule: the request goes to CONDUCTOR's
+    box, for the operator to send."""
+    with st.popover("N-1 screen of an option", icon=":material/shield:", type="tertiary",
+                    disabled=_ui_busy(),
+                    help="Screens every single outage with the option's dispatch applied, at its own moment "
+                         "(after its outage too, if it had one). A plain N-1 screen runs on the schedule."):
+        chosen = st.radio("Option", [o["ref"] for o in options], key=f"n1_pick_{idx}", label_visibility="collapsed",
+                          format_func=lambda ref: next(f"{o['label']} · {ref}" for o in options if o["ref"] == ref))
+        label = next(o["label"] for o in options if o["ref"] == chosen)
+        limit = next(o.get("screen_limit_pct") for o in options if o["ref"] == chosen)
+        at = f", with lines and transformers allowed up to {limit:g} % of their rating" if limit else ""
+        st.button(_RUN_IN_CONDUCTOR, key=f"n1_send_{idx}", type="primary", width="stretch",
+                  on_click=lambda: st.session_state.update(
+                      _box_pending=f"Run the N-1 screen with option {chosen} ({label}) applied{at}."),
+                  help="Puts the request in CONDUCTOR's box — you send it with **Run**.")
 
 
 def _attention_hint(attention: list[str]) -> str:
@@ -5086,11 +5504,32 @@ def _render_answer_footer(msg: dict, idx: int) -> None:
     recorded here. Everything else of the AI agent lives in its panel."""
     is_last = idx == len(st.session_state.messages) - 1
     panel_open = st.session_state.get("agent_panel_open")
+    _render_settings_change(msg, idx)
     _render_staleness(msg, idx)
     if is_last and msg.get("attention"):
         where = "the advisor (right) can help" if panel_open else "open the advisor (✨ on the right) to"
         st.caption(f"⚠️ {_attention_hint(msg['attention'])} — {where} decide what to check next.")
-    if is_last and not (panel_open and st.session_state.get("agent_mode") == "discuss"):
+    options_turn = _options_turn(msg, idx)
+    opening = _OPTIONS_OPENING.format(turn=options_turn) if options_turn else None
+    if opening and any(item.get("role") == "operator" and item.get("text") == opening
+                       for d in _discussions() for item in d.get("thread") or []):
+        opening = None                       # already opened: the discussion carries on
+    screenable = _screenable_options(msg) if is_last else []
+    if is_last and (opening or screenable):
+        with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"opt_actions_{idx}"):
+            if opening:
+                # Corrective options: one way in — the advisor opens on them, with a
+                # reading of the trade-offs and questions about what the solver cannot see.
+                st.button("💬 Discuss these options", key=f"discuss_options_{idx}", type="tertiary",
+                          disabled=_ui_busy(),
+                          help="Open the advisor on these options: it reads the trade-offs and asks what matters "
+                               "to you before comparing them. It runs no studies and picks no option for you.",
+                          on_click=lambda: st.session_state.update(
+                              agent_panel_open=True, agent_mode="discuss",
+                              _advisor_request=("ask", opening, idx)))
+            if screenable:
+                _render_screen_an_option(screenable, idx)
+    if is_last and not opening and not (panel_open and st.session_state.get("agent_mode") == "discuss"):
         # The way from an answer to the advisor, about that answer.
         st.button("💬 Discuss with the advisor", key=f"discuss_{idx}", type="tertiary",
                   disabled=_ui_busy(),
@@ -5454,6 +5893,12 @@ with _chat_tab:
                 logging.getLogger(__name__).warning("Could not render the AI agent panel.", exc_info=True)
                 st.caption("⚠️ The advisor panel could not be rendered.")
 
+with _export_slot:
+    _render_export_menu()
+
+with _context_slot:
+    _render_session_context_menu()
+
 
 with _system_tab:
     _render_system_view()
@@ -5608,23 +6053,31 @@ def _process_turn(effective_input: str, work) -> None:
                         turn = data.get("turn", 1)
                         st.write("⚡ Calling your LLM Orchestrator…" if turn == 1 else f"⚡ LLM Orchestrator reasoning (turn {turn})…")
                     elif event == "tool_start":
-                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        label = _tools_reg.label(data["name"])
                         st.write(f"⚙️ Running **{label}**…")
                     elif event == "tool_done":
-                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        label = _tools_reg.label(data["name"])
                         has_error = isinstance(data.get("result"), dict) and "error" in data["result"]
-                        st.write(f"⚠️ **{label}** returned an error" if has_error else f"✅ **{label}** complete")
+                        took = (f" ({_trace.seconds(data['duration_s'])})"
+                                if isinstance(data.get("duration_s"), (int, float)) else "")
+                        st.write(f"⚠️ **{label}** returned an error{took}" if has_error
+                                 else f"✅ **{label}** complete{took}")
                     elif event == "tool_error":
-                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        label = _tools_reg.label(data["name"])
                         st.write(f"❌ **{label}** failed: {data.get('error', '')}")
+                    elif event == "tool_reused":
+                        label = _tools_reg.label(data["name"])
+                        st.write(f"↺ **{label}** already "
+                                 + ("failed" if data.get("failed") else "ran")
+                                 + f" with the same arguments (step {data.get('same_as')}) — not run again")
                     elif event == "tool_rejected":
-                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        label = _tools_reg.label(data["name"])
                         st.write(
                             f"🛑 **{label}** not run — invalid parameters: "
                             + "; ".join(data.get("problems", []))
                         )
                     elif event == "integrity_warning":
-                        label = _TOOL_LABELS.get(data["name"], data["name"].replace("_", " ").title())
+                        label = _tools_reg.label(data["name"])
                         st.write(
                             f"⚠️ **{label}** returned an internally inconsistent result: "
                             + "; ".join(data.get("problems", []))
@@ -5668,6 +6121,9 @@ def _process_turn(effective_input: str, work) -> None:
                             st.session_state._model_switch_note = (
                                 f"Now using `{data.get('to')}`: {data.get('reason')}.")
 
+            # The session's settings before the answer: the note under it says
+            # what the answer changed, and Undo puts exactly that back.
+            settings_before = _fetch_settings()
             try:
                 final_text, updated_history = run_agent_turn(
                     user_message=llm_input,
@@ -5677,6 +6133,7 @@ def _process_turn(effective_input: str, work) -> None:
                     conversation_id=st.session_state.ui_conversation_id,
                     on_event=_on_event,
                     reflection=_reflection_mode(),
+                    earlier_context=_earlier_context_block(),
                 )
                 # Persist history
                 st.session_state.history = updated_history
@@ -5755,6 +6212,8 @@ def _process_turn(effective_input: str, work) -> None:
                     # What its studies ran under, to tell later whether the
                     # settings have changed since (agent/staleness.py).
                     "context": _staleness.stamp(charts_this_turn, _fetch_assumptions()),
+                    # What it changed in the session's settings, if anything.
+                    "settings_change": _settings_change_record(settings_before, _fetch_settings()),
                 })
                 status_box.update(label="Analysis complete", state="complete", expanded=False)
                 # The turn just refetched grid constants; if that failed, the

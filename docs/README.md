@@ -9,9 +9,11 @@ CONDUCTOR is an assistant for studying distribution grids in plain language.
 You ask a question; it runs the power-system studies that answer it (security
 assessment, N-1 contingencies, risk, optimal and robust dispatch, flexibility,
 hosting capacity, KPIs), shows the results as charts, and tells you where every
-figure in its answer came from. Changes to the grid can be tried as
-*proposals* without touching the loaded network, and an *advisor* helps you
-think results through.
+figure in its answer came from. Corrective actions come as *options* to choose
+from — cheapest, least disturbance, near-optimal alternatives, dispatches that
+stay secure after an outage — each re-checked by a power flow. Changes to the
+grid can be tried as *proposals* without touching the loaded network, and an
+*advisor* helps you think results and options through.
 
 These pages are for the people who use it: **grid operators and planners**
 asking questions about a network, and **researchers** using CONDUCTOR in
@@ -25,19 +27,19 @@ studies or evaluating it. To install and launch it, start with the
 | [Getting started](guide/getting-started.md) | The launch screen, your first questions, the layout of the app |
 | [Choosing a model](guide/choosing-a-model.md) | Free, paid and local options, their limits and data terms |
 | [Data and the operating point](guide/data-and-operating-point.md) | Measurements, forecasts and the nominal point; uploading a network and data; data quality |
-| [Asking questions](guide/asking-questions.md) | What CONDUCTOR can study, with example questions for each kind of study |
+| [Asking questions](guide/asking-questions.md) | What CONDUCTOR can study, with example questions for each kind of study — corrective options and N-1 secure dispatches among them — and when it asks you first |
 | [Reading an answer](guide/reading-an-answer.md) | Charts and their captions, "How this answer was produced", answer checks, answers computed under other settings |
 | [What-if proposals](guide/what-if-proposals.md) | Changing the grid without touching it: every kind of change, combining and comparing proposals |
 | [The System tab](guide/system-tab.md) | The network map, generator models, costs, the load power factor, renaming elements |
-| [The advisor](guide/advisor.md) | Discussing results and getting suggested next steps |
-| [Sessions and scenarios](guide/sessions-and-scenarios.md) | Resume and the demos, what is kept between sessions, Start fresh, the session report |
+| [The advisor](guide/advisor.md) | Discussing results and corrective options, and getting suggested next steps |
+| [Sessions and scenarios](guide/sessions-and-scenarios.md) | Resume and the demos, what is kept between sessions, Start fresh, session context, the session reports (raw and written by the model) |
 | [Troubleshooting](guide/troubleshooting.md) | Limits reached, slow or retired models, common problems |
 
 ## For researchers
 
 | Page | What it covers |
 | --- | --- |
-| [Using CONDUCTOR in research](research/using-conductor-in-research.md) | Reproducible demos, session logs, grading sessions, the what-if evaluation, what the checks can and cannot see |
+| [Using CONDUCTOR in research](research/using-conductor-in-research.md) | Reproducible demos, session logs, grading sessions, the what-if, options and clarification evaluations, what the checks can and cannot see |
 
 ## Reference
 

@@ -135,13 +135,14 @@ class TestItAnswersRatherThanDumping:
 
 class TestRegistration:
     def test_the_tool_is_dispatchable_and_declared(self):
-        from llm_agent.agent.tool_schemas import TOOL_DISPATCH, _NO_DATA_SOURCE_TOOLS
+        from llm_agent.agent.tool_registry import REGISTRY
+        from llm_agent.agent.tool_schemas import TOOL_DISPATCH
         from llm_agent.agent.providers.schema import to_json_schema_tools
         from llm_agent.agent.tool_schemas import TOOLS
 
         assert TOOL_DISPATCH["locate_network_element"] is tools.locate_network_element
         # Topology does not vary with the clock, so it takes no dataset.
-        assert "locate_network_element" in _NO_DATA_SOURCE_TOOLS
+        assert REGISTRY["locate_network_element"].data_source is None
 
         declared = {t["function"]["name"]: t["function"] for t in to_json_schema_tools(TOOLS)}
         parameters = declared["locate_network_element"]["parameters"]

@@ -30,6 +30,8 @@ def grade_sandbox(record: dict) -> list[Finding]:
     findings: list[Finding] = []
     for call, entry in zip(record.get("tool_calls") or [], record.get("tool_results") or []):
         result = entry.get("result") if isinstance(entry, dict) else None
+        if call.get("reused_from"):
+            continue            # a repeat of an earlier call, answered from it: counted there
         if call.get("name") == "edit_proposal" and isinstance(result, dict) and result.get("error"):
             findings.append(Finding(turn, EXECUTION, WARN, "invalid_edit",
                                     f"edit_proposal was refused: {result.get('detail') or result['error']}"))

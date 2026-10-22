@@ -612,7 +612,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                        current_safety_margin: float = 0.9,
                        fixed_setpoints: dict = None,
                        vm_upper_per_bus: dict = None,
-                       vm_lower_per_bus: dict = None):
+                       vm_lower_per_bus: dict = None,
+                       branch_limits: dict = None):
 
     
     # -------------------------
@@ -1032,6 +1033,12 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     model.reactive_balance = Constraint(model.B, rule=reactive_power_balance_rule)
 
     _csm = float(current_safety_margin)
+    # A cap the operator puts on a branch (a fraction of its rating), keyed by
+    # bus pair like the branches themselves; it replaces the margin there.
+    _caps = {tuple(sorted(k)): float(v) for k, v in (branch_limits or {}).items()}
+
+    def _limit(i, j) -> float:
+        return _caps.get(tuple(sorted((i, j))), _csm)
 
     def branch_current_from_rule(m, i, j):
         I_real = m.Yff_real_used[i,j]*m.V[i]*cos(m.theta[i]) - m.Yff_imag_used[i,j]*m.V[i]*sin(m.theta[i]) \
@@ -1040,7 +1047,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                  + m.Yft_real_used[i,j]*m.V[j]*sin(m.theta[j]) + m.Yft_imag_used[i,j]*m.V[j]*cos(m.theta[j])
         current_pu_sq = I_real**2 + I_imag**2
         max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j])**2
-        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
+        return current_pu_sq <= _limit(i, j) ** 2 * max_current_pu_sq
 
     def branch_current_to_rule(m, i, j):
         I_real = m.Yff_real_used[j,i]*m.V[j]*cos(m.theta[j]) - m.Yff_imag_used[j,i]*m.V[j]*sin(m.theta[j]) \
@@ -1049,7 +1056,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                  + m.Yft_real_used[j,i]*m.V[i]*sin(m.theta[i]) + m.Yft_imag_used[j,i]*m.V[i]*cos(m.theta[i])
         current_pu_sq = I_real**2 + I_imag**2
         max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i])**2
-        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
+        return current_pu_sq <= _limit(i, j) ** 2 * max_current_pu_sq
 
     model.branch_current_from_limit = Constraint(model.Branches, rule=branch_current_from_rule)
 

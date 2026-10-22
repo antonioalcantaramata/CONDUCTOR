@@ -8,10 +8,13 @@ its answers were.
 
 ## Reproducible starting points
 
-- **The demos are deterministic.** Both IEEE 14-bus demos (PGLib case 14 with a
-  synthetic week; the second adds measured reactive power with deliberate gaps)
-  are generated with fixed seeds, so the same scenario gives the same data on
-  every machine. Name the scenario in your method section.
+- **The demos are deterministic.** The IEEE 30-bus demos (PGLib's Alsac–Stott
+  case with a synthetic week; the second adds measured reactive power with
+  deliberate gaps) and the smaller IEEE 14-bus demo are generated with fixed
+  seeds, so the same scenario gives the same data on every machine. Name the
+  scenario in your method section. The 30-bus demo is the one for flexibility
+  studies: five dispatchable units with the case's own costs, and congestion at
+  the evening peaks.
 - **Your own data.** Upload a network (MATPOWER, pandapower, UCTE) and a CSV of
   measurements and forecasts; see
   [Data and the operating point](../guide/data-and-operating-point.md).
@@ -32,11 +35,17 @@ Every question and answer is appended to a JSON Lines file in
 | --- | --- |
 | `user`, `assistant` | The question and the final answer |
 | `provider`, `model`, reasoning settings | Which model answered, and how |
-| `tool_calls`, `tool_results` | Every study run, with its arguments and full result |
+| `tool_calls`, `tool_results` | Every study run, with its arguments and full result. A call repeated with identical arguments (and nothing changed in between) is not run again: it carries `reused_from` (the earlier call's number) and its result points to the earlier one |
 | `grid` | The network facts the model was given that turn |
 | `model_calls`, `prompt_tokens`, `duration_s` | Cost and time of the turn |
-| `status`, `error_classification` | How the turn ended |
+| `timing` | Where the time went: `model_s` (every model call, including rate-limit waits, flagged by `waited_for_rate_limit`), `studies_s` (tools running), `checks_s` (CONDUCTOR's own checks), `total_s`; each call in `tool_calls` also carries its `duration_s` |
+| `status`, `error_classification` | How the turn ended: `completed`; `max_turns_summarised` (the step limit was reached); `repeated_failure_summarised` (stopped after the model repeated a failed call it had been told would fail again); or an error |
 | `reflection` | When answer review was on: the checks' findings and what the model did with them |
+
+A turn given an earlier session as background records it in `earlier_context`
+(the context's title and save time); saving and loading a context are recorded
+as `context_saved` and `context_loaded` events. For experiments, compare runs
+with and without a context only as a deliberate condition.
 
 Advisor decision notes and suggestions are recorded in the same file, with a
 `kind` field. Logs stay on your machine and are not part of the repository.
@@ -67,8 +76,9 @@ Per turn it reports the figures in the answer and how each was grounded:
 
 ## The what-if evaluation
 
-A fixed set of proposal questions for the bundled IEEE 14-bus network, run
-repeatedly against the real agent and graded from the records:
+A fixed set of proposal questions for the bundled IEEE 14-bus network (load the
+**Demo: IEEE 14 · smaller** scenario first; its week is unchanged since the tasks
+were written), run repeatedly against the real agent and graded from the records:
 
 ```bash
 python -m evaluation.whatif list
@@ -82,6 +92,52 @@ modelling notes. `--follow-suggestion` repeats the run following the advisor's
 suggestions, to measure what they change. **`run` uses model credit** and asks
 for confirmation; `grade` costs nothing. Runs are written to their own folder,
 never to the session logs.
+
+## The options evaluation
+
+A fixed set of questions about corrective options for the IEEE 30-bus demo
+(the default scenario), graded the same way:
+
+```bash
+python -m evaluation.options list
+python -m evaluation.options run --repeats 10 [--tasks options_peak,rule_out_unit]
+python -m evaluation.options grade <run folder>
+```
+
+It measures whether the agent asks the solver for options when the operator
+wants a choice; keeps a unit the operator rules out in service with no
+instruction (`hold_units`, not taken out of service); asks for near-optimal
+alternatives — and the margin the operator names — when cost matters but
+another way is wanted, and says what each alternative avoids or adds; holds a
+line below the share of its rating the operator names (`branch_limits`); asks
+for the N-1 security study (`n1`) when the options must stay secure after an
+outage — corrective when the operator would act after it — and says what it
+could not secure and the corrective plan; answers
+"no action needed" when the schedule meets every limit; and leaves the choice
+to the operator. That last check is a narrow phrase check ("I recommend…",
+"the best option is…"): it catches a choice stated outright, not every way of
+steering. Like the what-if evaluation, **`run` uses model credit** and asks
+for confirmation; runs go to their own folder.
+
+## The clarification evaluation
+
+Whether the agent asks before running when it should — and only then:
+
+```bash
+python -m evaluation.clarify list
+python -m evaluation.clarify run --repeats 10 [--tasks which_line,secure_now]
+python -m evaluation.clarify grade <run folder>
+```
+
+Two tasks leave something open that changes the answer (an outage of "the line
+into Bus_23", which three lines fit; options keeping a line "comfortably" below
+its rating): the agent must ask first — a question, numbered choices, nothing
+run but lookups — and, given the answer, run the study it chose. Three are
+clear enough to run at once ("is the grid secure right now?", options secure
+after a line trips, the most critical outage): asking there fails, so an agent
+that asks about everything scores as badly as one that guesses. The rule's
+examples in the system prompt are kept apart from the tasks' wording. **`run`
+uses model credit** and asks for confirmation.
 
 ## Comparing models
 

@@ -58,6 +58,7 @@ from .providers import (
     user_message as make_user_message,
 )
 from .system_prompt import get_system_prompt
+from .tool_registry import LONG_SERIES, changes_state, label
 from .tool_schemas import TOOL_DISPATCH, TOOLS
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,7 @@ def run_agent_turn(
     conversation_id: str | None = None,
     on_event: Callable[[str, dict], None] | None = None,
     reflection: str | None = None,
+    earlier_context: str | None = None,
 ) -> tuple[str, list]:
     """
     Execute one user turn in the digital twin agentic loop.
@@ -235,6 +237,9 @@ def run_agent_turn(
                           its own provenance findings before the answer is
                           delivered. Defaults to the configured mode; see
                           `reflection.py`.
+        earlier_context:  An earlier session the operator continues from
+                          (`session_context.prompt_block`), added after the
+                          system prompt as background.
 
     Returns:
         (final_text, updated_history)
@@ -269,6 +274,15 @@ def run_agent_turn(
     turn_tool_calls: list[dict] = []
     turn_tool_results: list[dict] = []
     tool_error_count = 0
+    # Calls already made in this question, by tool and arguments: an identical
+    # call is answered from here instead of running again (`_reuse`).
+    turn_seen_calls: dict[str, tuple[int, object]] = {}
+    # A failed call repeated after the model was told it would fail the same
+    # way: the question stops there and is answered from what is known.
+    told_it_failed = False
+    stuck_on: str | None = None
+    # Where the time went: the model, the studies, CONDUCTOR's own checks.
+    timing = {"model_s": 0.0, "studies_s": 0.0, "checks_s": 0.0, "waited_for_rate_limit": False}
     # Tracks which operating point each tool actually ran at, so a chain
     # that silently mixes two of them is caught rather than presented as one.
     # Seeded with the moments the question names: comparing two of them is a
@@ -291,6 +305,8 @@ def run_agent_turn(
     #    take effect without restarting the app.
     provider = get_provider()
     system_prompt = get_system_prompt()
+    if earlier_context:
+        system_prompt = f"{system_prompt}\n\n{earlier_context}"
 
     # 4. Agentic loop.
     final_text = ""
@@ -302,7 +318,7 @@ def run_agent_turn(
     reflection_record: Reflection | None = None
 
     try:
-        while turns_used < MAX_AGENT_TURNS:
+        while turns_used < MAX_AGENT_TURNS and stuck_on is None:
             turns_used += 1
             logger.debug("Agent turn %d / %d", turns_used, MAX_AGENT_TURNS)
 
@@ -325,6 +341,8 @@ def run_agent_turn(
                 on_event=_watch,
             )
             model_calls += 1
+            timing["model_s"] += time.monotonic() - started
+            timing["waited_for_rate_limit"] = timing["waited_for_rate_limit"] or bool(waited)
             reported = _usage.prompt_tokens_from(response.raw)
             if reported:
                 prompt_tokens.append(reported)
@@ -351,7 +369,9 @@ def run_agent_turn(
                         "tool_calls": turn_tool_calls,
                         "tool_results": turn_tool_results,
                     }
+                    checked = time.monotonic()
                     findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
+                    timing["checks_s"] += time.monotonic() - checked
                     show = reflection_mode == INFORM and bool(findings or conflicts or gaps)
                     reflection_record = Reflection(
                         mode=reflection_mode,
@@ -387,6 +407,7 @@ def run_agent_turn(
                 break
 
             # 4d. Execute each tool call and append its result.
+            repeated_a_failure = False
             for call in response.tool_calls:
                 tool_name = call.name
                 kwargs, inherited = turn_operating_point.resolve(
@@ -396,8 +417,37 @@ def run_agent_turn(
                     logger.info("Inherited %s for %s from earlier in the turn.",
                                 sorted(inherited), tool_name)
 
+                key = _call_key(tool_name, kwargs)
+                if key in turn_seen_calls:
+                    # The same tool with the same arguments, nothing changed
+                    # since: answer from the earlier call instead of running it
+                    # again (a model repeating a study, or retrying one that
+                    # failed for a reason a retry cannot fix).
+                    same_as, earlier = turn_seen_calls[key]
+                    result = _reuse(same_as, earlier)
+                    if "error" in result:
+                        tool_error_count += 1
+                        turn_operating_point.rollback()
+                        repeated_a_failure = True
+                        if told_it_failed:
+                            stuck_on = tool_name
+                    logger.info("Reused %s: identical to call %d of this question.", tool_name, same_as)
+                    if on_event:
+                        on_event("tool_reused", {"name": tool_name, "same_as": same_as,
+                                                 "failed": "error" in result})
+                    call_record = {"name": tool_name, "args": kwargs, "reused_from": same_as}
+                    if inherited:
+                        call_record["inherited"] = inherited
+                    turn_tool_calls.append(call_record)
+                    turn_tool_results.append({"name": tool_name, "result": result})
+                    history.append(tool_message(tool_name, result, call_id=call.id))
+                    continue
+
                 tool_fn = TOOL_DISPATCH.get(tool_name)
+                checked = time.monotonic()
                 verdict = validate_call(tool_name, kwargs)
+                timing["checks_s"] += time.monotonic() - checked
+                ran_s = None
                 if tool_fn is None:
                     result = {"error": f"Unknown tool: {tool_name}"}
                     tool_error_count += 1
@@ -421,15 +471,22 @@ def run_agent_turn(
                     try:
                         if on_event:
                             on_event("tool_start", {"name": tool_name, "args": kwargs})
-                        result = tool_fn(**kwargs)
+                        ran = time.monotonic()
+                        try:
+                            result = tool_fn(**kwargs)
+                        finally:
+                            ran_s = time.monotonic() - ran
+                            timing["studies_s"] += ran_s
                         _attach_call_args(tool_name, result, kwargs)
                         if isinstance(result, dict) and "error" in result:
                             # Values that produced no result are not the turn's.
                             turn_operating_point.rollback()
                         # Check the result against itself before the model sees
                         # it; findings are attached, never substituted.
+                        checked = time.monotonic()
                         integrity = validate_result(tool_name, result)
                         integrity += turn_consistency.observe(tool_name, result)
+                        timing["checks_s"] += time.monotonic() - checked
                         if integrity:
                             result = annotate(result, integrity)
                             logger.warning("Integrity warnings from %s: %s", tool_name,
@@ -440,7 +497,8 @@ def run_agent_turn(
                                     "problems": [i.message for i in integrity],
                                 })
                         if on_event:
-                            on_event("tool_done", {"name": tool_name, "result": result})
+                            on_event("tool_done", {"name": tool_name, "result": result,
+                                                   "duration_s": round(ran_s, 3)})
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("Tool %s raised an exception", tool_name)
                         result = {"error": str(exc), "tool": tool_name}
@@ -458,39 +516,56 @@ def run_agent_turn(
                 call_record = {"name": tool_name, "args": kwargs}
                 if inherited:
                     call_record["inherited"] = inherited
+                if ran_s is not None:
+                    call_record["duration_s"] = round(ran_s, 3)
                 turn_tool_calls.append(call_record)
                 turn_tool_results.append({"name": tool_name, "result": result})
+                _remember_call(turn_seen_calls, key, len(turn_tool_calls), tool_name, kwargs, result)
                 model_result = _prepare_tool_result_for_model(tool_name, result)
 
                 history.append(tool_message(tool_name, model_result, call_id=call.id))
 
+            told_it_failed = told_it_failed or repeated_a_failure
+
         else:
-            # MAX_AGENT_TURNS reached: one last call asking for an answer from
-            # the results so far, rather than ending on a bare warning. Tools
-            # stay declared (some providers refuse tool history without them);
-            # any tool call in the reply is ignored.
-            logger.warning("MAX_AGENT_TURNS (%d) reached; asking for an answer from what is known.",
-                           MAX_AGENT_TURNS)
+            # MAX_AGENT_TURNS reached, or the model repeated a failed call it
+            # had been told would fail again: one last call asking for an
+            # answer from the results so far, rather than ending on a bare
+            # warning. Tools stay declared (some providers refuse tool history
+            # without them); any tool call in the reply is ignored.
+            if stuck_on:
+                logger.warning("%s repeated after failing; asking for an answer from what is known.", stuck_on)
+                why = (f"You repeated a `{stuck_on}` call that had already failed, after being told it "
+                       "would fail the same way.")
+                note = (f"⚠️ CONDUCTOR stopped this question: the model kept repeating a call that had "
+                        f"already failed ({label(stuck_on)})")
+            else:
+                logger.warning("MAX_AGENT_TURNS (%d) reached; asking for an answer from what is known.",
+                               MAX_AGENT_TURNS)
+                why = f"You have used all {MAX_AGENT_TURNS} steps allowed for this question."
+                note = (f"⚠️ CONDUCTOR used all {MAX_AGENT_TURNS} steps allowed for one question "
+                        f"(`DT_MAX_AGENT_TURNS`) before finishing")
             summary_text = ""
             try:
+                started = time.monotonic()
                 response = provider.chat(
                     messages=_messages_for_model(history, turn_start) + [make_user_message(
-                        f"You have used all {MAX_AGENT_TURNS} steps allowed for this question. Do not call "
-                        "any more tools. Answer now from the tool results above: what was found, and plainly "
-                        "what could not be done and why.")],
+                        f"{why} Do not call any more tools. Answer now from the tool results above: what "
+                        "was found, and plainly what could not be done and why.")],
                     tools=TOOLS, system=system_prompt, on_event=on_event)
                 model_calls += 1
+                timing["model_s"] += time.monotonic() - started
                 summary_text = (response.text or "").strip()
             except Exception:  # noqa: BLE001 — the warning below still reaches the operator
                 logger.warning("The final summary call failed.", exc_info=True)
-            note = (f"⚠️ CONDUCTOR used all {MAX_AGENT_TURNS} steps allowed for one question "
-                    f"(`DT_MAX_AGENT_TURNS`) before finishing")
+            stopped = "repeated_failure" if stuck_on else "max_turns"
             if summary_text:
-                final_text = f"{summary_text}\n\n*{note[2:]}; this answer is built from the results so far.*"
-                turn_status = "max_turns_summarised"
+                final_text = (f"{summary_text}\n\n*{note.removeprefix('⚠️ ')}; this answer is built from the "
+                              "results so far.*")
+                turn_status = f"{stopped}_summarised"
             else:
                 final_text = (final_text + "\n\n" + note + ". The last partial result is shown above.").strip()
-                turn_status = "max_turns_exceeded"
+                turn_status = "repeated_failure" if stuck_on else "max_turns_exceeded"
 
     except RuntimeError as exc:
         # User-friendly error from retry logic
@@ -563,7 +638,14 @@ def run_agent_turn(
         .isoformat()
         .replace("+00:00", "Z"),
         "duration_s": duration_s,
+        # Where those seconds went. The rest of the total (preparing messages,
+        # writing the log) is small; the panel shows it as "other" when not.
+        "timing": {"total_s": duration_s, "model_s": round(timing["model_s"], 3),
+                   "studies_s": round(timing["studies_s"], 3), "checks_s": round(timing["checks_s"], 3),
+                   "model_calls": model_calls, "waited_for_rate_limit": timing["waited_for_rate_limit"]},
         "status": turn_status,
+        # The earlier session this turn was given as background, if any.
+        **({"earlier_context": earlier_context.split("\n", 1)[0].lstrip("# ")} if earlier_context else {}),
         "error_classification": error_classification,
         "runner_error": runner_error,
         # Which backend answered. Without this a log cannot say whether a turn
@@ -639,8 +721,49 @@ def _without_long_series(tool_name: str, result: dict) -> dict:
     return out
 
 
-_SERIES_TOOLS = frozenset({"find_worst_case_timestamp", "get_element_timeseries", "scan_scenarios",
-                           "compare_networks"})  # its scan carries per-tick series for the chart
+# ---------------------------------------------------------------------------
+# Repeated calls within one question
+# ---------------------------------------------------------------------------
+
+def _call_key(tool_name: str, kwargs: dict) -> str:
+    """One call, as tool and arguments (after the operating point is filled in)."""
+    return tool_name + "|" + json.dumps(kwargs, sort_keys=True, default=str)
+
+
+def _transient(result) -> bool:
+    """A failure a retry might fix: no answer from the backend at all (a
+    timeout, the backend restarting). A failure the backend answered (a
+    refused argument, a power flow that did not converge) repeats exactly
+    for identical arguments."""
+    return isinstance(result, dict) and "endpoint" in result and result.get("status_code") is None
+
+
+def _remember_call(seen: dict, key: str, order: int, tool_name: str, kwargs: dict, result) -> None:
+    """Record a call that ran, for reuse later in the question — or forget
+    everything when it changed the state the earlier results describe."""
+    failed = isinstance(result, dict) and "error" in result
+    if not failed and changes_state(tool_name, kwargs):      # its effect, in tool_registry
+        seen.clear()
+    elif not (failed and _transient(result)):
+        seen[key] = (order, result)
+
+
+def _reuse(same_as: int, earlier) -> dict:
+    """What the model receives for a repeated call: a pointer to the earlier
+    result (not the payload again), or the earlier failure with a note that
+    repeating it will not help."""
+    if isinstance(earlier, dict) and "error" in earlier:
+        return {**earlier, "reused_from": same_as,
+                "note": (f"This exact call already failed in this question (call {same_as}), and nothing has "
+                         "changed since, so it would fail the same way again. Change the arguments or the "
+                         "approach, or answer with what is known.")}
+    return {"reused_from": same_as,
+            "note": (f"Identical to call {same_as} of this question (same tool and arguments, nothing changed "
+                     "since). It was not run again: its result above still applies.")}
+
+
+# Tools whose result carries per-tick series the model is not sent (tool_registry).
+_SERIES_TOOLS = LONG_SERIES
 
 
 def _attach_call_args(tool_name: str, result, kwargs: dict) -> None:

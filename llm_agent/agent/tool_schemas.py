@@ -23,6 +23,7 @@ from typing import Callable
 from google import genai
 
 from . import tools
+from .tool_registry import POINT, REGISTRY
 
 # Tool schemas are built once at import, so anything grid-specific baked in here
 # is frozen to whatever network happened to be the default — it does NOT follow
@@ -92,6 +93,8 @@ _PG_MAX_OVERRIDES_DESC = (
     "Per-substation maximum active power, MW: {name: MW}. Others keep their "
     "capacity."
 )
+
+_BRANCH_LIMITS_DESC = "Branches held below a share of their rating: {name or tag: %}, e.g. {\"L30\": 80}. 10–100."
 
 _PG_MIN_OVERRIDES_DESC = (
     "Per-substation minimum active power, MW: {name: MW}; positive = must-run. "
@@ -291,11 +294,17 @@ _simulate_all_contingencies = genai.types.FunctionDeclaration(
         "Returns whether the system is N-1 secure, total outages tested, "
         "number causing violations, and the full violation table. "
         "Use this when the user asks 'which contingency is worst' or "
-        "'is the grid N-1 secure'."
+        "'is the grid N-1 secure'. With option, it screens a corrective option instead of the schedule."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "option": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("A corrective option's `ref` from an options result (e.g. 'S2:cheapest'): the "
+                             "sweep runs at that option's moment, network and load level with its dispatch "
+                             "applied — after its outage too, if it had one (N-1-1)."),
+            ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
@@ -325,7 +334,8 @@ _optimize_contingency = genai.types.FunctionDeclaration(
     description=(
         "Compute the corrective flexibility dispatch after a single contingency "
         "using AC OPF (SMFAE). Returns the generator setpoints before and after "
-        "optimization. Use this when the user asks how to fix a specific outage."
+        "optimization. Use this when the user asks how to fix a specific outage. "
+        "options, hold_units, near_optimal(_pct), branch_limits: as in optimize_flexibility, after the outage."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -340,6 +350,27 @@ _optimize_contingency = genai.types.FunctionDeclaration(
                     "Zero-based index of the contingency element."
                     " Get it from locate_network_element; never guess it."
                 ),
+            ),
+            "options": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description="Several corrective options.",
+            ),
+            "hold_units": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING),
+                description="Units ruled out: in service, no instruction.",
+            ),
+            "near_optimal": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description="Near-optimal alternatives instead.",
+            ),
+            "near_optimal_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="How far above the cheapest an alternative may cost, %. Default 10.",
+            ),
+            "branch_limits": genai.types.Schema(
+                type=genai.types.Type.OBJECT,
+                description=_BRANCH_LIMITS_DESC,
             ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
@@ -393,11 +424,58 @@ _optimize_flexibility = genai.types.FunctionDeclaration(
         "in normal (N-0) operation using AC OPF (SMFAE). "
         "Returns generator setpoints and the optimization status. "
         "Use after run_rsa detects violations, or when the user asks about "
-        "corrective actions, generator outages, or cable derating."
+        "corrective actions, generator outages, or cable derating. options=true: several "
+        "corrective dispatches instead (named strategies, or near_optimal alternatives), each "
+        "meeting every limit, scored the same way and checked by a power flow."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "options": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description=("True: several corrective options to choose from, instead of the one "
+                             "least-disturbance dispatch."),
+            ),
+            "hold_units": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING),
+                description=("Units whose active power stays at its schedule — the operator's "
+                             "conditions ('without Gen 2', 'don't call the battery'). In service, "
+                             "unlike disabled_generators. With options=true, every option respects them."),
+            ),
+            "near_optimal": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description=("With options=true: instead of the named strategies, the cheapest option and up "
+                             "to three near-optimal alternatives, each costing at most near_optimal_pct above "
+                             "it and changing other units."),
+            ),
+            "near_optimal_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="How far above the cheapest an alternative may cost, %. Default 10.",
+            ),
+            "branch_limits": genai.types.Schema(
+                type=genai.types.Type.OBJECT,
+                description=_BRANCH_LIMITS_DESC,
+            ),
+            "n1": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                enum=["preventive", "corrective", "both"],
+                description=("Options secure after the critical outages. preventive: nothing to do when one "
+                             "happens; corrective: a quick action after it (plan returned); both."),
+            ),
+            "n1_outages": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING),
+                description="Outages to secure (names or tags). Default: the critical ones.",
+            ),
+            "n1_emergency_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="Loading allowed after an outage, % of rating. Default: the network's limit.",
+            ),
+            "n1_reach_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="Corrective: MW a unit may move after an outage, % of capacity. Default 20.",
+            ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
@@ -1434,22 +1512,25 @@ _set_generator_model = genai.types.FunctionDeclaration(
         properties={
             "changes": _S(
                 type=_T.ARRAY,
-                description="One object per unit to change; give only the fields to change.",
+                description=("One item per setting changed: the unit, which setting, and its new value in "
+                             "the slot that setting uses. Every other setting keeps its value. Several "
+                             "settings or units: several items (voltage control at 1.02 p.u. is control "
+                             "and vm_pu)."),
                 items=_S(
                     type=_T.OBJECT,
                     properties={
                         "unit": _S(type=_T.STRING, description="Unit name as listed, e.g. 'Gen_bus1'."),
-                        "control": _S(type=_T.STRING, enum=["voltage", "power_factor", "fixed_q"]),
-                        "q_mvar": _S(type=_T.NUMBER, description=(
-                            "For control='fixed_q': reactive output in Mvar (positive injects).")),
-                        "vm_pu": _S(type=_T.NUMBER, description="Voltage set-point (p.u.), 0.8–1.2."),
-                        "pf": _S(type=_T.NUMBER, description="Power factor for control='power_factor', 0.5–1.0."),
-                        "absorbing": _S(type=_T.BOOLEAN, description="True: absorbs reactive power (inductive)."),
-                        "q_min_mvar": _S(type=_T.NUMBER, description="Lower reactive limit (Mvar)."),
-                        "q_max_mvar": _S(type=_T.NUMBER, description="Upper reactive limit (Mvar)."),
-                        "dispatchable": _S(type=_T.BOOLEAN, description="False: the OPF keeps its output."),
+                        "setting": _S(type=_T.STRING, enum=list(tools.GENERATOR_SETTINGS), description=(
+                            "Which setting. control: in `control`. vm_pu (set-point, 0.8–1.2), pf "
+                            "(0.5–1.0), q_mvar (fixed_q output, positive injects), q_min_mvar, "
+                            "q_max_mvar: a number in `value`. absorbing (true: absorbs reactive power), "
+                            "dispatchable (false: the OPF keeps its output): in `on`.")),
+                        "control": _S(type=_T.STRING, enum=list(tools.GENERATOR_CONTROLS),
+                                      description="For setting=control."),
+                        "value": _S(type=_T.NUMBER, description="For a numeric setting."),
+                        "on": _S(type=_T.BOOLEAN, description="For absorbing or dispatchable."),
                     },
-                    required=["unit"],
+                    required=["unit", "setting"],
                 ),
             ),
             "reset": _S(type=_T.BOOLEAN, description="True: every unit back to how it was loaded."),
@@ -1464,30 +1545,31 @@ _set_unit_costs = genai.types.FunctionDeclaration(
         "production cost (c0 €/h + c1 €/MWh·P + c2 €/MW²h·P²; the grid's c1 is the import price) and "
         "redispatch costs up/down (€/MWh; down for a renewable is curtailment), a reactive price per "
         "unit (€/Mvarh) and the grid's reactive band (tan φ) and penalty beyond it, each marked 'case', "
-        "'synthetic' or 'operator'. Kept for this network and shown in the System tab. Not yet used by "
-        "any OPF (they minimise the change in dispatch) — say so if asked what they change."
+        "'synthetic' or 'operator'. Kept for this network and shown in the System tab. Used to cost "
+        "the flexibility options (optimize_flexibility with options) and to find the cheapest one; the "
+        "default dispatch ignores them."
     ),
     parameters=_S(
         type=_T.OBJECT,
         properties={
             "changes": _S(
                 type=_T.ARRAY,
-                description="One object per unit; null for a field restores its default.",
+                description=("One item per price changed: the unit, which price, the new value. Every other "
+                             "price keeps its value. Several prices or units: several items."),
                 items=_S(
                     type=_T.OBJECT,
                     properties={
                         "unit": _S(type=_T.STRING, description="Unit name as listed, or 'External grid'."),
-                        "cost_eur_per_mwh": _S(type=_T.NUMBER, description="c1, €/MWh."),
-                        "cost_eur_per_mw2h": _S(type=_T.NUMBER, description="c2, €/MW²h."),
-                        "cost_eur_per_h": _S(type=_T.NUMBER, description="c0, €/h."),
-                        "up_eur_per_mwh": _S(type=_T.NUMBER, description="Upward redispatch, €/MWh."),
-                        "down_eur_per_mwh": _S(type=_T.NUMBER, description="Downward redispatch, €/MWh."),
-                        "q_eur_per_mvarh": _S(type=_T.NUMBER, description="A unit's reactive power, €/Mvarh."),
-                        "q_band_tan_phi": _S(type=_T.NUMBER, description="External grid: free reactive band, tan φ."),
-                        "q_penalty_eur_per_mvarh": _S(type=_T.NUMBER, description=(
-                            "External grid: €/Mvarh beyond the band.")),
+                        "field": _S(type=_T.STRING, enum=list(tools.COST_FIELDS), description=(
+                            "Which price. cost_eur_per_mwh: c1, €/MWh (the grid's: import price); "
+                            "cost_eur_per_mw2h: c2; cost_eur_per_h: c0; up_eur_per_mwh / down_eur_per_mwh: "
+                            "redispatch; q_eur_per_mvarh: a unit's reactive power, €/Mvarh; "
+                            "q_band_tan_phi / q_penalty_eur_per_mvarh: external grid only, the free "
+                            "reactive band (tan φ) and €/Mvarh beyond it.")),
+                        "value": _S(type=_T.NUMBER, description="The new value."),
+                        "to_default": _S(type=_T.BOOLEAN, description="True: back to its default (no value)."),
                     },
-                    required=["unit"],
+                    required=["unit", "field"],
                 ),
             ),
             "reset": _S(type=_T.BOOLEAN, description="True: every cost back to its default."),
@@ -1804,73 +1886,32 @@ _POINT_DATA_SOURCE_SCHEMA_DESC = (
 _TIMESTAMP_SCHEMA_DESC = "Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock."
 _NETWORK_SCHEMA_DESC = "'base' (default) or a proposal id."
 
-# Clock-control and pure post-processing tools never read a selectable dataset.
-_NO_DATA_SOURCE_TOOLS = {
-    "edit_proposal",       # edits a proposal; studies nothing
-    "set_load_power_factor",   # a session setting; studies nothing
-    "get_data_quality",        # reads the loaded data; studies nothing
-    "set_generator_model",     # the units' model; studies nothing
-    "set_unit_costs",          # the units' costs; studies nothing
-    "rename_elements",         # names only; studies nothing
-
-    "locate_network_element",  # topology, not a time series
-    "get_current_timestamp",
-    "advance_timestamp",
-    "compare_results",
-    "scan_rsa_over_time",  # advances the live clock — measurements only by definition
-}
-# Point-in-time tools (no existing time-window params) that benefit from `timestamp`.
-_POINT_IN_TIME_TOOLS = {
-    "compute_violation_attribution",
-    "get_current_conditions",
-    "run_rsa",
-    "simulate_contingency",
-    "simulate_all_contingencies",
-    "optimize_contingency",
-    "optimize_flexibility",
-    "evaluate_kpis",
-    "forecast_kpis",
-    "run_probabilistic_rsa",
-    "optimize_robust_flexibility",
-    "compute_flexibility_envelope",
-    "compute_hosting_capacity",
-    "compare_networks",
-}
-# Point-in-time in their parameters, but they read a window (the next 24 h):
-# the nominal point, which has no time, is refused by them.
-_WINDOW_ONLY_TOOLS = {"forecast_kpis"}
-# Every tool that studies a network takes `network`, except the comparison
-# (which names its proposal) and the tools that study none.
-_NO_NETWORK_TOOLS = (_NO_DATA_SOURCE_TOOLS - {"scan_rsa_over_time", "locate_network_element"}
-                     | {"compare_networks"})
-
+# Which shared arguments each tool takes is part of its row in `tool_registry`.
 for _tool in TOOLS:
     for _fd in _tool.function_declarations or []:
-        if _fd.name in _NO_DATA_SOURCE_TOOLS and _fd.name in _NO_NETWORK_TOOLS:
+        _row = REGISTRY[_fd.name]
+        if not (_row.network or _row.load_pf or _row.data_source or _row.timestamp):
             continue
         if _fd.parameters is None:
             _fd.parameters = genai.types.Schema(type=genai.types.Type.OBJECT, properties={})
         if _fd.parameters.properties is None:
             _fd.parameters.properties = {}
         props = _fd.parameters.properties
-        if _fd.name not in _NO_NETWORK_TOOLS and "network" not in props:
+        if _row.network and "network" not in props:
             props["network"] = genai.types.Schema(
                 type=genai.types.Type.STRING, description=_NETWORK_SCHEMA_DESC
             )
-        if _fd.name not in _NO_DATA_SOURCE_TOOLS - {"scan_rsa_over_time"}:
+        if _row.load_pf:
             # Every study that assigns a tick: its load power factor.
             props.setdefault("load_power_factor", genai.types.Schema(
                 type=genai.types.Type.NUMBER, description=_LOAD_PF_SCHEMA_DESC))
-        if _fd.name in _NO_DATA_SOURCE_TOOLS:
-            continue
-        if "data_source" not in props:
+        if _row.data_source and "data_source" not in props:
             props["data_source"] = genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description=(_POINT_DATA_SOURCE_SCHEMA_DESC
-                             if _fd.name in _POINT_IN_TIME_TOOLS - _WINDOW_ONLY_TOOLS
+                description=(_POINT_DATA_SOURCE_SCHEMA_DESC if _row.data_source == POINT
                              else _DATA_SOURCE_SCHEMA_DESC),
             )
-        if _fd.name in _POINT_IN_TIME_TOOLS and "timestamp" not in props:
+        if _row.timestamp and "timestamp" not in props:
             props["timestamp"] = genai.types.Schema(
                 type=genai.types.Type.STRING, description=_TIMESTAMP_SCHEMA_DESC
             )

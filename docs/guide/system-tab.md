@@ -61,9 +61,9 @@ generation costs), *synthetic* (a fixed rule, shown under the tables) or
 to its default; **Back to defaults** resets one unit, **Reset all to defaults**
 every unit.
 
-The costs are kept for the economic flexibility studies; the current
-optimisations minimise the change in dispatch, so changing a cost does not yet
-change any result. CONDUCTOR says so if asked.
+The costs price the [corrective options](asking-questions.md#corrective-options)
+and decide which one is cheapest. The default corrective dispatch minimises the
+change in dispatch, so a cost does not change it. CONDUCTOR says so if asked.
 
 ### Load power factor
 
@@ -87,4 +87,6 @@ tab per kind of element; **Edit** on a row opens the rename form, and
 - CONDUCTOR can rename too: *"Rename Bus 3 to North."*
 
 Renames, costs, generator models and the power factor are kept for the network
-across restarts; see [Sessions and scenarios](sessions-and-scenarios.md).
+across restarts; see [Sessions and scenarios](sessions-and-scenarios.md). When
+CONDUCTOR changes any of them in an answer, the answer says so and offers
+**Undo** (see [Reading an answer](reading-an-answer.md#answers-that-changed-a-setting)).

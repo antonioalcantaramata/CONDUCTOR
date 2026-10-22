@@ -248,6 +248,18 @@ def _row_of(net, name: str) -> tuple[str, object]:
     raise ModelError(f"There is no unit {name!r}.")
 
 
+def _move_cost(net, table: str, idx, new_table: str, new_idx) -> None:
+    """The case's cost row follows its unit to the table its control needs
+    (costs.py reads it there): left behind, the unit fell back to synthetic
+    costs, and a unit later created at the freed index took them over."""
+    pc = net.get("poly_cost")
+    if pc is None or not len(pc):
+        return
+    rows = (pc["et"] == table) & (pc["element"] == idx)
+    pc.loc[rows, "et"] = new_table
+    pc.loc[rows, "element"] = new_idx
+
+
 def apply(loaded_net, model: dict):
     """A copy of the network as loaded with `model` applied: units moved to the
     table their control needs, set-points and limits set. Raises ModelError."""
@@ -271,15 +283,18 @@ def apply(loaded_net, model: dict):
         if want["control"] == VOLTAGE:
             if table == "sgen":
                 net.sgen.drop(index=idx, inplace=True)
-                idx = pp.create_gen(net, vm_pu=want["vm_pu"] or 1.0, name=name, **common)
-                table = "gen"
+                new = pp.create_gen(net, vm_pu=want["vm_pu"] or 1.0, name=name, **common)
+                _move_cost(net, "sgen", idx, "gen", new)
+                table, idx = "gen", new
             net.gen.at[idx, "vm_pu"] = float(want["vm_pu"] or 1.0)
             net.gen.at[idx, "min_q_mvar"] = float(want["q_min_mvar"])
             net.gen.at[idx, "max_q_mvar"] = float(want["q_max_mvar"])
         else:
             if table == "gen":
                 net.gen.drop(index=idx, inplace=True)
-                idx = pp.create_sgen(net, q_mvar=0.0, name=name, **common)
+                new = pp.create_sgen(net, q_mvar=0.0, name=name, **common)
+                _move_cost(net, "gen", idx, "sgen", new)
+                idx = new
                 if "substation_name" in net.sgen.columns:
                     net.sgen.at[idx, "substation_name"] = name
                 table = "sgen"

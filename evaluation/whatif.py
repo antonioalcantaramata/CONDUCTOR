@@ -27,15 +27,17 @@ import argparse
 import datetime
 import json
 import pathlib
+import re
 import sys
 from typing import NamedTuple
 
+from llm_agent.agent.tool_registry import OVER_TIME
 from llm_agent.agent.validators import PROPOSAL_NOTE_PREFIX
 
 from .report import grade_record
 
-_OVER_TIME = frozenset({"find_worst_case_timestamp", "scan_rsa_over_time", "scan_scenarios",
-                        "get_element_timeseries", "compute_historical_risk", "run_probabilistic_rsa"})
+# Studies that look at more than one moment: the same list the advisor uses.
+_OVER_TIME = OVER_TIME
 
 
 class Task(NamedTuple):
@@ -195,11 +197,101 @@ def check(spec: dict, records: list[dict]) -> bool:
                                                          and entry["result"].get("error"))
             for call, entry in zip(rec.get("tool_calls") or [], rec.get("tool_results") or []))
             for rec in records)
+    if kind == "options":
+        # optimize_flexibility in options mode, with each given argument.
+        return any(call.get("name") == "optimize_flexibility" and result.get("mode") == "options"
+                   and all(_arg_matches(want, (call.get("args") or {}).get(key))
+                           for key, want in spec.get("args", {}).items())
+                   for call, result in _successful(records))
+    if kind == "result":
+        # Some successful call of `tool` returned these fields.
+        return any(call.get("name") == spec["tool"] and all(_same(v, result.get(k)) for k, v in spec["fields"].items())
+                   for call, result in _successful(records))
+    if kind == "not_tool_arg":
+        # No call of `tool` passed `arg` naming this value (e.g. a unit ruled
+        # out sent to disabled_generators, which takes it out of service).
+        return not any(call.get("name") == spec["tool"] and _arg_matches(spec["value"], (call.get("args") or {}).get(spec["arg"]))
+                       for rec in records for call in rec.get("tool_calls") or [])
+    if kind == "any":
+        # Passes when any of the given checks does — two valid ways to the same end.
+        return any(check(sub, records) for sub in spec["of"])
+    if kind == "no_winner":
+        # The orchestrator presents options; it does not choose one.
+        return not any(_PICKS.search(rec.get("assistant") or "") for rec in records)
+    if kind == "quotes_alternatives":
+        # The answer names a unit some near-optimal alternative avoids or adds.
+        units = {u for _, r in _successful(records) for o in r.get("options") or []
+                 for u in (o.get("avoids") or []) + (o.get("adds") or [])}
+        text = " ".join(rec.get("assistant") or "" for rec in records)
+        return bool(units) and any(u in text for u in units)
+    if kind == "asked_first":
+        # That turn put a question to the operator and ran nothing: no study,
+        # no change — looking an element up or reading the clock is allowed.
+        rec = _turn(records, spec.get("turn", 0))
+        return rec is not None and "?" in (rec.get("assistant") or "") and not _acted(rec)
+    if kind == "choices":
+        # The question offered numbered choices ("1. … 2. …").
+        rec = _turn(records, spec.get("turn", 0))
+        return rec is not None and len(_CHOICE_RE.findall(rec.get("assistant") or "")) >= 2
+    if kind == "ran":
+        # That turn ran a study (or a given tool, with the given arguments)
+        # without stopping to ask.
+        rec = _turn(records, spec.get("turn", 0))
+        if rec is None:
+            return False
+        calls = [(c, r) for c, r in _successful([rec]) if c.get("name") not in LOOKUPS]
+        return any((not spec.get("tool") or call.get("name") == spec["tool"])
+                   and all(_arg_matches(want, (call.get("args") or {}).get(key))
+                           for key, want in spec.get("args", {}).items())
+                   for call, _ in calls)
     raise ValueError(f"Unknown check kind {kind!r}")
 
 
-def evaluate(task: Task, records: list[dict]) -> dict[str, bool]:
-    return {spec["label"]: check(spec, records) for spec in (*task.checks, *_ALWAYS)}
+# Tools that only look something up: calling one before asking is not acting
+# (the same list the answer checks use to recognise a clarifying question).
+from llm_agent.agent.provenance import LOOKUP_TOOLS as LOOKUPS  # noqa: E402
+_CHOICE_RE = re.compile(r"(?m)^\s*(?:[-*]\s*)?(?:\*\*)?\(?[1-9][.)]")
+
+
+def _turn(records: list[dict], turn: int) -> dict | None:
+    """The record of one turn of the task (0 = the first question)."""
+    return records[turn] if 0 <= turn < len(records) else None
+
+
+def _acted(rec: dict) -> bool:
+    """Whether a turn called anything beyond a lookup (a study or a change)."""
+    return any(call.get("name") not in LOOKUPS for call in rec.get("tool_calls") or [])
+
+
+# Phrases that choose an option for the operator. Deliberately narrow: "the
+# cheapest option costs…" describes; "I recommend the cheapest" chooses.
+_PICKS = re.compile(r"\b(I (?:would )?recommend|I(?:'d| would) (?:choose|pick|go with|take)|my recommendation|"
+                    r"you should (?:choose|pick|go with|take)|the best option is|the best choice is)\b", re.IGNORECASE)
+
+
+def _arg_matches(want, got) -> bool:
+    """A requested argument against the call's: a value in a list is enough
+    for list arguments ("Gen_bus1" in hold_units)."""
+    if isinstance(got, list):
+        return any(_same(want, g) for g in got) if not isinstance(want, list) else \
+            all(any(_same(w, g) for g in got) for w in want)
+    return got is not None and _same(want, got)
+
+
+def evaluate(task: Task, records: list[dict], always: tuple = None) -> dict[str, bool]:
+    return {spec["label"]: check(spec, records) for spec in (*task.checks, *(_ALWAYS if always is None else always))}
+
+
+class Suite(NamedTuple):
+    """A set of tasks, the checks every task gets, and the network it is written for."""
+    name: str
+    tasks: tuple[Task, ...]
+    always: tuple
+    needs: str               # a substring of the loaded network's name
+    scenario: str            # the scenario that loads it
+
+
+WHATIF = Suite("whatif", TASKS, _ALWAYS, "14", "Demo: IEEE 14 · smaller")
 
 
 # ---------------------------------------------------------------------------
@@ -250,26 +342,27 @@ def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[d
     return records
 
 
-def run(tasks: list[Task], repeats: int, out_dir: pathlib.Path, follow_suggestion: bool = False) -> pathlib.Path:
+def run(tasks: list[Task], repeats: int, out_dir: pathlib.Path, follow_suggestion: bool = False,
+        suite_kind: str = "whatif") -> pathlib.Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     for task in tasks:
         for k in range(1, repeats + 1):
-            print(f"[whatif] {task.id} run {k}/{repeats}", flush=True)
+            print(f"[{suite_kind}] {task.id} run {k}/{repeats}", flush=True)
             try:
                 records = run_task(task, k, follow_suggestion)
             except Exception as exc:  # noqa: BLE001 — one failed run must not end the batch
                 records = [{"turn": 0, "status": "runner_error", "runner_error": str(exc)}]
             with open(out_dir / f"{task.id}-{k:02d}.jsonl", "w", encoding="utf-8") as fh:
-                fh.write(json.dumps({"kind": "whatif", "task": task.id, "repeat": k,
+                fh.write(json.dumps({"kind": suite_kind, "task": task.id, "repeat": k,
                                      "follow_suggestion": follow_suggestion}) + "\n")
                 for rec in records:
                     fh.write(json.dumps(rec, default=str) + "\n")
     return out_dir
 
 
-def grade(out_dir: pathlib.Path) -> dict:
+def grade(out_dir: pathlib.Path, suite: Suite = WHATIF) -> dict:
     """{task: {"runs": n, "checks": {label: passes}, "findings": {code: count}}}."""
-    by_id = {t.id: t for t in TASKS}
+    by_id = {t.id: t for t in suite.tasks}
     summary: dict = {}
     for path in sorted(pathlib.Path(out_dir).glob("*.jsonl")):
         lines = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
@@ -279,7 +372,7 @@ def grade(out_dir: pathlib.Path) -> dict:
             continue
         entry = summary.setdefault(task.id, {"runs": 0, "checks": {}, "findings": {}})
         entry["runs"] += 1
-        for label, ok in evaluate(task, records).items():
+        for label, ok in evaluate(task, records, suite.always).items():
             entry["checks"][label] = entry["checks"].get(label, 0) + int(ok)
         for rec in records:
             for f in grade_record(rec).findings:
@@ -302,8 +395,8 @@ def render(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m evaluation.whatif", description=__doc__,
+def main(argv: list[str] | None = None, suite: Suite = WHATIF, doc: str | None = None) -> int:
+    parser = argparse.ArgumentParser(prog=f"python -m evaluation.{suite.name}", description=doc or __doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="show the tasks")
@@ -320,32 +413,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "list":
-        for t in TASKS:
+        for t in suite.tasks:
             print(f"{t.id}: " + " → ".join(t.turns))
         return 0
     if args.command == "grade":
-        summary = grade(pathlib.Path(args.folder))
+        summary = grade(pathlib.Path(args.folder), suite)
         print(json.dumps(summary, indent=1) if args.json else render(summary))
         return 0
 
     wanted = [s for s in args.tasks.split(",") if s.strip()]
-    tasks = [t for t in TASKS if not wanted or t.id in wanted]
-    unknown = set(wanted) - {t.id for t in TASKS}
+    tasks = [t for t in suite.tasks if not wanted or t.id in wanted]
+    unknown = set(wanted) - {t.id for t in suite.tasks}
     if unknown:
         print(f"Unknown task(s): {sorted(unknown)}", file=sys.stderr)
         return 2
     turns = sum(len(t.turns) + int(args.follow_suggestion) for t in tasks) * args.repeats
     name = _backend("get", "/api/grid_constants").get("name", "")
-    if "14" not in str(name):
-        print(f"Warning: the tasks are written for the IEEE 14-bus profile; the backend has {name!r}.")
+    if suite.needs not in str(name):
+        print(f"Warning: the tasks are written for another network than {name!r}. "
+              f"Load the '{suite.scenario}' scenario first.")
     print(f"{len(tasks)} task(s) × {args.repeats} repeats = {turns} agent turns"
           + (" plus one suggestion call per run" if args.follow_suggestion else "")
           + ". Every turn calls the configured model and spends credit.")
     if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
         return 1
-    out = pathlib.Path(args.out or f"evaluation_runs/whatif-{datetime.datetime.now():%Y%m%d-%H%M}")
-    run(tasks, args.repeats, out, args.follow_suggestion)
-    print(render(grade(out)))
+    out = pathlib.Path(args.out or f"evaluation_runs/{suite.name}-{datetime.datetime.now():%Y%m%d-%H%M}")
+    run(tasks, args.repeats, out, args.follow_suggestion, suite_kind=suite.name)
+    print(render(grade(out, suite)))
     print(f"\nRecords: {out}")
     return 0
 

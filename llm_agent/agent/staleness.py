@@ -18,6 +18,8 @@ Pure data in, pure data out: no Streamlit, no HTTP.
 
 from __future__ import annotations
 
+from .tool_registry import READS, REGISTRY
+
 
 def stamp(tool_results: list, assumptions: dict | None) -> dict | None:
     """What an answer's studies ran under; None when it ran no study.
@@ -25,7 +27,11 @@ def stamp(tool_results: list, assumptions: dict | None) -> dict | None:
     `tool_results`: the turn's (tool name, result) pairs. `assumptions`: the
     backend's `/api/assumptions` payload read after the turn (for the data key).
     """
-    results = [r for _, r in tool_results or [] if isinstance(r, dict) and "error" not in r]
+    # Studies only: a tool that changes a setting reports the setting it set,
+    # not settings a study ran under (an answer that set pf 0.90 and was
+    # undone did not "compute under 0.90").
+    results = [r for name, r in tool_results or [] if isinstance(r, dict) and "error" not in r
+               and (name not in REGISTRY or REGISTRY[name].effect == READS)]
     if not results:
         return None
     pf, gm = None, None

@@ -20,6 +20,8 @@ import json
 import re
 from datetime import datetime
 
+from .trace import seconds as trace_seconds
+
 # ---------------------------------------------------------------------------
 # A small Markdown subset — what the answers use: headings, paragraphs, lists,
 # tables, bold / italic / code, links. Everything is escaped first.
@@ -146,6 +148,8 @@ section > h2 { font-size:1.05rem; text-transform:uppercase; letter-spacing:.08em
 .turn.user { background:#eef3fd; border-color:#d6e3fb; }
 .turn.user .who { color:var(--blue); }
 .turn .who.conductor { color:var(--blue); }
+.settings { display:inline-block; font-size:.82rem; color:#1d4f9c; background:rgba(29,111,232,.08);
+  border:1px solid rgba(29,111,232,.3); border-radius:999px; padding:.15rem .7rem; margin:.3rem 0; }
 .stale { display:inline-block; font-size:.82rem; color:var(--warn); background:rgba(240,170,30,.12);
          border:1px solid rgba(240,170,30,.35); border-radius:999px; padding:2px 10px; margin:6px 0; }
 .chart-caption { color:var(--muted); font-size:.85rem; margin:14px 0 4px; }
@@ -238,6 +242,8 @@ def _evidence_html(trace) -> str:
         f"<li><code>{html.escape(s.name)}</code>"
         f"{' — ' + html.escape(json.dumps(s.args, default=str)) if s.args else ''}"
         f"{'' if s.ok else ' — <span class=concern>failed: ' + html.escape(str(s.error)) + '</span>'}"
+        f"{' · reused (same as step ' + str(s.reused_from) + ')' if s.reused_from is not None else ''}"
+        f"{' · ' + trace_seconds(s.duration_s) if s.duration_s is not None and s.reused_from is None else ''}"
         f"{' · carried forward: ' + html.escape(s.inherited_summary) if s.inherited_summary else ''}</li>"
         for s in trace.steps)
     figures = "".join(
@@ -247,6 +253,9 @@ def _evidence_html(trace) -> str:
     concerns = "".join(f"<li class='concern'>{html.escape(c)}</li>" for c in trace.concerns)
     limits = "".join(f"<li>{html.escape(x)}</li>" for x in trace.limits)
     parts = []
+    timing = trace.timing_line() if hasattr(trace, "timing_line") else None
+    if timing:
+        parts.append(f"<p><strong>Time</strong> {html.escape(timing)}</p>")
     if steps:
         parts.append(f"<p><strong>Tools that ran</strong></p><ol>{steps}</ol>")
     if figures:
@@ -276,6 +285,11 @@ def build(messages: list[dict], meta: dict, *, charts_html=None, plotly_js: str 
                          "</div>")
             continue
         body = ["<div class='who conductor'>CONDUCTOR</div>", markdown(msg.get("text", ""))]
+        change = msg.get("settings_change") or {}
+        if change.get("lines"):
+            shown = html.escape(" · ".join(change["lines"]))
+            body.append(f"<div class='settings'>{'↶ Undone afterwards — ' if change.get('undone') else '⚙ '}"
+                        f"This answer changed the session's settings: {shown}</div>")
         why = stale(msg) if stale else []
         if why:
             body.append(f"<div class='stale'>⏱ Computed under other settings than the ones above: "

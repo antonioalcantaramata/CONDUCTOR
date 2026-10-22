@@ -94,7 +94,7 @@ class TestReset:
         assert (systems / "last_uploaded.json").exists()
 
         r = client.post("/api/network/reset_active", json={})
-        assert r.status_code == 200 and r.json()["n_buses"] == 14
+        assert r.status_code == 200 and r.json()["n_buses"] == 30          # the default demo, IEEE 30
         assert not (systems / "last_uploaded.json").exists()
         assert not (data / "last_uploaded_timeseries.json").exists()
 

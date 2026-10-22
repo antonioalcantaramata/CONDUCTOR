@@ -47,6 +47,27 @@ class _C:
     NEUTRAL = "#9AA3B2"     # no data, uncontrollable, reference
     INK = "#2E3140"         # text, zero lines
     GRID = "#ECEFF5"
+    # Two more categorical hues, for series that need five (the flexibility
+    # options). With PRIMARY, TEAL and PURPLE they pass the palette validator
+    # (lightness band, chroma, colour-blind separation, contrast on white).
+    MAGENTA = "#D9578F"
+    OLIVE = "#7B8A12"
+    # A sixth, for the sixth strategy: passes against every one of the five
+    # (normal vision; against OLIVE in the 6–8 colour-blind band, so the
+    # legend and the labels carry the name too).
+    SIENNA = "#A0522D"
+
+
+# One colour per flexibility strategy, whatever else an answer shows: the
+# colour follows the option, never its rank.
+OPTION_COLOURS = {"least_disturbance": _C.PRIMARY, "cheapest": _C.TEAL, "fewest_units": _C.PURPLE,
+                  "without_main_unit": _C.MAGENTA, "least_import": _C.OLIVE, "most_headroom": _C.SIENNA,
+                  # A near-optimal set holds the cheapest and its alternatives only,
+                  # an N-1 set the least-disturbance, the cheapest and the secure
+                  # ones: the validated hues are reused, each once per chart.
+                  "near_optimal_1": _C.PURPLE, "near_optimal_2": _C.MAGENTA, "near_optimal_3": _C.OLIVE,
+                  "n1_preventive": _C.PURPLE, "n1_corrective": _C.MAGENTA}
+_PRICE_SOURCES = {"case": "the case file", "synthetic": "the synthetic rule", "operator": "your changes"}
 
 
 pio.templates["conductor"] = go.layout.Template(
@@ -387,6 +408,16 @@ _VIOLATION_COLORS = {
 _PROBLEM_LABELS = {"line_loading": "Line overload", "trafo_loading": "Transformer overload"}
 
 
+def _screened(result: dict) -> str:
+    """What an N-1 screen ran on: the schedule, or a corrective option applied."""
+    option = result.get("option") or {}
+    if not option:
+        return "N-1 screen"
+    applied = f"with option {option.get('ref')} ({option.get('label')}) applied"
+    return (f"N-1-1 screen after the outage of {option['after_outage']}, {applied}" if option.get("after_outage")
+            else f"N-1 screen {applied}")
+
+
 def render_contingency_violations(result: dict):
     """N-1 results: which outage causes what, worst first.
 
@@ -416,7 +447,8 @@ def render_contingency_violations(result: dict):
     violations = result.get("violations") or []
     if not violations:
         if result.get("system_secure") or result.get("system_n1_secure"):
-            return _empty_figure("✅ No violations detected", color=_C.OK)
+            secure = "✅ No violations detected"
+            return _empty_figure(f"{secure} — {_screened(result)}" if result.get("option") else secure, color=_C.OK)
         return figs or _empty_figure("No violation data available")
 
     vlo = _float_or_none(thresholds.get("vm_lower_pu"))
@@ -468,7 +500,7 @@ def render_contingency_violations(result: dict):
                "fill_color": [["#fdecea" if r[3] != "—" else "white" for r in shown]]},
     ))
     if is_full_sweep:
-        title = (f"N-1 screen — {result.get('total_outages_causing_violations', '?')} of "
+        title = (f"{_screened(result)} — {result.get('total_outages_causing_violations', '?')} of "
                  f"{result.get('total_outages_tested', '?')} outages cause violations")
     else:
         title = "Violations after the outage"
@@ -535,6 +567,179 @@ def _render_post_opf_voltages(result: dict) -> go.Figure | None:
     return fig
 
 
+def _render_options(result: dict) -> list[go.Figure]:
+    """optimize_flexibility(options=true): the options side by side — a
+    copyable table of the same figures for every option, then the change each
+    asks of every unit (active power; reactive power when any option moves it).
+    No option is highlighted: the operator chooses."""
+    when = str(result.get("timestamp") or "")[:16]
+    if result.get("status") == "no_action_needed":
+        return [_empty_figure(f"No corrective action needed at {when}: the schedule meets every limit", _C.OK)]
+    options = [o for o in result.get("options") or [] if isinstance(o, dict)]
+    if not options:
+        return [_empty_figure("No corrective options were found")]
+
+    def num(v, fmt):
+        return format(v, fmt) if isinstance(v, (int, float)) and not isinstance(v, bool) else "—"
+
+    headers = ["Option", "What it does", "Units called", "MW moved", "Mvar moved", "Import MW",
+               "Cost €/h", "Above cheapest €/h", "Lowest V p.u.", "Highest loading %", "Power flow"]
+
+    def checked(o):
+        """The independent AC power flow with the option's dispatch applied."""
+        check = o.get("power_flow_check") or {}
+        if not check:
+            return "—"
+        if check.get("confirmed"):
+            return "✓ confirmed"
+        first = (check.get("violations") or ["not confirmed"])[0]
+        return "✗ " + (first if len(first) <= 40 else first[:39] + "…")
+    def name(o):
+        also = " and ".join(o.get("also") or [])
+        return o.get("label", o.get("id")) + (f" (also {also})" if also else "")
+
+    rows = [[name(o), o.get("how", ""), str(o.get("n_units_called", "—")),
+             num(o.get("moved_mw"), ".2f"), num(o.get("moved_mvar"), ".2f"), num(o.get("import_mw"), ".1f"),
+             num(o.get("cost_eur_per_h"), ".2f"), num(o.get("above_cheapest_eur_per_h"), "+.2f"),
+             num(o.get("min_vm_pu"), ".3f"), num(o.get("max_loading_pct"), ".1f"), checked(o)] for o in options]
+    sources = [_PRICE_SOURCES.get(k, k) for k in (result.get("costs") or {}).get("prices_from") or {}]
+    kept = list(result.get("held_units") or {})
+    after = f" after the outage of {result['outage']['element']}" if (result.get("outage") or {}).get("element") else ""
+    held = (f" with {', '.join(kept)} at {'its' if len(kept) == 1 else 'their'} schedule" if kept else "")
+    caps = result.get("branch_limits") or {}
+    if caps:
+        held += (" and " if held else " with ") + ", ".join(f"{_tag(n)} at most {p:g} %" for n, p in caps.items())
+    study = result.get("n1_study") or {}
+    table = go.Figure(go.Table(
+        columnwidth=[1.2, 2.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0, 0.9, 1.0, 1.1],
+        header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
+                "font": {"size": 12}},
+        cells={"values": [list(col) for col in zip(*rows)], "align": "left", "height": 26, "font": {"size": 12}},
+    ))
+    table.update_layout(
+        title=((f"Near-optimal alternatives{after} at {when}<br><sup>Each meets every limit{held} and costs at most "
+                f"{result.get('budget_eur_per_h', 0):.2f} €/h ({result.get('near_optimal_pct', 0):g} % above the "
+                f"cheapest) · prices from {', '.join(sources) or 'the cost table'}</sup>")
+               if result.get("set") == "near_optimal" else
+               (f"Options for N-1 security{after} at {when}<br><sup>{len(study.get('outages_studied') or [])} critical "
+                f"outage(s) studied ({' and '.join(study.get('modes') or [])}) · each meets every limit{held} with "
+                f"everything in service · prices from {', '.join(sources) or 'the cost table'}</sup>")
+               if result.get("set") == "n1" else
+               (f"Corrective options{after} at {when}<br><sup>Each meets every limit{held} · cost of the action, "
+                f"prices from {', '.join(sources) or 'the cost table'}</sup>")),
+        height=140 + 56 * len(rows), **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
+    figures = [table]
+    if result.get("set") == "n1":
+        figures += _n1_tables(options, study, when)
+
+    for key, unit, title, threshold in (("dp_mw", "MW", "Change in active power by option", 0.01),
+                                        ("dq_mvar", "Mvar", "Change in reactive power by option", 0.05)):
+        units = []
+        for o in options:
+            for row in o.get("dispatch") or []:
+                if abs(row.get(key) or 0.0) >= threshold and row.get("unit") not in units:
+                    units.append(row.get("unit"))
+        if not units:
+            continue
+        fig = go.Figure()
+        for o in options:
+            by_unit = {row.get("unit"): row.get(key) or 0.0 for row in o.get("dispatch") or []}
+            fig.add_trace(go.Bar(
+                name=o.get("label", o.get("id")), y=_safe_labels(units, "Unit"),
+                x=[by_unit.get(u, 0.0) for u in units], orientation="h",
+                marker={"color": OPTION_COLOURS.get(o.get("id"), _C.NEUTRAL), "cornerradius": 4},
+                hovertemplate="%{y}: %{x:+.2f} " + unit + "<extra>" + str(o.get("label", "")) + "</extra>"))
+        fig.update_layout(**CHART_THEME, barmode="group", bargap=0.35, bargroupgap=0.08,
+                          title=f"{title} ({unit}) — {when}", xaxis_title="", yaxis_title="",
+                          height=max(260, 26 * len(units) * max(1, len(options)) + 160),
+                          legend={"orientation": "h", "y": -0.12, "x": 0, "entrywidth": 150,
+                                  "entrywidthmode": "pixels"})
+        fig.add_vline(x=0, line={"color": _C.INK, "width": 1})
+        figures.append(fig)
+    return figures
+
+
+def _tag(name) -> str:
+    """"Bus_21 -> Bus_23 [L30]" -> "L30"; a name without a tag as it is."""
+    found = re.search(r"\[([^\]]+)\]\s*$", str(name))
+    return found.group(1) if found else str(name)
+
+
+def _n1_tables(options: list[dict], study: dict, when: str) -> list[go.Figure]:
+    """An N-1 set: each option's N-1 screen and what its study secured, then
+    the corrective plan of a corrective option — what to do after each outage."""
+    def table(headers, rows, widths, title, row_height):
+        fig = go.Figure(go.Table(
+            columnwidth=widths,
+            header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
+                    "font": {"size": 12}},
+            cells={"values": [list(col) for col in zip(*rows)], "align": "left", "height": 26, "font": {"size": 12}}))
+        fig.update_layout(title=title, height=118 + row_height * len(rows),
+                          **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
+        return fig
+
+    studied = study.get("outages_studied") or []
+    figures, rows = [], []
+    for o in options:
+        n1 = o.get("n1") or {}
+        screen = n1.get("screen") or {}
+        if not screen:
+            continue
+        found = (f"{screen.get('outages_with_violations', '—')} of {screen.get('outages_tested', '—')}"
+                 + (" before its action" if n1.get("screen_is") else ""))
+        if "secured" in n1:
+            secured = f"{n1['secured']} of {len(n1.get('studied') or studied)}"
+            missing = ", ".join(_tag(x.get("outage")) for x in n1.get("not_secured") or []) or "none"
+        else:
+            secured, missing = "not studied", "—"
+        cost = o.get("cost_eur_per_h")
+        gap = o.get("above_cheapest_eur_per_h")
+        rows.append([o.get("label", o.get("id")), found, str(screen.get("violations", "—")), secured, missing,
+                     f"{cost:.2f}" if isinstance(cost, (int, float)) else "—",
+                     f"{gap:+.2f}" if isinstance(gap, (int, float)) else "—"])
+    if rows:
+        band = study.get("post_outage_band_pu") or []
+        limits = (f"after an outage up to {study.get('emergency_loading_pct', 100):g} % of rating"
+                  + (f", voltages {band[0]:g}–{band[1]:g} p.u." if len(band) == 2 else ""))
+        figures.append(table(
+            ["Option", "Outages with violations", "Violations", "Studied outages secured", "Not secured",
+             "Cost €/h", "Above cheapest €/h"], rows, [1.4, 1.3, 0.8, 1.1, 1.3, 0.8, 1.0],
+            f"N-1 screen of each option at {when}<br><sup>Every line and transformer out in turn; {limits} · "
+            "a corrective option is screened before its action</sup>", 28))
+    for o in options:
+        plan = (o.get("n1") or {}).get("corrective_plan") or []
+        if not plan:
+            continue
+        units = sorted({str(a.get("unit")) for p in plan for a in p.get("actions") or []},
+                       key=lambda u: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", u)])
+
+        def cell(p, unit):
+            a = next((a for a in p.get("actions") or [] if a.get("unit") == unit), None)
+            if a is None:
+                return "—"
+            parts = [f"{a['dp_mw']:+.2f} MW"] if abs(a.get("dp_mw") or 0.0) >= 0.005 else []
+            if "setpoint_vm_pu_after" in a:
+                parts.append(f"V {a['setpoint_vm_pu_before']:.3f}→{a['setpoint_vm_pu_after']:.3f}")
+            return ", ".join(parts) or "—"
+
+        def outcome(p):
+            if p.get("no_action_needed"):
+                return "✓ no action needed"
+            if p.get("checked_by_power_flow"):
+                return "✓ confirmed"
+            first = (p.get("after_action") or ["not confirmed"])[0]
+            return "✗ " + (first if len(first) <= 40 else first[:39] + "…")
+        rows = [[p.get("outage", "")] + [cell(p, u) for u in units] + [outcome(p)] for p in plan]
+        reach = study.get("reach_pct")
+        figures.append(table(
+            ["After the outage of"] + units + ["Power flow"], rows, [1.6] + [1.0] * len(units) + [1.4],
+            f"Corrective plan of {o.get('label', o.get('id'))} at {when}<br><sup>What to do after each studied "
+            f"outage: active power change{f' (at most {reach:g} % of capacity)' if reach else ''} and voltage "
+            "set-points · each checked by a power flow without the outaged branch</sup>",
+            48 if any("V " in c for r in rows for c in r[1:-1]) else 28))
+    return figures
+
+
 def render_dispatch(result: dict) -> list[go.Figure]:
     """
     Grouped bar chart for optimize_flexibility / optimize_contingency results.
@@ -550,6 +755,8 @@ def render_dispatch(result: dict) -> list[go.Figure]:
       2. Grey       — P_base (operating point OPF departs from).
       3. Green/orange — P_new (OPF result).
     """
+    if result.get("mode") == "options" and result.get("feasible") is not False:
+        return _render_options(result)
     # Any failed solve, not just the one spelled "infeasible": an iteration
     # limit or a capped solve that cannot meet its cap used to fall through to
     # "No dispatch data — run the optimizer first".

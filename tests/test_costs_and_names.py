@@ -75,7 +75,7 @@ class TestCaseCosts:
 
     @pytest.mark.parametrize("change, reason", [
         ({"unit": "Gen_bus1", "q_band_tan_phi": 0.3}, "external grid only"),
-        ({"unit": "External grid", "q_eur_per_mvarh": 3}, "applies to units"),
+        ({"unit": "External grid", "q_eur_per_mvarh": 3}, "units only"),
         ({"unit": "External grid", "q_band_tan_phi": 5}, "between"),
     ])
     def test_reactive_fields_belong_where_they_apply(self, change, reason):
@@ -221,20 +221,87 @@ class TestRenames:
 
 
 def test_the_launcher_says_what_is_kept_and_start_fresh_clears_it(client):
-    _ok(client.post("/api/scenario", json={"name": "ieee14"}))
+    _ok(client.post("/api/scenario", json={"name": "ieee30"}))
     _ok(client.post("/api/names", json={"changes": [{"element_type": "bus", "element": "Bus_3", "name": "North"}]}))
     _ok(client.post("/api/costs", json={"changes": [{"unit": "Gen_bus1", "up_eur_per_mwh": 90}]}))
     _ok(client.post("/api/proposals/edit", json={"proposal": "p1", "edits": [
         {"op": "scale", "element_type": "load", "all": True, "factor": 1.1}]}))
-    _ok(client.post("/api/scenario", json={"name": "ieee14_reactive"}))
+    _ok(client.post("/api/scenario", json={"name": "ieee30_reactive"}))
     kept = {o["name"]: o.get("kept") for o in _ok(client.get("/api/scenario"))["options"]}
-    assert kept["ieee14"] == kept["ieee14_reactive"] == {"renames": 1, "costs": 1, "proposals": 1}  # one network
+    assert kept["ieee30"] == kept["ieee30_reactive"] == {"renames": 1, "costs": 1, "proposals": 1}  # one network
+    assert kept["ieee14"] is None                                                         # another network
     assert kept["resume"] is None
     # Switching back restores them; Start fresh clears them, live and saved.
-    _ok(client.post("/api/scenario", json={"name": "ieee14"}))
+    _ok(client.post("/api/scenario", json={"name": "ieee30"}))
     assert _ok(client.get("/api/names"))["renamed"]
-    out = _ok(client.post("/api/scenario/forget", json={"name": "ieee14"}))
+    out = _ok(client.post("/api/scenario/forget", json={"name": "ieee30"}))
     assert all(o.get("kept") is None for o in out["options"])
     assert _ok(client.get("/api/names"))["renamed"] == [] and _ok(client.get("/api/costs"))["changed"] == {}
     assert _ok(client.get("/api/proposals"))["proposals"] == []
     assert client.post("/api/scenario/forget", json={"name": "resume"}).status_code == 400
+
+
+class TestTheCostTool:
+    """The model changes one price per item: a model that fills in every
+    property it is shown turned "reactive price to 0" into all eight prices
+    at 0 (seen live, and refused again and again)."""
+
+    @pytest.fixture
+    def posted(self, monkeypatch):
+        from llm_agent.agent import tools
+        sent = []
+        monkeypatch.setattr(tools, "_post", lambda path, body: sent.append(body) or {"ok": True})
+        return tools, sent
+
+    def test_items_are_grouped_by_unit(self, posted):
+        tools, sent = posted
+        tools.set_unit_costs(changes=[{"unit": u, "field": "q_eur_per_mvarh", "value": 0}
+                                      for u in ("Gen_bus1", "Gen_bus2")]
+                             + [{"unit": "Gen_bus1", "field": "up_eur_per_mwh", "value": 80, "to_default": False},
+                                {"unit": "External grid", "field": "q_band_tan_phi", "to_default": True}])
+        assert sent == [{"changes": [{"unit": "Gen_bus1", "q_eur_per_mvarh": 0, "up_eur_per_mwh": 80},
+                                     {"unit": "Gen_bus2", "q_eur_per_mvarh": 0},
+                                     {"unit": "External grid", "q_band_tan_phi": None}], "reset": False}]
+
+    @pytest.mark.parametrize("item, says", [
+        ({"unit": "Gen_bus1", "q_eur_per_mvarh": 0}, "give unit, field"),        # the old one-object-per-unit shape
+        ({"unit": "Gen_bus1", "field": "q_eur_per_mvarh"}, "give a value"),
+        ({"unit": "Gen_bus1", "field": "q_eur_per_mvarh", "value": True}, "give a value"),
+    ])
+    def test_an_incomplete_item_is_refused_before_the_backend(self, posted, item, says):
+        tools, sent = posted
+        assert says in tools.set_unit_costs(changes=[item])["error"] and sent == []
+
+    def test_to_default_beside_a_value(self, posted):
+        tools, sent = posted
+        item = {"unit": "Gen_bus1", "field": "up_eur_per_mwh", "to_default": True}
+        tools.set_unit_costs(changes=[{**item, "value": 0}])           # a filled-in blank: back to default
+        assert sent[-1]["changes"] == [{"unit": "Gen_bus1", "up_eur_per_mwh": None}]
+        assert "not both" in tools.set_unit_costs(changes=[{**item, "value": 80}])["error"]
+
+    def test_the_same_price_twice_is_refused(self, posted):
+        tools, sent = posted
+        twice = [{"unit": "Gen_bus1", "field": "q_eur_per_mvarh", "value": v} for v in (0, 1)]
+        assert "given twice" in tools.set_unit_costs(changes=twice)["error"] and sent == []
+
+    def test_the_schema_offers_one_price_per_item(self):
+        from llm_agent.agent import tool_schemas as ts
+        decl = {fd.name: fd for t in ts.TOOLS for fd in t.function_declarations}["set_unit_costs"]
+        item = decl.parameters.properties["changes"].items
+        assert set(item.properties) == {"unit", "field", "value", "to_default"}
+        assert set(item.properties["field"].enum) == set(uc.FIELDS)          # the backend's prices, all of them
+
+
+def test_reactive_price_of_every_unit_to_zero_end_to_end(client, monkeypatch):
+    """The request that failed live, through the tool to the backend: only the
+    reactive prices change."""
+    from llm_agent.agent import tools
+    monkeypatch.setattr(tools, "_post", lambda path, body: _ok(client.post(path, json=body)))
+    before = {u["unit"]: u for u in _ok(client.get("/api/costs"))["units"]}
+    units = [name for name, u in before.items() if u["kind"] != "external_grid"]
+    tools.set_unit_costs(changes=[{"unit": u, "field": "q_eur_per_mvarh", "value": 0} for u in units])
+    after = {u["unit"]: u for u in _ok(client.get("/api/costs"))["units"]}
+    for name in units:
+        assert after[name]["q_eur_per_mvarh"] == 0
+        assert {k: after[name][k] for k in uc.PRODUCTION + uc.REDISPATCH} == \
+               {k: before[name][k] for k in uc.PRODUCTION + uc.REDISPATCH}

@@ -1,0 +1,32 @@
+name: "PGLib IEEE 30-Bus System (Alsac–Stott)"
+source: matpower
+matpower_path: "systems/pglib_opf_case30_as.m"
+measurement_source: synthetic
+synthetic_n_days: 7
+synthetic_resolution_min: 15
+synthetic_load_profile: "residential"
+# Five dispatchable units with their own quadratic costs: each runs at about
+# 60 % of its capacity, so every one can move up or down.
+synthetic_generation_profile: "flat"
+synthetic_peak_load_factor: 1.05
+synthetic_forecast_overlap_days: 2
+ext_grid_vm_pu: 1.0
+# The units are synchronous machines: as loaded they hold a voltage set-point,
+# as the case's own data describe them (1.025 p.u. at its two PV buses, 1.0 at
+# the three units it places at load buses), not power factor 1.0. At power
+# factor 1.0 this case cannot hold its voltages (below 0.9 p.u. most hours).
+unit_model:
+  Gen_bus1: {control: voltage, vm_pu: 1.025}
+  Gen_bus12: {control: voltage, vm_pu: 1.025}
+  Gen_bus4: {control: voltage, vm_pu: 1.0}
+  Gen_bus7: {control: voltage, vm_pu: 1.0}
+  Gen_bus10: {control: voltage, vm_pu: 1.0}
+precomputed_ybus_path: null
+slack_max_mw: 999.0
+vm_lower: 0.95
+vm_upper: 1.05
+max_loading_pct: 100.0
+voltage_level_kv: 135
+grid_type: "transmission"
+slack_name: "External Grid"
+description: "Synthetic 7-day profile generated from the bundled PGLib IEEE 30-bus (Alsac–Stott) MATPOWER case: five dispatchable units with their own costs, line ratings from PGLib."

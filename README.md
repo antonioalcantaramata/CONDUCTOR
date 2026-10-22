@@ -16,6 +16,17 @@ without touching the loaded network, every figure in an answer is traced to the
 solver that produced it, and an advisor — a second agent that runs no studies —
 suggests next steps and discusses results with the operator.
 
+Corrective actions come as **options to choose from**, not one answer: the
+least disturbance, the cheapest, the fewest units, the most headroom,
+near-optimal alternatives that use other units, branches held below a chosen
+share of their rating, and dispatches that stay secure after an outage
+(preventive, or with a corrective plan per outage — a security-constrained OPF).
+Each is re-checked by an ordinary AC power flow, and the operator chooses: the
+advisor helps weigh what the solver cannot see. When a question leaves open
+something that changes the answer, the agent asks before running. A session can
+be exported as a raw record or as a report written by the model, and saved as
+context to continue from later.
+
 The agent runs on a **hosted model** or a **local model via Ollama**, picked
 on a launch screen grouped into tiers:
 
@@ -55,9 +66,9 @@ do once it is running: [getting started](docs/guide/getting-started.md),
   Pyomo/IPOPT) exposed as tools.
 - **`llm_agent/`** — Streamlit chat app and the LLM agent that orchestrates the
   backend tools.
-- **`systems/`**, **`data_files/`** — networks and time-series data (a small
-  bundled IEEE case and an example CSV are included; everything else is generated
-  or user-supplied at runtime).
+- **`systems/`**, **`data_files/`** — networks and time-series data (the bundled
+  demos — PGLib's IEEE 30-bus case, the default, and IEEE 14 — and an example
+  CSV are included; everything else is generated or user-supplied at runtime).
 
 ## Requirements
 
@@ -159,7 +170,7 @@ also filters to models that report it.
 
 ### What to expect
 
-The agent sends a large prompt — the system instructions plus 27 tool schemas
+The agent sends a large prompt — the system instructions plus 29 tool schemas
 come to roughly **28,000 tokens before any conversation** (measured with
 Gemini's token counter; CONDUCTOR estimates it at startup and refines it from
 the token counts providers report). Hosted models absorb
@@ -179,7 +190,7 @@ isn't the thing that waits. Keeping the model resident (`OLLAMA_KEEP_ALIVE`,
 default 60 min) is what keeps subsequent questions fast.
 
 A smaller model processes the prompt proportionally faster, at some cost to how
-reliably it picks the right tool among twenty-seven.
+reliably it picks the right tool among twenty-nine.
 
 ### Context window
 
@@ -189,9 +200,13 @@ front, which is where the system prompt lives. That produces a model that looks
 functional but has lost its instructions.
 
 CONDUCTOR sets the window explicitly and refuses over-long prompts rather than
-letting them be truncated. The launch screen suggests a size based on your
-machine's detected memory and warns if the value you choose is too small for the
-prompt or larger than your RAM comfortably allows.
+letting them be truncated. The default is **65,536 tokens**: the prompt takes
+~28k before any conversation, and one study's results can add several thousand
+more (a set of corrective options is ~6k), so a 32k window fills within a
+question or two. The launch screen suggests a size based on your machine's
+detected memory and warns if the value you choose is too small for the prompt or
+larger than your RAM comfortably allows; on a small machine, set
+`OLLAMA_NUM_CTX` lower and expect shorter conversations.
 
 ## Configuration
 
@@ -217,7 +232,7 @@ Key choices:
 | `ANTHROPIC_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
 | `ANTHROPIC_THINKING` | `1` (default) for adaptive thinking; `0` to disable |
 | `OLLAMA_MODEL` | any tool-capable model you have pulled |
-| `OLLAMA_NUM_CTX` | context window — must exceed the ~28k-token prompt |
+| `OLLAMA_NUM_CTX` | context window — must exceed the ~28k-token prompt (default 65536) |
 | `OLLAMA_KEEP_ALIVE` | how long the model and its prompt cache stay resident |
 
 The OpenAI provider drives two endpoints. Newer reasoning models **refuse
@@ -393,9 +408,10 @@ If you use CONDUCTOR in your work, please cite the paper
 ```
 
 The paper describes an earlier version of CONDUCTOR. It has changed a great deal
-since — network proposals and their comparison, the advisor, free, paid and local
-model options, measured reactive power and data quality, generator models, unit
-costs, renaming and more — so please also name the version you used (the git
+since — network proposals and their comparison, the advisor, corrective options
+and N-1 secure dispatches, free, paid and local model options, measured reactive
+power and data quality, generator models, unit costs, renaming and more — so
+please also name the version you used (the git
 commit) and its settings, as described in
 [Using CONDUCTOR in research](docs/research/using-conductor-in-research.md#citing).
 

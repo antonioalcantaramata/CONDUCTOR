@@ -9,7 +9,7 @@ Usage:
     py start.py                # Windows
 
 Environment overrides:
-    GRID_PROFILE=ieee14        # bundled network profile (default: pglib_case14)
+    GRID_PROFILE=pglib_case14  # bundled network profile (default: pglib_case30)
     BACKEND_PORT=8010          # FastAPI port   (default: 8000)
     STREAMLIT_PORT=8502        # Streamlit port (default: 8501)
     BACKEND_HOST=0.0.0.0       # bind address   (default: 127.0.0.1 — keep it
@@ -68,7 +68,7 @@ def streamlit_url_host(host: str = STREAMLIT_HOST) -> str:
     """Where the chat app is reached: localhost, unless it is bound to one
     specific address — then only that address answers."""
     return "localhost" if host in _WILDCARD_OR_LOCAL else host
-GRID_PROFILE = os.environ.get("GRID_PROFILE", "pglib_case14")
+GRID_PROFILE = os.environ.get("GRID_PROFILE", "pglib_case30")
 
 # Enable ANSI colours (the empty os.system call switches on VT processing in
 # legacy Windows consoles; harmless elsewhere).

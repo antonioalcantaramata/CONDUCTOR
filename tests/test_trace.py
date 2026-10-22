@@ -481,3 +481,64 @@ class TestArgumentLegibility:
         ))
         summary = trace.steps[0].inherited_summary
         assert "1.045" in summary and "the request" in summary
+
+
+class TestTiming:
+    RECORD = {"user": "q", "assistant": "a", "tool_calls": [{"name": "run_rsa", "args": {}, "duration_s": 3.2}],
+              "tool_results": [{"name": "run_rsa", "result": {"ok": 1}}],
+              "timing": {"total_s": 14.2, "model_s": 9.8, "studies_s": 3.2, "checks_s": 0.05,
+                         "model_calls": 4, "waited_for_rate_limit": False}}
+
+    def test_the_breakdown(self):
+        t = build(self.RECORD)
+        assert t.steps[0].duration_s == 3.2
+        assert t.timing_line() == "14 s — model 9.8 s (4 calls), studies 3.2 s, checks <0.1 s, other 1.1 s"
+        assert t.headline().endswith("· 14 s")
+
+    def test_a_rate_limit_wait_is_said(self):
+        record = {**self.RECORD, "timing": {**self.RECORD["timing"], "waited_for_rate_limit": True}}
+        assert "waiting for a rate limit" in build(record).timing_line()
+
+    def test_older_records_have_no_timing(self):
+        record = {k: v for k, v in self.RECORD.items() if k != "timing"}
+        t = build(record)
+        assert t.timing_line() is None and t.headline() == "1 tool"
+
+    @pytest.mark.parametrize("value, shown", [(0.03, "<0.1 s"), (2.345, "2.3 s"), (42.4, "42 s"),
+                                              (125, "2 min 5 s")])
+    def test_seconds(self, value, shown):
+        from llm_agent.agent.trace import seconds
+        assert seconds(value) == shown
+
+
+def test_the_report_shows_the_time():
+    from llm_agent.agent import report
+    html_text = report._evidence_html(build(TestTiming.RECORD))
+    assert "<strong>Time</strong> 14 s — model 9.8 s" in html_text and "run_rsa" in html_text and "3.2 s" in html_text
+
+
+class TestAClarifyingQuestion:
+    """A question put to the operator before anything ran (rule 32 of the
+    system prompt) proposes figures; it does not claim them."""
+
+    QUESTION = ("Three lines run into Bus_23. Which one should I take out?\n\n"
+                "1. **L30**: Bus_21 -> Bus_23 (suggested)\n2. **L31**: Bus_22 -> Bus_23 at 80 %\n3. 90 %")
+    LOOKUP = [{"name": "locate_network_element", "args": {"element": "Bus_23"}}]
+
+    def test_its_choices_raise_no_concern(self):
+        trace = build(_record(self.QUESTION, calls=self.LOOKUP,
+                              results=[{"name": "locate_network_element", "result": {"name": "Bus_23"}}],
+                              user="Simulate losing the line into Bus_23 at 20:00, and how loaded does it get in %?"))
+        assert trace.concerns == ()
+        assert not any(f.value in (80, 90) for f in trace.figures)
+
+    def test_a_figure_stated_in_the_question_itself_is_still_checked(self):
+        trace = build(_record("L30 is at 77.9 % now. How far below its rating do you want it?\n1. 70 %\n2. 60 %",
+                              calls=[], results=[]))
+        assert any(f.value == pytest.approx(77.9) and not f.traced for f in trace.figures)
+        assert not any(f.value in (70, 60) for f in trace.figures)
+
+    def test_a_study_turn_is_an_answer_whatever_it_ends_with(self):
+        trace = build(_record("Which do you prefer?\n1. Bus_3 at 0.8123 p.u.\n2. Bus_4"))   # run_rsa ran
+        assert any(f.value == pytest.approx(0.8123) and not f.traced for f in trace.figures)
+

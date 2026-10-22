@@ -17,13 +17,15 @@ backend/
 ├── rsa_engine.py            ← Real-time security assessment (power flow + limits)
 ├── ca_engine.py             ← Contingency assessment (single outage)
 ├── flex_engine.py           ← Pyomo + IPOPT optimizer, Ybus helpers
+├── flex_options.py          ← Several corrective dispatches (strategies), priced
+├── scopf.py                 ← Security-constrained OPF: N-1 preventive / corrective options
 ├── element_names.py         ← One spelling of every bus/line/trafo name
 ├── load_gen_assignment.py   ← Maps measurement rows → pandapower loads/sgens
 ├── network_loader.py        ← Load networks, gen→sgen conversion, build Ybus
 ├── sandbox.py               ← Network proposals: edits, validation, profiles
 ├── synthetic_timeseries.py  ← Generate synthetic measurement + forecast series
 ├── pipeline_functions.py    ← Optional external time-series data client
-└── network_profiles/        ← Bundled grid profiles (YAML): pglib_case14, ieee14
+└── network_profiles/        ← Bundled grid profiles (YAML): pglib_case30 (default), pglib_case14, ieee14
 ```
 
 The files other than `main_backend.py` are computation **engines**;
@@ -94,7 +96,7 @@ stay fast:
 
 1. Load the saved **scenario** (`systems/scenario.json`, chosen in the app —
    see *Starting scenarios* below): a demo, or Resume — the last uploaded
-   network, else the profile named by `GRID_PROFILE` (defaults to `pglib_case14`).
+   network, else the profile named by `GRID_PROFILE` (defaults to `pglib_case30`).
 2. Load the network (MATPOWER `.m`, pandapower JSON/Excel, or UCTE).
 3. Generate (or restore) the **measurement** and **forecast** time-series.
 4. Apply the first operating point and run a seed power flow.
@@ -106,8 +108,16 @@ stay fast:
 | Scenario | Loads |
 |---|---|
 | `resume` | The last uploaded network and data (the "last uploaded" records). Only offered once something has been uploaded. |
-| `ieee14` | PGLib IEEE 14-bus with its synthetic week, active power only (loads use the load power factor). The nominal operating point is included. |
-| `ieee14_reactive` | The same network and week plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
+| `ieee30` (default) | PGLib IEEE 30-bus (Alsac–Stott, `pglib_case30`) with its synthetic week, active power only (loads use the load power factor). Five dispatchable units with the case's own quadratic costs, loaded on voltage control (the profile's `unit_model`); the line from the external grid congests at the evening peaks (about 11 of 168 hours with a violation). The nominal operating point is included. |
+| `ieee30_reactive` | The same network and week plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
+| `ieee14` | PGLib IEEE 14-bus (`pglib_case14`) with its synthetic week, active power only. Its week is unchanged (`twin_peak` demand shape), so the what-if evaluation written for it still holds. |
+
+A profile can carry `unit_model` — the starting model of named units (e.g.
+`Gen_bus1: {control: voltage, vm_pu: 1.025}`), applied by `generators.apply`
+before the network is recorded as loaded, so "reset to as loaded" returns to it.
+MATPOWER cases are read by `network_loader.read_matpower`, which puts back as
+generators the units pandapower makes static generators (those at load buses):
+every unit is then converted, named and priced the same way.
 
 `GET /api/assumptions` also returns `data_key`, which changes whenever other
 measurements or forecasts are loaded (a hash of a few sums, so it survives a
@@ -262,7 +272,9 @@ the base, the capacities and the admittances, re-checks the proposals (those tha
 no longer apply are dropped and reported) and is saved with the load power factor
 in `systems/assumptions.json`, keyed to the network as loaded (restored before the
 proposals at startup). Defaults reproduce the previous behaviour: generators with
-active power at pf 1.0 (Q = 0), condensers on voltage control. `gen_to_sgen` keeps
+active power at pf 1.0 (Q = 0), condensers on voltage control — unless the profile's
+`unit_model` says otherwise (the IEEE 30 demo loads its units on voltage control). A
+unit moved between tables takes its case cost row with it. `gen_to_sgen` keeps
 a converted unit's set-point and reactive limits on its row (`orig_*`) so it can go
 back to voltage control. In the OPF every voltage-controlled unit keeps its own Q
 limits (they used to get the power-factor cone whenever they had active power).
@@ -283,8 +295,92 @@ redispatch costs are synthetic until changed. Every figure carries its source
 the defaults, saved with the other assumptions. Read from the network as loaded,
 keyed by unit name. `gen_to_sgen` now moves a converted unit's `poly_cost` row with
 it and renumbers the generators kept (before, case14's 23.27 €/MWh sat on the
-bus-2 condenser). No OPF uses the costs yet: they are kept for the economic
-objective of the flexibility work (B.6 step 3).
+bus-2 condenser). The costs price the flexibility options (below); the default
+corrective dispatch does not use them.
+
+**Flexibility options** (`flex_options.py`, `POST /api/flexibility/optimize` with
+`options: true`): instead of the one least-disturbance dispatch, several, each the
+solution of a strategy on a copy of the same capped OPF model — least disturbance
+(the default objective), cheapest (cost of the action at the cost table's prices),
+fewest units changing active power, without the unit that moves most, least
+import (then least disturbance under that import), most headroom (the lowest
+highest branch loading: an epigraph variable over every branch's current², then
+least disturbance). Every option meets the same
+limits and is scored the same way: units called, MW and Mvar moved, import, cost
+of the action against the schedule (doing nothing costs 0; less import is a
+saving) and its gap to the cheapest, voltages and the most loaded branch.
+`select` drops duplicates and options no better than another on any count (least
+disturbance always stays), at most five — beyond that, the option closest to another
+shown goes (never least disturbance or cheapest); the response says why each strategy
+not shown was not shown — and an option that is best of all on some count is never the
+one capped. Units called count *instructions* (`Option.instructions`): a change of
+active power, of the voltage set-point of a unit that holds one (the OPF's bus voltage
+against the schedule's), or of the reactive output of one that does not; fewest units
+and without-unit give the other units no instruction at all (`keep_setpoints`).
+Every option carries `power_flow_check` (`_power_flow_check`): its dispatch applied
+to the network — active power, voltage set-points of units that hold one, reactive
+output of the others — and solved by pandapower's AC power flow, independently of
+the OPF model: voltages, loadings (against 100 % of the ratings), import, units'
+reactive limits, `confirmed` and the first violations.
+Each options set is kept in memory (`_remember_options`, last 20; cleared when another
+network is loaded) under `set_id`, each option under `ref` (`S2:cheapest`).
+`POST /api/contingency/simulate_all` with `option` resolves it (`_resolve_option`:
+refused if unknown, or if the unit models, names or load power factor changed since),
+rebuilds its moment, network and load level (refused if the request names others),
+applies its outage if it had one, then its dispatch (`_apply_option_dispatch`), and
+sweeps every outage: N-1 of the option, or N-1-1 after its outage; the result echoes
+`option`.
+`near_optimal: true` (with `options`) returns instead the cheapest option and up to three
+near-optimal alternatives (`generate_near_optimal`, Hop-Skip-Jump MGA): each solves the
+same capped OPF with `add_cost` bounded by `near_optimal_budget` (`near_optimal_pct`
+above the cheapest, default 10, with a 1 €/h floor) and minimises |ΔP| weighted
+`USED_WEIGHT` on the units earlier options moved; each reports `avoids` / `adds`
+against the cheapest, and the result its `budget_eur_per_h`.
+`hold_units` keeps named units at their schedule (pinned through `fixed_setpoints` at
+their MW at that moment) in the one dispatch and in every option — in options their
+set-points too — and every result echoes `held_units`; an unknown unit is refused by name. When the schedule already meets the limits the answer is
+`no_action_needed`, not a menu. `add_cost` builds the cost as a Pyomo expression
+and `action_cost` evaluates it on a solution, so a near-optimal search (cost ≤
+(1+ε)·cheapest) can reuse both.
+
+**Branch caps** (`branch_limits: {"L30": 80}` on `/api/flexibility/optimize` and
+`/api/contingency/optimize`): `_branch_caps` resolves each name (tag, buses or full
+name, `_branch_index`; unknown refused with examples; 10–100 %) to the engine's
+`branch_limits` (`flex_engine.optimization_model_base`: the current limit of those
+branches is the cap instead of `current_safety_margin`), so the one dispatch and
+every option respect it; the power-flow check holds each option to it too, and
+results echo `branch_limits` by full name.
+
+**N-1 security study** (`n1: "preventive" | "corrective" | "both"`, `scopf.py`,
+`_n1_study`): options that also stay within limits after the critical outages — a
+security-constrained OPF. Each post-outage state is the same
+`optimization_model_base` model built on the network without that branch, one
+Pyomo block per state under a parent model with the base case:
+- *preventive*: every unit's active power is linked to the base case; a unit that
+  holds a voltage keeps its set-point, any other its reactive output;
+- *corrective*: each unit may move its active power by at most `n1_reach_pct` of
+  its capacity (default 20) and change its set-point; the moves are split into
+  up/down variables and costed by absolute value (plus a small quadratic term), so
+  a plan changes as few units as it can.
+Post-outage limits are soft (`scopf.soften`): a slack per branch current
+(`n1_emergency_loading_pct`, default the network's limit: 100 % of rating on
+the bundled networks) and per bus voltage (the
+band; set-point buses stay hard), so a solution always exists and says what no
+dispatch can secure. Two stages (`secure_first`): least total violation, then —
+keeping it — least disturbance and smallest corrective actions. Outages: the
+operator's (`n1_outages`, studied alone) or the critical ones from the
+least-disturbance option's N-1 screen (`_critical_outages`, at most
+`_N1_MAX_OUTAGES` = 8, the worst first), then the new dispatch is screened and
+outages it fails are added (`_N1_ROUNDS` = 2). Outages that island a bus are
+skipped with the reason. The result (`set: "n1"`, `n1_study`) holds least
+disturbance, cheapest and the secure options; each carries `n1.screen` (the
+ordinary N-1 sweep, `_n1_sweep`, with loading up to `n1_emergency_loading_pct` —
+by default the network's own limit, the one a plain N-1 screen uses, so the two
+agree), and a secure one `studied`, `secured`,
+`not_secured` (what remains, by branch and bus name) and, corrective,
+`corrective_plan`: per outage the actions (MW, set-point) — or `no_action_needed`
+when a power flow of the dispatch without the branch already holds — each checked
+by `_power_flow_check` on that network. `n1` with `near_optimal` is refused.
 
 **Names** (`naming.py`, `GET/POST /api/names`): the operator renames buses, lines,
 transformers, loads and units; every result uses the new name. A layer over the
@@ -310,7 +406,7 @@ measurement row it reads, not a name).
 
 | Group | Endpoints |
 |---|---|
-| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee14\|ieee14_reactive`) |
+| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee30\|ieee30_reactive\|ieee14`) |
 | **State / clock** | `GET /api/grid_constants`, `GET /api/time/current`, `GET /api/time/timeline`, `POST /api/time/advance` |
 | **Upload** | `POST /api/network/upload`, `POST /api/data/upload` (`kind=measurements\|forecasts`), `GET /api/data/template` (a CSV for the loaded network: substation names, the first hour as example values, the optional reactive columns), `GET /api/data/quality`, `POST /api/network/snapshot` |
 | **Security** | `POST /api/grid/rsa`, `POST /api/rsa/worst_case`, `POST /api/rsa/scan_scenarios`, `POST /api/rsa/probabilistic`, `POST /api/rsa/historical_risk`, `POST /api/grid/element_timeseries` |

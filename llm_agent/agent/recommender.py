@@ -30,6 +30,7 @@ import re
 from typing import Any, NamedTuple
 
 from . import usage
+from .tool_registry import OVER_TIME
 from .provenance import MISATTRIBUTED, UNGROUNDED, check_answer, collect_sources, subject_names
 
 logger = logging.getLogger(__name__)
@@ -147,7 +148,8 @@ results, and any concerns the system raised);
 _SHARED_RULES = """\
 Always:
 - Do not state engineering figures except those that appear in the turn \
-records or the conversation, copied exactly. Never estimate, extrapolate or \
+records or the conversation — copied, or rounded as the conversation shows \
+them (114.7 %, not 114.66441216357369 %). Never estimate, extrapolate or \
 calculate. Figures you write are checked against the session, and any that \
 are not found are flagged to the operator.
 - Never claim the result of a study that has not been run.
@@ -162,10 +164,12 @@ Never rely on "the same as before" or "that bus".
 - A bus in `voltage_controlled_buses` is held at its setpoint by a unit: its \
 voltage is not a weak spot. Its margin is that unit's `q_headroom_up_mvar`.
 - Concerns that start with "answer check:" are about how the answer was \
-written, found by deterministic checks — not about the grid. Say plainly what \
-each means for the operator (e.g. a figure the tools never produced) and, \
-where a study would settle it, propose that study; never restate an \
-unverified figure as if it were confirmed.
+written, found by deterministic checks — not about the grid. These checks \
+match text and can be wrong, so present each as what the check flagged ("the \
+check could not trace 114.7 % to that bus"), never as a confirmed error; look \
+at the turn record yourself and say whether it bears the flag out. Where a \
+study would settle it, propose that study; never restate an unverified figure \
+as if it were confirmed.
 - A result carrying a `network` block was computed on a network proposal, \
 not on the loaded network; name the proposal whenever you refer to it.
 - To look beyond one moment at a proposal, `compare_networks` with study \
@@ -246,7 +250,49 @@ grid's state (voltages, loadings, security, margins); only the session context \
 describes the network.
 
 Respond with JSON only, in this format:
-{{"reply": "...", "studies": [{{"title": "...", "prompt": "...", "why": "..."}}]}}
+{{"reply": "...", "studies": [{{"title": "...", "prompt": "...", "why": "..."}}], "criteria": ["..."]}}
+"criteria": what the operator has said matters for the decision so far, in their words, short \
+("Gen_bus1 untrusted today", "as few instructions as possible") — all of them, not only new ones; \
+[] when none.
+"""
+
+# Added to the discussion when the session holds corrective options: the
+# solver made and scored them; the advisor helps the operator choose.
+_OPTIONS_TASK = """The session holds corrective options (listed under "Corrective options"): \
+several dispatches the solver generated and scored the same way, each meeting \
+every limit. Each is named by its turn and id, e.g. T3·cheapest — use those \
+names. They exist because the solver cannot see everything the operator \
+weighs: how far a unit can be trusted today, how fast someone answers, \
+contracts, the cost of issuing instructions.
+
+Rules for options:
+1. Opening ("Discuss these options"): a short neutral reading of the \
+trade-offs, in solver figures only (units called, MW moved, import, cost and \
+gap to the cheapest, lowest voltage, highest loading); then 2 or 3 questions \
+specific to THESE options — e.g. when several lean on the same unit, ask how \
+far that unit can be trusted today; when the cheapest calls more units, ask \
+what an instruction costs the operator. No recommendation yet, unless the \
+operator has already said what matters; then compare on that instead.
+2. Never pick a winner on your own. Asked for your view, give it as your \
+view, against the criteria stated, quoting each option's solver figures.
+3. A criterion the solver can act on becomes a study at once, written so \
+CONDUCTOR can run it: a unit ruled out → "Give me corrective options at \
+<timestamp> with <unit> held at its schedule (hold_units)", on the same \
+network and limits; when cost matters but a unit is doubted, the near-optimal \
+alternatives (near_optimal: within a margin of the cheapest, changing other \
+units); the same options at another hour; the N-1 screen of an option ("Run \
+the N-1 screen with option <its ref> applied" — the ref is in the options \
+list, e.g. S2:cheapest; a plain N-1 screens the schedule); options for the \
+corrective action after an outage; branches held below a share of their \
+rating ("... with L30 kept below 80 % (branch_limits)") when a loading worries \
+the operator; the N-1 secure options ("... secure under N-1, preventive and \
+corrective (n1)") when security after an outage matters. Never claim what \
+such a study will show.
+5. N-1 secure options (n1_preventive, n1_corrective): secure only for the \
+outages their study lists ("n1_study"), at that moment; compare their N-1 screens and what security costs \
+against the cheapest; a corrective option relies on its plan being carried \
+out after the outage — ask whether the operator can.
+4. An option the operator refers to that is not listed does not exist: say so.
 """
 
 _NOTE_TASK = """\
@@ -256,6 +302,10 @@ Write a short decision note from the thread and the session.
 Rules for the note:
 1. "decision": what the operator decided, in their words or close to them. If \
 no decision was reached, write "No decision recorded" and say what remains open.
+   If the operator chose one of the corrective options, "chosen_option" is its \
+name exactly as listed (e.g. "T3·cheapest"), else null; its figures are added \
+from the solver result, so do not restate them. "criteria": what the operator \
+said mattered, in their words.
 2. "evidence": the results the decision rests on — each naming the study and \
 the turn, figures copied exactly. Only results in the session; nothing from \
 studies that were proposed but not run.
@@ -265,7 +315,8 @@ depends on.
 Keep each item to one sentence.
 
 Respond with JSON only, in this format:
-{{"decision": "...", "evidence": ["..."], "open_risks": ["..."], "studies_run": ["..."]}}
+{{"decision": "...", "chosen_option": "T3·cheapest or null", "criteria": ["..."], "evidence": ["..."], \
+"open_risks": ["..."], "studies_run": ["..."]}}
 """
 
 def capability_list() -> list[tuple[str, str]]:
@@ -309,9 +360,11 @@ def build_system_prompt(capabilities: list[tuple[str, str]] | None = None) -> st
                    change_angle=_CHANGE_ANGLE)
 
 
-def build_discussion_prompt(capabilities: list[tuple[str, str]] | None = None) -> str:
-    """The discussion mode: a side thread with the operator."""
-    return _prompt(_DISCUSS_TASK, "Here you are the operator's advisor: they think a result "
+def build_discussion_prompt(capabilities: list[tuple[str, str]] | None = None, options: bool = False) -> str:
+    """The discussion mode: a side thread with the operator. With `options`,
+    the rules for discussing corrective options are added."""
+    return _prompt(_DISCUSS_TASK + ("\n" + _OPTIONS_TASK if options else ""),
+                   "Here you are the operator's advisor: they think a result "
                    "through with you, and decide what to do and what to study next.",
                    "the side discussion so far", capabilities)
 
@@ -377,10 +430,8 @@ def compact_turn(record: dict, max_chars_per_tool: int = 3000) -> dict:
     return {"question": record.get("user") or "", "tools": tools}
 
 
-# Studies that look at more than one moment.
-_OVER_TIME = frozenset({"find_worst_case_timestamp", "scan_rsa_over_time", "scan_scenarios",
-                        "get_element_timeseries", "compute_historical_risk", "run_probabilistic_rsa",
-                        "forecast_kpis"})
+# Studies that look at more than one moment (tool_registry).
+_OVER_TIME = OVER_TIME
 
 
 def proposal_gaps(record: dict | None) -> list[str]:
@@ -572,6 +623,82 @@ def session_digest(records: list[dict], latest: dict | None) -> str:
     return "\n".join(head + list(reversed(kept)))
 
 
+# What a corrective option is shown with, copied from the solver result.
+OPTION_FIGURES = ("ref", "label", "also", "units_called", "units_changing_p", "moved_mw", "moved_mvar", "import_mw",
+                  "cost_eur_per_h", "above_cheapest_eur_per_h", "min_vm_pu", "max_loading_pct", "max_loading_branch",
+                  "avoids", "adds", "power_flow_check")
+_MAX_OPTION_SETS = 3
+
+
+def option_sets(records: list[dict]) -> list[dict]:
+    """Every set of corrective options in the conversation, oldest first:
+    `{turn, timestamp, network, held_units, prices_from, options: {ref: figures},
+    not_offered}`. An option is named by its turn (its place among the turn
+    records, as in the digest) and its strategy id — "T3·cheapest" — so a
+    re-solve later in the session never changes what an earlier name means."""
+    out = []
+    for turn, record in enumerate(records or [], start=1):
+        for entry in record.get("tool_results") or []:
+            result = entry.get("result") if isinstance(entry, dict) else None
+            if entry.get("name") != "optimize_flexibility" or not isinstance(result, dict) \
+                    or result.get("mode") != "options" or not result.get("options"):
+                continue
+            options = {f"T{turn}·{o['id']}": {**{k: o[k] for k in OPTION_FIGURES if k in o},
+                                              **({"n1": _n1_figures(o["n1"])} if isinstance(o.get("n1"), dict) else {})}
+                       for o in result["options"] if isinstance(o, dict) and o.get("id")}
+            out.append({"turn": turn, "timestamp": result.get("timestamp"),
+                        "network": (result.get("network") or {}).get("id"),
+                        "held_units": result.get("held_units") or {},
+                        **({"branch_limits": result["branch_limits"]} if result.get("branch_limits") else {}),
+                        **({"n1_study": _n1_study_figures(result["n1_study"])}
+                           if isinstance(result.get("n1_study"), dict) else {}),
+                        "prices_from": (result.get("costs") or {}).get("prices_from") or {},
+                        "options": options,
+                        "not_offered": [f"{n.get('label')}: {n.get('reason')}" for n in result.get("not_offered") or []]})
+    return out
+
+
+def _n1_figures(n1: dict) -> dict:
+    """An option's N-1 figures, compact: its screen, and for a secure option
+    what its study secured and how many outages need a corrective action."""
+    out = {"screen": n1.get("screen")}
+    if "secured" in n1:
+        out["secured"] = n1["secured"]
+        out["not_secured"] = [x.get("outage") for x in n1.get("not_secured") or []]
+    plan = n1.get("corrective_plan")
+    if plan:
+        out["outages_needing_action"] = sum(1 for p in plan if not p.get("no_action_needed"))
+        out["plans_confirmed_by_power_flow"] = sum(1 for p in plan if p.get("checked_by_power_flow"))
+        out["screen_is"] = n1.get("screen_is")
+    return out
+
+
+def _n1_study_figures(study: dict) -> dict:
+    return {"modes": study.get("modes"), "outages_studied": study.get("outages_studied"),
+            "skipped": len(study.get("skipped") or []), "emergency_loading_pct": study.get("emergency_loading_pct"),
+            **({"reach_pct": study["reach_pct"]} if "reach_pct" in study else {})}
+
+
+def _ref_key(ref) -> str:
+    """"T3·cheapest", "T3 · cheapest", "t3.Cheapest": one option."""
+    return re.sub(r"[\s·.:/_-]+", "", str(ref or "")).casefold()
+
+
+def resolve_option(ref: str | None, records: list[dict]) -> dict | None:
+    """The option a decision names, with its figures copied from the solver
+    result — never the model's restatement of them. None when no option of
+    the session has that name."""
+    key = _ref_key(ref)
+    if not key:
+        return None
+    for found in option_sets(records):
+        for name, figures in found["options"].items():
+            if _ref_key(name) == key:
+                return {"ref": name, "turn": found["turn"], "timestamp": found["timestamp"],
+                        "network": found["network"], "held_units": found["held_units"], **figures}
+    return None
+
+
 def _session_parts(messages: list[dict], record: dict | None, context: dict,
                    records: list[dict] | None) -> list[str]:
     """What both modes are shown about the session."""
@@ -585,7 +712,16 @@ def _session_parts(messages: list[dict], record: dict | None, context: dict,
     attention = needs_attention(record)
     if attention:
         parts.append("## Concerns raised by the system\n" + "\n".join(f"- {r}" for r in attention))
+    sets = option_sets(records or ([record] if record else []))
+    if sets:
+        parts.append("## Corrective options (solver results; name them as listed, e.g. "
+                     f"{next(iter(sets[-1]['options']))})\n"
+                     + json.dumps(sets[-_MAX_OPTION_SETS:], ensure_ascii=False, default=str))
+    context = dict(context or {})
+    earlier = context.pop("earlier_session", None)
     parts.append("## Session context\n" + json.dumps(context, ensure_ascii=False, default=str))
+    if earlier:
+        parts.append(earlier)            # session_context.prompt_block: background, framed
     return parts
 
 
@@ -768,6 +904,8 @@ class AdvisorReply(NamedTuple):
     unverified: tuple[str, ...] = ()
     error: str = ""
     raw: str = ""
+    # What the operator has said matters for the decision, so far.
+    criteria: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -782,6 +920,11 @@ class DecisionNote(NamedTuple):
     unverified: tuple[str, ...] = ()
     error: str = ""
     raw: str = ""
+    criteria: tuple[str, ...] = ()
+    # The corrective option chosen, its figures copied from the solver result
+    # (`resolve_option`); `chosen_unresolved` is a name the session has no option for.
+    chosen_option: dict | None = None
+    chosen_unresolved: str = ""
 
     @property
     def ok(self) -> bool:
@@ -790,7 +933,8 @@ class DecisionNote(NamedTuple):
     def as_record(self) -> dict:
         return {"decision": self.decision, "evidence": list(self.evidence),
                 "open_risks": list(self.open_risks), "studies_run": list(self.studies_run),
-                "unverified": list(self.unverified)}
+                "unverified": list(self.unverified), "criteria": list(self.criteria),
+                "chosen_option": self.chosen_option, "chosen_unresolved": self.chosen_unresolved}
 
 
 def _thread_text(thread: list[dict]) -> str:
@@ -860,7 +1004,18 @@ def parse_discussion(text: str) -> AdvisorReply:
             break
     if not reply and not studies:
         return AdvisorReply("", error="The advisor returned an empty reply.", raw=text or "")
-    return AdvisorReply(reply, tuple(studies), raw=text or "")
+    return AdvisorReply(reply, tuple(studies), raw=text or "", criteria=_strings(data.get("criteria")))
+
+
+_MAX_CRITERIA = 8
+
+
+def _strings(value) -> tuple[str, ...]:
+    """A list of short strings from the model, as given; anything else, ()."""
+    if not isinstance(value, list):
+        return ()
+    out = [" ".join(str(x).split()) for x in value if isinstance(x, (str, int, float)) and str(x).strip()]
+    return tuple(dict.fromkeys(out))[:_MAX_CRITERIA]
 
 
 def parse_note(text: str) -> DecisionNote:
@@ -872,8 +1027,11 @@ def parse_note(text: str) -> DecisionNote:
         return tuple(str(x).strip() for x in (data.get(key) or []) if str(x).strip())
 
     decision = str(data.get("decision") or "").strip() or "No decision recorded"
+    chosen = str(data.get("chosen_option") or "").strip()
+    if chosen.casefold() in ("null", "none", "n/a", "-"):
+        chosen = ""
     return DecisionNote(decision, items("evidence"), items("open_risks"), items("studies_run"),
-                        raw=text or "")
+                        raw=text or "", criteria=_strings(data.get("criteria")), chosen_unresolved=chosen)
 
 
 def _call(system: str, request: str, provider):
@@ -894,7 +1052,7 @@ def discuss(question: str, thread: list[dict], messages: list[dict], latest: dic
     `why` are checked against those records and flagged when not found.
     """
     try:
-        response = _call(build_discussion_prompt(),
+        response = _call(build_discussion_prompt(options=bool(option_sets(records))),
                          build_discussion_request(question, thread, messages, latest, context, records),
                          provider)
     except Exception as exc:  # noqa: BLE001
@@ -922,6 +1080,11 @@ def decision_note(thread: list[dict], messages: list[dict], latest: dict | None,
         logger.warning("Decision note call failed.", exc_info=True)
         return DecisionNote("", error=f"The advisor could not be reached: {exc}")
     note = parse_note(response.text or "")
+    if note.ok and note.chosen_unresolved:
+        # The option's figures come from the solver result, not from the model.
+        found = resolve_option(note.chosen_unresolved, records)
+        if found is not None:
+            note = note._replace(chosen_option=found, chosen_unresolved="")
     if note.ok:
         try:
             check = _figure_check(records)
