@@ -286,9 +286,15 @@ list, e.g. S2:cheapest; a plain N-1 screens the schedule); options for the \
 corrective action after an outage; branches held below a share of their \
 rating ("... with L30 kept below 80 % (branch_limits)") when a loading worries \
 the operator; the N-1 secure options ("... secure under N-1, preventive and \
-corrective (n1)") when security after an outage matters. Never claim what \
-such a study will show.
-5. N-1 secure options (n1_preventive, n1_corrective): secure only for the \
+corrective (n1)") when security after an outage matters; for a chosen option, \
+how long it holds ("Hold option <ref> for the next 4 hours") or the next \
+action from it ("Starting from option <ref>, give me the corrective options at \
+<later timestamp>"); a plan for a peak ("A corrective plan from <start> to \
+<end>"). Never claim what such a study will show.
+5. An option that reduces load (load_reduction_mw: demand response, load \
+relief) asks customers, not units, to act: say so, and ask whether the operator \
+can call that demand response (or accept relief) before comparing it.
+6. N-1 secure options (n1_preventive, n1_corrective): secure only for the \
 outages their study lists ("n1_study"), at that moment; compare their N-1 screens and what security costs \
 against the cheapest; a corrective option relies on its plan being carried \
 out after the outage — ask whether the operator can.
@@ -576,11 +582,13 @@ _VERDICT_KEYS = (
     "status", "secure", "system_secure", "system_n1_secure", "feasible", "converged",
     "usable", "total_violations", "total_outages_tested", "total_outages_causing_violations",
     "p_any_violation", "worst_timestamp", "worst_value", "guarantee_met",
+    "set", "holds_until", "first_failure",
 )
 _ARG_KEYS = (
     "network", "proposal", "study",
     "timestamp", "data_source", "element_type", "element_index", "gen_name", "bus",
     "metric", "load_scaling_factor", "slack_max_mw", "disabled_generators",
+    "option", "from_option", "start", "end", "n1",
 )
 
 
@@ -626,7 +634,8 @@ def session_digest(records: list[dict], latest: dict | None) -> str:
 # What a corrective option is shown with, copied from the solver result.
 OPTION_FIGURES = ("ref", "label", "also", "units_called", "units_changing_p", "moved_mw", "moved_mvar", "import_mw",
                   "cost_eur_per_h", "above_cheapest_eur_per_h", "min_vm_pu", "max_loading_pct", "max_loading_branch",
-                  "avoids", "adds", "power_flow_check")
+                  "avoids", "adds", "found_by", "load_reduction_mw", "demand_response_mw", "load_relief_mw",
+                  "power_flow_check")
 _MAX_OPTION_SETS = 3
 
 

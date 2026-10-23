@@ -112,7 +112,9 @@ another way is wanted, and says what each alternative avoids or adds; holds a
 line below the share of its rating the operator names (`branch_limits`); asks
 for the N-1 security study (`n1`) when the options must stay secure after an
 outage — corrective when the operator would act after it — and says what it
-could not secure and the corrective plan; answers
+could not secure and the corrective plan; presents the last resort (demand
+response, load relief) when redispatch alone cannot clear the violations;
+holds a chosen option over the next hours; plans a peak as one window; answers
 "no action needed" when the schedule meets every limit; and leaves the choice
 to the operator. That last check is a narrow phrase check ("I recommend…",
 "the best option is…"): it catches a choice stated outright, not every way of

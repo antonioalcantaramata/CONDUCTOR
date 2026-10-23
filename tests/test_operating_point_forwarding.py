@@ -37,6 +37,7 @@ REQUIRED_ARGS = {
     "compute_hosting_capacity": {"bus": 23},
     "optimize_contingency": {"element_type": "line", "element_index": 0},
     "simulate_contingency": {"element_type": "line", "element_index": 0},
+    "flexibility_over_time": {"study": "plan"},
 }
 
 

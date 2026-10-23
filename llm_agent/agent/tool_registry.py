@@ -101,11 +101,12 @@ REGISTRY: dict[str, Tool] = {
     "optimize_robust_flexibility": Tool("Robust flexibility OPF", GROUPS[3], **_AT_A_MOMENT),
     "compute_flexibility_envelope": Tool("Flexibility envelope", GROUPS[3], **_AT_A_MOMENT),
     "compute_hosting_capacity": Tool("Hosting capacity", GROUPS[3], **_AT_A_MOMENT),
+    # Its window is its own (start, end); a held option brings its own moment.
+    "flexibility_over_time": Tool("Flexibility over time", GROUPS[3], **_OVER_A_WINDOW),
     # Key performance indicators
     "evaluate_kpis": Tool("KPI evaluation", GROUPS[4], **_AT_A_MOMENT),
-    # Point-in-time in its arguments, but it reads the next 24 h: no nominal point.
-    "forecast_kpis": Tool("KPI forecast", GROUPS[4], data_source=SERIES, timestamp=True, over_time=True,
-                          **_STUDY),
+    # Its window is its own (start, end); a held option brings its own moment.
+    "kpis_over_time": Tool("KPIs over time", GROUPS[4], **_OVER_A_WINDOW),
     # What-if proposals
     "edit_proposal": Tool("Network proposal", GROUPS[5], effect=CHANGES_PROPOSAL),
     # Names its proposals itself, so it takes no `network`.

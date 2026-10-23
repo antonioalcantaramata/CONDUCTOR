@@ -14,11 +14,13 @@ time-series in memory and runs pandapower / Pyomo+IPOPT under the hood.
 ```
 backend/
 ├── main_backend.py          ← FastAPI app + all endpoints (orchestration)
-├── rsa_engine.py            ← Real-time security assessment (power flow + limits)
+├── rsa_engine.py            ← Real-time security assessment (power flow + limits; a 1e-6 float tolerance)
 ├── ca_engine.py             ← Contingency assessment (single outage)
 ├── flex_engine.py           ← Pyomo + IPOPT optimizer, Ybus helpers
 ├── flex_options.py          ← Several corrective dispatches (strategies), priced
 ├── scopf.py                 ← Security-constrained OPF: N-1 preventive / corrective options
+│                              (load reduced after an outage when units are not enough)
+├── kpis.py                  ← Key performance indicators: the schedule against a corrective action
 ├── element_names.py         ← One spelling of every bus/line/trafo name
 ├── load_gen_assignment.py   ← Maps measurement rows → pandapower loads/sgens
 ├── network_loader.py        ← Load networks, gen→sgen conversion, build Ybus
@@ -330,12 +332,80 @@ rebuilds its moment, network and load level (refused if the request names others
 applies its outage if it had one, then its dispatch (`_apply_option_dispatch`), and
 sweeps every outage: N-1 of the option, or N-1-1 after its outage; the result echoes
 `option`.
-`near_optimal: true` (with `options`) returns instead the cheapest option and up to three
-near-optimal alternatives (`generate_near_optimal`, Hop-Skip-Jump MGA): each solves the
-same capped OPF with `add_cost` bounded by `near_optimal_budget` (`near_optimal_pct`
-above the cheapest, default 10, with a 1 €/h floor) and minimises |ΔP| weighted
-`USED_WEIGHT` on the units earlier options moved; each reports `avoids` / `adds`
-against the cheapest, and the result its `budget_eur_per_h`.
+`near_optimal: true` (with `options`) returns instead the cheapest option and up to five
+near-optimal alternatives (`generate_near_optimal`, MGA): a pool, every member the same
+capped OPF with `add_cost` bounded by `near_optimal_budget` (`near_optimal_pct` above the
+cheapest, default 10, with a 1 €/h floor), filled by `near_optimal_methods` (default all):
+`hsj` (Hop-Skip-Jump: |ΔP| weighted `USED_WEIGHT` on units earlier ones moved), `unit_ranges`
+(each unit minimised and maximised — also every unit's `near_optimal_ranges`), `objectives`
+(fewest units, least import, most headroom, least disturbance within the budget), `random`
+(seeded directions). The shown ones (`near_optimal_count`) are picked farthest-first by MW
+distance, at least `DIVERSE_MW` apart; each reports `found_by` (also in `how`) and
+`avoids` / `adds` against the cheapest, and the result its `budget_eur_per_h`.
+
+**Demand response and load relief** (`load_flex` in `flex_engine.optimization_model_base`):
+per load, `Pdr` (up to its demand response, `dr_share_pct` of its demand now) and `Pshed`
+(the rest), entering the power balance at the load's power factor — built fixed at 0, so the
+default dispatch never touches a load (the same dispatch to 1e-13 MW). Prices are per load in
+the cost table (`costs.load_table`; `GET /api/costs` → `loads`; synthetic 10 %, 150 €/MWh,
+relief 3,000 €/MWh; changed by load name or its bus). `flex_options.free_loads` frees them:
+the `demand_response` strategy (cheapest with demand response at its price; offered only when
+it uses any) and `last_resort` — when unit redispatch has no feasible dispatch (the engine's
+fold 2, or the capped re-solve), `_with_last_resort` re-solves a clone (`fe._restart`, the cap
+via `_cap_exchange`): least load reduction first (relief weighted `RELIEF_WEIGHT` × demand
+response), then least disturbance keeping it, and the cheapest with loads at their prices.
+Asked for options, the answer is that set (`set: "last_resort"`, `redispatch_alone`);
+otherwise the failure carries it as `last_resort`. Options with loads carry `load_actions`
+(load, bus, MW of each) and `_apply_option_dispatch` reduces the loads too, so their power-flow
+check and N-1 screen include it. `_switching_remedies` screens single branch openings by AC
+power flow (islanding skipped; kept when they clear a violation or relieve ≥ 10 % of the
+excess) — for a failed dispatch, and per outage an N-1 study cannot secure. In the N-1 study,
+corrective post-outage blocks may reduce load (`n1_load_reduction`, default on; scopf
+`DR_WEIGHT` / `RELIEF_WEIGHT`), the plan lists `loads`.
+
+**Carrying an option forward**: `option` on `/api/grid/rsa`, `/api/contingency/simulate`
+and `/simulate_all` applies an option (`_option_context`: its network, data and load level;
+its moment or a later one, `held`; earlier refused) via `_apply_stored_option` — at a later
+moment only its instructions (`Option.instructions`), every other unit on its schedule;
+`from_option` on `/api/flexibility/optimize` starts from it (its held set-points become the
+schedule; an option after an outage is refused there); `POST /api/flexibility/hold` holds it
+over `hours` (every tick, at most 49; with `n1`, the N-1 screen at each, at most 13), with
+`holds_until` and `first_failure`. Results echo `option` / `from_option`. Studies that do not
+apply an option (attribution, network comparison) refuse it (422). Option sets are saved
+beside the proposals (`option_sets.json`, per network fingerprint) and restored on load.
+
+**Over a window** (`_window`: `start`, `end` or `hours`, at most `moments`, evenly spaced):
+`POST /api/flexibility/plan` builds one engine model per moment, frees the units, caps the
+exchange, and solves them together — `objective` least disturbance or cheapest, plus
+`steadiness` × an L1 cost on each change of a unit's redispatch from one moment to the next
+(the first from the schedule too), optionally `ramp_pct_per_h`; it reports the plan and each
+moment solved alone (`instructions_issued`, MWh moved, € of action), each step checked by a
+power flow. `POST /api/flexibility/security_over_time` runs the flexibility study with `n1`
+at each moment (the same as asking at it) and reports, per moment, the schedule's N-1 screen,
+the cheapest and the N-1 secure options (cost, screen, secured), `security_cost_eur_per_h`
+and totals weighted by the time each moment stands for. Its moments run in parallel worker
+processes (`_run_moments`: forked, so each starts with the network, data and settings as they
+are; at most 4 and one less than the cores; `CONDUCTOR_STUDY_WORKERS` caps it, 1 runs them in
+turn, as on Windows where processes cannot be forked). A worker runs the study function itself
+(`_run_coroutine` on `optimise_flexibility.__wrapped__`: the endpoints never suspend), saves
+nothing, and returns its row with the option sets it created, which the parent keeps under
+fresh ids (`_adopt_option_sets`, refs rewritten). With `progress_id` the run reports how far it
+has got (`GET /api/progress/{id}`, no lock taken); the agent's tool polls it and the app's
+status line shows it. The backend sets `OMP_NUM_THREADS` and its kin to 1 unless already set:
+IPOPT inherits them, and on these networks multithreaded linear algebra only adds overhead
+(a 9-moment study: 78 s → 52 s in turn, 16 s with 4 workers).
+
+**Key performance indicators** (`kpis.py`, `POST /api/kpi/evaluate`, `POST /api/kpi/over_time`)
+compare two states of one moment, each by AC power flow (`_kpi_state`: violations, voltage margin,
+loading headroom, N-1 screen, dispatch): the schedule, and the schedule with a corrective action —
+the cheapest the options study finds at that moment, or `option` (its instructions held at a later
+moment). The options study hands the KPI study the model it solved (`_FLEX_MODEL_SINK`), on which
+`fo.least_moved_mw` finds the fewest MW of redispatch that clear the violations (an L1 minimum)
+and `fo.deliverable` how far the units can move within every limit, each alone and all together.
+KPI-1/2/3 keep the project notebook's names with their flaws fixed (`kpis.py` says how). A window
+runs `_kpi_moment` through `_run_moments`; its result describes each indicator once and gives each
+moment's values as `[as scheduled, with the action]`. A moment that cannot be studied is a row with
+its reason — unknown, never zero.
 `hold_units` keeps named units at their schedule (pinned through `fixed_setpoints` at
 their MW at that moment) in the one dispatch and in every option — in options their
 set-points too — and every result echoes `held_units`; an unknown unit is refused by name. When the schedule already meets the limits the answer is
@@ -412,7 +482,7 @@ measurement row it reads, not a name).
 | **Security** | `POST /api/grid/rsa`, `POST /api/rsa/worst_case`, `POST /api/rsa/scan_scenarios`, `POST /api/rsa/probabilistic`, `POST /api/rsa/historical_risk`, `POST /api/grid/element_timeseries` |
 | **Contingency (N-1)** | `POST /api/contingency/simulate`, `POST /api/contingency/simulate_all`, `POST /api/contingency/optimize` |
 | **Flexibility / OPF** | `POST /api/flexibility/optimize`, `POST /api/flexibility/robust`, `POST /api/flexibility/envelope`, `POST /api/flexibility/hosting_capacity` |
-| **KPIs** | `POST /api/kpi/evaluate`, `POST /api/kpi/forecast` |
+| **KPIs** | `POST /api/kpi/evaluate` (one moment), `POST /api/kpi/over_time` (a window, in parallel) |
 | **Network proposals** | `GET /api/proposals`, `POST /api/proposals/edit`, `DELETE /api/proposals/{id}`, `DELETE /api/proposals/{id}/edits/{n}`, `POST /api/proposals/compare` (`study=rsa\|n1\|opf\|scan` — `opf`: corrective dispatch on both; `scan`: both networks at every tick of a window; `against`: another proposal as the reference; `proposals`: up to 6 against one reference at one tick, with a ranking `table`) |
 | **External data** *(optional)* | `POST /api/eddk/fetch`, `POST /api/eddk/push` |
 

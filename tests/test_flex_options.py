@@ -97,6 +97,21 @@ class TestSelect:
         assert {"fewest_units", "most_headroom"} <= {o.id for o, _ in kept}
         assert [d["id"] for d in dropped] == ["without_main_unit"]
 
+    def test_load_reductions_are_priced_and_tell_options_apart(self):
+        prices = PRICES._replace(dr={7: 150.0}, relief={7: 3000.0})
+        base = _option("cheapest", p={"A": 12.0, "B": 5.0})
+        with_dr = base._replace(id="demand_response", dr={7: 2.0}, relief={7: 0.5})
+        cost = fo.action_cost(with_dr, prices, {"grid": 50.0}, {"grid": 0.0})
+        assert cost["demand_response"] == 300.0 and cost["load_relief"] == 1500.0
+        assert "demand_response" not in fo.action_cost(base, prices, {"grid": 50.0}, {"grid": 0.0})
+        assert with_dr.load_reduction == 2.5 and base.load_reduction == 0
+        assert not fo._same(base, with_dr) and fo._same(with_dr, with_dr._replace(id="x"))
+        assert fo._key(with_dr, cost)[-1] == 2.5            # less load reduced is better, as fewer MW moved
+
+    def test_the_last_strategy_is_demand_response(self):
+        assert list(fo.STRATEGY_FUNCTIONS)[-1] == "demand_response"
+        assert fo.NEAR_OPTIMAL_METHODS == ("hsj", "unit_ranges", "objectives", "random")
+
     def test_moved_ignores_solver_noise(self):
         assert _option(p={"A": 10.000001, "B": 5.5}).moved == {"B": 0.5}
 

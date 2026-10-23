@@ -537,8 +537,37 @@ class TestRepeatedCalls:
         assert headline.startswith("1 tool")                 # a reused step ran nothing
 
 
+_ROUNDING = 0.0005          # durations are rounded to the millisecond
+
+
+class TestProgress:
+    """A long study reports how far it has got while it runs: the loop routes
+    it to the live status, and the hook is gone once the tool returns."""
+
+    def test_progress_reaches_the_events_and_the_hook_is_cleared(self, stub):
+        from llm_agent.agent import tools as tools_module
+
+        def long_study(**kwargs):
+            tools_module._say_progress("3 of 9 moments done")
+            return {"value": 1}
+
+        stub([ModelResponse(tool_calls=[ToolCall("long", {"x": 1})]), ModelResponse(text="done")],
+             tools={"long": long_study})
+        events = []
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append((e, d)))
+        assert ("tool_progress", {"name": "long", "text": "3 of 9 moments done"}) in events
+        assert [e for e, _ in events].index("tool_progress") < [e for e, _ in events].index("tool_done")
+        assert tools_module.progress_hook is None
+
+    def test_without_a_listener_progress_is_silent(self):
+        from llm_agent.agent import tools as tools_module
+        tools_module._say_progress("nobody listens")                 # no hook: nothing, no error
+
+
 class TestTiming:
-    """Each answer records where its time went: the model, the studies, the checks."""
+    """Each answer records where its time went: the model, the studies, the checks.
+    Timed with perf_counter: on Windows before Python 3.13, monotonic ticks every
+    15.6 ms and this test failed there (a 50 ms study read as 46.9 ms)."""
 
     def test_the_record_breaks_the_time_down(self, stub, monkeypatch):
         import time as _time
@@ -556,11 +585,13 @@ class TestTiming:
         timing = records[-1]["timing"]
         assert set(timing) == {"total_s", "model_s", "studies_s", "checks_s", "model_calls",
                                "waited_for_rate_limit"}
-        assert timing["model_calls"] == 2 and timing["studies_s"] >= 0.05
-        assert timing["total_s"] >= timing["studies_s"] + timing["model_s"]
-        assert records[-1]["tool_calls"][0]["duration_s"] >= 0.05
+        # Each figure is rounded to the millisecond on its own: the parts may
+        # outgrow the total by that rounding, never by more.
+        assert timing["model_calls"] == 2 and timing["studies_s"] >= 0.05 - _ROUNDING
+        assert timing["total_s"] >= timing["studies_s"] + timing["model_s"] - 2 * _ROUNDING
+        assert records[-1]["tool_calls"][0]["duration_s"] >= 0.05 - _ROUNDING
         done = [d for e, d in events if e == "tool_done"][0]
-        assert done["duration_s"] >= 0.05
+        assert done["duration_s"] >= 0.05 - _ROUNDING
 
     def test_a_reused_or_refused_call_has_no_duration(self, stub, monkeypatch):
         records = []

@@ -45,7 +45,8 @@ those buses can be switched to follow it with one click.
 
 ### Costs
 
-Each unit's costs, in two tables with an **Edit** button per row.
+Each unit's costs, in two tables with an **Edit** button per row, and — folded
+under **Demand response and load relief** — what reducing each load costs.
 
 | Figure | Meaning |
 | --- | --- |
@@ -54,6 +55,8 @@ Each unit's costs, in two tables with an **Edit** button per row.
 | **Down €/MWh** | What each MWh of downward redispatch costs (for renewables, curtailment) |
 | **Q €/Mvarh** | What each Mvarh of reactive power the unit is asked to inject or absorb costs |
 | **External grid** | Its import price (production €/MWh); reactive exchange is free within a band (\|Q\| ≤ tan φ · \|P\|) and charged per Mvarh beyond it |
+| **DR share %, DR €/MWh** | Per load: the share that can be reduced on request (demand response) and its price |
+| **Relief €/MWh** | Per load: involuntary load relief beyond its demand response — the last resort (the value of lost load) |
 
 **Source** says where each figure comes from: *case* (the network file's own
 generation costs), *synthetic* (a fixed rule, shown under the tables) or
@@ -64,6 +67,12 @@ every unit.
 The costs price the [corrective options](asking-questions.md#corrective-options)
 and decide which one is cheapest. The default corrective dispatch minimises the
 change in dispatch, so a cost does not change it. CONDUCTOR says so if asked.
+
+No network file has demand-response figures, so every load starts with the same
+synthetic ones — 10 % reducible at 150 €/MWh, relief at 3,000 €/MWh — until you
+change them, for one load or many (*no demand response at Bus_4*). Loads are
+reduced only when you ask for options (the **With demand response** option) or
+when [redispatching the units is not enough](asking-questions.md#when-redispatching-the-units-is-not-enough).
 
 ### Load power factor
 

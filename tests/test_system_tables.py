@@ -75,3 +75,16 @@ def test_the_kept_line():
         "Your changes are kept: 1 rename · 2 cost changes · 1 proposal"
     assert t.kept_line({"load_power_factor": 1}) == "Your changes are kept: load power factor"
     assert t.kept_line({}) == "" and t.kept_line(None) == ""
+
+
+def test_loads_get_their_own_demand_response_table_and_form():
+    load = {"unit": "Load 20", "kind": "load", "bus_name": "Bus_29", "dr_share_pct": 10.0, "dr_eur_per_mwh": 150.0,
+            "relief_eur_per_mwh": 3000.0, "source": {"dr_share_pct": "synthetic", "dr_eur_per_mwh": "operator",
+                                                     "relief_eur_per_mwh": "synthetic"}, "changed": True}
+    rows = t.cost_rows([load])
+    assert list(rows) == ["loads"] and rows["loads"][0]["cells"] == ["Load 20", "Bus_29", "10", "150.00", "3000",
+                                                                     "changed + synth."]
+    assert len(t.GROUPS["loads"]["columns"]) == len(rows["loads"][0]["cells"])
+    form = t.fields_of(load)
+    assert list(form) == ["Demand response", "Load relief"] and "relief_eur_per_mwh" in form["Load relief"]
+    assert t.cost_changes(load, {"dr_eur_per_mwh": 120.0}) == {"unit": "Load 20", "dr_eur_per_mwh": 120.0}

@@ -247,6 +247,9 @@ def run_agent_turn(
         updated_history is the full conversation including this turn.
     """
     # Track execution time for performance metrics
+    # One clock for the whole answer and its parts: perf_counter is fine-grained
+    # everywhere, where monotonic ticks every 15.6 ms on Windows before Python
+    # 3.13 (a 50 ms study read as 46.9 ms, and the parts outgrew the total).
     turn_start_time = time.perf_counter()
     turn_status = "completed"  # default, may be overridden by error
     error_classification = "none"
@@ -333,7 +336,7 @@ def run_agent_turn(
                 if on_event:
                     on_event(event, data)
 
-            started = time.monotonic()
+            started = time.perf_counter()
             response = provider.chat(
                 messages=_messages_for_model(history, turn_start),
                 tools=TOOLS,
@@ -341,14 +344,14 @@ def run_agent_turn(
                 on_event=_watch,
             )
             model_calls += 1
-            timing["model_s"] += time.monotonic() - started
+            timing["model_s"] += time.perf_counter() - started
             timing["waited_for_rate_limit"] = timing["waited_for_rate_limit"] or bool(waited)
             reported = _usage.prompt_tokens_from(response.raw)
             if reported:
                 prompt_tokens.append(reported)
             if not waited:      # a latency measured across retries means nothing
                 _usage.record_latency(getattr(provider, "name", "unknown"), getattr(provider, "model", ""),
-                                      time.monotonic() - started)
+                                      time.perf_counter() - started)
 
             # 4b. Append model response to history.
             history.append(assistant_message(response))
@@ -369,9 +372,9 @@ def run_agent_turn(
                         "tool_calls": turn_tool_calls,
                         "tool_results": turn_tool_results,
                     }
-                    checked = time.monotonic()
+                    checked = time.perf_counter()
                     findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
-                    timing["checks_s"] += time.monotonic() - checked
+                    timing["checks_s"] += time.perf_counter() - checked
                     show = reflection_mode == INFORM and bool(findings or conflicts or gaps)
                     reflection_record = Reflection(
                         mode=reflection_mode,
@@ -444,9 +447,9 @@ def run_agent_turn(
                     continue
 
                 tool_fn = TOOL_DISPATCH.get(tool_name)
-                checked = time.monotonic()
+                checked = time.perf_counter()
                 verdict = validate_call(tool_name, kwargs)
-                timing["checks_s"] += time.monotonic() - checked
+                timing["checks_s"] += time.perf_counter() - checked
                 ran_s = None
                 if tool_fn is None:
                     result = {"error": f"Unknown tool: {tool_name}"}
@@ -471,22 +474,26 @@ def run_agent_turn(
                     try:
                         if on_event:
                             on_event("tool_start", {"name": tool_name, "args": kwargs})
-                        ran = time.monotonic()
+                            # A long study's progress, as it runs (tools._post_following).
+                            _tools_module.progress_hook = (
+                                lambda text, name=tool_name: on_event("tool_progress", {"name": name, "text": text}))
+                        ran = time.perf_counter()
                         try:
                             result = tool_fn(**kwargs)
                         finally:
-                            ran_s = time.monotonic() - ran
+                            ran_s = time.perf_counter() - ran
                             timing["studies_s"] += ran_s
+                            _tools_module.progress_hook = None
                         _attach_call_args(tool_name, result, kwargs)
                         if isinstance(result, dict) and "error" in result:
                             # Values that produced no result are not the turn's.
                             turn_operating_point.rollback()
                         # Check the result against itself before the model sees
                         # it; findings are attached, never substituted.
-                        checked = time.monotonic()
+                        checked = time.perf_counter()
                         integrity = validate_result(tool_name, result)
                         integrity += turn_consistency.observe(tool_name, result)
-                        timing["checks_s"] += time.monotonic() - checked
+                        timing["checks_s"] += time.perf_counter() - checked
                         if integrity:
                             result = annotate(result, integrity)
                             logger.warning("Integrity warnings from %s: %s", tool_name,
@@ -547,14 +554,14 @@ def run_agent_turn(
                         f"(`DT_MAX_AGENT_TURNS`) before finishing")
             summary_text = ""
             try:
-                started = time.monotonic()
+                started = time.perf_counter()
                 response = provider.chat(
                     messages=_messages_for_model(history, turn_start) + [make_user_message(
                         f"{why} Do not call any more tools. Answer now from the tool results above: what "
                         "was found, and plainly what could not be done and why.")],
                     tools=TOOLS, system=system_prompt, on_event=on_event)
                 model_calls += 1
-                timing["model_s"] += time.monotonic() - started
+                timing["model_s"] += time.perf_counter() - started
                 summary_text = (response.text or "").strip()
             except Exception:  # noqa: BLE001 — the warning below still reaches the operator
                 logger.warning("The final summary call failed.", exc_info=True)

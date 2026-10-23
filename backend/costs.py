@@ -38,8 +38,20 @@ are always synthetic until changed:
 - reactive: 3 €/Mvarh for every unit, condensers included; the external
   grid's free band tan φ 0.4 (pf ≈ 0.93) and 10 €/Mvarh beyond it.
 
-The operator's changes are kept as a difference from the defaults, per unit,
-like the generator model (generators.py). Pure functions: no app state.
+Per load, what it costs to reduce it — the remedies after unit redispatch,
+in that order (flex_options.py):
+
+- **demand response** — ``dr_share_pct`` of the load can be reduced on request
+  (contracted flexibility, an aggregator), at ``dr_eur_per_mwh``;
+- **load relief** — involuntary reduction of the rest, the last resort, at
+  ``relief_eur_per_mwh`` (the value of lost load).
+
+No case file has these; synthetic until changed: 10 % of every load at
+150 €/MWh, load relief at 3,000 €/MWh.
+
+The operator's changes are kept as a difference from the defaults, per unit
+(or load), like the generator model (generators.py). Pure functions: no app
+state.
 """
 
 from __future__ import annotations
@@ -55,7 +67,8 @@ PRODUCTION = ("cost_eur_per_h", "cost_eur_per_mwh", "cost_eur_per_mw2h")
 REDISPATCH = ("up_eur_per_mwh", "down_eur_per_mwh")
 REACTIVE = ("q_eur_per_mvarh",)
 INTERFACE = ("q_band_tan_phi", "q_penalty_eur_per_mvarh")      # the external grid only
-FIELDS = PRODUCTION + REDISPATCH + REACTIVE + INTERFACE
+LOAD = ("dr_share_pct", "dr_eur_per_mwh", "relief_eur_per_mwh")  # loads only
+FIELDS = PRODUCTION + REDISPATCH + REACTIVE + INTERFACE + LOAD
 MAX_TAN_PHI = 2.0
 _POLY = {"cost_eur_per_h": "cp0_eur", "cost_eur_per_mwh": "cp1_eur_per_mw", "cost_eur_per_mw2h": "cp2_eur_per_mw2"}
 # Bounds well beyond any real price, to catch a typo (a € figure in cents).
@@ -65,11 +78,15 @@ MAX_QUADRATIC = 100.0           # €/MW²h
 SYNTHETIC_UNIT, SYNTHETIC_IMPORT = 50.0, 60.0
 UP_PREMIUM, DOWN_SHARE, CURTAILMENT = 1.2, 0.5, 40.0
 SYNTHETIC_Q, SYNTHETIC_TAN_PHI, SYNTHETIC_Q_PENALTY = 3.0, 0.4, 10.0
+SYNTHETIC_DR_SHARE, SYNTHETIC_DR, SYNTHETIC_RELIEF = 10.0, 150.0, 3000.0
 RENEWABLE_KINDS = ("pv", "wind")
 RULE = ("Synthetic where the case gives no cost: a unit 50 €/MWh, the import 60 €/MWh, condensers 0; "
         "up = 1.2 × marginal cost at full output, down = 0.5 × it; added pv/wind units 0 to produce and "
         "40 €/MWh to curtail; condensers and the external grid are not redispatched; reactive power 3 €/Mvarh "
-        "per unit; at the external grid, reactive exchange free within tan φ 0.4 (pf ≈ 0.93), 10 €/Mvarh beyond.")
+        "per unit; at the external grid, reactive exchange free within tan φ 0.4 (pf ≈ 0.93), 10 €/Mvarh beyond. "
+        "Loads: 10 % of each can be reduced as demand response at 150 €/MWh; load relief beyond it at 3,000 €/MWh.")
+LOAD_RULE = ("Synthetic until changed: 10 % of each load available as demand response at 150 €/MWh; "
+             "involuntary load relief of the rest at 3,000 €/MWh (the value of lost load).")
 
 
 class CostError(ValueError):
@@ -148,6 +165,50 @@ def defaults(net) -> list[dict]:
     return out
 
 
+def _bus_names(net, bus) -> set[str]:
+    """What a bus answers to, casefolded: "bus_29", its name as loaded and now."""
+    names = {f"bus_{int(bus)}", f"bus {int(bus)}"}
+    for col in ("name", "loaded_name"):
+        if col in net.bus.columns:
+            v = net.bus.at[bus, col]
+            if isinstance(v, str) and v.strip():
+                names.add(v.strip().casefold())
+    return names
+
+
+def load_name(net, idx) -> str:
+    """A load as the cost table keys it: its name as loaded ("Load 20")."""
+    tbl = net.load
+    kept = tbl.at[idx, "loaded_name"] if "loaded_name" in tbl.columns else None
+    raw = kept if isinstance(kept, str) else tbl.at[idx, "name"] if "name" in tbl.columns else None
+    raw = str(raw).strip() if raw is not None and raw == raw else ""
+    return raw or f"Load {int(idx)}"
+
+
+def load_defaults(net) -> list[dict]:
+    """Every load with its default demand-response and load-relief prices."""
+    out = []
+    tbl = net.load
+    for idx in tbl.index:
+        proposed = gm._proposed(tbl, idx)
+        out.append({"unit": load_name(net, idx), "kind": "load", "table": "load", "index": int(idx),
+                    "bus": int(tbl.at[idx, "bus"]), "proposed": proposed,
+                    "dr_share_pct": SYNTHETIC_DR_SHARE, "dr_eur_per_mwh": SYNTHETIC_DR,
+                    "relief_eur_per_mwh": SYNTHETIC_RELIEF, "source": {k: "synthetic" for k in LOAD}})
+    return out
+
+
+def load_table(net, changes: dict | None = None) -> list[dict]:
+    """The loads' demand-response and relief prices in force."""
+    changes = changes or {}
+    out = []
+    for row in load_defaults(net):
+        diff = {k: v for k, v in (changes.get(row["unit"]) or {}).items() if k in LOAD}
+        out.append({**row, **diff, "source": {**row["source"], **{k: "operator" for k in diff}},
+                    "changed": bool(diff)})
+    return out
+
+
 def table(net, changes: dict | None = None) -> list[dict]:
     """The costs in force: the defaults with the operator's changes."""
     changes = changes or {}
@@ -167,7 +228,7 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
     if not isinstance(raw_changes, list) or not raw_changes:
         raise CostError("Give a list of cost changes, each with a 'unit'.")
     current = current or {}
-    rows = {r["unit"]: r for r in defaults(net) if not r.get("proposed")}
+    rows = {r["unit"]: r for r in defaults(net) + load_defaults(net) if not r.get("proposed")}
     out: dict[str, dict] = {}
     for n, raw in enumerate(raw_changes, start=1):
         if not isinstance(raw, dict):
@@ -178,7 +239,15 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
                 and len(net.ext_grid) == 1:
             row = rows[ext_grid_name(net, net.ext_grid.index[0])]
         if row is None:
-            raise CostError(f"Change {n}: there is no unit {name!r}. Units: {sorted(rows)[:20]}.")
+            # A load named by its bus ("Bus_29", "the load at Bus_29"), when the bus has one.
+            at_bus = [r for r in rows.values() if r["kind"] == "load" and name.casefold().removeprefix(
+                "the load at ").removeprefix("load at ").strip() in _bus_names(net, r["bus"])]
+            row = at_bus[0] if len(at_bus) == 1 else None
+        if row is None:
+            units = sorted(k for k, r in rows.items() if r["kind"] != "load")
+            loads = [k for k, r in rows.items() if r["kind"] == "load"]
+            raise CostError(f"Change {n}: there is no unit or load {name!r}. Units: {units[:20]}"
+                            + (f"; loads: {loads[0]} … {loads[-1]} (or a load's bus)." if loads else "."))
         name = row["unit"]
         if name in out:
             raise CostError(f"Change {n}: {name} is changed twice; give one change per unit.")
@@ -189,6 +258,12 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
         if not given:
             raise CostError(f"{name}: give at least one of {list(FIELDS)}.")
         grid = row["kind"] == "external_grid"
+        load = row["kind"] == "load"
+        if load != all(k in LOAD for k in given):
+            wrong = [k for k in given if (k in LOAD) != load]
+            raise CostError(f"{name}: leave out {', '.join(wrong)} " + (
+                f"(units only); a load's fields are {', '.join(LOAD)}." if load else
+                f"(loads only); for a unit give {', '.join(PRODUCTION + REDISPATCH + REACTIVE)}."))
         misplaced = [k for k in given if (k in INTERFACE) != grid and (k in INTERFACE or k in REACTIVE)]
         if misplaced:
             raise CostError(f"{name}: leave out {', '.join(misplaced)} " + (
@@ -202,7 +277,7 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
                 continue
             v = _finite(value)
             high = (MAX_QUADRATIC if key == "cost_eur_per_mw2h" else MAX_TAN_PHI if key == "q_band_tan_phi"
-                    else MAX_PRICE)
+                    else 100.0 if key == "dr_share_pct" else MAX_PRICE)
             low = -MAX_PRICE if key == "cost_eur_per_mwh" else 0.0   # a negative energy price is real
             if v is None or not (low <= v <= high):
                 raise CostError(f"{name}: {key} must be a number between {low:g} and {high:g}.")

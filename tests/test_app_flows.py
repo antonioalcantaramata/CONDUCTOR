@@ -228,6 +228,25 @@ def test_while_anything_runs_the_chat_box_waits_and_the_panel_is_locked(agent, m
     assert [s.disabled for s in at.get("segmented_control") if s.label == "Advisor"] == [True]
 
 
+def test_the_status_runs_until_the_answer_and_shows_a_long_studys_progress(agent, monkeypatch):
+    import streamlit as st
+    _script(agent, monkeypatch)
+
+    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None):
+        on_event("llm_call", {"turn": 1})
+        on_event("tool_start", {"name": "flexibility_over_time"})
+        on_event("tool_progress", {"name": "flexibility_over_time", "text": "3 of 9 moments done"})
+        st.stop()                                         # the screen while the study runs
+
+    monkeypatch.setattr(agent["loop"], "run_agent_turn", turn)
+    at = _app()
+    _send(at, "What does N-1 security cost this evening?")
+    box = at.status[0]
+    assert box.state == "running"                         # not shown as done after its first step
+    assert box.label.endswith("3 of 9 moments done")
+    assert any("3 of 9 moments done" in m.value for m in at.markdown)
+
+
 def test_interrupted_work_resumes_and_stops_after_two_attempts(agent, monkeypatch):
     calls = _script(agent, monkeypatch, freeze={"turn": 1})
     at = _app()
@@ -697,6 +716,20 @@ def test_the_n1_screen_of_an_option_goes_to_conductors_box(agent, monkeypatch):
     at.radio(key="n1_pick_1").set_value("S1:cheapest").run()
     _button(at, key_prefix="n1_send_1").click().run()
     assert at.session_state["_box_value"] == "Run the N-1 screen with option S1:cheapest (Cheapest) applied."
+    # What else follows from a chosen option: each a request for the box.
+    then = at.radio(key="use_what_1")
+    assert list(then.options) == ["N-1 screen with it applied", "Security assessment with it applied",
+                                  "Hold it for the next hours", "KPIs before and after it",
+                                  "Next corrective action, an hour later"]
+    for action, request in (
+            ("hold", "Hold option S1:cheapest (Cheapest) for the next 4 hours: until when does it keep every limit?"),
+            ("kpis", "Evaluate the KPIs with option S1:cheapest (Cheapest) against the schedule: what it needs, "
+                     "uses and leaves."),
+            ("next", "Starting from option S1:cheapest (Cheapest), give me the corrective options at 2000-01-06 21:00."),
+            ("assess", "Run the security assessment with option S1:cheapest (Cheapest) applied.")):
+        at.radio(key="use_what_1").set_value(action).run()
+        _button(at, key_prefix="n1_send_1").click().run()
+        assert at.session_state["_box_value"] == request
     assert not at.exception
 
 

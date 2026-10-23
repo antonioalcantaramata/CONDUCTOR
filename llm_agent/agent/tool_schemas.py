@@ -95,6 +95,8 @@ _PG_MAX_OVERRIDES_DESC = (
 )
 
 _BRANCH_LIMITS_DESC = "Branches held below a share of their rating: {name or tag: %}, e.g. {\"L30\": 80}. 10–100."
+_OPTION_DESC = ("A corrective option's `ref` (e.g. 'S2:cheapest'): applied (its outage too); at a later "
+                "timestamp, its instructions held.")
 
 _PG_MIN_OVERRIDES_DESC = (
     "Per-substation minimum active power, MW: {name: MW}; positive = must-run. "
@@ -218,6 +220,7 @@ _run_rsa = genai.types.FunctionDeclaration(
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "option": genai.types.Schema(type=genai.types.Type.STRING, description=_OPTION_DESC),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
@@ -251,6 +254,7 @@ _simulate_contingency = genai.types.FunctionDeclaration(
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "option": genai.types.Schema(type=genai.types.Type.STRING, description=_OPTION_DESC),
             "element_type": genai.types.Schema(
                 type=genai.types.Type.STRING,
                 description=_ELEMENT_TYPE_DESC,
@@ -301,9 +305,9 @@ _simulate_all_contingencies = genai.types.FunctionDeclaration(
         properties={
             "option": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description=("A corrective option's `ref` from an options result (e.g. 'S2:cheapest'): the "
-                             "sweep runs at that option's moment, network and load level with its dispatch "
-                             "applied — after its outage too, if it had one (N-1-1)."),
+                description=("A corrective option's `ref` (e.g. 'S2:cheapest'): the sweep runs with its "
+                             "dispatch applied — after its outage too, if it had one (N-1-1); at a later "
+                             "timestamp, its instructions held."),
             ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
@@ -476,6 +480,24 @@ _optimize_flexibility = genai.types.FunctionDeclaration(
                 type=genai.types.Type.NUMBER,
                 description="Corrective: MW a unit may move after an outage, % of capacity. Default 20.",
             ),
+            "n1_load_reduction": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description="Corrective: load may be reduced after an outage too (default true).",
+            ),
+            "near_optimal_methods": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING,
+                                         enum=["hsj", "unit_ranges", "objectives", "random"]),
+                description="Which ways to find alternatives (default all).",
+            ),
+            "near_optimal_count": genai.types.Schema(
+                type=genai.types.Type.INTEGER, description="Alternatives shown, 1–5 (default 5).",
+            ),
+            "from_option": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("Start from a corrective option's ref instead of the schedule (its "
+                             "instructions held to this timestamp)."),
+            ),
             "load_scaling_factor": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
                 description=_LOAD_SCALING_DESC,
@@ -533,93 +555,70 @@ _optimize_flexibility = genai.types.FunctionDeclaration(
     ),
 )
 
+_KPI_OPTION_DESC = ("A corrective option's ref (e.g. 'S3:cheapest') to compare with the schedule; at a later "
+                    "moment its instructions held. Default: the cheapest corrective action at each moment.")
+_KPI_N1_DESC = "Also the cost of N-1 security above the cheapest (a security-constrained OPF: slower)."
+
+
+def _kpi_conditions() -> dict:
+    """The arguments both KPI tools take: what to compare, and the options' conditions."""
+    return {
+        "option": genai.types.Schema(type=genai.types.Type.STRING, description=_KPI_OPTION_DESC),
+        "n1": genai.types.Schema(type=genai.types.Type.STRING, enum=["preventive", "corrective", "both"],
+                                 description=_KPI_N1_DESC),
+        "hold_units": genai.types.Schema(type=genai.types.Type.ARRAY,
+                                         items=genai.types.Schema(type=genai.types.Type.STRING),
+                                         description="Units kept at their schedule (the operator's conditions)."),
+        "branch_limits": genai.types.Schema(type=genai.types.Type.OBJECT, description=_BRANCH_LIMITS_DESC),
+        "load_scaling_factor": genai.types.Schema(type=genai.types.Type.NUMBER, description=_LOAD_SCALING_DESC),
+        "slack_max_mw": genai.types.Schema(type=genai.types.Type.NUMBER, description=_SLACK_MAX_MW_DESC),
+        "slack_q_max_mvar": genai.types.Schema(type=genai.types.Type.NUMBER, description=_SLACK_Q_MAX_MVAR_DESC),
+        "vm_upper_pu": genai.types.Schema(type=genai.types.Type.NUMBER, description=_OPF_VM_UPPER_DESC),
+        "vm_lower_pu": genai.types.Schema(type=genai.types.Type.NUMBER, description=_OPF_VM_LOWER_DESC),
+        "pg_max_overrides": genai.types.Schema(type=genai.types.Type.OBJECT, description=_PG_MAX_OVERRIDES_DESC),
+        "pg_min_overrides": genai.types.Schema(type=genai.types.Type.OBJECT, description=_PG_MIN_OVERRIDES_DESC),
+        "fixed_setpoints": genai.types.Schema(type=genai.types.Type.OBJECT, description=_FIXED_SETPOINTS_DESC),
+        "opf_current_safety_margin": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                                        description=_CURRENT_SAFETY_MARGIN_DESC),
+    }
+
+
 _evaluate_kpis = genai.types.FunctionDeclaration(
     name="evaluate_kpis",
     description=(
-        "Evaluate the three system KPIs for the current timestamp. "
-        "KPI-1: available upward flexibility as fraction of demand. "
-        "KPI-2: fraction of required flexibility actually activated. "
-        "KPI-3: fraction of violations prevented by optimization. "
-        "When slack_max_mw is set below the network's physical cap, also runs a constrained-scenario solve."
+        "Key performance indicators at one moment: the schedule against a corrective action (the "
+        "cheapest, or `option`), each checked by AC power flow. KPI-1 target demand flexibility (spare "
+        "upward capacity, % of demand), KPI-2 flexibility utilisation (fewest MW that clear the "
+        "violations ÷ MW the action moves), KPI-3 prevented violation ratio; N-0 and N-1 security "
+        "margins; flexibility the units can deliver within every limit, up and down, per unit and "
+        "together; flexibility required; the action's cost (`n1`: of N-1 security too)."
     ),
-    parameters=genai.types.Schema(
-        type=genai.types.Type.OBJECT,
-        properties={
-            "load_scaling_factor": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_LOAD_SCALING_DESC,
-            ),
-            "slack_max_mw": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_SLACK_MAX_MW_DESC,
-            ),
-            "slack_q_max_mvar": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_SLACK_Q_MAX_MVAR_DESC,
-            ),
-            "vm_upper_pu": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_OPF_VM_UPPER_DESC,
-            ),
-            "vm_lower_pu": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_OPF_VM_LOWER_DESC,
-            ),
-            "opf_lambda_p": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_OPF_LAMBDA_P_DESC,
-            ),
-            "opf_lambda_q": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_OPF_LAMBDA_Q_DESC,
-            ),
-            "pg_max_overrides": genai.types.Schema(
-                type=genai.types.Type.OBJECT,
-                description=_PG_MAX_OVERRIDES_DESC,
-            ),
-            "pg_min_overrides": genai.types.Schema(
-                type=genai.types.Type.OBJECT,
-                description=_PG_MIN_OVERRIDES_DESC,
-            ),
-            "fixed_setpoints": genai.types.Schema(
-                type=genai.types.Type.OBJECT,
-                description=_FIXED_SETPOINTS_DESC,
-            ),
-            "opf_min_power_factor": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_MIN_PF_DESC,
-            ),
-            "opf_current_safety_margin": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_CURRENT_SAFETY_MARGIN_DESC,
-            ),
-        },
-    ),
+    parameters=genai.types.Schema(type=genai.types.Type.OBJECT, properties=_kpi_conditions()),
 )
 
-_forecast_kpis = genai.types.FunctionDeclaration(
-    name="forecast_kpis",
+_kpis_over_time = genai.types.FunctionDeclaration(
+    name="kpis_over_time",
     description=(
-        "Generate a 24-hour ahead forecast of KPI-1 (target demand flexibility %) "
-        "at 15-minute resolution (96 data points). "
-        "WARNING: This call takes approximately 2 minutes to complete. "
-        "Only invoke when the user explicitly asks for a forecast or 'next 24 hours'."
+        "The key performance indicators of evaluate_kpis at each moment of a window (measurements or "
+        "forecasts), each moment with its own corrective action (or `option` held): ranges, worst "
+        "moments, the actions' cost and the MWh moved against the MWh required. Moments run in "
+        "parallel; its progress is shown."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
-            "load_scaling_factor": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_LOAD_SCALING_DESC,
-            ),
-            "slack_max_mw": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_SLACK_MAX_MW_DESC,
-            ),
-            "slack_q_max_mvar": genai.types.Schema(
-                type=genai.types.Type.NUMBER,
-                description=_SLACK_Q_MAX_MVAR_DESC,
-            ),
+            "start": genai.types.Schema(type=genai.types.Type.STRING,
+                                        description="First moment (default: the clock; forecasts: their first)."),
+            "end": genai.types.Schema(type=genai.types.Type.STRING, description="Last moment."),
+            "hours": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                        description="Length without an end, hours (default 6; at most 48)."),
+            "moments": genai.types.Schema(type=genai.types.Type.INTEGER,
+                                          description="Moments studied, 2–12 (default 6), evenly spaced, the first "
+                                                      "and last always kept; hour by hour is one more than the "
+                                                      "hours (16:00–00:00: 9)."),
+            **{k: v for k, v in _kpi_conditions().items()
+               if k in ("option", "n1", "hold_units", "branch_limits", "load_scaling_factor", "slack_max_mw",
+                        "vm_upper_pu", "vm_lower_pu")},
         },
     ),
 )
@@ -1545,9 +1544,9 @@ _set_unit_costs = genai.types.FunctionDeclaration(
         "production cost (c0 €/h + c1 €/MWh·P + c2 €/MW²h·P²; the grid's c1 is the import price) and "
         "redispatch costs up/down (€/MWh; down for a renewable is curtailment), a reactive price per "
         "unit (€/Mvarh) and the grid's reactive band (tan φ) and penalty beyond it, each marked 'case', "
-        "'synthetic' or 'operator'. Kept for this network and shown in the System tab. Used to cost "
-        "the flexibility options (optimize_flexibility with options) and to find the cheapest one; the "
-        "default dispatch ignores them."
+        "'synthetic' or 'operator'; and per load, its demand response (share %, €/MWh) and load-relief "
+        "price. Kept for this network and shown in the System tab. Used to cost the flexibility options "
+        "and to find the cheapest one; the default dispatch ignores them."
     ),
     parameters=_S(
         type=_T.OBJECT,
@@ -1559,13 +1558,14 @@ _set_unit_costs = genai.types.FunctionDeclaration(
                 items=_S(
                     type=_T.OBJECT,
                     properties={
-                        "unit": _S(type=_T.STRING, description="Unit name as listed, or 'External grid'."),
+                        "unit": _S(type=_T.STRING, description="Unit or load as listed, or 'External grid'."),
                         "field": _S(type=_T.STRING, enum=list(tools.COST_FIELDS), description=(
                             "Which price. cost_eur_per_mwh: c1, €/MWh (the grid's: import price); "
                             "cost_eur_per_mw2h: c2; cost_eur_per_h: c0; up_eur_per_mwh / down_eur_per_mwh: "
                             "redispatch; q_eur_per_mvarh: a unit's reactive power, €/Mvarh; "
                             "q_band_tan_phi / q_penalty_eur_per_mvarh: external grid only, the free "
-                            "reactive band (tan φ) and €/Mvarh beyond it.")),
+                            "reactive band (tan φ) and €/Mvarh beyond it; loads only: dr_share_pct (share "
+                            "reducible on request), dr_eur_per_mwh, relief_eur_per_mwh.")),
                         "value": _S(type=_T.NUMBER, description="The new value."),
                         "to_default": _S(type=_T.BOOLEAN, description="True: back to its default (no value)."),
                     },
@@ -1836,6 +1836,42 @@ _compare_networks = genai.types.FunctionDeclaration(
 )
 
 
+_flexibility_over_time = genai.types.FunctionDeclaration(
+    name="flexibility_over_time",
+    description=(
+        "Flexibility across several moments. study='hold': a corrective option held from its moment — "
+        "until when it keeps every limit. study='plan': one corrective plan for a window (a peak), "
+        "instructions kept from moment to moment, compared with solving each alone. study='security': "
+        "what N-1 security costs above the cheapest at each moment of a window (a full study per moment, "
+        "in parallel; its progress is shown)."
+    ),
+    parameters=_S(
+        type=_T.OBJECT,
+        properties={
+            "study": _S(type=_T.STRING, enum=["hold", "plan", "security"]),
+            "option": _S(type=_T.STRING, description="hold: the option's ref (e.g. 'S3:cheapest')."),
+            "start": _S(type=_T.STRING, description="plan, security: first moment (default: the clock)."),
+            "end": _S(type=_T.STRING, description="plan, security: last moment."),
+            "hours": _S(type=_T.NUMBER, description="Length without an end, hours (default 6)."),
+            "moments": _S(type=_T.INTEGER, description="plan, security: moments studied, 2–12 (default 6), "
+                                                     "evenly spaced, the first and last always kept; hour by "
+                                                     "hour is one more than the hours (16:00–00:00: 9)."),
+            "n1": _S(type=_T.STRING, enum=["preventive", "corrective", "both"],
+                     description="security: which N-1 secure option (default preventive)."),
+            "screen_n1": _S(type=_T.BOOLEAN, description="hold: the N-1 screen at each moment too."),
+            "objective": _S(type=_T.STRING, enum=["least_disturbance", "cheapest"], description="plan."),
+            "steadiness": _S(type=_T.NUMBER,
+                             description="plan: how strongly instructions are kept, 0–10 (default 1)."),
+            "ramp_pct_per_h": _S(type=_T.NUMBER, description="plan: ramp limit, % of capacity per hour."),
+            "load_scaling_factor": _S(type=_T.NUMBER, description=_LOAD_SCALING_DESC),
+            "hold_units": _S(type=_T.ARRAY, items=_S(type=_T.STRING),
+                             description="plan, security: units kept at their schedule."),
+            "branch_limits": _S(type=_T.OBJECT, description=_BRANCH_LIMITS_DESC),
+        },
+        required=["study"],
+    ),
+)
+
 TOOLS: list = [
     genai.types.Tool(
         function_declarations=[
@@ -1850,7 +1886,7 @@ TOOLS: list = [
             _optimize_contingency,
             _optimize_flexibility,
             _evaluate_kpis,
-            _forecast_kpis,
+            _kpis_over_time,
             _scan_rsa_over_time,
             _find_worst_case_timestamp,
             _scan_scenarios,
@@ -1868,6 +1904,7 @@ TOOLS: list = [
             _set_unit_costs,
             _rename_elements,
             _compare_networks,
+            _flexibility_over_time,
         ]
     )
 ]
@@ -1929,7 +1966,7 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "optimize_contingency": tools.optimize_contingency,
     "optimize_flexibility": tools.optimize_flexibility,
     "evaluate_kpis": tools.evaluate_kpis,
-    "forecast_kpis": tools.forecast_kpis,
+    "kpis_over_time": tools.kpis_over_time,
     "scan_rsa_over_time": tools.scan_rsa_over_time,
     "find_worst_case_timestamp": tools.find_worst_case_timestamp,
     "scan_scenarios": tools.scan_scenarios,
@@ -1947,4 +1984,5 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "set_unit_costs": tools.set_unit_costs,
     "rename_elements": tools.rename_elements,
     "compare_networks": tools.compare_networks,
+    "flexibility_over_time": tools.flexibility_over_time,
 }

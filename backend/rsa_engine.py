@@ -17,6 +17,9 @@ from element_names import bus_display_name, line_display_name, trafo_display_nam
 # In[2]:
 
 
+
+FLOAT_TOL = 1e-6           # p.u. and %: rounding, not a violation
+
 def map_bus_names_to_lines(net):
     """
     Map bus names to line endpoints in a pandapower network.
@@ -123,7 +126,10 @@ def real_time_security_assessment(
 
     # -------------------- Step 2: Voltage Violation Check --------------------
     print("[2] Checking for voltage violations...")
-    v_min, v_max = vm_lower, vm_upper
+    # A tolerance for floating-point noise only: a dispatch the OPF put exactly
+    # on a limit comes back from the power flow at 0.9499999904 p.u., which is
+    # the limit, not a violation of it.
+    v_min, v_max = vm_lower - FLOAT_TOL, vm_upper + FLOAT_TOL
     voltage_violations = net.res_bus[(net.res_bus.vm_pu < v_min) | (net.res_bus.vm_pu > v_max)]
     print(f"    ⚡ Voltage Violations: {len(voltage_violations)}")
 
@@ -139,7 +145,7 @@ def real_time_security_assessment(
     
     # -------------------- Step 3: Thermal Overload Check --------------------
     print("[3] Checking for thermal overloads on lines...")
-    overloads = net.res_line[net.res_line.loading_percent > max_line_loading_pct]
+    overloads = net.res_line[net.res_line.loading_percent > max_line_loading_pct + FLOAT_TOL]
     print(f"    🌡️ Line Overloads: {len(overloads)}")
 
     for idx, row in overloads.iterrows():
@@ -154,7 +160,7 @@ def real_time_security_assessment(
 
     # -------------------- Step 3b: Thermal Overload Check for Transformers --------------------
     print("[3b] Checking for thermal overloads on transformers...")
-    trafo_overloads = net.res_trafo[net.res_trafo.loading_percent > max_trafo_loading_pct]
+    trafo_overloads = net.res_trafo[net.res_trafo.loading_percent > max_trafo_loading_pct + FLOAT_TOL]
     print(f"    🌡️ Transformer Overloads: {len(trafo_overloads)}")
 
     for idx, row in trafo_overloads.iterrows():

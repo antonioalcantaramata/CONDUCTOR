@@ -185,6 +185,20 @@ def unit_renames(net) -> dict[str, str]:
     return out
 
 
+def load_renames(net) -> dict[str, str]:
+    """{name as loaded: name now} for every renamed load (the key of its
+    demand-response prices, costs.load_name)."""
+    tbl = net.load
+    if LOADED_NAME not in tbl.columns:
+        return {}
+    out = {}
+    for idx in tbl.index:
+        kept = tbl.at[idx, LOADED_NAME]
+        if isinstance(kept, str):
+            out[kept.strip() or f"Load {int(idx)}"] = display(net, "load", idx)
+    return out
+
+
 def elements(net) -> dict[str, list[dict]]:
     """Every nameable element (not added by a proposal) with its name now and
     as loaded — what the System tab's names table lists."""

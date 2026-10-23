@@ -93,7 +93,9 @@ def test_the_options_differ_and_nothing_is_left_out_unsaid(client):
         assert check["import_mw"] == pytest.approx(o["import_mw"], abs=0.05)
     shown = {o["id"] for o in out["options"]} | {n["id"] for n in out["not_offered"]}
     assert shown == {"least_disturbance", "cheapest", "fewest_units", "without_main_unit", "least_import",
-                     "most_headroom"}
+                     "most_headroom", "demand_response"}
+    dr = next(n for n in out["not_offered"] if n["id"] == "demand_response")
+    assert "redispatching the units is cheaper" in dr["reason"]       # at the synthetic prices
     assert all(n["reason"] for n in out["not_offered"])
     assert "case" in out["costs"]["prices_from"]
 
@@ -149,9 +151,13 @@ def test_options_for_the_corrective_action_after_an_outage(client):
     assert all(o["power_flow_check"]["confirmed"] for o in out["options"])     # without the line
     by_id = {o["id"]: o for o in out["options"]}
     assert by_id["fewest_units"]["n_units_called"] < by_id["least_disturbance"]["n_units_called"]
+    # After L29 no redispatch of the units clears it: the last resort is the answer
+    # — options that also reduce load — and it says why the units alone cannot.
     stuck = _ok(client.post("/api/contingency/optimize", json={"timestamp": noon, "element_type": "line",
                                                                "element_index": 29, "options": True}))
-    assert stuck["feasible"] is False and stuck["outage"]["element"] == "Bus_14 -> Bus_22 [L29]"
+    assert stuck["outage"]["element"] == "Bus_14 -> Bus_22 [L29]" and stuck["set"] == "last_resort"
+    assert stuck["redispatch_alone"]["clears_violations"] is False and stuck["redispatch_alone"]["why"]
+    assert all(o["load_reduction_mw"] > 0 and o["power_flow_check"]["confirmed"] for o in stuck["options"])
 
 
 @needs_ipopt

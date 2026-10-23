@@ -16,7 +16,11 @@ power-flow state per outage, all tied to the same dispatch.
               change its voltage set-point (within the voltage band). The
               dispatch is chosen so that such an action exists for every outage
               studied; the action is part of the answer, as few units and as
-              small moves as it can be.
+              small moves as it can be. When moving the units is not enough,
+              the action may also reduce load after the outage — demand
+              response first, load relief only beyond it (`load_reduction`):
+              far costlier than any unit move, far cheaper than a limit left
+              broken.
 
 Each state is the OPF model every other study builds
 (`flex_engine.optimization_model_base`), one Pyomo block per state, linked —
@@ -46,6 +50,10 @@ SETPOINT_L1, SETPOINT_WEIGHT = 2.0, 10.0     # per p.u., per p.u.²: 0.01 p.u. w
 RESIDUAL_TOL = 1e-4         # slack below this is solver tolerance, not a violation
 SECURE_TOL = 1e-6           # stage 2 keeps stage 1's security to within this (absolute) ...
 SECURE_REL = 1e-3           # ... and this share
+# Load reduced after an outage, per MW: above any unit move (free in stage 1),
+# below what a MW typically relieves (~0.1 of loading² on a small line, ~0.05
+# of weighted voltage), relief ten times demand response.
+DR_WEIGHT, RELIEF_WEIGHT = 2e-3, 2e-2
 
 
 def _deactivate_objectives(m) -> None:
@@ -116,11 +124,13 @@ def _slacks(m):
         sum(m.s_vlo[b] for b in m.s_vlo) + sum(m.s_vhi[b] for b in m.s_vhi)))
 
 
-def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, lambda_q: float = 0.001):
+def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, lambda_q: float = 0.001,
+          load_reduction: bool = False):
     """The SCOPF: `base` (the model with everything in service, hard limits)
     and one softened block per outage in `states` ({outage name: model}),
     linked by `mode`. `reach`: unit -> MW it may move after an outage
-    (corrective). Returns the parent model; its blocks are `base` and `c0`…"""
+    (corrective). `load_reduction` (corrective): the post-outage blocks may
+    also reduce load. Returns the parent model; its blocks are `base` and `c0`…"""
     top = ConcreteModel()
     top.base = base
     _deactivate_objectives(base)
@@ -153,6 +163,16 @@ def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, la
             setattr(top, f"vmove{k}", Constraint(buses, rule=lambda t, b, m=m, k=k: (
                 m.V[b] - t.base.V[b] == getattr(t, f"vup{k}")[b] - getattr(t, f"vdown{k}")[b])))
     blocks = [getattr(top, f"c{k}") for k in range(len(names))]
+    shed = 0.0
+    if mode == CORRECTIVE and load_reduction:
+        for m in blocks:
+            if not hasattr(m, "LFlex"):
+                continue
+            for load in m.LFlex:
+                if (m.Pdr[load].ub or 0.0) > 1e-6:
+                    m.Pdr[load].unfix()
+                m.Pshed[load].unfix()
+            shed += sum(DR_WEIGHT * m.Pdr[k] + RELIEF_WEIGHT * m.Pshed[k] for k in m.LFlex)
     disturbance = (lambda_p * sum((base.Pg_new[g] - base.Pg_base[g]) ** 2 for g in base.G)
                    + lambda_q * sum((base.Qg_new[g] - base.Qg_base[g]) ** 2 for g in base.G))
     moves = 0.0
@@ -163,7 +183,7 @@ def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, la
             moves += sum(SETPOINT_L1 * (vup[b] + vdown[b]) + SETPOINT_WEIGHT * (vup[b] - vdown[b]) ** 2 for b in vup)
     # Two stages (`secure_first`): as secure as possible, then — keeping that —
     # the smallest change and the smallest corrective actions.
-    top.violation = Expression(expr=sum(_slacks(m) for m in blocks))
+    top.violation = Expression(expr=sum(_slacks(m) for m in blocks) + shed)
     top.preference = Expression(expr=disturbance + moves)
     top.obj = Objective(expr=top.violation + 1e-6 * top.preference, sense=minimize)
     top._outages = names

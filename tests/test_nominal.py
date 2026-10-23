@@ -123,7 +123,7 @@ class TestThroughTheBackend:
         assert hc.status_code == 200
 
     @pytest.mark.parametrize("path, body", [
-        ("/api/rsa/worst_case", {}), ("/api/rsa/historical_risk", {}), ("/api/kpi/forecast", {}),
+        ("/api/rsa/worst_case", {}), ("/api/rsa/historical_risk", {}), ("/api/kpi/over_time", {}),
         ("/api/data/series", {})])
     def test_window_studies_refuse_it_with_the_reason(self, backend_client, path, body):
         r = backend_client.post(path, json={**body, "data_source": "nominal"})
