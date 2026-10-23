@@ -27,12 +27,24 @@ Overview
    results back(remains to be completed).
 """
 
+import os
+
+# One thread per solve, unless the operator set otherwise: IPOPT runs as a
+# subprocess and inherits these. On distribution-sized networks its
+# multithreaded linear algebra only adds overhead — measured on the IEEE 30
+# demo, a 9-moment N-1 study took 78 s with it and 52 s without, and four
+# parallel workers each using every core were barely faster than one.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import asyncio
+import contextvars
 import functools
 import hashlib
 import json
 import math
 import threading
+import logging
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,7 +52,6 @@ from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import io
-import os
 import pandapower as pp
 from contextlib import asynccontextmanager
 import copy
@@ -75,6 +86,7 @@ import ca_engine as ca
 
 import flex_engine as fe
 import flex_options as fo
+import kpis as kp
 import scopf
 import network_loader as nl
 import data_quality as dq
@@ -391,201 +403,6 @@ def extract_flexibility_results(model, net_base, ts):
 # KPI calculations — ported verbatim from main_KPIs_Included.ipynb
 # The function below is the source of truth for the /api/kpi/evaluate endpoint.
 
-def calculate_kpi_target_demand_flexibility(df_reg_flex_rsa: pd.DataFrame, Pg_max_data: dict) -> dict:
-    """
-    KPI-1: Target demand flexibility as percentage of system demand.
-
-    Measures the **residual upward reserve** from local generators
-    relative to total system demand, *after* the optimizer has
-    committed its dispatch.
-
-    Formula
-        KPI_1 (%) = [ Σ (Pg_max_i − Pg_new_i) / Σ Pg_new ] * 100
-
-    where:
-        * ``Pg_max_i`` is the maximum active power of generator ``i``
-          (looked up in ``Pg_max_data``).
-        * ``Pg_new_i`` is its **post-optimization** dispatch.
-        * ``Σ Pg_new`` covers **all** rows (generators + external grid)
-          and represents total system demand (load + losses).
-                * Only rows with ``type == "Generator"`` contribute to the
-                    numerator; the external-grid interface is intentionally
-          excluded because it is import/export, not a controllable
-          flexibility resource.
-        * Minimum generator output is assumed to be 0, so only upward
-          flexibility is considered.
-
-    Departure from notebook
-    -----------------------
-    Anosh's notebook used ``Pg_max - Pg_base`` (pre-dispatch headroom).
-    We use ``Pg_max - Pg_new`` (post-dispatch reserve) so the indicator
-    is responsive to operational decisions: load level *and* Sweden-cable
-    cap both move ``Pg_new`` and therefore move KPI-1. The two formulas
-    coincide when the optimizer leaves local generators untouched
-    (typical low-load case where the slack cable absorbs everything).
-
-    Parameters
-    df_reg_flex_rsa : pandas.DataFrame
-        Full regulation frame from ``flex_engine.prepare_regulation_df_rsa``.
-        Must contain columns ``element``, ``type``, ``Pg_base``, ``Pg_new``.
-    Pg_max_data : dict
-        Mapping ``substation_name -> Pg_max (MW)``. See :data:`PG_MAX_DATA`.
-
-    Returns
-    dict
-        ``{available_upward_flexibility_MW, system_demand_MW,
-        target_demand_flexibility_pct}``.
-    """
-
-    required_cols = {'element', 'type', 'Pg_base', 'Pg_new'}
-    missing_cols = required_cols - set(df_reg_flex_rsa.columns)
-    if missing_cols:
-        raise ValueError(f"Missing required columns in df_reg_flex_rsa: {missing_cols}")
-
-    df = df_reg_flex_rsa.copy(deep=True)
-
-    # Keep only generators for flexibility calculation
-    df_gen = df[df['type'].str.strip().str.lower() == 'generator'].copy(deep=True)
-
-    if df_gen.empty:
-        raise ValueError("No generator rows found in df_reg_flex_rsa.")
-
-    # Map maximum active power values to generator rows
-    df_gen['Pg_max'] = df_gen['element'].map(Pg_max_data)
-
-    # Check if any generator is missing from Pg_max_data
-    missing_pgmax = df_gen[df_gen['Pg_max'].isna()]['element'].unique()
-    if len(missing_pgmax) > 0:
-        raise ValueError(f"Pg_max_data is missing values for generators: {list(missing_pgmax)}")
-
-    # Available upward flexibility for each generator
-    df_gen['available_upward_flex_MW'] = (df_gen['Pg_max'] - df_gen['Pg_new']).clip(lower=0.0)
-
-    # Total available upward flexibility from generators
-    total_available_flex_MW = df_gen['available_upward_flex_MW'].sum()
-
-    # Total system demand = total supplied active power at this timestamp
-    system_demand_MW = df['Pg_new'].sum()
-
-    if system_demand_MW <= 0:
-        raise ValueError(f"System demand must be positive, but got {system_demand_MW:.6f} MW.")
-
-    # KPI calculation
-    kpi_target_demand_flexibility_pct = (total_available_flex_MW / system_demand_MW) * 100
-
-    return {
-        'available_upward_flexibility_MW': total_available_flex_MW,
-        'system_demand_MW': system_demand_MW,
-        'target_demand_flexibility_pct': kpi_target_demand_flexibility_pct
-    }
-
-
-def calculate_kpi_flexibility_utilization(df_reg_flex_rsa: pd.DataFrame) -> dict:
-    """
-    KPI-2: Flexibility utilization rate.
-
-    Measures how accurately the activated flexibility matches the
-    required flexibility at the considered timestamp.
-
-    Formula
-        KPI_2 (%) = (1 − |F_activated − F_required| / F_required) * 100
-
-    where:
-        * ``F_required  = | Σ Pg_new − Σ Pg_base |``
-        * ``F_activated = Σ (Pg_up + Pg_down)``
-
-    Edge cases
-    * If ``F_required == 0`` and ``F_activated == 0`` -> KPI = 100%.
-    * If ``F_required == 0`` and ``F_activated > 0`` -> KPI = 0%.
-
-
-    To keep the indicator interpretable we apply two safeguards:
-
-    1. Treat ``F_required < 1e-2 MW`` (10 kW — below any meaningful
-       dispatch resolution) as effectively zero, falling through to
-       the explicit zero edge-case branch.
-    2. Clip the final percentage to ``[0, 100]`` as a defensive cap.
-
-    Both safeguards leave the indicator unchanged in any regime where
-    the original formula was well-conditioned.
-
-    Parameters
-    df_reg_flex_rsa : pandas.DataFrame
-        Must contain ``Pg_base``, ``Pg_new``, ``Pg_up``, ``Pg_down``.
-
-    Returns
-    dict
-        ``{required_flexibility_MW, activated_flexibility_MW,
-        flexibility_utilization_pct}``.
-    """
-
-    required_cols = {'Pg_base', 'Pg_new', 'Pg_up', 'Pg_down'}
-    missing_cols = required_cols - set(df_reg_flex_rsa.columns)
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-
-    df = df_reg_flex_rsa.copy()
-
-    # Required flexibility
-    F_required = abs(df['Pg_new'].sum() - df['Pg_base'].sum())
-
-    # Activated flexibility
-    F_activated = (df['Pg_up'].abs() + df['Pg_down'].abs()).sum()
-
-    # Treat sub-resolution F_required as zero — see "Numerical robustness".
-    F_REQUIRED_NOISE_MW = 1e-2  # 10 kW
-
-    if F_required < F_REQUIRED_NOISE_MW:
-        if F_activated < F_REQUIRED_NOISE_MW:
-            kpi = 100.0
-        else:
-            kpi = 0.0
-    else:
-        kpi = (1 - abs(F_activated - F_required) / F_required) * 100
-        # Clip — formula can produce values outside [0,100] when the
-        # optimizer over- or under-shoots. Outside that range the metric
-        # stops being interpretable as a percentage.
-        kpi = max(0.0, min(100.0, kpi))
-
-    return {
-        'required_flexibility_MW': F_required,
-        'activated_flexibility_MW': F_activated,
-        'flexibility_utilization_pct': kpi
-    }
-
-
-def calculate_kpi_prevented_violation_ratio(df_reg_flex_rsa) -> dict:
-    """
-    KPI-3: Prevented violation ratio in the distribution grid.
-
-    Binary indicator: if the optimizer returned a feasible regulation
-    frame, every detected violation is considered resolved (100%).
-    Otherwise the KPI is 0%.
-
-    Parameters
-    df_reg_flex_rsa : pandas.DataFrame or None
-        The regulation frame from a solved Pyomo model, or ``None``
-        (or empty) if the solve was infeasible.
-
-    Returns
-    dict
-        ``{prevented_violation_ratio_pct, status}``.
-    """
-
-    # If dataframe exists and is not empty → feasible solution
-    if df_reg_flex_rsa is not None and not df_reg_flex_rsa.empty:
-        kpi = 100.0
-        status = "All detected violations resolved"
-    else:
-        kpi = 0.0
-        status = "Violations not fully resolved (infeasible)"
-
-    return {
-        'prevented_violation_ratio_pct': kpi,
-        'status': status
-    }
-
-
 # ===================================================================
 # Constrained-slack scenario re-solve helper
 # ===================================================================
@@ -644,6 +461,19 @@ def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max
     """
     from pyomo.environ import SolverFactory
 
+    _cap_exchange(model_opt, max_slack_mw, slack_q_max_mvar, fixed_setpoints)
+    try:
+        results = SolverFactory('ipopt').solve(model_opt, tee=False)
+    except Exception:
+        return None, model_opt
+    return results, model_opt
+
+
+def _cap_exchange(model_opt, max_slack_mw: float, slack_q_max_mvar: float | None = None,
+                  fixed_setpoints: dict | None = None) -> None:
+    """The external-grid cap on a model (in place): units free, the exchange
+    within ±cap, pinned set-points kept. The capped re-solve's setup, also
+    used by the last resort."""
     _phys_cap = float(app_data.get("slack_max_mw", 999.0))
     bound = max(0.0, min(float(max_slack_mw), _phys_cap))
     q_bound = max(0.0, min(float(slack_q_max_mvar), _phys_cap)) if slack_q_max_mvar is not None else bound
@@ -672,12 +502,6 @@ def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max
                 model_opt.Pg_new[_name].fix(float(_mw))
             elif _name in model_opt.Ext:
                 model_opt.Pext[_name].fix(float(_mw))
-
-    try:
-        results = SolverFactory('ipopt').solve(model_opt, tee=False)
-    except Exception:
-        return None, model_opt
-    return results, model_opt
 
 
 # ``/api/time/advance`` which bumps ``current_index``. is the only write API point
@@ -806,6 +630,65 @@ def _save_proposals() -> None:
     _note_where_changes_are_kept()
 
 
+def _option_sets_path() -> str:
+    """Kept beside the proposals (per network, like them)."""
+    return os.path.join(os.path.dirname(_PROPOSALS_FILE), "option_sets.json")
+
+
+def _option_to_json(option) -> dict:
+    out = option._asdict()
+    out["max_loading_branch"] = list(option.max_loading_branch) if option.max_loading_branch else None
+    return out
+
+
+def _option_from_json(raw: dict):
+    """An option as saved, its bus and load keys back to numbers."""
+    def by_int(d):
+        return {int(k): v for k, v in d.items()} if isinstance(d, dict) else d
+    fields = {k: raw.get(k) for k in fo.Option._fields}
+    for key in ("v", "v0", "dr", "relief"):
+        fields[key] = by_int(fields[key])
+    if fields.get("vc_bus"):
+        fields["vc_bus"] = {g: int(b) for g, b in fields["vc_bus"].items()}
+    if fields.get("max_loading_branch"):
+        fields["max_loading_branch"] = tuple(int(b) for b in fields["max_loading_branch"])
+    return fo.Option(**fields)
+
+
+def _save_option_sets() -> None:
+    """This network's option sets to disk, so a reference ("S3:cheapest")
+    still applies after a restart. A failure to write is reported, not raised.
+    A study worker saves nothing: its parent keeps what it returns."""
+    fp = app_data.get("loaded_fingerprint")
+    if not fp or _IN_WORKER:
+        return
+    store = _read_store(_option_sets_path())
+    sets = app_data.get("option_sets") or {}
+    if sets:
+        store[fp] = {"counter": app_data.get("option_set_counter", 0),
+                     "sets": {sid: {**{k: v for k, v in s.items() if k != "options"},
+                                    "options": {oid: _option_to_json(o) for oid, o in s["options"].items()}}
+                              for sid, s in sets.items()}}
+    else:
+        store.pop(fp, None)
+    _write_store(_option_sets_path(), store)
+
+
+def _restore_option_sets() -> None:
+    """This network's saved option sets, if any. One computed under other unit
+    models, names or load power factor is restored too — `_resolve_option`
+    refuses it with the reason, rather than it silently vanishing."""
+    entry = _read_store(_option_sets_path()).get(app_data.get("loaded_fingerprint")) or {}
+    try:
+        sets = {sid: {**s, "options": {oid: _option_from_json(o) for oid, o in s["options"].items()}}
+                for sid, s in (entry.get("sets") or {}).items()}
+    except Exception as exc:  # noqa: BLE001 — a file from another version is ignored, not fatal
+        print(f"[options] Saved option sets not restored ({exc}).")
+        return
+    app_data["option_sets"] = sets
+    app_data["option_set_counter"] = max(int(entry.get("counter") or 0), app_data.get("option_set_counter", 0))
+
+
 def _remember_loaded(net) -> None:
     """The network as loaded: the reference every generator model is applied
     to (generators.py), and the identity the saved assumptions are keyed to."""
@@ -815,6 +698,7 @@ def _remember_loaded(net) -> None:
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
     app_data["option_sets"] = {}        # options of another network mean nothing on this one
+    _restore_option_sets()              # ... but this network's, saved earlier, still do
 
 
 def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
@@ -1533,6 +1417,9 @@ class GridRequest(_TimeseriesRequest):
     vm_lower_pu: float = 0.95
     max_line_loading_pct: float = 90.0
     max_trafo_loading_pct: float = 90.0
+    # A corrective option's reference ("S3:cheapest"): the study runs with its
+    # dispatch applied, at its moment or a later one (its set-points held).
+    option: str | None = None
     # island_mode: bool = False was meant to be added for testing without the swedish slack bus as a contingency event
 
 
@@ -1590,15 +1477,17 @@ class ContingencyRequest(_TimeseriesRequest):
     vm_lower_pu: float = 0.95
     max_line_loading_pct: float = 90.0
     max_trafo_loading_pct: float = 90.0
+    # A corrective option's reference: the outage studied with its dispatch applied.
+    option: str | None = None
     # island_mode: bool = False was meant to be added without the swedish slack bus as a contingency event
 
 
 class ContingencySweepRequest(GridRequest):
     """Request body for ``POST /api/contingency/simulate_all``. ``option``: a
     corrective option's reference from an options result ("S3:cheapest") —
-    the sweep then runs at that option's moment, network and load level, with
-    its dispatch applied (and, for an option after an outage, that outage)."""
-    option: str | None = None
+    the sweep then runs at that option's network and load level, with its
+    dispatch applied (and, for an option after an outage, that outage), at
+    its moment or a later one (its set-points held)."""
 
 
 class ContingencyOptimizeRequest(_TimeseriesRequest):
@@ -1625,6 +1514,8 @@ class ContingencyOptimizeRequest(_TimeseriesRequest):
     options: bool = False
     near_optimal: bool = False
     near_optimal_pct: float = Field(default=10.0, gt=0, le=100)
+    near_optimal_methods: list[Literal["hsj", "unit_ranges", "objectives", "random"]] = []
+    near_optimal_count: int = Field(default=5, ge=1, le=5)
     branch_limits: dict[str, float] = {}
 
 
@@ -1696,67 +1587,56 @@ class FlexibilityRequest(_TimeseriesRequest):
     # every N-1 screen uses (100 % on the bundled networks), so they agree.
     n1_emergency_loading_pct: float | None = Field(default=None, ge=50, le=150)
     n1_reach_pct: float = Field(default=20.0, gt=0, le=100)
+    # After an outage, corrective actions may also reduce load — demand
+    # response, then load relief — when redispatch alone cannot secure it.
+    n1_load_reduction: bool = True
+    # Near-optimal: which MGA methods fill the pool (default: all), and how
+    # many alternatives to show.
+    near_optimal_methods: list[Literal["hsj", "unit_ranges", "objectives", "random"]] = []
+    near_optimal_count: int = Field(default=5, ge=1, le=5)
     # True: several corrective dispatches (flex_options.py), each the solution
     # of a strategy, scored the same way — instead of the one least-disturbance
     # dispatch. The default dispatch is unchanged either way.
     options: bool = False
+    # Start from a corrective option ("S3:cheapest") instead of the schedule:
+    # its set-points held to this moment (its own or a later one) are what the
+    # corrective action changes — "we took the cheapest at 20:00; what now at 21:00?"
+    from_option: str | None = None
 
 
-class KPIRequest(_TimeseriesRequest):
-    """Request body for ``POST /api/kpi/evaluate``.
-
-    Attributes
-    load_scaling_factor : float
-        Multiplicative load multiplier driven by the global UI slider.
-    disabled_generators : list[str]
-        Substation names whose sgens are removed before solving.
-        slack_max_mw : float
-                Maximum bidirectional capacity (MW) of the external-grid
-                interface for the *constrained* scenario solve. The connected
-                baseline solve always runs with the engine's default ±200 MW
-                (a modelling artefact); this field controls the second,
-                *what-if* solve and is clamped to the active profile limit.
-
-                * profile maximum -> realistic upper bound; constrained
-                    scenario will resemble the connected baseline at most
-                    timestamps.
-                * 0.0 -> fully islanded (the interface carries no power).
-        * Any value in between models a de-rated / partially available
-          cable.
-
-        Driven by the slider on the *KPIs & Export* tab. The same
-        value is mirrored into ``slack-store`` and consumed by
-        :class:`FlexibilityRequest` so the *Flexibility Management*
-        dispatch table reports a configuration consistent with the
-        KPI numbers.
-    opf_vm_upper : float
-        Voltage upper bound enforced inside the OPF (p.u.). Default 1.05.
-    opf_vm_lower : float
-        Voltage lower bound enforced inside the OPF (p.u.). Default 0.95.
-    opf_lambda_p : float
-        Weight on active power deviation squared in the OPF objective. Default 0.01.
-    opf_lambda_q : float
-        Weight on reactive power deviation squared in the OPF objective. Default 0.001.
-    pg_max_overrides : dict[str, float]
-        Per-substation active power upper bound overrides (MW). Keys are substation names.
-        Merged on top of the hardcoded Pg_max_data defaults inside the OPF engine.
-    pg_min_overrides : dict[str, float]
-        Per-substation active power lower bound overrides (MW). Negative = allow curtailment.
-        Use positive values for must-run constraints.
-    """
-    load_scaling_factor: float = 1.0
-    disabled_generators: list[str] = []
+class _KPIStudy(BaseModel):
+    """What a KPI study takes at one moment and over a window (`kpis.py`):
+    the corrective options' conditions, and what to compare the schedule with."""
     slack_max_mw: float | None = None
-    opf_vm_upper: float = 1.05
-    opf_vm_lower: float = 0.95
+    slack_q_max_mvar: float | None = None
     opf_lambda_p: float = 0.01
     opf_lambda_q: float = 0.001
     pg_max_overrides: dict[str, float] = {}
     pg_min_overrides: dict[str, float] = {}
     fixed_setpoints: dict[str, float] = {}
     opf_min_power_factor: float = 0.95
-    slack_q_max_mvar: float | None = None
     opf_current_safety_margin: float = 0.9
+    hold_units: list[str] = []
+    branch_limits: dict[str, float] = {}
+    # A corrective option to compare with the schedule, by its ref ("S3:cheapest"),
+    # held from its own moment at a later one; default: the cheapest at each moment.
+    option: str | None = None
+    # Also the cost of N-1 security: a security-constrained OPF at each moment (slower).
+    n1: Literal["preventive", "corrective", "both"] | None = None
+
+
+class KPIRequest(_KPIStudy, _TimeseriesRequest):
+    """Request body for ``POST /api/kpi/evaluate``: the indicators at one
+    moment, the schedule against a corrective action. The `vm_*_pu` and
+    `max_*_loading_pct` limits judge each state's power flow (the network's own
+    unless sent); `opf_vm_*` bound the corrective options' OPF."""
+    load_scaling_factor: float = 1.0
+    vm_upper_pu: float = 1.05
+    vm_lower_pu: float = 0.95
+    max_line_loading_pct: float = 90.0
+    max_trafo_loading_pct: float = 90.0
+    opf_vm_upper: float | None = None
+    opf_vm_lower: float | None = None
 
 
 class ElementTimeseriesRequest(_TimeseriesRequest):
@@ -3526,16 +3406,24 @@ class GeneratorModelRequest(BaseModel):
     reset: bool = False
 
 
+def _renames_now() -> dict:
+    """{name as loaded: name now} for every renamed unit and load."""
+    if app_data.get("net") is None:
+        return {}
+    base = _net_for(None)
+    return {**naming.unit_renames(base), **naming.load_renames(base)}
+
+
 def _by_name_now(keyed: dict) -> dict:
-    """A {unit name as loaded: …} table under the units' names now."""
-    now = naming.unit_renames(_net_for(None)) if app_data.get("net") is not None else {}
+    """A {unit or load name as loaded: …} table under their names now."""
+    now = _renames_now()
     return {now.get(k, k): v for k, v in keyed.items()}
 
 
 def _by_name_loaded(changes: list) -> list:
     """Unit changes named as the operator sees the units now, keyed back to
     their names as loaded (what the model and costs are kept under)."""
-    now = naming.unit_renames(_net_for(None)) if app_data.get("net") is not None else {}
+    now = _renames_now()
     back = {v.casefold(): k for k, v in now.items()}
     out = []
     for c in changes or []:
@@ -3608,15 +3496,18 @@ def _costs_payload() -> dict:
     if loaded is None:
         raise HTTPException(status_code=503, detail="No network loaded yet.")
     rows = uc.table(loaded, app_data.get("unit_costs") or {})
+    loads = uc.load_table(loaded, app_data.get("unit_costs") or {})
     base = _net_for(None)
-    now = naming.unit_renames(base)
-    for r in rows:
+    now = {**naming.unit_renames(base), **naming.load_renames(base)}
+    for r in rows + loads:
         r["unit"] = now.get(r["unit"], r["unit"])
         r["bus_name"] = _bus_display_name(base, r["bus"])
         for k in ("table", "index", "proposed"):
             r.pop(k, None)
     return {
         "units": rows, "changed": _by_name_now(app_data.get("unit_costs") or {}), "currency": "EUR",
+        # Per load: demand response and load relief — the remedies after redispatch.
+        "loads": [r for r in loads], "loads_rule": uc.LOAD_RULE,
         "synthetic_rule": uc.RULE,
         "used_by": "They price the flexibility options and find the cheapest one; the default corrective "
                    "dispatch (least disturbance) does not use them.",
@@ -3630,6 +3521,9 @@ def _costs_payload() -> dict:
             "q_band_tan_phi / q_penalty_eur_per_mvarh": "external grid: reactive exchange within |Q| ≤ tan φ·|P| "
                                                         "is free; each Mvarh beyond costs the penalty",
             "source": "per figure: 'case' (the network file's gencost), 'synthetic' (the rule) or 'operator'",
+            "dr_share_pct / dr_eur_per_mwh": "a load: the share that can be reduced on request (demand response) "
+                                             "and its price",
+            "relief_eur_per_mwh": "a load: involuntary load relief beyond its demand response, the last resort",
         },
     }
 
@@ -4683,6 +4577,38 @@ def _branch_labeller(net):
     return label
 
 
+def _with_last_resort(failed: dict, request, ts: str, model, net, net_base, held: dict | None,
+                      caps_shown: dict | None, fixed: dict | None, cap: float | None,
+                      outage: dict | None = None) -> dict:
+    """A failed dispatch — no redispatch of the units clears the violations —
+    with the remedies beyond redispatch: the options that also reduce load
+    (demand response, then load relief; flex_options.last_resort) and single
+    branches whose opening helps (checked by power flow). Asked for options,
+    the answer is those options; otherwise the failure stays the answer and
+    carries them as `last_resort`. `model`: a clone of the failed model."""
+    if model is None or not hasattr(model, "LFlex") or getattr(request, "n1", None):
+        return failed
+    try:
+        if cap is not None:
+            _cap_exchange(model, cap, getattr(request, "slack_q_max_mvar", None), fixed)
+        rescue = _flexibility_options(request, ts, model, net, net_base, cap if cap is not None else float(
+            app_data.get("slack_max_mw", 999.0)), held, outage=outage, caps_shown=caps_shown,
+            last_resort={"why": failed.get("message"), "restart": fe._restart})
+        switching = _switching_remedies(net, None, request.opf_vm_lower, request.opf_vm_upper,
+                                        _network_limits()["max_line_loading_pct"])
+    except Exception:  # noqa: BLE001 — the failure is still the answer
+        logging.getLogger(__name__).warning("Last resort failed.", exc_info=True)
+        return failed
+    if switching:
+        rescue["switching"] = switching
+    if getattr(request, "options", False) and rescue.get("status") == "options":
+        return {**rescue, "redispatch_alone": {**rescue.get("redispatch_alone", {}), "status": failed.get("status"),
+                                               **({"diagnosis": failed["infeasibility_diagnosis"]}
+                                                  if failed.get("infeasibility_diagnosis") else {})}}
+    failed["last_resort"] = {k: v for k, v in rescue.items() if k not in ("timestamp", "mode")}
+    return failed
+
+
 def _with_infeasibility_diagnosis(failed: dict, model, net=None) -> dict:
     """A failed OPF result, with the reason when one can be found.
 
@@ -4800,17 +4726,29 @@ def _voltage_controlled_buses(net) -> list[dict]:
     return out
 
 
-def _run_rsa_snapshot(timestamp: str, request: GridRequest) -> dict:
-    """Run the existing RSA pipeline for one explicit timestamp."""
+def _prepared_net(timestamp: str, request, applied: tuple | None = None):
+    """The network of a study at one moment: its measurements, the load and
+    renewable scaling asked for, then — `applied`, (option set, option[, held])
+    — a corrective option's outage and dispatch. Returns (net, pg_max)."""
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(timestamp, request.data_source))
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, timestamp, _dataset_of(request))
     pg_max = _pg_max_for(request, net_copy)
     _scale_loads(net_copy, request.load_scaling_factor)
-    if request.sgen_scaling_factor != 1.0:
+    if getattr(request, "sgen_scaling_factor", 1.0) != 1.0:
         net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
         net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
+    if applied:
+        stored, option, *rest = applied
+        _apply_stored_option(net_copy, stored, option, held=bool(rest and rest[0]))
+    return net_copy, pg_max
+
+
+def _run_rsa_snapshot(timestamp: str, request: GridRequest, applied: tuple | None = None) -> dict:
+    """Run the existing RSA pipeline for one explicit timestamp. `applied`:
+    (option set, option[, held]) — its dispatch (and outage) applied first."""
+    net_copy, pg_max = _prepared_net(timestamp, request, applied)
 
     _vlo, _vhi, _mll, _mtl = _effective_thresholds(request)
     net_calculated, df_results_rsa = rs.real_time_security_assessment(
@@ -5255,6 +5193,13 @@ async def run_security_assessment(request: GridRequest):
     voltages they reported came from a grid the assessments never showed
     (review 2.2).
     """
+    if request.option:
+        # The assessment with a corrective option applied — at its moment, or
+        # held to a later one.
+        stored, option, request, held = _option_context(request, later=True)
+        current_ts = _resolve_tick(request.data_source, request.timestamp)
+        result = _run_rsa_snapshot(current_ts, request, applied=(stored, option, held))
+        return {**result, "option": _option_echo(stored, option, current_ts, held)}
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     return _run_rsa_snapshot(current_ts, request)
 
@@ -6448,12 +6393,22 @@ async def simulate_contingency(request: ContingencyRequest):
     """
     _check_outage_element(request.element_type, request.element_index, _net_for(request))
 
+    applied = None
+    if request.option:
+        # The outage with a corrective option applied: at its moment, or held to a later one.
+        stored, option, request, held = _option_context(request, later=True)
+        applied = (stored, option, held)
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_copy = copy.deepcopy(_net_for(request))
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
     _scale_loads(net_copy, request.load_scaling_factor)
+    if applied:
+        _apply_stored_option(net_copy, applied[0], applied[1], held=applied[2])
+
+    def echoed(result: dict) -> dict:
+        return {**result, "option": _option_echo(applied[0], applied[1], current_ts, applied[2])} if applied else result
 
     if request.element_type == "line":
         net_copy.line.at[request.element_index, "in_service"] = False
@@ -6477,21 +6432,21 @@ async def simulate_contingency(request: ContingencyRequest):
     # flow does not converge, which this endpoint used to report as secure —
     # an outage that collapses the system, presented as harmless.
     if not getattr(net_copy, "converged", True):
-        return {"timestamp": current_ts, "system_secure": False, "converged": False,
+        return echoed({"timestamp": current_ts, "system_secure": False, "converged": False,
                 "total_violations": None, "violations": [],
                 "message": "The power flow did not converge after this outage — the "
                            "system has no stable operating point without this element. "
                            "Treat it as insecure.",
                 "data_source": _dataset_label(request),
                 "thresholds_used": _thresholds_used(request),
-                **_supply_lost(net_copy, request.element_type, request.element_index)}
+                **_supply_lost(net_copy, request.element_type, request.element_index)})
 
     if df_results_ca.empty:
-        return {"timestamp": current_ts, "system_secure": True, "total_violations": 0,
+        return echoed({"timestamp": current_ts, "system_secure": True, "total_violations": 0,
                 "violations": [],
                 "data_source": _dataset_label(request),
                 "thresholds_used": _thresholds_used(request),
-                **_supply_lost(net_copy, request.element_type, request.element_index)}
+                **_supply_lost(net_copy, request.element_type, request.element_index)})
 
     element_names = []
     for _, row in df_results_ca.iterrows():
@@ -6511,11 +6466,11 @@ async def simulate_contingency(request: ContingencyRequest):
 
     # Placeholder: publish_ca_results(df_results_ca, current_ts, topic="topic6913"...)
 
-    return {"timestamp": current_ts, "system_secure": False, "total_violations": len(df_results_ca),
+    return echoed({"timestamp": current_ts, "system_secure": False, "total_violations": len(df_results_ca),
             "violations": df_results_ca.to_dict(orient="records"),
             "data_source": _dataset_label(request),
             "thresholds_used": _thresholds_used(request),
-            **_supply_lost(net_copy, request.element_type, request.element_index)}
+            **_supply_lost(net_copy, request.element_type, request.element_index)})
 
 
 _SCREEN_VM_TOL, _SCREEN_LOADING_TOL = 1e-4, 0.01      # p.u., % — solver precision, not a violation
@@ -6647,26 +6602,10 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
     chosen = None
     # Network comparisons call this with a plain GridRequest: no option there.
     if getattr(request, "option", None):
-        stored, option = _resolve_option(request.option)
-        # The option's own moment, network and load level: a dispatch is a
-        # solution for one operating point, and means nothing at another.
-        asked_ts = _resolve_tick(request.data_source, request.timestamp) if request.timestamp else None
-        clashes = [what for what, asked, own in (
-            ("moment", asked_ts, stored["timestamp"]),
-            ("network", request.network, stored["network"] if request.network else None),
-            ("load scaling", request.load_scaling_factor if request.load_scaling_factor != 1.0 else None,
-             stored["load_scaling_factor"] if request.load_scaling_factor != 1.0 else None))
-            if asked is not None and asked != own]
-        if clashes:
-            raise HTTPException(status_code=400, detail=(
-                f"option: {stored['id']}:{option.id} was computed at {stored['timestamp']} on "
-                f"{stored['network']} with loads ×{stored['load_scaling_factor']:g}; this screen asked for another "
-                f"{' and '.join(clashes)}. Screen it at its own, or compute options for this one."))
-        request = request.model_copy(update={
-            "timestamp": stored["timestamp"], "data_source": stored["data_source"],
-            "network": None if stored["network"] == "base" else stored["network"],
-            "load_scaling_factor": stored["load_scaling_factor"]})
-        chosen = (stored, option)
+        # At the option's own network and load level — at its moment, or a
+        # later one with its set-points held.
+        stored, option, request, held = _option_context(request, later=True)
+        chosen = (stored, option, held)
 
     current_ts = _resolve_tick(request.data_source, request.timestamp)
     net_copy = copy.deepcopy(_net_for(request))
@@ -6676,22 +6615,12 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
     _scale_loads(net_copy, request.load_scaling_factor)
     screened_with = None
     if chosen:
-        stored, option = chosen
-        outage = stored.get("outage")
-        if outage:
-            # The option was computed after this outage: it stays out, and the
-            # sweep screens every further one (N-1-1).
-            table = net_copy.line if outage["element_type"] == "line" else net_copy.trafo
-            table.at[outage["element_index"], "in_service"] = False
-            islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(net_copy))
-            if islanded:
-                net_copy.bus.loc[islanded, "in_service"] = False
-        _apply_option_dispatch(net_copy, option)
-        screened_with = {"ref": f"{stored['id']}:{option.id}", "label": option.label, "timestamp": stored["timestamp"],
-                         "network": stored["network"], "load_scaling_factor": stored["load_scaling_factor"],
-                         "held_units": stored.get("held_units") or {},
-                         "after_outage": outage["element"] if outage else None,
-                         "screen": "N-1-1" if outage else "N-1"}
+        stored, option, held = chosen
+        # An option computed after an outage keeps it out, and the sweep
+        # screens every further one (N-1-1).
+        _apply_stored_option(net_copy, stored, option, held=held)
+        screened_with = _option_echo(stored, option, current_ts, held,
+                                     screen="N-1-1" if stored.get("outage") else "N-1")
     # Accepted by the request and the agent's wrapper, but never applied: the
     # sweep ran at measured renewable output whatever was asked.
     if request.sgen_scaling_factor != 1.0:
@@ -6810,6 +6739,7 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
             current_safety_margin=request.opf_current_safety_margin,
             fixed_setpoints=fixed_setpoints or None,
             branch_limits=caps or None,
+            load_flex=_load_flex(modified_net),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Solver crashed: {str(e)}")
@@ -6854,7 +6784,11 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
                   "feasible": False, "converged": False, "activated_resources": [], "outage": outage, **islanding,
                   **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
-        return _with_infeasibility_diagnosis(failed, model_opt, modified_net)
+        rescue = model_opt.clone() if model_opt is not None else None      # the diagnosis changes the model
+        failed = _with_infeasibility_diagnosis(failed, model_opt, modified_net)
+        out = _with_last_resort(failed, request, current_ts, rescue, modified_net, net_base, held, caps_shown,
+                                fixed_setpoints, cap=None, outage=outage)
+        return {**out, "outage": outage, **islanding}
 
 
 # ---------------------------------------------------------------------------
@@ -9167,7 +9101,58 @@ def _flex_prices(net, model) -> tuple[fo.Prices, dict]:
                                        row.get("q_penalty_eur_per_mvarh"))
         sources[str(e)] = sorted({(row.get("source") or {}).get(k, "synthetic")
                                   for k in ("cost_eur_per_mwh", "q_band_tan_phi", "q_penalty_eur_per_mvarh")})
-    return fo.Prices(up, down, q, imp, band, penalty), sources
+    _avail, dr, relief, _src = _load_prices(net)
+    return fo.Prices(up, down, q, imp, band, penalty, dr=dr, relief=relief), sources
+
+
+def _load_prices(net) -> tuple[dict, dict, dict, list]:
+    """Per load of `net` (by index): the MW of demand response available now
+    (its share of the load as it stands — scaled, at this moment), and the
+    €/MWh of demand response and of load relief, from the cost table; and
+    where those figures come from. A load a proposal added has the defaults."""
+    loaded = app_data.get("net_loaded")
+    rows = ({r["unit"]: r for r in uc.load_table(loaded, app_data.get("unit_costs") or {})}
+            if loaded is not None else {})
+    added = {r["unit"]: r for r in uc.load_defaults(net)}
+    avail, dr, relief, sources = {}, {}, {}, set()
+    for idx in net.load.index:
+        name = uc.load_name(net, idx)
+        row = rows.get(name) or added.get(name)
+        if row is None:
+            continue
+        scale = net.load.at[idx, "scaling"] if "scaling" in net.load.columns else 1.0
+        scale = 1.0 if scale is None or scale != scale else float(scale)
+        p = max(float(net.load.at[idx, "p_mw"]) * scale, 0.0)
+        avail[int(idx)] = p * float(row.get("dr_share_pct") or 0.0) / 100.0
+        dr[int(idx)], relief[int(idx)] = row.get("dr_eur_per_mwh"), row.get("relief_eur_per_mwh")
+        sources |= set((row.get("source") or {}).values())
+    return avail, dr, relief, sorted(sources)
+
+
+def _load_flex(net) -> dict:
+    """What the OPF may reduce at each load (`flex_engine` load_flex): its
+    demand response, MW. Load relief covers the rest. Used only when a
+    strategy frees them; the default dispatch never touches a load."""
+    return _load_prices(net)[0]
+
+
+def _load_label(net, idx) -> dict:
+    """A load as results name it: its name now and its bus."""
+    idx = int(idx)
+    if idx not in net.load.index:
+        return {"load": f"Load {idx}", "bus": None}
+    return {"load": naming.display(net, "load", idx), "bus": _bus_display_name(net, int(net.load.at[idx, "bus"]))}
+
+
+def _load_actions(net, option) -> list[dict]:
+    """The load reductions an option asks for, by load: demand response and
+    load relief, MW."""
+    out = []
+    for idx in sorted(set(option.dr or {}) | set(option.relief or {})):
+        dr_mw, relief_mw = (option.dr or {}).get(idx, 0.0), (option.relief or {}).get(idx, 0.0)
+        out.append({**_load_label(net, idx), "demand_response_mw": round(dr_mw, 3),
+                    "load_relief_mw": round(relief_mw, 3)})
+    return out
 
 
 def _finite_exchange(net) -> bool:
@@ -9182,21 +9167,39 @@ def _finite_exchange(net) -> bool:
 _PF_VM_TOL, _PF_LOADING_MAX, _PF_LOADING_TOL, _PF_Q_TOL = 0.002, 100.0, 0.1, 0.5
 
 
-def _apply_option_dispatch(net, option) -> None:
+def _apply_option_dispatch(net, option, units: bool = True, loads: bool = True, held: bool = False) -> None:
     """An option's dispatch onto `net` (in place): every unit's active power,
     the set-point of a unit that holds a voltage, the reactive output of one
-    that does not. The external grid takes the balance, as in the OPF."""
+    that does not; and its load reductions. The external grid takes the
+    balance, as in the OPF. `held` (at a later moment than it was computed
+    for): only what the option told a unit to change stays — every other unit
+    follows its own schedule there, as it would in operation."""
     where = {gm.unit_name(net, table, idx): (table, idx) for table in ("gen", "sgen") for idx in net[table].index}
-    for unit, p in option.p.items():
-        if unit not in where:
+    told = option.instructions if held else None
+    for unit, p in (option.p if units else {}).items():
+        if unit not in where or (told is not None and unit not in told):
             continue
+        what = told.get(unit, "") if told is not None else "P+V+Q"
         table, idx = where[unit]
-        net[table].at[idx, "p_mw"] = p
+        if "P" in what:
+            net[table].at[idx, "p_mw"] = p
         bus = (option.vc_bus or {}).get(unit)
         if table == "gen" and bus is not None and option.v.get(bus) is not None:
-            net.gen.at[idx, "vm_pu"] = option.v[bus]          # the set-point the option gives it
-        elif table == "sgen":
+            if "V" in what:
+                net.gen.at[idx, "vm_pu"] = option.v[bus]      # the set-point the option gives it
+        elif table == "sgen" and "Q" in what:
             net.sgen.at[idx, "q_mvar"] = option.q.get(unit, net.sgen.at[idx, "q_mvar"])
+    # Load reductions (demand response, load relief), each load keeping its power factor.
+    for idx in (set(option.dr or {}) | set(option.relief or {})) if loads else ():
+        if idx not in net.load.index:
+            continue
+        scale = net.load.at[idx, "scaling"] if "scaling" in net.load.columns else 1.0
+        scale = 1.0 if scale is None or scale != scale else float(scale)
+        served = float(net.load.at[idx, "p_mw"]) * scale
+        cut = (option.dr or {}).get(idx, 0.0) + (option.relief or {}).get(idx, 0.0)
+        share = max(1.0 - cut / served, 0.0) if served > 1e-9 else 1.0
+        net.load.at[idx, "p_mw"] = float(net.load.at[idx, "p_mw"]) * share
+        net.load.at[idx, "q_mvar"] = float(net.load.at[idx, "q_mvar"]) * share
 
 
 def _conditions_key() -> str:
@@ -9222,6 +9225,7 @@ def _remember_options(request, ts: str, kept: list, outage: dict | None, held: d
                     "options": {o.id: o for o, _ in kept}}
     for old in list(sets)[:-_MAX_OPTION_SETS]:
         sets.pop(old)
+    _save_option_sets()
     return set_id
 
 
@@ -9247,6 +9251,64 @@ def _resolve_option(ref: str) -> tuple[dict, object]:
             f"option: {found['id']}:{oid} was computed before the unit models, names or load power factor "
             "changed; compute the options again."))
     return found, found["options"][oid]
+
+
+def _option_context(request, later: bool = True, ref: str | None = None) -> tuple[dict, object, object, bool]:
+    """Resolve `request.option` for a study that applies it: (its set, the
+    option, the request at the option's network, data and load level, held).
+    The moment is the option's own unless the request names a later one — then
+    (`later`) its set-points are held since it was computed, `held` True.
+    Refused: an unknown option, another network or load level, an earlier
+    moment (or any other moment, when not `later`)."""
+    stored, option = _resolve_option(ref or request.option)
+    own = stored["timestamp"]
+    asked = _resolve_tick(stored["data_source"], request.timestamp) if request.timestamp else None
+    clashes = [what for what, asked_, own_ in (
+        ("network", request.network, stored["network"] if request.network else None),
+        ("load scaling", request.load_scaling_factor if request.load_scaling_factor != 1.0 else None,
+         stored["load_scaling_factor"] if request.load_scaling_factor != 1.0 else None))
+        if asked_ is not None and asked_ != own_]
+    if asked is not None and asked != own and (not later or own == nom.NOMINAL or str(asked) < str(own)):
+        clashes.append("moment" + (" (before it was computed)" if later and str(asked) < str(own) else ""))
+    if clashes:
+        raise HTTPException(status_code=400, detail=(
+            f"option: {stored['id']}:{option.id} was computed at {own} on {stored['network']} with loads "
+            f"×{stored['load_scaling_factor']:g}; this study asked for another {' and '.join(clashes)}. "
+            + ("Use it at its own moment or a later one (its set-points held), or compute options for this one."
+               if later else "Screen it at its own moment, or compute options for this one.")))
+    at = asked or own
+    request = request.model_copy(update={
+        "timestamp": at, "data_source": stored["data_source"],
+        "network": None if stored["network"] == "base" else stored["network"],
+        "load_scaling_factor": stored["load_scaling_factor"]})
+    return stored, option, request, at != own
+
+
+def _apply_stored_option(net, stored: dict, option, units: bool = True, loads: bool = True,
+                         held: bool = False) -> None:
+    """An option onto `net` (in place): the outage it was computed after, if
+    any (buses it leaves without supply out of service too), then its dispatch
+    — `held` at a later moment: its instructions only (`_apply_option_dispatch`)."""
+    outage = stored.get("outage")
+    if outage:
+        table = net.line if outage["element_type"] == "line" else net.trafo
+        table.at[outage["element_index"], "in_service"] = False
+        islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(net))
+        if islanded:
+            net.bus.loc[islanded, "in_service"] = False
+    _apply_option_dispatch(net, option, units=units, loads=loads, held=held)
+
+
+def _option_echo(stored: dict, option, at: str, held: bool, **extra) -> dict:
+    """What a study ran with, said in its result: the option, when it was
+    computed, when it is applied, and whether its set-points are held."""
+    return {"ref": f"{stored['id']}:{option.id}", "label": option.label, "timestamp": stored["timestamp"],
+            "applied_at": at, "held": held, "network": stored["network"],
+            # Held at a later moment: what it told units to change stays; the rest follow their schedule.
+            **({"held_instructions": dict(sorted(option.instructions.items()))} if held else {}),
+            "load_scaling_factor": stored["load_scaling_factor"], "held_units": stored.get("held_units") or {},
+            "after_outage": (stored.get("outage") or {}).get("element"),
+            **({"load_reduction_mw": round(option.load_reduction, 3)} if option.load_reduction else {}), **extra}
 
 
 def _power_flow_check(net, option, vm_lower: float, vm_upper: float, caps: dict | None = None,
@@ -9295,9 +9357,82 @@ def _power_flow_check(net, option, vm_lower: float, vm_upper: float, caps: dict 
             "violations": violations[:6]}
 
 
+_SWITCH_SHOWN = 3              # switching candidates reported, best first
+_SWITCH_GAIN_PCT = 10.0        # an opening must relieve at least this share of the excess, or clear a violation
+
+
+def _pf_violations(n, lo: float, hi: float, limit_pct: float) -> list[tuple[str, float]]:
+    """What a solved power flow breaks, worst first: (in words, excess) —
+    loading above the limit in % of rating, voltage outside the band in
+    hundredths of a p.u."""
+    out = []
+    live = n.bus.index[n.bus["in_service"]] if "in_service" in n.bus.columns else n.bus.index
+    for b, v in n.res_bus.vm_pu.reindex(live).dropna().items():
+        if v < lo - _PF_VM_TOL or v > hi + _PF_VM_TOL:
+            out.append((f"{_bus_display_name(n, b)} at {v:.3f} p.u.", 100.0 * max(lo - v, v - hi)))
+    for table, label in (("line", _line_display_name), ("trafo", _trafo_display_name)):
+        res = n.get(f"res_{table}")
+        if res is None or not len(res):
+            continue
+        for idx, pct in res["loading_percent"].dropna().items():
+            if pct > limit_pct + _PF_LOADING_TOL:
+                out.append((f"{label(n, idx)} at {pct:.1f} %", float(pct) - limit_pct))
+    return sorted(out, key=lambda x: -x[1])
+
+
+def _switching_remedies(net, option, lo: float, hi: float, limit_pct: float) -> list[dict]:
+    """Single lines or transformers whose opening clears or relieves what
+    `net` (an operating point; an outage already applied, maybe; `option`'s
+    dispatch applied when given) breaks — each opening checked by an AC power
+    flow, any that leaves a bus without supply skipped. Best first, at most
+    _SWITCH_SHOWN. A screen, not an optimisation: protection, supply paths
+    and switching sequence are the operator's to check."""
+    n = copy.deepcopy(net)
+    if option is not None:
+        _apply_option_dispatch(n, option)
+    try:
+        pp.runpp(n, algorithm="nr", calculate_voltage_angles=True, numba=False)
+    except Exception:  # noqa: BLE001 — nothing to compare against
+        return []
+    before = _pf_violations(n, lo, hi, limit_pct)
+    if not before:
+        return []
+    severity = sum(e for _, e in before)
+    found = []
+    for table, label in (("line", _line_display_name), ("trafo", _trafo_display_name)):
+        frame = n.get(table)
+        if frame is None or not len(frame):
+            continue
+        for idx in frame.index[frame["in_service"].astype(bool)]:
+            frame.at[idx, "in_service"] = False
+            try:
+                if len(pp.topology.unsupplied_buses(n)):
+                    continue
+                pp.runpp(n, algorithm="nr", calculate_voltage_angles=True, numba=False)
+                after = _pf_violations(n, lo, hi, limit_pct)
+                left = sum(e for _, e in after)
+                if left < severity and (100.0 * (severity - left) / severity >= _SWITCH_GAIN_PCT
+                                        or len(after) < len(before)):
+                    found.append({"open": label(n, idx), "clears_all": not after,
+                                  "relieves_pct": round(100.0 * (severity - left) / severity),
+                                  "remaining": [text for text, _ in after[:3]], "checked_by_power_flow": True,
+                                  "_left": left})
+            except Exception:  # noqa: BLE001 — an opening the power flow cannot solve is not offered
+                pass
+            finally:
+                frame.at[idx, "in_service"] = True
+    found.sort(key=lambda f: (not f["clears_all"], f["_left"]))
+    return [{k: v for k, v in f.items() if k != "_left"} for f in found[:_SWITCH_SHOWN]]
+
+
 _N1_MAX_OUTAGES = 8            # outages a study takes on at once (the most severe first)
 _PLAN_MW, _PLAN_VM = 0.1, 0.002   # the smallest corrective instruction worth issuing
 _N1_ROUNDS = 2                 # solve, screen, add what newly fails, solve again
+
+
+def _natural(name) -> list:
+    """Gen_bus4 before Gen_bus10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(name))]
 
 
 def _outage_net(net, table: str, idx: int):
@@ -9379,8 +9514,9 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
                          pg_min_overrides=request.pg_min_overrides or None,
                          min_power_factor=request.opf_min_power_factor,
                          current_safety_margin=request.opf_current_safety_margin,
-                         fixed_setpoints=fixed or None)
+                         fixed_setpoints=fixed or None, load_flex=_load_flex(net))
     keep = set(held or {}) | set(held_now)
+    load_reduction = bool(getattr(request, "n1_load_reduction", True))
     reach = {g: float(request.n1_reach_pct) / 100.0 * max(float(value(model.Pg_max[g])), 0.0) for g in model.G}
 
     def solve_mode(mode, outages):
@@ -9408,7 +9544,8 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
                     m_k.Pext[e].setub(base.Pext[e].ub)
             states[name] = m_k
             built.append((name, table, idx))
-        top = scopf.build(base, states, mode, reach, request.opf_lambda_p, request.opf_lambda_q)
+        top = scopf.build(base, states, mode, reach, request.opf_lambda_p, request.opf_lambda_q,
+                          load_reduction=load_reduction)
         if not fo.solve(top):
             return None, built
         scopf.secure_first(top)
@@ -9466,7 +9603,13 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
             block = getattr(top, f"c{k}")
             remaining = scopf.residuals(block, branch_name, lambda b, n=net: _bus_display_name(n, b))
             if remaining:
-                not_secured.append({"outage": name, "remaining": remaining[:4]})
+                # What else might: opening one more branch after it (power flow),
+                # with this option's dispatch — after its corrective action, if any.
+                net_k, _ = _outage_net(net, table, idx)
+                dispatch = fo.capture(block, sid) if mode == scopf.CORRECTIVE else option
+                switching = _switching_remedies(net_k, dispatch, lo, hi, emergency)
+                not_secured.append({"outage": name, "remaining": remaining[:4],
+                                    **({"switching": switching} if switching else {})})
             if mode == scopf.CORRECTIVE:
                 net_k, _ = _outage_net(net, table, idx)
                 # First the dispatch alone: an outage it already survives needs no plan.
@@ -9478,8 +9621,7 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
                 after = fo.capture(block, sid)
                 check = _power_flow_check(net_k, after, lo, hi, max_loading_pct=emergency)
                 actions = []
-                # Gen_bus4 before Gen_bus10.
-                for g in sorted(after.p, key=lambda u: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", u)]):
+                for g in sorted(after.p, key=_natural):
                     dp = round(after.p[g] - option.p[g], 2) + 0.0
                     bus = (option.vc_bus or {}).get(g)
                     dv = abs(after.v.get(bus, 0) - option.v.get(bus, 0)) if bus is not None else 0.0
@@ -9489,10 +9631,18 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
                                     **({"setpoint_vm_pu_before": round(option.v.get(bus, 0), 3),
                                         "setpoint_vm_pu_after": round(after.v.get(bus, 0), 3)}
                                        if bus is not None and dv >= _PLAN_VM else {})})
+                loads = _load_actions(net, after)
                 plan.append({"outage": name, "actions": actions, "no_action_needed": False,
+                             # When moving the units is not enough: load reduced after the outage.
+                             **({"loads": loads} if loads else {}),
                              "checked_by_power_flow": check.get("confirmed"),
                              "after_action": check.get("violations") or []})
         detail["secured"] = len(built) - len(not_secured)
+        if mode == scopf.CORRECTIVE:
+            unsecured = {x["outage"] for x in not_secured}
+            detail["secured_with_load_reduction"] = sum(1 for p in plan if p.get("loads")
+                                                        and p["outage"] not in unsecured)
+            detail["load_reduction_allowed"] = load_reduction
         detail["not_secured"] = not_secured
         if plan:
             detail["corrective_plan"] = plan
@@ -9505,10 +9655,19 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
     return {"kept": kept, "info": info, "study": study}
 
 
+# A study that reads a moment's indicators (`_kpi_moment`) sets a dict here
+# and gets, besides the options, the solved model they came from: the flexibility
+# the moment requires and how far the units can go are solved on the same model.
+_FLEX_MODEL_SINK: contextvars.ContextVar = contextvars.ContextVar("flex_model_sink", default=None)
+
+
 def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: float, held: dict | None = None,
-                         outage: dict | None = None, caps_shown: dict | None = None) -> dict:
+                         outage: dict | None = None, caps_shown: dict | None = None,
+                         last_resort: dict | None = None) -> dict:
     """Several corrective dispatches from the solved, capped least-disturbance
-    model, scored the same way. The operator chooses; nothing here ranks them."""
+    model, scored the same way. The operator chooses; nothing here ranks them.
+    `last_resort` ({"why", "restart", "fixed"}): unit redispatch alone found no
+    dispatch on `model`; the options are those that also reduce load."""
     # The exchange at the studied point (its loads, generation at schedule) —
     # not the unscaled network's, or a load-scaling study would count the extra
     # load itself as a cost of the corrective action.
@@ -9523,24 +9682,46 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
               **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
     # A held unit gets no instruction at all: its set-point is kept too, not
     # only its active power (pinned already).
-    model, kept_too = fo.with_setpoints_kept(model, [g for g in (held or {}) if g in model.G])
+    model, kept_too = (fo.with_setpoints_kept(model, [g for g in (held or {}) if g in model.G])
+                       if not last_resort else (model, True))
     if held and not kept_too:
         common["held_note"] = ("Their active power is held; keeping their voltage set-points as well has no "
                                "feasible dispatch, so those may change.")
+    sink = _FLEX_MODEL_SINK.get()
+    if sink is not None:
+        sink.update(model=model, net=net, pext0=pext0, qext0=qext0, last_resort=bool(last_resort))
     first = fo.capture(model, "least_disturbance")
     # No action: the schedule itself (active and reactive output as scheduled)
     # meets every limit. Not "no instruction": a condenser past its reactive
     # limit cannot hold its set-point, and its bus voltage differs untouched.
     n1 = getattr(request, "n1", None)
     # An N-1 study goes on even then: secure now is not secure after an outage.
-    if not n1 and not first.moved and all(abs(first.q[g] - first.q0[g]) < fo.MOVE_MVAR for g in first.q):
+    if not last_resort and not n1 and not first.moved and all(
+            abs(first.q[g] - first.q0[g]) < fo.MOVE_MVAR for g in first.q):
         return {**common, "status": "no_action_needed", "feasible": True, "converged": True, "options": [],
                 "message": "The schedule already meets every limit: no corrective action is needed, so there "
                            "are no options to compare."}
     prices, sources = _flex_prices(net, model)
     budget = None
     n1_info = {}
-    if n1:
+    if last_resort:
+        kept, not_offered = fo.last_resort(model, prices, pext0, qext0, restart=last_resort.get("restart"))
+        cheapest_total = min((c["total"] for _, c in kept), default=None)
+        common.update({"set": "last_resort",
+                       # Why the units alone could not: the diagnosis, in words. A remedy
+                       # it names is another way out, not a condition of these options
+                       # (seen live: "raise the grid voltage" read as a prerequisite).
+                       "redispatch_alone": {"clears_violations": False, "why": last_resort.get("why"),
+                                            "note": "Why redispatching the units alone fails. Any other remedy "
+                                                    "named here (e.g. raising the grid-connection voltage) is "
+                                                    "an alternative to the load-reduction options, not part of "
+                                                    "them: they need nothing else changed."}})
+        if not kept:
+            return {**common, "status": "infeasible", "feasible": False, "converged": False, "options": [],
+                    "not_offered": not_offered,
+                    "message": "Neither redispatching the units nor reducing load clears the violations: "
+                               + "; ".join(n["reason"] for n in not_offered) + "."}
+    elif n1:
         study = _n1_study(request, ts, model, net, net_base, prices, pext0, qext0, held)
         kept, n1_info = study["kept"], study["info"]
         not_offered = [{"id": sid, "label": fo.STRATEGIES[sid][0], "reason": entry["not_offered"]}
@@ -9548,10 +9729,15 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
         cheapest_total = next((c["total"] for o, c in kept if o.id == "cheapest"), None)
         common.update({"set": "n1", "n1_study": study["study"]})
     elif request.near_optimal:
-        kept, not_offered, cheapest_total, budget = fo.generate_near_optimal(
-            model, prices, pext0, qext0, request.near_optimal_pct)
+        methods = tuple(request.near_optimal_methods or fo.NEAR_OPTIMAL_METHODS)
+        kept, not_offered, cheapest_total, budget, ranges = fo.generate_near_optimal(
+            model, prices, pext0, qext0, request.near_optimal_pct, methods=methods,
+            count=request.near_optimal_count)
         common.update({"set": "near_optimal", "near_optimal_pct": request.near_optimal_pct,
-                       "budget_eur_per_h": budget})
+                       "budget_eur_per_h": budget, "near_optimal_methods": list(methods),
+                       # How far each unit can go within the margin — what the
+                       # alternatives have in common, and where they differ.
+                       **({"near_optimal_ranges": ranges} if ranges else {})})
     else:
         kept, not_offered, cheapest_total = fo.generate(model, prices, pext0, qext0)
     best = next((o for o, _ in kept if o.id == "cheapest"), None)
@@ -9619,6 +9805,13 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
             # studied, what it could not secure and (corrective) its plan.
             **({"n1": {k: v for k, v in n1_info[option.id].items() if k != "not_offered"}}
                if option.id in n1_info else {}),
+            # Load reductions, where an option has them: demand response and
+            # load relief, by load — instructions to customers, not units.
+            **({"load_actions": _load_actions(net, option), "loads_called": len(_load_actions(net, option)),
+                "load_reduction_mw": round(option.load_reduction, 3),
+                "demand_response_mw": round(sum((option.dr or {}).values()), 3),
+                "load_relief_mw": round(sum((option.relief or {}).values()), 3)}
+               if option.load_reduction else {}),
         }
         if cheapest_total is not None:
             gap = cost["total"] - cheapest_total
@@ -9634,19 +9827,27 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
             gap_text = (f"{entry['above_cheapest_pct']:.1f} % above the cheapest" if "above_cheapest_pct" in entry
                         else f"{entry.get('above_cheapest_eur_per_h', 0):+.2f} €/h against the cheapest")
             changes = ([f"avoids {', '.join(avoids)}"] if avoids else []) + ([f"adds {', '.join(adds)}"] if adds else [])
-            entry["how"] = gap_text + "; " + ("; ".join(changes) or "the same units, moved differently")
+            # How it was found (the MGA method), then what it does differently.
+            entry["found_by"] = option.how
+            entry["how"] = "; ".join([gap_text, option.how, "; ".join(changes) or "the same units, moved differently"])
         options.append(entry)
     counts: dict = {}
     for kinds in sources.values():
         for k in kinds:
             counts[k] = counts.get(k, 0) + 1
+    used_loads = sorted({i for o, _ in kept for i in set(o.dr or {}) | set(o.relief or {})})
     return {**common, "status": "options", "feasible": True, "converged": True,
-            "message": ((f"N-1 security study: {len(common['n1_study']['outages_studied'])} critical outage(s) "
+            "message": ((f"Redispatching the units alone cannot clear the violations (why: `redispatch_alone`). "
+                         f"{len(options)} option(s) that also reduce load — demand response first, load relief only "
+                         "beyond it — each meeting every limit with nothing else changed; the operator chooses."
+                         if last_resort else
+                         f"N-1 security study: {len(common['n1_study']['outages_studied'])} critical outage(s) "
                          "studied; the options are compared by their N-1 screens, each meets every limit with "
                          "everything in service; the operator chooses." if n1 else
                          f"The cheapest option and {len(options) - 1} near-optimal alternative(s), each costing at "
-                         f"most {budget:.2f} €/h ({request.near_optimal_pct:g} % above the cheapest) and changing "
-                         "other units; each meets every limit; the operator chooses." if request.near_optimal else
+                         f"most {budget:.2f} €/h ({request.near_optimal_pct:g} % above the cheapest) and picked to "
+                         "be as different from the others as the margin allows (how each was found is in `how`); "
+                         "each meets every limit; the operator chooses." if request.near_optimal else
                          f"{len(options)} corrective option(s), each meeting every limit; the operator chooses.")
                         + " Costs are of the corrective action (doing nothing costs 0)."),
             "options": options, "not_offered": not_offered,
@@ -9656,7 +9857,12 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
                       "prices": {"up_eur_per_mwh": prices.up, "down_eur_per_mwh": prices.down,
                                  "reactive_eur_per_mvarh": prices.q, "import_eur_per_mwh": prices.import_,
                                  "reactive_band_tan_phi": prices.band,
-                                 "beyond_band_eur_per_mvarh": prices.penalty}}}
+                                 "beyond_band_eur_per_mvarh": prices.penalty},
+                      # The loads the options reduce, with their prices (cost table, per load).
+                      **({"load_prices": {_load_label(net, i)["load"]: {
+                          "demand_response_eur_per_mwh": (prices.dr or {}).get(i),
+                          "load_relief_eur_per_mwh": (prices.relief or {}).get(i)} for i in used_loads}}
+                         if used_loads else {})}}
 
 
 def _branch_index(net) -> dict:
@@ -9769,6 +9975,19 @@ async def optimise_flexibility(request: FlexibilityRequest):
       * Fold 2 unfixes them and minimizes ``|Pg_new - Pg_base|``.
     """
     if _db_for("full", request) is None: raise HTTPException(status_code=503)
+    start = None
+    if request.from_option:
+        stored, held_option, request, held_since = _option_context(request, later=True, ref=request.from_option)
+        if stored.get("outage"):
+            raise HTTPException(status_code=400, detail=(
+                f"from_option: {stored['id']}:{held_option.id} was computed after the outage of "
+                f"{stored['outage']['element']}; start from it with optimize_contingency for that outage."))
+        start = (stored, held_option, held_since)
+
+    def echoed(result: dict) -> dict:
+        if not start or not isinstance(result, dict):
+            return result
+        return {**result, "from_option": _option_echo(start[0], start[1], result.get("timestamp") or "", start[2])}
     if request.n1 and request.near_optimal:
         raise HTTPException(status_code=400, detail=(
             "n1 and near_optimal are two different option sets: ask for the N-1 secure options, or for "
@@ -9779,6 +9998,8 @@ async def optimise_flexibility(request: FlexibilityRequest):
     measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
 
     net_base, _ = _assign_tick(net_base, measurement_prod_cons, current_ts, _dataset_of(request))
+    if start:
+        _apply_option_dispatch(net_base, start[1], loads=False, held=start[2])   # the held set-points: the schedule now
 
     disabled_gens = request.disabled_generators
 
@@ -9812,6 +10033,8 @@ async def optimise_flexibility(request: FlexibilityRequest):
 
     net = copy.deepcopy(net_base)
     _scale_loads(net, request.load_scaling_factor)
+    if start:
+        _apply_option_dispatch(net, start[1], units=False, held=start[2])        # and its load reductions, if any
 
     try:
         pp.runpp(net)
@@ -9835,6 +10058,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
             vm_upper_per_bus=request.vm_upper_per_bus or None,
             vm_lower_per_bus=request.vm_lower_per_bus or None,
             branch_limits=caps or None,
+            load_flex=_load_flex(net),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -9849,7 +10073,10 @@ async def optimise_flexibility(request: FlexibilityRequest):
                   "feasible": False, "converged": False,
                   "activated_resources": [], "slack_max_mw": _reported_cap,
                   **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
-        return _with_infeasibility_diagnosis(failed, model_opt, net)
+        rescue = model_opt.clone() if model_opt is not None else None      # the diagnosis changes the model
+        failed = _with_infeasibility_diagnosis(failed, model_opt, net)
+        return echoed(_with_last_resort(failed, request, current_ts, rescue, net, net_base, held, caps_shown,
+                                        fixed_setpoints, cap=_reported_cap))
 
     # Constrained-slack re-solve so the dispatch respects the global
     # Sweden-cable slider. If the constrained solve fails we fall back
@@ -9940,18 +10167,20 @@ async def optimise_flexibility(request: FlexibilityRequest):
 
     # Phase 3 Placeholder: publish_flex_rsa_results(df, current_ts, topic="topic6916"...)
     if not cap_respected:
-        return {
+        failed = {
             "timestamp": current_ts, "status": "cap_infeasible", "message": msg,
             "feasible": False, "converged": True, "slack_cap_respected": False,
             "activated_resources": [], "slack_max_mw": slack_cap,
             "uncapped_reference_dispatch": regulation_data,
             **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {}),
         }
+        return echoed(_with_last_resort(failed, request, current_ts, model_opt.clone(), net, net_base, held,
+                                        caps_shown, fixed_setpoints, cap=slack_cap))
     if request.options or request.n1:          # an N-1 study is a set of options
         app_data["last_dispatch_result"] = regulation_data
         app_data["last_dispatch_timestamp"] = current_ts
-        return _flexibility_options(request, current_ts, cscen_model, net, net_base, slack_cap, held,
-                                    caps_shown=caps_shown)
+        return echoed(_flexibility_options(request, current_ts, cscen_model, net, net_base, slack_cap, held,
+                                           caps_shown=caps_shown))
     response = {
         "timestamp": current_ts, "status": "optimal", "message": msg,
         "feasible": True, "converged": True, "slack_cap_respected": True,
@@ -9967,351 +10196,892 @@ async def optimise_flexibility(request: FlexibilityRequest):
         response["dispatch_pre_disable"] = dispatch_pre_disable
     app_data["last_dispatch_result"] = regulation_data
     app_data["last_dispatch_timestamp"] = current_ts
-    return response
+    return echoed(response)
+
+
+class HoldOptionRequest(GridRequest):
+    """Request body for ``POST /api/flexibility/hold``: a corrective option
+    (`option`, required) held from its moment over the next `hours` hours;
+    `n1` adds the N-1 screen of the held dispatch at each moment studied."""
+    hours: float = Field(default=6, gt=0, le=48)
+    n1: bool = False
+
+
+_HOLD_MAX_TICKS = 49             # moments studied at most (sampled evenly beyond)
+_HOLD_N1_MAX_TICKS = 13          # with the N-1 screen at each
+
+
+def _ticks_within(timestamps: list, start: str, hours: float, most: int) -> list:
+    """The series' moments from `start` to `hours` after it, at most `most`
+    of them. When there are more, they are evenly spaced with the first and
+    the last always kept — on a round step where one lands on the last and
+    keeps at least half of `most` (16:00–00:00 every 15 min, at most 6:
+    16:00, 18:00, …, 00:00), else as evenly as the series allows."""
+    first = timestamps.index(start)
+    try:
+        end = pd.Timestamp(start) + pd.Timedelta(hours=float(hours))
+        ticks = [t for t in timestamps[first:] if pd.Timestamp(t) <= end]
+    except (ValueError, TypeError):
+        ticks = timestamps[first:first + int(hours) + 1]
+    if len(ticks) > most:
+        last = len(ticks) - 1
+        fewest = max(2, (most + 1) // 2)
+        step = next((s for s in range(math.ceil(last / (most - 1)), last + 1)
+                     if last % s == 0 and last // s + 1 >= fewest), None)
+        picks = range(0, last + 1, step) if step else sorted({round(i * last / (most - 1)) for i in range(most)})
+        ticks = [ticks[i] for i in picks]
+    return ticks
+
+
+def _rsa_brief(result: dict) -> dict:
+    """An assessment in a line: its violations and worst figures."""
+    rows = result.get("violations") or []
+
+    def words(v):
+        name = v.get("element_name") or v.get("element") or "?"
+        value_ = v.get("value")
+        unit = " p.u." if "vm" in str(v.get("violation_type")) else " %"
+        return f"{name} at {value_:.3f}{unit}" if unit == " p.u." and isinstance(value_, (int, float)) else \
+            f"{name} at {value_:.1f}{unit}" if isinstance(value_, (int, float)) else str(name)
+    loadings = [r.get("loading_percent") for r in result.get("all_line_loading") or []
+                if isinstance(r.get("loading_percent"), (int, float))]
+    volts = [r.get("vm_pu") for r in result.get("all_voltages") or [] if isinstance(r.get("vm_pu"), (int, float))]
+    return {"violations": int(result.get("total_violations") or 0),
+            "max_line_loading_pct": round(max(loadings), 2) if loadings else None,
+            "min_vm_pu": round(min(volts), 4) if volts else None,
+            "worst": [words(v) for v in rows[:3]]}
+
+
+@app.post("/api/flexibility/hold")
+@_off_event_loop
+async def hold_option(request: HoldOptionRequest):
+    """Hold a corrective option from its moment over the next hours: at each
+    tick, the assessment with its instructions kept (every other unit follows
+    its schedule; load reductions stay) beside the schedule untouched — how
+    long the action keeps the grid within limits, and when a new one is
+    needed. With `n1`, each tick's N-1 screen of the held dispatch too."""
+    if not request.option:
+        raise HTTPException(status_code=400, detail="option: give the reference of a corrective option "
+                                                    "(e.g. S3:cheapest) to hold.")
+    stored, option, req, _ = _option_context(request.model_copy(update={"timestamp": None}), later=True)
+    timestamps, _dataset, _label = _resolve_dataset(stored["data_source"])
+    if stored["timestamp"] not in timestamps:
+        raise HTTPException(status_code=400, detail=(
+            f"option: {stored['id']}:{option.id} was computed at {stored['timestamp']}, which has no hours "
+            "after it in the data; hold an option computed at a moment of the series."))
+    ticks = _ticks_within(timestamps, stored["timestamp"], request.hours,
+                          _HOLD_N1_MAX_TICKS if request.n1 else _HOLD_MAX_TICKS)
+    note = None
+    rows, lo, hi = [], req.vm_lower_pu, req.vm_upper_pu
+    for k, ts in enumerate(ticks):
+        held = k > 0
+        schedule = _rsa_brief(_run_rsa_snapshot(ts, req))
+        applied = (stored, option, held)
+        with_option = _rsa_brief(_run_rsa_snapshot(ts, req, applied=applied))
+        row = {"timestamp": ts, "held": held, "schedule": schedule, "with_option": with_option}
+        if request.n1:
+            net_held, _ = _prepared_net(ts, req, applied)
+            sweep = _n1_sweep(net_held, ts, lo, hi, req.max_line_loading_pct, req.max_trafo_loading_pct)
+            row["with_option"]["n1_outages_with_violations"] = sweep["total_outages_causing_violations"]
+            row["with_option"]["n1_outages_tested"] = sweep["total_outages_tested"]
+        rows.append(row)
+    failing = next((r for r in rows if r["with_option"]["violations"]), None)
+    holds_until = None
+    for r in rows:
+        if r["with_option"]["violations"]:
+            break
+        holds_until = r["timestamp"]
+    echo = _option_echo(stored, option, stored["timestamp"], len(rows) > 1)
+    if failing is None:
+        message = (f"Held from {stored['timestamp']}, {option.label} keeps every limit through {rows[-1]['timestamp']} "
+                   f"({len(rows) - 1} hour(s) after it).")
+    elif failing is rows[0]:
+        message = f"{option.label} does not meet every limit even at its own moment ({failing['timestamp']})."
+    else:
+        message = (f"Held from {stored['timestamp']}, {option.label} keeps every limit until {holds_until}; at "
+                   f"{failing['timestamp']} it no longer does ({'; '.join(failing['with_option']['worst'][:2])}). "
+                   f"A new corrective action is needed then — options from it: optimize_flexibility with "
+                   f"from_option={echo['ref']} at {failing['timestamp']}.")
+    return {"timestamp": stored["timestamp"], "mode": "hold", "option": echo, "hours": rows,
+            "holds_until": holds_until, "first_failure": failing["timestamp"] if failing else None,
+            "message": message + (f" {note}" if note else ""),
+            "data_source": _dataset_label(req), "thresholds_used": _thresholds_used(req)}
+
+
+class _WindowRequest(_TimeseriesRequest):
+    """A window of moments: from `start` (default the clock, or the first
+    forecast tick) to `end`, or `hours` after it; `moments` of them at most,
+    evenly spaced."""
+    start: str | None = None
+    end: str | None = None
+    hours: float = Field(default=6, gt=0, le=48)
+    moments: int = Field(default=6, ge=2, le=12)
+    load_scaling_factor: float = 1.0
+    vm_upper_pu: float = 1.05            # the network's own limits unless sent (_NetworkLimitsMixin)
+    vm_lower_pu: float = 0.95
+    max_line_loading_pct: float = 90.0
+    max_trafo_loading_pct: float = 90.0
+    opf_vm_lower: float | None = None
+    opf_vm_upper: float | None = None
+    hold_units: list[str] = []
+    branch_limits: dict[str, float] = {}
+    # A caller-chosen id to follow a long study's progress (GET /api/progress/{id}).
+    progress_id: str | None = Field(default=None, max_length=64)
+
+
+def _window(request: _WindowRequest) -> list[str]:
+    """The moments a window study runs at (the nominal point refused: it has no time)."""
+    timestamps, _dataset, _label = _window_dataset(request.data_source)
+    start = _resolve_tick(request.data_source, request.start or request.timestamp)
+    hours = request.hours
+    if request.end:
+        end = _resolve_tick(request.data_source, request.end)
+        if str(end) <= str(start):
+            raise HTTPException(status_code=400, detail=f"end ({end}) must come after start ({start}).")
+        hours = (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds() / 3600.0
+    ticks = _ticks_within(timestamps, start, hours, request.moments)
+    if len(ticks) < 2:
+        raise HTTPException(status_code=400, detail=f"The window from {start} holds one moment only; make it longer.")
+    return ticks
+
+
+def _gaps(ticks: list[str]) -> list[float]:
+    """Hours between consecutive moments (a ramp limit is per gap)."""
+    times = [pd.Timestamp(t) for t in ticks]
+    return [(b - a).total_seconds() / 3600.0 for a, b in zip(times, times[1:])]
+
+
+def _weights(ticks: list[str]) -> list[float]:
+    """Hours each moment stands for in a total over the window — half the gap
+    to each neighbour (the trapezoid rule), so the total covers exactly the
+    window from the first moment to the last: 16:00–00:00 is eight hours,
+    not nine."""
+    gaps = _gaps(ticks)
+    if not gaps:
+        return [0.0] * len(ticks)
+    return [(gaps[k - 1] if k > 0 else 0.0) / 2 + (gaps[k] if k < len(gaps) else 0.0) / 2
+            for k in range(len(ticks))]
+
+
+class KPIOverTimeRequest(_KPIStudy, _WindowRequest):
+    """Request body for ``POST /api/kpi/over_time``: the indicators at each
+    moment of a window."""
+
+
+class SecurityOverTimeRequest(_WindowRequest):
+    """Request body for ``POST /api/flexibility/security_over_time``."""
+    n1: Literal["preventive", "corrective", "both"] = "preventive"
+
+
+# ---------------------------------------------------------------------------
+# Long studies: progress, and moments in parallel worker processes
+# ---------------------------------------------------------------------------
+
+# Progress of a long study, by the id its caller chose (`progress_id`), read
+# while the study runs (GET /api/progress/{id}) — that endpoint takes no lock.
+_PROGRESS: dict[str, dict] = {}
+_PROGRESS_LOCK = threading.Lock()
+_PROGRESS_KEEP_S = 3600.0
+
+
+def _report_progress(job: str | None, **fields) -> None:
+    if not job:
+        return
+    now = time.time()
+    with _PROGRESS_LOCK:
+        for old in [k for k, v in _PROGRESS.items() if now - v.get("updated", now) > _PROGRESS_KEEP_S]:
+            _PROGRESS.pop(old, None)
+        _PROGRESS.setdefault(job, {"started": now}).update(fields, updated=now)
+
+
+@app.get("/api/progress/{job}")
+async def study_progress(job: str):
+    """How far a long study has got: {"done", "total", "last", "elapsed_s"}."""
+    with _PROGRESS_LOCK:
+        entry = dict(_PROGRESS.get(job) or {})
+    if not entry:
+        return {"known": False}
+    return {"known": True, **{k: v for k, v in entry.items() if k not in ("started", "updated")},
+            "elapsed_s": round(time.time() - entry["started"], 1)}
+
+
+# Inside a study worker process: it computes and returns; saving to disk is
+# the parent's (two workers writing one file would race).
+_IN_WORKER = False
+_MAX_STUDY_WORKERS = 4
+
+
+def _study_workers(n: int) -> int:
+    """How many worker processes a study of `n` independent moments uses: one
+    per moment, at most _MAX_STUDY_WORKERS and one less than the cores; 1
+    (in turn, in this process) where processes cannot be forked (Windows) or
+    CONDUCTOR_STUDY_WORKERS says so."""
+    import multiprocessing
+    wanted = os.environ.get("CONDUCTOR_STUDY_WORKERS", "").strip()
+    if "fork" not in multiprocessing.get_all_start_methods() or n <= 1:
+        return 1
+    cap = int(wanted) if wanted.isdigit() else _MAX_STUDY_WORKERS
+    return max(1, min(n, cap, (os.cpu_count() or 2) - 1))
+
+
+def _worker_start() -> None:
+    global _IN_WORKER
+    _IN_WORKER = True
+    # One thread per solve in a worker whatever the parent was told: several
+    # workers each using every core only fight over the cores.
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def _run_coroutine(coro):
+    """A coroutine that never suspends — the study endpoints compute, they do
+    not wait — run to its result without an event loop (a forked worker has
+    none of its own)."""
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value
+    coro.close()
+    raise RuntimeError("the study suspended")
+
+
+def _security_moment(request, ts: str) -> tuple[dict, dict]:
+    """One moment of security_over_time — the same study a question at that
+    moment gets — as (its row, the option sets it created)."""
+    before = set(app_data.get("option_sets") or {})
+    modes = ["preventive", "corrective"] if request.n1 == "both" else [request.n1]
+    limits = {k: getattr(request, k) for k in ("vm_upper_pu", "vm_lower_pu", "max_line_loading_pct",
+                                               "max_trafo_loading_pct")}
+    opf = {k: v for k, v in (("opf_vm_lower", request.opf_vm_lower), ("opf_vm_upper", request.opf_vm_upper))
+           if v is not None}
+    study = FlexibilityRequest(timestamp=ts, data_source=request.data_source, network=request.network,
+                               load_scaling_factor=request.load_scaling_factor, n1=request.n1,
+                               hold_units=request.hold_units, branch_limits=request.branch_limits,
+                               load_power_factor=request.load_power_factor, **opf, **limits)
+    sweep_req = GridRequest(timestamp=ts, data_source=request.data_source, network=request.network,
+                            load_scaling_factor=request.load_scaling_factor,
+                            load_power_factor=request.load_power_factor, **limits)
+    net_now, _ = _prepared_net(ts, sweep_req)
+    schedule = _n1_sweep(net_now, ts, sweep_req.vm_lower_pu, sweep_req.vm_upper_pu,
+                         sweep_req.max_line_loading_pct, sweep_req.max_trafo_loading_pct)
+    row = {"timestamp": ts, "schedule_n1_outages_with_violations": schedule["total_outages_causing_violations"],
+           "outages_tested": schedule["total_outages_tested"]}
+    try:
+        # The study itself, not its locked wrapper: this thread (or worker) already runs one.
+        result = _run_coroutine(optimise_flexibility.__wrapped__(study))
+    except HTTPException as exc:
+        return {**row, "status": "error", "why": str(exc.detail)[:300]}, {}
+    created = {sid: entry for sid, entry in (app_data.get("option_sets") or {}).items() if sid not in before}
+    if result.get("status") != "options":
+        return {**row, "status": result.get("status"), "why": (result.get("message") or "")[:300]}, created
+    by_id = {o["id"]: o for o in result.get("options") or []}
+
+    def brief(o):
+        n1 = o.get("n1") or {}
+        # The full N-1 screen (of the row's outages_tested) and, apart, the few
+        # outages the security-constrained OPF studied and how many it secured.
+        return {"ref": o.get("ref"), "cost_eur_per_h": o.get("cost_eur_per_h"),
+                "n1_outages_with_violations": (n1.get("screen") or {}).get("outages_with_violations"),
+                **({"outages_studied_by_the_opf": len(n1.get("studied") or []),
+                    "of_those_secured": n1["secured"]} if "secured" in n1 else {}),
+                **({"secured_with_load_reduction": n1["secured_with_load_reduction"]}
+                   if n1.get("secured_with_load_reduction") else {})}
+    # Whether the schedule itself meets every normal-operation limit (the
+    # OPF's current margin included): where it does not, it is a reference,
+    # not an option — security is compared with the cheapest action.
+    least = by_id.get("least_disturbance") or {}
+    row.update({"status": "options", "cheapest": brief(by_id["cheapest"]) if "cheapest" in by_id else None,
+                "schedule_meets_limits": not least.get("n_units_called") and not least.get("moved_mw")})
+    for mode in modes:
+        option = by_id.get(f"n1_{mode}")
+        if option is None:
+            why = next((n["reason"] for n in result.get("not_offered") or [] if n["id"] == f"n1_{mode}"), None)
+            row[mode] = {"not_offered": why or "not found"}
+            continue
+        row[mode] = brief(option)
+        if row["cheapest"] is not None:
+            row[mode]["security_cost_eur_per_h"] = round(option["cost_eur_per_h"] - row["cheapest"]["cost_eur_per_h"], 2)
+    return row, created
+
+
+def _moment_in_worker(moment, request, ts: str) -> tuple[str, dict, dict]:
+    return (ts, *moment(request, ts))
+
+
+def _adopt_option_sets(created: dict) -> dict:
+    """Option sets a worker created, kept here under fresh ids (the worker's
+    own ids were from its copy). Returns {its id: id here}."""
+    sets = app_data.setdefault("option_sets", {})
+    renamed = {}
+    for old in sorted(created, key=lambda sid: int(sid[1:]) if sid[1:].isdigit() else 0):
+        app_data["option_set_counter"] = app_data.get("option_set_counter", 0) + 1
+        new = f"S{app_data['option_set_counter']}"
+        sets[new] = {**created[old], "id": new}
+        renamed[old] = new
+    for old in list(sets)[:-_MAX_OPTION_SETS]:
+        sets.pop(old)
+    return renamed
+
+
+def _renamed_refs(row: dict, renamed: dict) -> dict:
+    """A row's option references ("S5:cheapest") under the ids kept here:
+    every `ref` or `*_ref` string, however deep."""
+    def walk(node):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if (key == "ref" or key.endswith("_ref")) and isinstance(val, str) and ":" in val:
+                    sid, oid = val.split(":", 1)
+                    node[key] = f"{renamed.get(sid, sid)}:{oid}"
+                else:
+                    walk(val)
+        elif isinstance(node, list):
+            for val in node:
+                walk(val)
+    walk(row)
+    return row
+
+
+def _run_moments(request, ticks: list[str], job: str | None, moment=None) -> tuple[list[dict], int]:
+    """Every moment's row — `moment(request, ts)`, (row, option sets it
+    created); the cost of security by default — in order: in parallel worker
+    processes when the platform allows (each a fork of this one: the network,
+    data and settings as they are now), else in turn. A worker pool that fails
+    falls back to running what is left in turn. Returns (rows, workers used)."""
+    moment = moment or _security_moment
+    workers = _study_workers(len(ticks))
+    rows: dict[str, dict] = {}
+
+    def note():
+        last = max(rows, default=None)
+        _report_progress(job, done=len(rows), total=len(ticks), last=last, workers=workers)
+
+    note()
+    if workers > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("fork"),
+                                     initializer=_worker_start) as pool:
+                futures = [pool.submit(_moment_in_worker, moment, request, ts) for ts in ticks]
+                for future in as_completed(futures):
+                    ts, row, created = future.result()
+                    rows[ts] = _renamed_refs(row, _adopt_option_sets(created))
+                    note()
+        except (BrokenProcessPool, OSError, RuntimeError):
+            logging.getLogger(__name__).warning("Study workers failed; finishing in turn.", exc_info=True)
+            workers = 1
+        _save_option_sets()
+    for ts in ticks:
+        if ts not in rows:
+            rows[ts], _created = moment(request, ts)
+            note()
+    return [rows[ts] for ts in ticks], workers
+
+
+@app.post("/api/flexibility/security_over_time")
+@_off_event_loop
+async def security_over_time(request: SecurityOverTimeRequest):
+    """The cost of N-1 security over a window: at each moment the same study
+    a single question gets (the cheapest corrective action, and the N-1
+    secure option — preventive and/or corrective — with every option's N-1
+    screen), then hour by hour what security costs above the cheapest, and in
+    total over the window (each moment weighted by half the time to its
+    neighbours, see `_weights`). The moments run
+    in parallel worker processes where the platform allows; `progress_id`
+    lets the caller follow them (GET /api/progress/{id})."""
+    ticks = _window(request)
+    modes = ["preventive", "corrective"] if request.n1 == "both" else [request.n1]
+    started = time.time()
+    rows, workers = _run_moments(request, ticks, request.progress_id)
+    spans = _weights(ticks)
+    totals = {}
+    for mode in modes:
+        priced = [(r[mode]["security_cost_eur_per_h"], h) for r, h in zip(rows, spans)
+                  if isinstance(r.get(mode), dict) and "security_cost_eur_per_h" in r[mode]]
+        if priced:
+            totals[mode] = {"security_cost_eur": round(sum(c * h for c, h in priced), 2),
+                            "moments_priced": len(priced),
+                            "highest_eur_per_h": max(c for c, _ in priced)}
+    worst = max(rows, key=lambda r: r.get("schedule_n1_outages_with_violations") or 0)
+    lines = [f"{len(rows)} moments from {ticks[0]} to {ticks[-1]}"]
+    short = [r["timestamp"] for r in rows if r.get("schedule_meets_limits") is False]
+    def span(counts):
+        counts = [c for c in counts if isinstance(c, int)]
+        return "" if not counts else f"{min(counts)}" if min(counts) == max(counts) else f"{min(counts)}–{max(counts)}"
+    tested = next((r["outages_tested"] for r in rows if r.get("outages_tested")), None)
+    for mode, t in totals.items():
+        screened = span([(r.get(mode) or {}).get("n1_outages_with_violations") for r in rows])
+        lines.append(f"N-1 {mode}: {t['security_cost_eur']:.2f} € above the cheapest over the window "
+                     f"(at most {t['highest_eur_per_h']:.2f} €/h)"
+                     + (f", and in the full N-1 screen {screened} of {tested} outages still with violations"
+                        if screened and tested else ""))
+    if tested:
+        lines.append(f"the cheapest: {span([(r.get('cheapest') or {}).get('n1_outages_with_violations') for r in rows])}"
+                     f" of {tested}; the schedule: {span([r.get('schedule_n1_outages_with_violations') for r in rows])}"
+                     f" of {tested}")
+    return {"timestamp": ticks[0], "mode": "security_over_time", "modes": modes, "moments": rows,
+            "hours_each": [round(h, 3) for h in spans], "totals": totals,
+            "worst_moment": worst["timestamp"],
+            "message": "; ".join(lines) + ". Each moment is the same study as asking at that moment — secure only "
+                       "for the outages its optimisation studied (outages_studied_by_the_opf, of_those_secured), so "
+                       "report the full screen (n1_outages_with_violations of outages_tested) as the chart does; the total "
+                       f"covers the {sum(spans):g} h from the first moment to the last, each moment weighted by half "
+                       "the time to its neighbours — an estimate between the moments studied."
+                       + (f" At {len(short)} of the {len(rows)} moments the schedule itself breaks a normal-operation "
+                          "limit (the 90 % current margin included), so it is a reference, not an option: compare the "
+                          "secure option with the cheapest corrective action, not with the schedule." if short else ""),
+            "schedule_breaks_limits_at": short,
+            "computed_in": {"seconds": round(time.time() - started, 1), "workers": workers},
+            "data_source": _dataset_label(request)}
+
+
+class PlanRequest(_WindowRequest):
+    """Request body for ``POST /api/flexibility/plan``."""
+    objective: Literal["least_disturbance", "cheapest"] = "least_disturbance"
+    # How strongly the plan keeps an instruction from one moment to the next
+    # (0: each moment on its own; 1: the default).
+    steadiness: float = Field(default=1.0, ge=0, le=10)
+    # Ramp limit between consecutive moments, % of a unit's capacity per hour (None: none).
+    ramp_pct_per_h: float | None = Field(default=None, gt=0, le=1000)
+
+
+_PLAN_CHANGE_MW = fo.MOVE_MW      # an instruction changes when it moves at all (as options count units moved)
+
+
+@app.post("/api/flexibility/plan")
+@_off_event_loop
+async def plan_over_time(request: PlanRequest):
+    """A corrective plan across a window (an evening peak): one OPF over every
+    moment, each meeting every limit, linked so that an instruction is kept
+    from one moment to the next unless changing it is worth it (`steadiness`),
+    and — when given — within each unit's ramp. Compared with solving each
+    moment on its own: how many active-power instructions each issues, the MW
+    moved and, for the cheapest, the cost."""
+    if _db_for("full", request) is None:
+        raise HTTPException(status_code=503)
+    from pyomo.environ import ConcreteModel, Constraint, NonNegativeReals, Objective, Var, minimize, value as pv
+    ticks = _window(request)
+    spans, gaps = _weights(ticks), _gaps(ticks)
+    lo = request.opf_vm_lower if request.opf_vm_lower is not None else _network_limits()["opf_vm_lower"]
+    hi = request.opf_vm_upper if request.opf_vm_upper is not None else _network_limits()["opf_vm_upper"]
+    cap = float(app_data.get("slack_max_mw", 999.0))
+    db = _db_for("full", request)
+    blocks, nets, prices_at, ext0 = [], [], [], []
+    held_any: dict = {}
+    for ts in ticks:
+        req = FlexibilityRequest(timestamp=ts, data_source=request.data_source, network=request.network,
+                                 load_scaling_factor=request.load_scaling_factor, hold_units=request.hold_units,
+                                 load_power_factor=request.load_power_factor)
+        net_base, _ = _prepared_net(ts, GridRequest(timestamp=ts, data_source=request.data_source,
+                                                    network=request.network, load_power_factor=request.load_power_factor))
+        try:
+            pp.runpp(net_base)
+        except Exception:  # noqa: BLE001
+            pass
+        fixed, held = _held_at_schedule(net_base, req)
+        held_any.update(held)
+        caps, _shown = _branch_caps(net_base, request.branch_limits)
+        net = copy.deepcopy(net_base)
+        _scale_loads(net, request.load_scaling_factor)
+        try:
+            pp.runpp(net)
+        except Exception:  # noqa: BLE001
+            pass
+        _res, m = fe.optimization_model_base(
+            net, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"], db["TAPS"], db["trafo_ranges"],
+            db["trafo_defaults"], db["branch_to_trafo"], opf_vm_lower=lo, opf_vm_upper=hi,
+            fixed_setpoints=fixed or None, branch_limits=caps or None)
+        _cap_exchange(m, cap, None, fixed)
+        scopf.release(m, set(held))
+        blocks.append(m)
+        nets.append(net)
+        prices_at.append(_flex_prices(net, m)[0])
+        ref = net if _finite_exchange(net) else net_base
+        ext0.append(({e: float(ref.res_ext_grid["p_mw"].values[i]) for i, e in enumerate(m.Ext)},
+                     {e: float(ref.res_ext_grid["q_mvar"].values[i]) for i, e in enumerate(m.Ext)}))
+    units = sorted((g for g in blocks[0].G if all(g in set(b.G) for b in blocks)), key=_natural)
+
+    def solve_window(link: bool):
+        top = ConcreteModel()
+        objective = 0.0
+        copies = [b.clone() for b in blocks]
+        for k, m in enumerate(copies):
+            setattr(top, f"t{k}", m)
+            for obj in list(m.component_objects(Objective, active=True)):
+                obj.deactivate()
+            if request.objective == "cheapest":
+                objective += fo.add_cost(m, prices_at[k], *ext0[k]) + 1e-3 * fo._disturbance(m)
+            else:
+                objective += (0.01 * sum((m.Pg_new[g] - m.Pg_base[g]) ** 2 for g in m.G)
+                              + 0.001 * sum((m.Qg_new[g] - m.Qg_base[g]) ** 2 for g in m.G))
+        if link and len(copies) > 1:
+            # Per MW of change: a 5 MW move at least-disturbance prices ~0.1 at the
+            # margin, so the default holds an instruction unless changing it moves
+            # a good deal more (cheapest: € per MW).
+            weight = (6.0 if request.objective == "cheapest" else 0.15) * request.steadiness
+            # Every change of an instruction counts — the first one too (from
+            # the schedule), or the plan would issue at the first moment what
+            # only a later one needs, to save a "change".
+            pairs = [(k, g) for k in range(len(copies)) for g in units]
+            top.change = Var(pairs, within=NonNegativeReals, initialize=0.0)
+
+            def delta(k, g):
+                if k < 0:
+                    return 0.0
+                m = copies[k]
+                return m.Pg_new[g] - m.Pg_base[g]
+            top.change_up = Constraint(pairs, rule=lambda t, k, g: t.change[k, g] >= delta(k, g) - delta(k - 1, g))
+            top.change_down = Constraint(pairs, rule=lambda t, k, g: t.change[k, g] >= delta(k - 1, g) - delta(k, g))
+            objective += weight * sum(top.change[p] for p in pairs)
+            pairs = [(k, g) for k in range(1, len(copies)) for g in units]
+            if request.ramp_pct_per_h:
+                pmax = {g: float(pv(copies[0].Pg_max[g])) for g in units}
+                ramp = {(k, g): request.ramp_pct_per_h / 100.0 * pmax[g] * gaps[k - 1] for k, g in pairs}
+                top.ramp_up = Constraint(pairs, rule=lambda t, k, g: (
+                    copies[k].Pg_new[g] - copies[k - 1].Pg_new[g] <= ramp[k, g]))
+                top.ramp_down = Constraint(pairs, rule=lambda t, k, g: (
+                    copies[k - 1].Pg_new[g] - copies[k].Pg_new[g] <= ramp[k, g]))
+        top.obj = Objective(expr=objective, sense=minimize)
+        if not fo.solve(top):
+            return None
+        return [fo.capture(m, "least_disturbance" if request.objective == "least_disturbance" else "cheapest")
+                for m in copies]
+
+    plan = solve_window(link=True)
+    if plan is None:
+        raise HTTPException(status_code=422, detail=(
+            "No plan meets every limit at every moment of the window"
+            + (" within the ramp limit" if request.ramp_pct_per_h else "")
+            + ". Ask for the options at the worst moment, or relax the ramp."))
+    separate = solve_window(link=False)
+
+    def describe(options):
+        steps, issued, moved, cost = [], 0, 0.0, 0.0
+        previous = {g: 0.0 for g in units}
+        for k, (o, ts) in enumerate(zip(options, ticks)):
+            dp = {g: o.p[g] - o.p0[g] for g in units}
+            changed = [g for g in units if abs(dp[g] - previous[g]) >= _PLAN_CHANGE_MW]
+            issued += len(changed)
+            moved += sum(abs(v) for v in dp.values()) * spans[k]
+            c = fo.action_cost(o, prices_at[k], *ext0[k])["total"]
+            cost += c * spans[k]
+            volts = [v for v in o.v.values() if v is not None]
+            steps.append({"timestamp": ts, "dp_mw": {g: round(dp[g], 2) + 0.0 for g in units},
+                          "changed": changed, "cost_eur_per_h": c,
+                          "max_loading_pct": round(o.max_loading_pct, 2) if o.max_loading_pct is not None else None,
+                          "min_vm_pu": round(min(volts), 4) if volts else None,
+                          "power_flow_check": _power_flow_check(nets[k], o, lo, hi).get("confirmed")})
+            previous = dp
+        return {"steps": steps, "instructions_issued": issued, "mwh_moved": round(moved, 2),
+                "cost_eur": round(cost, 2)}
+    planned = describe(plan)
+    alone = describe(separate) if separate else None
+    msg = (f"A plan over {len(ticks)} moments from {ticks[0]} to {ticks[-1]}: {planned['instructions_issued']} "
+           f"active-power instruction(s)" + (f" against {alone['instructions_issued']} solving each moment on its "
+                                             f"own" if alone else "")
+           + f"; {planned['mwh_moved']:.1f} MWh moved, {planned['cost_eur']:.2f} € of corrective action at the cost "
+             f"table's prices over the {sum(spans):g} h window. Every moment meets every limit.")
+    return {"timestamp": ticks[0], "mode": "plan", "objective": request.objective, "units": units,
+            "moments": ticks, "hours_each": [round(h, 3) for h in spans], "steadiness": request.steadiness,
+            **({"ramp_pct_per_h": request.ramp_pct_per_h} if request.ramp_pct_per_h else {}),
+            **({"held_units": held_any} if held_any else {}),
+            "plan": planned, "each_moment_alone": alone, "message": msg,
+            "data_source": _dataset_label(request)}
+
+
+# ---------------------------------------------------------------------------
+# Key performance indicators (kpis.py): the schedule against a corrective action
+# ---------------------------------------------------------------------------
+
+def _kpi_state(ts: str, req: GridRequest, applied: tuple | None = None) -> dict:
+    """One state of a moment, by AC power flow — the schedule, or `applied`
+    ((option set, option, held)) on it: its violations and margins to the
+    limits, its N-1 screen, each unit's output, the supply and the import."""
+    net, pmax = _prepared_net(ts, req, applied)
+    vlo, vhi, mll, mtl = _effective_thresholds(req)
+    sweep = _n1_sweep(copy.deepcopy(net), ts, vlo, vhi, mll, mtl)
+    net_c, found = rs.real_time_security_assessment(net, ts, vm_lower=vlo, vm_upper=vhi,
+                                                    max_line_loading_pct=mll, max_trafo_loading_pct=mtl)
+    if net_c.res_bus.empty or net_c.res_bus["vm_pu"].isna().all():
+        raise HTTPException(status_code=503, detail=f"The power flow did not converge at {ts}"
+                                                    + (" with the option applied." if applied else "."))
+    found = pd.DataFrame(found) if isinstance(found, list) else found
+    records = found.to_dict(orient="records") if not found.empty else []
+
+    def in_service(table):
+        return net_c[table].index[net_c[table]["in_service"].astype(bool)] if len(net_c[table]) else []
+
+    vm = net_c.res_bus.loc[in_service("bus"), "vm_pu"].dropna()
+    lines = net_c.res_line.loc[in_service("line"), "loading_percent"].dropna()
+    trafos = net_c.res_trafo.loc[in_service("trafo"), "loading_percent"].dropna() if len(net_c.trafo) else pd.Series()
+    margins = [m for m in ((vm.min() - vlo) if len(vm) else None, (vhi - vm.max()) if len(vm) else None)
+               if m is not None]
+    headroom = [h for h in ((mll - lines.max()) if len(lines) else None, (mtl - trafos.max()) if len(trafos) else None)
+                if h is not None]
+    units = {gm.unit_name(net_c, t, i): (float(net_c[f"res_{t}"].at[i, "p_mw"]), float(net_c[f"res_{t}"].at[i, "q_mvar"]))
+             for t in ("gen", "sgen") for i in in_service(t)}
+    ext_p = [float(v) for v in net_c.res_ext_grid["p_mw"].values]
+    ext_q = [float(v) for v in net_c.res_ext_grid["q_mvar"].values]
+    return {
+        "violations": len(records), "worst": _rsa_brief({"violations": records})["worst"],
+        "min_vm_pu": round(float(vm.min()), 4) if len(vm) else None,
+        "min_vm_bus": _bus_display_name(net_c, int(vm.idxmin())) if len(vm) else None,
+        "max_vm_pu": round(float(vm.max()), 4) if len(vm) else None,
+        "max_vm_bus": _bus_display_name(net_c, int(vm.idxmax())) if len(vm) else None,
+        "vm_margin_pu": round(float(min(margins)), 4) + 0.0 if margins else None,       # never "-0.0"
+        "max_line_loading_pct": round(float(lines.max()), 2) if len(lines) else None,
+        "max_line": _line_display_name(net_c, int(lines.idxmax())) if len(lines) else None,
+        **({"max_trafo_loading_pct": round(float(trafos.max()), 2),
+            "max_trafo": _trafo_display_name(net_c, int(trafos.idxmax()))} if len(trafos) else {}),
+        "loading_headroom_pct": round(float(min(headroom)), 2) + 0.0 if headroom else None,
+        "n1_outages_with_violations": sweep["total_outages_causing_violations"],
+        "n1_outages_tested": sweep["total_outages_tested"],
+        "supply_mw": round(sum(p for p, _ in units.values()) + sum(ext_p), 3),
+        "load_mw": round(float(net_c.res_load["p_mw"].sum()), 3) if len(net_c.load) else 0.0,
+        "import_mw": round(sum(ext_p), 3),
+        # For the indicators; not shown.
+        "_p": {u: p for u, (p, _) in units.items()}, "_q": {u: q for u, (_, q) in units.items()},
+        "_ext": (ext_p, ext_q), "_pmax": {**pmax, **(getattr(req, "pg_max_overrides", None) or {})},
+    }
+
+
+def _kpi_public(state: dict | None) -> dict | None:
+    return None if state is None else {k: v for k, v in state.items() if not k.startswith("_")}
+
+
+def _kpi_option_cost(option, held: bool, before: dict, after: dict, sink: dict) -> float | None:
+    """An option's cost at this moment, at the cost table's prices: as the
+    options study prices it at its own moment; held at a later one, the change
+    from this moment's schedule its power flow shows."""
+    if sink.get("model") is None:
+        return None
+    prices, _ = _flex_prices(sink["net"], sink["model"])
+    if not held:
+        return round(fo.action_cost(option, prices, sink["pext0"], sink["qext0"])["total"], 2)
+    exts = list(sink["model"].Ext)
+    (p0, q0), (p1, q1) = before["_ext"], after["_ext"]
+    change = option._replace(p=dict(after["_p"]), p0=dict(before["_p"]), q=dict(after["_q"]), q0=dict(before["_q"]),
+                             pext={e: p1[i] for i, e in enumerate(exts) if i < len(p1)},
+                             qext={e: q1[i] for i, e in enumerate(exts) if i < len(q1)})
+    return round(fo.action_cost(change, prices, {e: p0[i] for i, e in enumerate(exts) if i < len(p0)},
+                                {e: q0[i] for i, e in enumerate(exts) if i < len(q0)})["total"], 2)
+
+
+def _kpi_deliverable(model, state: dict | None) -> dict | None:
+    """`fo.deliverable` from a state's dispatch, rounded for the result, with
+    each unit's spare capacity beside its range (what it has, against what the
+    network lets it deliver). A range the solver found no dispatch for: None."""
+    if model is None or state is None:
+        return None
+    found = fo.deliverable(model, {g: state["_p"][g] for g in model.G if g in state["_p"]})
+    if found is None:
+        return None
+    r = lambda v: round(v, 2) if v is not None else None  # noqa: E731
+    pmax, p = state["_pmax"], state["_p"]
+    return {"up_mw": r(found["up_mw"]), "down_mw": r(found["down_mw"]),
+            "units": {g: {"up_mw": r((u or {}).get("up_mw")), "down_mw": r((u or {}).get("down_mw")),
+                          "spare_mw": r(max(float(pmax[g]) - p[g], 0.0)) if pmax.get(g) is not None else None}
+                      for g, u in sorted(found["units"].items(), key=lambda kv: _natural(kv[0]))}}
+
+
+_KPI_FLEX_FIELDS = ("load_scaling_factor", "load_power_factor", "slack_max_mw", "slack_q_max_mvar", "opf_vm_upper",
+                    "opf_vm_lower", "opf_lambda_p", "opf_lambda_q", "pg_max_overrides", "pg_min_overrides",
+                    "fixed_setpoints", "opf_min_power_factor", "opf_current_safety_margin", "hold_units",
+                    "branch_limits", "n1")
+
+
+def _kpi_option(request, ts: str) -> tuple:
+    """`request.option` for the indicators at `ts`: (its set, the option,
+    held). Refused: an option computed after an outage — the schedule it would
+    be compared with has every branch in service."""
+    stored, option, _req, held = _option_context(request.model_copy(update={"timestamp": ts}), later=True)
+    if stored.get("outage"):
+        raise HTTPException(status_code=400, detail=(
+            f"option: {stored['id']}:{option.id} was computed after the outage of {stored['outage']['element']}; "
+            "the indicators compare it with the schedule, every branch in service. Screen it with "
+            "simulate_all_contingencies or assess it with run_rsa instead."))
+    return stored, option, held
+
+
+def _kpi_moment(request, ts: str) -> tuple[dict, dict]:
+    """The indicators of one moment (`kpis.py`), as (row, option sets created):
+    the schedule and a corrective action — `request.option` (held from its own
+    moment at a later one), else the cheapest at this moment — each checked by
+    AC power flow; the flexibility required and deliverable solved on the
+    options' own model. Never raises: a moment that cannot be studied says why."""
+    before_sets = set(app_data.get("option_sets") or {})
+    try:
+        return _kpi_moment_unguarded(request, ts, before_sets)
+    except HTTPException as exc:
+        why = str(exc.detail)
+    except Exception as exc:  # noqa: BLE001 — one moment's failure is reported, not the window's
+        logging.getLogger(__name__).warning("KPI moment %s failed", ts, exc_info=True)
+        why = f"{type(exc).__name__}: {exc}"
+    created = {sid: e for sid, e in (app_data.get("option_sets") or {}).items() if sid not in before_sets}
+    return {"timestamp": ts, "status": "error", "why": why[:300]}, created
+
+
+def _kpi_moment_unguarded(request, ts: str, before_sets: set) -> tuple[dict, dict]:
+    limits = {k: getattr(request, k) for k in ("vm_upper_pu", "vm_lower_pu", "max_line_loading_pct",
+                                               "max_trafo_loading_pct")}
+    grid_req = GridRequest(timestamp=ts, data_source=request.data_source, network=request.network,
+                           load_scaling_factor=request.load_scaling_factor,
+                           load_power_factor=request.load_power_factor, **limits)
+    chosen = _kpi_option(request, ts) if request.option else None
+    # The corrective options at this moment, and the model they were solved on.
+    sink: dict = {}
+    token = _FLEX_MODEL_SINK.set(sink)
+    try:
+        study = FlexibilityRequest(timestamp=ts, data_source=request.data_source, network=request.network,
+                                   options=True, **{k: getattr(request, k) for k in _KPI_FLEX_FIELDS
+                                                    if getattr(request, k, None) is not None})
+        flex = _run_coroutine(optimise_flexibility.__wrapped__(study))
+    except HTTPException as exc:
+        flex = {"status": "error", "message": str(exc.detail)[:300]}
+    finally:
+        _FLEX_MODEL_SINK.reset(token)
+    created = {sid: e for sid, e in (app_data.get("option_sets") or {}).items() if sid not in before_sets}
+    status = flex.get("status")
+    offered = flex.get("options") or []
+    by_id = {o["id"]: o for o in offered}
+    last_resort = flex.get("set") == "last_resort"
+    least = by_id.get("least_disturbance") or {}
+    needs_action = last_resort or bool(least.get("n_units_called") or least.get("moved_mw"))
+
+    row = {"timestamp": ts, "status": "ok", "options_status": status}
+    pick = None
+    if chosen:
+        stored, option, held = chosen
+        applied = (stored, option, held)
+        row.update(after_is="option", after_ref=f"{stored['id']}:{option.id}", after_label=option.label, held=held,
+                   option=_option_echo(stored, option, ts, held),
+                   **({"held_since": stored["timestamp"]} if held else {}))
+    elif status == "no_action_needed" or (status == "options" and not needs_action):
+        applied = None
+        row.update(after_is="schedule", after_label="the schedule (no action needed)")
+    elif status == "options" and offered:
+        pick = by_id.get("cheapest") or min(offered, key=lambda o: o.get("cost_eur_per_h") or 0.0)
+        stored, option = _resolve_option(pick["ref"])
+        applied = (stored, option, False)
+        row.update(after_is="last_resort" if last_resort else "cheapest", after_ref=pick["ref"],
+                   after_label=pick["label"], held=False)
+    else:
+        applied = None
+        row.update(after_is="none", why=flex.get("message") or f"the options study ended {status}")
+
+    before = _kpi_state(ts, grid_req)
+    after = before if row["after_is"] == "schedule" else _kpi_state(ts, grid_req, applied) if applied else None
+    model = None if sink.get("last_resort") else sink.get("model")
+
+    # Flexibility: what the moment requires, what the action activates, how far the units can go.
+    required = (0.0 if status == "no_action_needed" else
+                fo.least_moved_mw(model) if model is not None and status == "options" else None)
+    moved = None
+    if after is not None:
+        moved = sum(abs(after["_p"][u] - p) for u, p in before["_p"].items()
+                    if u in after["_p"] and abs(after["_p"][u] - p) >= kp.NOISE_MW)
+        moved += max(before["load_mw"] - after["load_mw"], 0.0)       # loads the action reduces
+    deliver_after = _kpi_deliverable(model, after)
+    deliver_before = deliver_after if row["after_is"] == "schedule" else (
+        _kpi_deliverable(model, before) if status == "no_action_needed" else None)
+    k1 = {"schedule": kp.target_demand_flexibility(before["_p"], before["_pmax"], before["supply_mw"]),
+          "after": kp.target_demand_flexibility(after["_p"], after["_pmax"], after["supply_mw"]) if after else None}
+    k2 = kp.flexibility_utilisation(required, moved, violations=before["violations"])
+    k3 = kp.prevented_violation_ratio(before["violations"], after["violations"] if after else None)
+
+    # Costs: the action's, the cheapest at this moment, and N-1 security above it.
+    cheapest = (by_id["cheapest"]["cost_eur_per_h"] if "cheapest" in by_id else
+                0.0 if status == "no_action_needed" else None)
+    cost = (0.0 if row["after_is"] == "schedule" else pick["cost_eur_per_h"] if pick else
+            _kpi_option_cost(chosen[1], chosen[2], before, after, sink) if chosen and after else None)
+    n1_costs = {}
+    for mode in (("preventive", "corrective") if request.n1 == "both" else (request.n1,) if request.n1 else ()):
+        secure = by_id.get(f"n1_{mode}")
+        if secure is not None and cheapest is not None:
+            n1_costs[mode] = round(secure["cost_eur_per_h"] - cheapest, 2)
+        elif secure is None:
+            why = next((n["reason"] for n in flex.get("not_offered") or [] if n.get("id") == f"n1_{mode}"), None)
+            n1_costs[mode] = None
+            row.setdefault("n1_not_offered", {})[mode] = why or "not found"
+    a = after or {}
+    values = {
+        "violations": (before["violations"], a.get("violations")),
+        "vm_margin_pu": (before["vm_margin_pu"], a.get("vm_margin_pu")),
+        "loading_headroom_pct": (before["loading_headroom_pct"], a.get("loading_headroom_pct")),
+        "n1_outages_with_violations": (before["n1_outages_with_violations"], a.get("n1_outages_with_violations")),
+        "kpi_3_prevented_violation_ratio_pct": (None, k3["pct"]),
+        "kpi_1_target_demand_flex_pct": (k1["schedule"]["pct"], (k1["after"] or {}).get("pct")),
+        "spare_up_mw": (k1["schedule"]["spare_mw"], (k1["after"] or {}).get("spare_mw")),
+        "deliverable_up_mw": ((deliver_before or {}).get("up_mw"), (deliver_after or {}).get("up_mw")),
+        "deliverable_down_mw": ((deliver_before or {}).get("down_mw"), (deliver_after or {}).get("down_mw")),
+        "required_mw": (None, round(required, 3) if required is not None else None),
+        "moved_mw": (0.0, round(moved, 3) if moved is not None else None),
+        "kpi_2_flex_utilization_pct": (None, k2["pct"]),
+        "cost_eur_per_h": (0.0, cost),
+    }
+    if request.n1:
+        known = [c for c in n1_costs.values() if c is not None]
+        values["n1_security_eur_per_h"] = (None, min(known) if known else None)
+    row.update(
+        schedule=_kpi_public(before), after=_kpi_public(after) if after is not before else _kpi_public(before),
+        indicators=kp.indicator_rows(values),
+        kpi_details={"kpi_1": k1, "kpi_2": k2, "kpi_3": k3},
+        deliverable={"with_action": deliver_after, "schedule": deliver_before,
+                     **({"note": "the units the operator holds are not among them"} if request.hold_units else {})},
+        costs={"action_eur_per_h": cost, "cheapest_eur_per_h": cheapest,
+               **({"n1_security_above_cheapest_eur_per_h": n1_costs} if request.n1 else {})},
+    )
+    return row, created
 
 
 @app.post("/api/kpi/evaluate")
 @_off_event_loop
 async def evaluate_kpis(request: KPIRequest):
-    """Compute the 3 official KPIs from ``main_KPIs_Included.ipynb`` in
-    both a **connected** scenario (external-grid interface at engine
-    default ±200 MW) and a **constrained** scenario (interface capped
-    to ±``slack_max_mw``).
-
-    Pipeline
-    1. Clone the base network, apply measurements, neutralize taps.
-    2. Optionally drop a disabled substation's sgens.
-    3. Run a seed power flow on ``net_base``.
-    4. Build ``net`` = ``net_base`` with ``load_scaling_factor`` applied.
-    5. Count pre-optimization violations via
-       ``rsa_engine.real_time_security_assessment`` — used only as
-       informational context (``violations_before``).
-    6. **Connected solve**: Pyomo + Ipopt with intact ``db_full`` Ybus
-       matrices. External grid bounded at ±200 MW (engine default).
-    7. Build full regulation DataFrame via
-       ``flex_engine.prepare_regulation_df_rsa`` (all rows, incl. slack).
-       Compute KPI-1 / KPI-2 / KPI-3 for the connected scenario.
-    8. **Constrained-slack solve**: re-run Ipopt on the same model after
-       :func:`solve_constrained_slack_scenario` tightens
-       ``Pext, Qext`` bounds to ``±slack_max_mw``. If optimal, compute
-       the 3 KPIs on the new dispatch; if infeasible, KPI-3 = 0% and
-       the response surfaces ``status: "infeasible"``.
-
-    Response shape
-    --------------
-    ``{
-        timestamp,
-        status: "success"|"failed",
-        metrics: {  # CONNECTED scenario (interface at engine default ±200 MW)
-            kpi_1_target_demand_flex_pct, kpi_1_available_upward_flex_mw,
-            kpi_1_system_demand_mw,
-            kpi_2_flex_utilization_pct, kpi_2_required_flex_mw,
-            kpi_2_activated_flex_mw,
-            kpi_3_prevented_violation_ratio_pct, kpi_3_status,
-            violations_before, algorithm_runtime_sec
-        },
-        constrained_metrics: {  # interface capped to ±slack_max_mw
-            status: "optimal"|"infeasible"|"error"|"skipped",
-            slack_max_mw,            # echo of the user-chosen cap
-            kpi_1_*, kpi_2_*, kpi_3_*,
-            algorithm_runtime_sec
-        }
-     }``.
-
-    Special cases
-        * ``slack_max_mw == profile maximum`` -> constrained scenario will
-            typically match the connected baseline since the natural interface
-      flow is below this threshold for most timestamps.
-    * ``slack_max_mw == 0``   -> fully islanded; if infeasible, that's
-            the headline answer "The active system cannot self-sustain right now".
-    """
+    """The key performance indicators at one moment (`kpis.py`): the schedule
+    against a corrective action — the cheapest at that moment, or `option`
+    (held from its own moment when applied later) — each checked by AC power
+    flow. The three of the project notebook (target demand flexibility,
+    flexibility utilisation, prevented violation ratio), N-0 and N-1 security
+    margins, the flexibility the units can deliver within every limit, the
+    flexibility required, and costs (`n1`: of N-1 security too)."""
     if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
-
-    current_ts = _resolve_tick(request.data_source, request.timestamp)
-    net_base = copy.deepcopy(_net_for(request))
-    measurement_prod_cons = prepare_measurement_df(_lookup_measurement_df(current_ts, request.data_source))
-
-    net_base, _ = _assign_tick(net_base, measurement_prod_cons, current_ts, _dataset_of(request))
-
-    disabled_gens = request.disabled_generators
-    if disabled_gens:
-        _drop_disabled_sgens(net_base, disabled_gens)
-
-    try:
-        pp.runpp(net_base)
-    except Exception:
-        pass
-
-    net = copy.deepcopy(net_base)
-    _scale_loads(net, request.load_scaling_factor)
-
-    # --- Pre-optimization RSA: informational context only ---
-    try:
-        pp.runpp(net)
-        _, df_results_before = rs.real_time_security_assessment(net, current_ts)
-        violations_before = len(pd.DataFrame(df_results_before)) if isinstance(df_results_before, list) \
-            else len(df_results_before)
-    except Exception:
-        violations_before = 0
-
-    # --- Solve the Pyomo optimization model ---
-    start_time = time.perf_counter()
-    db = _db_for("full", request)
-
-    try:
-        results_opt, model_opt = fe.optimization_model_base(
-            net, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"],
-            db["TAPS"], db["trafo_ranges"], db["trafo_defaults"], db["branch_to_trafo"],
-            missing_substation=disabled_gens or None,
-            opf_vm_lower=request.opf_vm_lower, opf_vm_upper=request.opf_vm_upper,
-            lambda_p=request.opf_lambda_p, lambda_q=request.opf_lambda_q,
-            pg_max_overrides=request.pg_max_overrides or None,
-            pg_min_overrides=request.pg_min_overrides or None,
-            min_power_factor=request.opf_min_power_factor,
-            current_safety_margin=request.opf_current_safety_margin,
-            fixed_setpoints=request.fixed_setpoints or None,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Solver crashed: {str(e)}")
-
-    runtime = round(time.perf_counter() - start_time, 2)
-
-    tc = getattr(results_opt.solver, "termination_condition", None)
-    if tc != TerminationCondition.optimal:
-        # Connected solve itself failed. Islanded solve depends on that
-        # model being in a valid state, so we skip it rather than
-        # risk reporting spurious KPIs.
-        kpi3 = calculate_kpi_prevented_violation_ratio(None)
-        return {
-            "timestamp": current_ts,
-            "status": "failed",
-            "solver_status": str(tc),
-            "metrics": {
-                "kpi_1_target_demand_flex_pct": 0.0,
-                "kpi_1_available_upward_flex_mw": 0.0,
-                "kpi_1_system_demand_mw": 0.0,
-                "kpi_2_flex_utilization_pct": 0.0,
-                "kpi_2_required_flex_mw": 0.0,
-                "kpi_2_activated_flex_mw": 0.0,
-                "kpi_3_prevented_violation_ratio_pct": kpi3['prevented_violation_ratio_pct'],
-                "kpi_3_status": kpi3['status'],
-                "violations_before": violations_before,
-                "algorithm_runtime_sec": runtime,
-            },
-            "constrained_metrics": {
-                "status": "skipped",
-                "slack_max_mw": float(app_data.get("slack_max_mw", 70.0) if request.slack_max_mw is None else request.slack_max_mw),
-                "message": "Connected solve failed; constrained-slack check skipped.",
-            },
-        }
-
-    # --- Build the full regulation DataFrame and run the 3 KPIs ---
-    try:
-        df_reg_flex_rsa = fe.prepare_regulation_df_rsa(model_opt, net, net_base, current_ts)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Regulation frame build failed: {str(e)}")
-
-    try:
-        kpi1 = calculate_kpi_target_demand_flexibility(df_reg_flex_rsa, {**_pg_max_for(request, net_base), **request.pg_max_overrides})
-    except ValueError as e:
-        # Typically: generator absent from PG_MAX_DATA, or zero system demand.
-        raise HTTPException(status_code=500, detail=f"KPI-1 failed: {str(e)}")
-
-    try:
-        kpi2 = calculate_kpi_flexibility_utilization(df_reg_flex_rsa)
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=f"KPI-2 failed: {str(e)}")
-
-    kpi3 = calculate_kpi_prevented_violation_ratio(df_reg_flex_rsa)
-
-    # Constrained-slack scenario — re-solve the SAME model with the
-    # external-grid interface capped to ±slack_max_mw, then compute the 3 KPIs
-    # on the new dispatch.
-    _phys_cap = app_data.get("slack_max_mw", 999.0)
-    slack_cap = float(max(0.0, _phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap)))
-    cscen_start = time.perf_counter()
-    try:
-        cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar, fixed_setpoints=request.fixed_setpoints or None)
-    except Exception as e:
-        constrained_metrics = {
-            "status": "error",
-            "slack_max_mw": slack_cap,
-            "message": f"Constrained-slack solver crashed: {str(e)}",
-            "algorithm_runtime_sec": round(time.perf_counter() - cscen_start, 2),
-        }
-    else:
-        cscen_runtime = round(time.perf_counter() - cscen_start, 2)
-        cscen_tc = (getattr(cscen_results.solver, "termination_condition", None)
-                    if cscen_results is not None else None)
-
-        if cscen_tc != TerminationCondition.optimal:
-            # Infeasible at the chosen cap.
-            if slack_cap == 0.0:
-                  msg = ("Grid cannot be secured without external-grid support at this "
-                       "timestamp + load level.")
-            else:
-                  msg = (f"Grid cannot be secured with the external-grid interface capped at "
-                       f"±{slack_cap:.0f} MW at this timestamp + load level.")
-            constrained_metrics = {
-                "status": "infeasible",
-                "slack_max_mw": slack_cap,
-                "solver_status": str(cscen_tc) if cscen_tc else "solver_error",
-                "message": msg,
-                "kpi_1_target_demand_flex_pct": 0.0,
-                "kpi_2_flex_utilization_pct": 0.0,
-                "kpi_3_prevented_violation_ratio_pct": 0.0,
-                "kpi_3_status": f"Infeasible with slack capped at ±{slack_cap:.0f} MW.",
-                "algorithm_runtime_sec": cscen_runtime,
-            }
-        else:
-            try:
-                df_cs = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, current_ts)
-                kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**_pg_max_for(request, net_base), **request.pg_max_overrides})
-                kpi2_cs = calculate_kpi_flexibility_utilization(df_cs)
-                kpi3_cs = calculate_kpi_prevented_violation_ratio(df_cs)
-                constrained_metrics = {
-                    "status": "optimal",
-                    "slack_max_mw": slack_cap,
-                    "kpi_1_target_demand_flex_pct": round(kpi1_cs['target_demand_flexibility_pct'], 2),
-                    "kpi_1_available_upward_flex_mw": round(kpi1_cs['available_upward_flexibility_MW'], 4),
-                    "kpi_1_system_demand_mw": round(kpi1_cs['system_demand_MW'], 4),
-                    "kpi_2_flex_utilization_pct": round(kpi2_cs['flexibility_utilization_pct'], 2),
-                    "kpi_2_required_flex_mw": round(kpi2_cs['required_flexibility_MW'], 4),
-                    "kpi_2_activated_flex_mw": round(kpi2_cs['activated_flexibility_MW'], 4),
-                    "kpi_3_prevented_violation_ratio_pct": kpi3_cs['prevented_violation_ratio_pct'],
-                    "kpi_3_status": kpi3_cs['status'],
-                    "message": (f"Grid securable with the external-grid interface capped at "
-                                f"±{slack_cap:.0f} MW."),
-                    "algorithm_runtime_sec": cscen_runtime,
-                }
-            except Exception as e:
-                constrained_metrics = {
-                    "status": "error",
-                    "slack_max_mw": slack_cap,
-                    "message": f"Constrained-slack KPI computation failed: {str(e)}",
-                    "algorithm_runtime_sec": cscen_runtime,
-                }
-
-    return {
-        "timestamp": current_ts,
-        "status": "success",
-        "metrics": {
-            "kpi_1_target_demand_flex_pct": round(kpi1['target_demand_flexibility_pct'], 2),
-            "kpi_1_available_upward_flex_mw": round(kpi1['available_upward_flexibility_MW'], 4),
-            "kpi_1_system_demand_mw": round(kpi1['system_demand_MW'], 4),
-            "kpi_2_flex_utilization_pct": round(kpi2['flexibility_utilization_pct'], 2),
-            "kpi_2_required_flex_mw": round(kpi2['required_flexibility_MW'], 4),
-            "kpi_2_activated_flex_mw": round(kpi2['activated_flexibility_MW'], 4),
-            "kpi_3_prevented_violation_ratio_pct": kpi3['prevented_violation_ratio_pct'],
-            "kpi_3_status": kpi3['status'],
-            "violations_before": violations_before,
-            "algorithm_runtime_sec": runtime,
-        },
-        "constrained_metrics": constrained_metrics,
-    }
+    ts = _resolve_tick(request.data_source, request.timestamp)
+    if request.option:                  # refused with the reason before anything runs (another moment, network…)
+        _kpi_option(request, ts)
+    started = time.time()
+    row, _created = _kpi_moment(request, ts)
+    if row.get("status") == "error":
+        raise HTTPException(status_code=503, detail=f"No indicators at {ts}: {row.get('why')}")
+    return {**row, "mode": "kpis", "message": kp.moment_message(row), "metrics": kp.flat_metrics(row["indicators"]),
+            "computed_in_s": round(time.time() - started, 1), "data_source": _dataset_label(request)}
 
 
-
-@app.post("/api/kpi/forecast")
+@app.post("/api/kpi/over_time")
 @_off_event_loop
-async def forecast_kpi(request: KPIRequest):
-    """Generates a 24-hour forecast of KPI-1 by evaluating multiple timestamps."""
+async def kpis_over_time(request: KPIOverTimeRequest):
+    """The indicators at each moment of a window, as `/api/kpi/evaluate` gives
+    them, and over the window: each indicator's range and worst moment, the
+    cost of the actions and the MWh moved and required (each moment weighted by
+    half the time to its neighbours). `option` is held from its moment. The
+    moments run in parallel where the platform allows; `progress_id` lets the
+    caller follow them (GET /api/progress/{id})."""
     if _db_for("full", request) is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
-
-    fk_timestamps, fk_measurements, fk_source = _window_dataset(request.data_source)
-    # Start from the chosen tick (clock for measurements, or an explicit timestamp);
-    # forecasts default to their first tick.
-    start_ts = _resolve_tick(request.data_source, request.timestamp)
-    start_idx = fk_timestamps.index(start_ts)
-    # Limit to 24 hours (96 intervals) from the start timestamp
-    end_idx = min(start_idx + 96, len(fk_timestamps))
-    forecast_data = []
-
-    db = _db_for("full", request)
-    disabled_gens = request.disabled_generators
-
-    for i in range(start_idx, end_idx):
-        ts = fk_timestamps[i]
-        net_base = copy.deepcopy(_net_for(request))
-        measurement_prod_cons = prepare_measurement_df(fk_measurements[ts])
-
-        net_base, _ = _assign_tick(net_base, measurement_prod_cons, ts, fk_measurements)
-
-        if disabled_gens:
-            _drop_disabled_sgens(net_base, disabled_gens)
-            
-        try:
-            pp.runpp(net_base)
-        except Exception:
-            pass
-
-        net = copy.deepcopy(net_base)
-        _scale_loads(net, request.load_scaling_factor)
-
-        try:
-            pp.runpp(net)
-        except Exception:
-            pass
-
-        try:
-            results_opt, model_opt = fe.optimization_model_base(
-                net, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"],
-                db["TAPS"], db["trafo_ranges"], db["trafo_defaults"], db["branch_to_trafo"],
-                missing_substation=disabled_gens or None,
-                opf_vm_lower=request.opf_vm_lower, opf_vm_upper=request.opf_vm_upper,
-                lambda_p=request.opf_lambda_p, lambda_q=request.opf_lambda_q,
-                pg_max_overrides=request.pg_max_overrides or None,
-                pg_min_overrides=request.pg_min_overrides or None,
-                min_power_factor=request.opf_min_power_factor,
-                current_safety_margin=request.opf_current_safety_margin,
-                fixed_setpoints=request.fixed_setpoints or None,
-            )
-        except Exception:
-            # Kept as a failed tick: dropping it made the series silently
-            # shorter than the 24 hours it claims to cover.
-            forecast_data.append({"timestamp": ts, "kpi_1_target_demand_flex_pct": None,
-                                  "status": "error"})
-            continue
-
-        tc = getattr(results_opt.solver, "termination_condition", None) if results_opt else None
-
-        _phys_cap = app_data.get("slack_max_mw", 70.0)
-        slack_cap = float(max(0.0, _phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap)))
-        # None, not 0 %, when there is no solution: a failed tick read as "no
-        # flexibility available" (code review 2.11).
-        kpi1_pct = None
-        status = str(tc) if tc is not None else "error"
-
-        if tc == TerminationCondition.optimal:
-            try:
-                cscen_results, cscen_model = solve_constrained_slack_scenario(
-                    model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar,
-                    fixed_setpoints=request.fixed_setpoints or None)
-                cscen_tc = getattr(cscen_results.solver, "termination_condition", None) if cscen_results else None
-                if cscen_tc == TerminationCondition.optimal:
-                    df_cs = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, ts)
-                    kpi1_cs = calculate_kpi_target_demand_flexibility(df_cs, {**_pg_max_for(request, net_base), **(request.pg_max_overrides or {})})
-                    kpi1_pct = round(kpi1_cs['target_demand_flexibility_pct'], 2)
-                    status = "optimal"
-                else:
-                    status = "cap_infeasible"
-            except Exception:
-                status = "error"
-
-        forecast_data.append({
-            "timestamp": ts,
-            "kpi_1_target_demand_flex_pct": kpi1_pct,
-            "status": status,
-        })
-
-    n_failed = sum(1 for f in forecast_data if f["kpi_1_target_demand_flex_pct"] is None)
-    result = {"forecast": forecast_data, "n_ticks": len(forecast_data), "n_failed": n_failed}
-    if n_failed:
-        result["note"] = (f"{n_failed} of {len(forecast_data)} tick(s) have no KPI: the optimisation "
-                          "found no solution there (see each tick's status). They are not 0 %.")
-    return result
+    ticks = _window(request)
+    if request.option:                               # an option from after the window's start: refused now
+        _kpi_option(request, ticks[0])
+    started = time.time()
+    rows, workers = _run_moments(request, ticks, request.progress_id, _kpi_moment)
+    weights = _weights(ticks)
+    summary = kp.window_summary(rows, weights)
+    return {"timestamp": ticks[0], "mode": "kpis_over_time", **kp.compact_moments(rows),
+            "hours_each": [round(h, 3) for h in weights], "summary": summary,
+            "message": kp.window_message(ticks, summary),
+            **({"option": request.option} if request.option else {}), **({"n1": request.n1} if request.n1 else {}),
+            "computed_in": {"seconds": round(time.time() - started, 1), "workers": workers},
+            "data_source": _dataset_label(request)}
 
 EDDK_VALUES_URL = "https://admin.energydata.dk/api/v1/datastreams/values"
 
@@ -10523,7 +11293,19 @@ async def push_eddk_data():
             "message": "Publishing to the EDDK Data Space is not implemented yet; nothing was sent."}
 
 
-class AttributionRequest(GridRequest):
+class _NoOption(BaseModel):
+    """For a study that does not apply a corrective option: refused, not ignored."""
+
+    @field_validator("option", check_fields=False)
+    @classmethod
+    def _no_option(cls, value):
+        if value:
+            raise ValueError("option is not applied by this study; run it on the schedule, or use the N-1 "
+                             "screen, the assessment or a single outage with the option.")
+        return value
+
+
+class AttributionRequest(_NoOption, GridRequest):
     """Request body for ``POST /api/rsa/attribution``.
 
     Attributes
@@ -10619,7 +11401,7 @@ class ProposalEditRequest(BaseModel):
     replace: bool = False
 
 
-class CompareNetworksRequest(GridRequest):
+class CompareNetworksRequest(_NoOption, GridRequest):
     """Run one study on the base and on a proposal at the same operating point.
 
     proposal : str

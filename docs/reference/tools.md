@@ -9,8 +9,8 @@ Most studies also take the arguments in [Shared arguments](#shared-arguments).
 - [Reading the grid and the data](#reading-the-grid-and-the-data): [`locate_network_element`](#locate_network_element), [`get_current_timestamp`](#get_current_timestamp), [`advance_timestamp`](#advance_timestamp), [`get_current_conditions`](#get_current_conditions), [`get_element_timeseries`](#get_element_timeseries), [`get_data_quality`](#get_data_quality)
 - [Security at one moment](#security-at-one-moment): [`run_rsa`](#run_rsa), [`simulate_contingency`](#simulate_contingency), [`simulate_all_contingencies`](#simulate_all_contingencies), [`compute_violation_attribution`](#compute_violation_attribution), [`compare_results`](#compare_results)
 - [Over time, scenarios and risk](#over-time-scenarios-and-risk): [`scan_rsa_over_time`](#scan_rsa_over_time), [`find_worst_case_timestamp`](#find_worst_case_timestamp), [`scan_scenarios`](#scan_scenarios), [`run_probabilistic_rsa`](#run_probabilistic_rsa), [`compute_historical_risk`](#compute_historical_risk)
-- [Optimisation and flexibility](#optimisation-and-flexibility): [`optimize_flexibility`](#optimize_flexibility), [`optimize_contingency`](#optimize_contingency), [`optimize_robust_flexibility`](#optimize_robust_flexibility), [`compute_flexibility_envelope`](#compute_flexibility_envelope), [`compute_hosting_capacity`](#compute_hosting_capacity)
-- [Key performance indicators](#key-performance-indicators): [`evaluate_kpis`](#evaluate_kpis), [`forecast_kpis`](#forecast_kpis)
+- [Optimisation and flexibility](#optimisation-and-flexibility): [`optimize_flexibility`](#optimize_flexibility), [`optimize_contingency`](#optimize_contingency), [`optimize_robust_flexibility`](#optimize_robust_flexibility), [`compute_flexibility_envelope`](#compute_flexibility_envelope), [`compute_hosting_capacity`](#compute_hosting_capacity), [`flexibility_over_time`](#flexibility_over_time)
+- [Key performance indicators](#key-performance-indicators): [`evaluate_kpis`](#evaluate_kpis), [`kpis_over_time`](#kpis_over_time)
 - [What-if proposals](#what-if-proposals): [`edit_proposal`](#edit_proposal), [`compare_networks`](#compare_networks)
 - [Settings](#settings): [`set_load_power_factor`](#set_load_power_factor), [`set_generator_model`](#set_generator_model), [`set_unit_costs`](#set_unit_costs), [`rename_elements`](#rename_elements)
 
@@ -85,6 +85,7 @@ Run a Real-time Security Assessment (RSA) on the active grid model. Returns volt
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `option` | text | A corrective option's `ref` (e.g. 'S2:cheapest'): applied (its outage too); at a later timestamp, its instructions held. |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `vm_upper_pu` | number | Upper voltage limit, p.u.; default the network's (Grid domain knowledge). |
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
@@ -101,6 +102,7 @@ Simulate a single N-1 contingency (one line or transformer outage). Returns whet
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `option` | text | A corrective option's `ref` (e.g. 'S2:cheapest'): applied (its outage too); at a later timestamp, its instructions held. |
 | `element_type` (required) | text | Network element type: 'line' for power lines or 'trafo' for transformers. Element indices depend on the currently loaded network. |
 | `element_index` (required) | whole number | Zero-based index of the element to take out of service. Get it from locate_network_element; never guess it. |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
@@ -119,7 +121,7 @@ Run a full N-1 security sweep across all lines and transformers. Returns whether
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
-| `option` | text | A corrective option's `ref` from an options result (e.g. 'S2:cheapest'): the sweep runs at that option's moment, network and load level with its dispatch applied — after its outage too, if it had one (N-1-1). |
+| `option` | text | A corrective option's `ref` (e.g. 'S2:cheapest'): the sweep runs with its dispatch applied — after its outage too, if it had one (N-1-1); at a later timestamp, its instructions held. |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `vm_upper_pu` | number | Upper voltage limit, p.u.; default the network's (Grid domain knowledge). |
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
@@ -267,11 +269,14 @@ Optimize local generator dispatch to resolve voltage or thermal violations in no
 | `hold_units` | list of text | Units whose active power stays at its schedule — the operator's conditions ('without Gen 2', 'don't call the battery'). In service, unlike disabled_generators. With options=true, every option respects them. |
 | `near_optimal` | true/false | With options=true: instead of the named strategies, the cheapest option and up to three near-optimal alternatives, each costing at most near_optimal_pct above it and changing other units. |
 | `near_optimal_pct` | number | How far above the cheapest an alternative may cost, %. Default 10. |
-| `branch_limits` | object | Branches held below a share of their rating: {name or tag: %}, e.g. {"L30": 80}. 10–100. |
 | `n1` | `preventive` / `corrective` / `both` | Options secure after the critical outages. preventive: nothing to do when one happens; corrective: a quick action after it (plan returned); both. |
 | `n1_outages` | list of text | Outages to secure (names or tags). Default: the critical ones. |
 | `n1_emergency_loading_pct` | number | Loading allowed after an outage, % of rating. Default: the network's limit. |
 | `n1_reach_pct` | number | Corrective: MW a unit may move after an outage, % of capacity. Default 20. |
+| `n1_load_reduction` | true/false | Corrective: load may be reduced after an outage too (default true). |
+| `near_optimal_methods` | list of `hsj` / `unit_ranges` / `objectives` / `random` | Which ways to find alternatives (default all). |
+| `near_optimal_count` | whole number | Alternatives shown, 1–5 (default 5). |
+| `from_option` | text | Start from a corrective option's ref instead of the schedule (its instructions held to this timestamp). |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `disabled_generators` | list of text | Substations whose generators are forced offline (generator loss, islanding). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
 | `slack_max_mw` | number | External-grid exchange cap, MW, both directions. Omit for the network's own limit; 0.0 = islanded. For islanding or derating questions. |
@@ -283,11 +288,12 @@ Optimize local generator dispatch to resolve voltage or thermal violations in no
 | `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
 | `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
 | `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |
 | `opf_current_safety_margin` | number | Fraction of rated branch current the OPF may use (0–1). Default 0.9; 1.0 = full rating. |
 | `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
 | `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
 
-Also takes: `opf_min_power_factor`, `network`, `load_power_factor`.
+Also takes: `branch_limits`, `network`, `load_power_factor`.
 
 ### `optimize_contingency`
 
@@ -301,7 +307,6 @@ Compute the corrective flexibility dispatch after a single contingency using AC 
 | `hold_units` | list of text | Units ruled out: in service, no instruction. |
 | `near_optimal` | true/false | Near-optimal alternatives instead. |
 | `near_optimal_pct` | number | How far above the cheapest an alternative may cost, %. Default 10. |
-| `branch_limits` | object | Branches held below a share of their rating: {name or tag: %}, e.g. {"L30": 80}. 10–100. |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
@@ -310,11 +315,12 @@ Compute the corrective flexibility dispatch after a single contingency using AC 
 | `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
 | `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
 | `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |
 | `opf_current_safety_margin` | number | Fraction of rated branch current the OPF may use (0–1). Default 0.9; 1.0 = full rating. |
 | `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
 | `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
 
-Also takes: `opf_min_power_factor`, `network`, `load_power_factor`.
+Also takes: `branch_limits`, `network`, `load_power_factor`.
 
 ### `optimize_robust_flexibility`
 
@@ -322,6 +328,7 @@ Robust OPF with two methods: heuristic constraint tightening (back-off) and scen
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |
 | `risk_target` | number | Canonical target violation probability used across modes. Default 0.05. In heuristic mode maps to confidence=1-risk_target and target_p_any unless overridden; in scenario mode maps to alpha. |
 | `robust_method` | text | Robust method: 'heuristic' (default) or 'scenario' for scenario-based chance-constrained AC-OPF. |
 | `sgen_sigma` | number | Relative standard deviation for the sgen (wind/solar) multiplier. Default 0.00 (disabled unless explicitly requested). Set this only when the user explicitly asks for generator uncertainty. |
@@ -346,7 +353,7 @@ Robust OPF with two methods: heuristic constraint tightening (back-off) and scen
 | `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
 | `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
 
-Also takes: `opf_min_power_factor`, `network`, `load_power_factor`.
+Also takes: `network`, `load_power_factor`.
 
 ### `compute_flexibility_envelope`
 
@@ -399,21 +406,45 @@ Computes hosting capacity for an incremental injection at one bus in determinist
 
 Also takes: `network`, `load_power_factor`.
 
+### `flexibility_over_time`
+
+Flexibility across several moments. study='hold': a corrective option held from its moment — until when it keeps every limit. study='plan': one corrective plan for a window (a peak), instructions kept from moment to moment, compared with solving each alone. study='security': what N-1 security costs above the cheapest at each moment of a window (a full study per moment, in parallel; its progress is shown).
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `study` (required) | `hold` / `plan` / `security` |  |
+| `option` | text | hold: the option's ref (e.g. 'S3:cheapest'). |
+| `start` | text | plan, security: first moment (default: the clock). |
+| `end` | text | plan, security: last moment. |
+| `hours` | number | Length without an end, hours (default 6). |
+| `moments` | whole number | plan, security: moments studied, 2–12 (default 6), evenly spaced, the first and last always kept; hour by hour is one more than the hours (16:00–00:00: 9). |
+| `n1` | `preventive` / `corrective` / `both` | security: which N-1 secure option (default preventive). |
+| `screen_n1` | true/false | hold: the N-1 screen at each moment too. |
+| `objective` | `least_disturbance` / `cheapest` | plan. |
+| `steadiness` | number | plan: how strongly instructions are kept, 0–10 (default 1). |
+| `ramp_pct_per_h` | number | plan: ramp limit, % of capacity per hour. |
+| `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
+| `hold_units` | list of text | plan, security: units kept at their schedule. |
+| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+
+Also takes: `branch_limits`, `network`, `load_power_factor`.
+
 ## Key performance indicators
 
 ### `evaluate_kpis`
 
-Evaluate the three system KPIs for the current timestamp. KPI-1: available upward flexibility as fraction of demand. KPI-2: fraction of required flexibility actually activated. KPI-3: fraction of violations prevented by optimization. When slack_max_mw is set below the network's physical cap, also runs a constrained-scenario solve.
+Key performance indicators at one moment: the schedule against a corrective action (the cheapest, or `option`), each checked by AC power flow. KPI-1 target demand flexibility (spare upward capacity, % of demand), KPI-2 flexibility utilisation (fewest MW that clear the violations ÷ MW the action moves), KPI-3 prevented violation ratio; N-0 and N-1 security margins; flexibility the units can deliver within every limit, up and down, per unit and together; flexibility required; the action's cost (`n1`: of N-1 security too).
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `option` | text | A corrective option's ref (e.g. 'S3:cheapest') to compare with the schedule; at a later moment its instructions held. Default: the cheapest corrective action at each moment. |
+| `n1` | `preventive` / `corrective` / `both` | Also the cost of N-1 security above the cheapest (a security-constrained OPF: slower). |
+| `hold_units` | list of text | Units kept at their schedule (the operator's conditions). |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `slack_max_mw` | number | External-grid exchange cap, MW, both directions. Omit for the network's own limit; 0.0 = islanded. For islanding or derating questions. |
 | `slack_q_max_mvar` | number | External-grid reactive exchange cap, Mvar. Omit to use slack_max_mw. A cap makes local generators supply more Q. |
 | `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
-| `opf_lambda_p` | number | OPF weight on squared active-power deviation. Default 0.01; higher keeps P closer to its base value. |
-| `opf_lambda_q` | number | OPF weight on squared reactive-power deviation. Default 0.001; higher keeps Q closer to its base value. |
 | `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
 | `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
 | `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
@@ -421,21 +452,28 @@ Evaluate the three system KPIs for the current timestamp. KPI-1: available upwar
 | `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
 | `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
 
-Also takes: `opf_min_power_factor`, `network`, `load_power_factor`.
+Also takes: `branch_limits`, `network`, `load_power_factor`.
 
-### `forecast_kpis`
+### `kpis_over_time`
 
-Generate a 24-hour ahead forecast of KPI-1 (target demand flexibility %) at 15-minute resolution (96 data points). WARNING: This call takes approximately 2 minutes to complete. Only invoke when the user explicitly asks for a forecast or 'next 24 hours'.
+The key performance indicators of evaluate_kpis at each moment of a window (measurements or forecasts), each moment with its own corrective action (or `option` held): ranges, worst moments, the actions' cost and the MWh moved against the MWh required. Moments run in parallel; its progress is shown.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `start` | text | First moment (default: the clock; forecasts: their first). |
+| `end` | text | Last moment. |
+| `hours` | number | Length without an end, hours (default 6; at most 48). |
+| `moments` | whole number | Moments studied, 2–12 (default 6), evenly spaced, the first and last always kept; hour by hour is one more than the hours (16:00–00:00: 9). |
+| `option` | text | A corrective option's ref (e.g. 'S3:cheapest') to compare with the schedule; at a later moment its instructions held. Default: the cheapest corrective action at each moment. |
+| `n1` | `preventive` / `corrective` / `both` | Also the cost of N-1 security above the cheapest (a security-constrained OPF: slower). |
+| `hold_units` | list of text | Units kept at their schedule (the operator's conditions). |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `slack_max_mw` | number | External-grid exchange cap, MW, both directions. Omit for the network's own limit; 0.0 = islanded. For islanding or derating questions. |
-| `slack_q_max_mvar` | number | External-grid reactive exchange cap, Mvar. Omit to use slack_max_mw. A cap makes local generators supply more Q. |
+| `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
+| `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
 | `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
 
-Also takes: `network`, `load_power_factor`.
+Also takes: `branch_limits`, `network`, `load_power_factor`.
 
 ## What-if proposals
 
@@ -500,7 +538,7 @@ Read or change how each generating unit is modelled. Call with no arguments to l
 
 ### `set_unit_costs`
 
-Read or change what each unit costs. No arguments: every unit and the external grid with its production cost (c0 €/h + c1 €/MWh·P + c2 €/MW²h·P²; the grid's c1 is the import price) and redispatch costs up/down (€/MWh; down for a renewable is curtailment), a reactive price per unit (€/Mvarh) and the grid's reactive band (tan φ) and penalty beyond it, each marked 'case', 'synthetic' or 'operator'. Kept for this network and shown in the System tab. Used to cost the flexibility options (optimize_flexibility with options) and to find the cheapest one; the default dispatch ignores them.
+Read or change what each unit costs. No arguments: every unit and the external grid with its production cost (c0 €/h + c1 €/MWh·P + c2 €/MW²h·P²; the grid's c1 is the import price) and redispatch costs up/down (€/MWh; down for a renewable is curtailment), a reactive price per unit (€/Mvarh) and the grid's reactive band (tan φ) and penalty beyond it, each marked 'case', 'synthetic' or 'operator'; and per load, its demand response (share %, €/MWh) and load-relief price. Kept for this network and shown in the System tab. Used to cost the flexibility options and to find the cheapest one; the default dispatch ignores them.
 
 **Effect:** Changes the session's settings, for every later study. Called without changes, it only reads them.
 
@@ -526,6 +564,6 @@ Arguments many studies take, with the same meaning everywhere.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
+| `branch_limits` | object | Branches held below a share of their rating: {name or tag: %}, e.g. {"L30": 80}. 10–100. |
 | `load_power_factor` | number | Measured loads' power factor (0.5–1, lagging) for THIS study only; omit for the session setting. |
 | `network` | text | 'base' (default) or a proposal id. |
-| `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |

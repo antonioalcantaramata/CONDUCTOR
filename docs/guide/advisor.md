@@ -69,6 +69,11 @@ helps with those; the solver made and scored every option.
   Discussing those, it compares their N-1 screens and what security costs
   against the cheapest, says which outages each secures, and asks whether a
   corrective plan can be carried out in time — a corrective option relies on it.
+- An option that reduces load asks customers, not units, to act: it says so, and
+  asks whether you can call that demand response (or accept relief).
+- Once you lean towards one, it can propose what follows from it:
+  [how long it holds, or the next action from it](asking-questions.md#carrying-an-option-forward),
+  or a [plan for the whole peak](asking-questions.md#over-a-window-a-plan-for-the-peak-and-the-cost-of-security).
 - Options are named by turn and strategy, *T3·cheapest*, so a name keeps its
   meaning after a re-solve adds more.
 - When you close with a decision, the note records the option chosen with its

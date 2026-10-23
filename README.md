@@ -22,10 +22,14 @@ near-optimal alternatives that use other units, branches held below a chosen
 share of their rating, and dispatches that stay secure after an outage
 (preventive, or with a corrective plan per outage — a security-constrained OPF).
 Each is re-checked by an ordinary AC power flow, and the operator chooses: the
-advisor helps weigh what the solver cannot see. When a question leaves open
-something that changes the answer, the agent asks before running. A session can
-be exported as a raw record or as a report written by the model, and saved as
-context to continue from later.
+advisor helps weigh what the solver cannot see. When redispatching the units is
+not enough, demand response, then load relief, then switching are offered as a
+last resort. A chosen option can be carried forward — its N-1 screen, how long it
+holds, the next action from it — and a whole peak planned at once, or the cost of
+N-1 security priced hour by hour. When a question leaves open something that
+changes the answer, the agent asks before running. A session can be exported as
+a raw record or as a report written by the model, and saved as context to
+continue from later.
 
 The agent runs on a **hosted model** or a **local model via Ollama**, picked
 on a launch screen grouped into tiers:

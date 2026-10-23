@@ -44,6 +44,9 @@ arguments are in the [tool reference](../reference/tools.md).
 | **Corrective options** — several ways to remove the violations, side by side | *Give me options to clear the violations at 18:00.* |
 | **Options with a branch held lower** — every option keeps chosen lines below a share of their rating | *Give me options at 18:00 that keep L30 below 80 %.* |
 | **N-1 secure options** — dispatches that stay within limits after the critical outages | *Give me options at 20:00 that are secure under N-1.* · *What would a preventive N-1 secure dispatch cost?* |
+| **When redispatch is not enough** — demand response, load relief and switching, as a last resort | *At 20:00 with loads at 125 %, what are my options?* |
+| **Carrying an option forward** — what follows from the option you chose | *Hold option S3:cheapest for the next 4 hours.* · *Starting from S3:cheapest, what are my options at 21:00?* |
+| **Over a window** — one plan for a peak, the cost of N-1 security hour by hour | *Plan the corrective action from 17:00 to 22:00.* · *What does N-1 security cost this evening?* |
 | **Robust OPF** — a dispatch that stays secure with a stated confidence under uncertainty | *Find a robust corrective dispatch that is secure 95 % of the time.* |
 | **Flexibility envelope** — how far one unit can move while the grid stays secure | *How much can Gen_bus1 move up or down at 18:00?* |
 | **Hosting capacity** — how much new generation a bus can take | *What is the hosting capacity at the most heavily loaded bus?* · *Compare hosting capacity at Bus 9 for unity and 0.95 power factor.* |
@@ -61,6 +64,7 @@ dispatches instead of one, each the best answer to a different question:
 | **Without *unit*** | The unit whose active power the least-disturbance option moves most gets no instruction |
 | **Least import** | The smallest import from the external grid, then the smallest change |
 | **Most headroom** | Every line as far below its rating as possible: the lowest highest loading in the network — spare capacity for what the forecast missed, at a cost |
+| **With demand response** | The cheapest action when flexible loads may also be reduced, at their [demand-response price](system-tab.md#costs) — shown only when it does use demand response (otherwise the answer says redispatch was cheaper) |
 
 Every option meets every limit and is scored the same way: units called, MW and
 Mvar moved, import, the cost of the action (what it costs against the schedule;
@@ -91,24 +95,40 @@ band). CONDUCTOR does not pick one: the choice is the operator's — the
 [advisor](advisor.md#discussing-corrective-options) helps think it through. When
 the schedule already meets every limit, the answer is that no action is needed.
 
-### Screening an option under N-1
+### Carrying an option forward
 
-A plain N-1 screen runs on the schedule. To screen an option instead, ask
-*Is the cheapest option N-1 secure?* — or use **N-1 screen of an option** under
-the answer, which puts the request in CONDUCTOR's box. Each option carries a
-reference (*S2:cheapest*: its set and strategy); the screen applies that
-option's dispatch at its own moment, network and load level, and screens every
-single outage. The table's title says which option was applied. Options can
-differ a lot here: at the 30-bus demo's worst hour the cheapest option leaves 31
-of 41 outages with violations, least import all 41.
+Choosing an option is rarely the end: you want to know whether it holds after an
+outage, for how long, and what comes next. Each option carries a reference
+(*S2:cheapest*: its set and strategy), and **Use an option** under the answer
+puts any of these in CONDUCTOR's box — or ask in your own words:
 
-An option computed after an outage is screened with that outage kept out — the
-**N-1-1** screen: is the corrected state secure against a further outage?
+- **Its N-1 screen** — *Is the cheapest option N-1 secure?* A plain N-1 screen
+  runs on the schedule; this one applies the option's dispatch and screens every
+  single outage. Options can differ a lot here: at the 30-bus demo's worst hour
+  the cheapest option leaves 31 of 41 outages with violations, least import all
+  41. An option computed after an outage is screened with that outage kept out —
+  the **N-1-1** screen.
+- **The assessment with it applied** — *Run the security assessment with option
+  S2:cheapest applied*, or one outage with it (*… if L31 trips*).
+- **How long it holds** — *Hold option S2:cheapest for the next 4 hours.* At each
+  moment after it, its **instructions** stay (the set-points it changed); every
+  other unit follows its own schedule, as it would in operation. The charts show
+  the highest loading and lowest voltage held against the schedule untouched,
+  with the limits, and mark the first moment it no longer keeps every limit;
+  ask for the N-1 screen at each moment too if you want it. The answer says when
+  a new action is needed.
+- **Its KPIs** — *Evaluate the KPIs with S2:cheapest.* The schedule against the
+  option: what it needs, what it moves, what flexibility it leaves and what it
+  costs (see [Key performance indicators](#key-performance-indicators)).
+- **The next action from it** — *Starting from S2:cheapest, what are my options
+  at 21:00?* The corrective options then start from the option's instructions
+  held, not from the schedule — what you would actually face an hour later.
 
-The screen applies the option as a fixed dispatch; it does not redispatch after
-each outage. Options are kept until the backend restarts or another network is
-loaded, and are refused when the unit models, names or load power factor have
-changed since — compute them again then.
+The option's own moment, network and load level always apply; a later moment
+holds its instructions, an earlier one is refused. Options are kept on disk with
+the network (beside its proposals), so a reference still works after a restart;
+one computed before the unit models, names or load power factor changed is
+refused with the reason — compute the options again then.
 
 ### After an outage
 
@@ -116,30 +136,76 @@ The same works for the corrective action after an outage: *If line L36 trips at
 noon on 3 January, what are my options?* Each option is priced against the
 schedule after the outage and checked by a power flow of the network without
 the line; the table's title names the outage. When no local redispatch can
-clear what the outage causes, the answer says so and why.
+clear what the outage causes, the answer says so and why, and goes on to
+[the last resort](#when-redispatching-the-units-is-not-enough) — after the loss
+of L29 at that noon, demand response and load relief do.
 
 ### Near-optimal alternatives
 
 The cheapest option is cheapest by the cost table — which knows nothing of how
 far you trust a unit or how many instructions you would rather send. Ask *Are
 there other ways that cost about the same?* (or name a margin: *within 20 %*)
-and CONDUCTOR returns the cheapest option and up to three **near-optimal
+and CONDUCTOR returns the cheapest option and up to five **near-optimal
 alternatives**: each costs at most that margin above the cheapest (10 % unless
-you say otherwise) and changes other units. Each says, from the solver, how far
-above the cheapest it is and which units it **avoids** or **adds** — for example
-*10.0 % above the cheapest; avoids Gen_bus10; adds Gen_bus4* — and the chart
-title states the margin.
+you say otherwise), and they are as different from each other as the margin
+allows. Each says, from the solver, how far above the cheapest it is, how it was
+found, and which units it **avoids** or **adds** — for example *10.0 % above the
+cheapest; Gen_bus1 as high as it can be within the margin; avoids Gen_bus10*.
 
-They are found by *modelling to generate alternatives* (the Hop-Skip-Jump
-method): each alternative keeps within the cost margin while moving as little
-power as possible on the units earlier options moved, so it finds another way
-when there is one. When none exists within the margin, the answer says so; a
-wider margin may find some.
+They are found by *modelling to generate alternatives* (MGA), several ways at
+once, every one inside the same cost margin:
+
+| Method | What it looks for |
+| --- | --- |
+| **Hop-Skip-Jump** | Moving as little as possible on the units earlier alternatives moved — another way, when there is one |
+| **Unit ranges** | Each unit as low, and as high, as it can be |
+| **Other objectives** | The fewest units, the least import, the most headroom, the least disturbance — each within the margin |
+| **Random directions** | Seeded random directions in the space of unit outputs (the same question gives the same alternatives) |
+
+From everything found, the ones shown are picked farthest-first — each the most
+different from those already shown. You can ask for fewer (*give me two
+alternatives*) or one method (*… by Hop-Skip-Jump only*).
+
+The unit ranges give a chart of their own: **what each unit can do within the
+margin** — a bar from its lowest to its highest output, with its schedule and
+where the cheapest puts it. A short bar is a unit every cheap way needs at that
+level; a long one is a unit you can trade. At the demo's evening peak, Gen_bus7
+must rise by at least 13 MW in every alternative within 10 %, while Gen_bus10
+can stay anywhere from its schedule to its maximum. When no alternative exists
+within the margin, the answer says so; a wider margin may find some.
 
 Rule a unit out and ask again: *Give me options without Gen_bus1.* The unit
 stays in service and gets no instruction in any option — its active power and
 its set-point stay as scheduled (unlike a unit taken out of service) — and the
 table's subtitle says so.
+
+### When redispatching the units is not enough
+
+Sometimes no redispatch of the units clears the violations — the feeder is too
+loaded, or the units too far away. CONDUCTOR then says so, with the reason, and
+goes on to the remedies after redispatch, in a fixed order:
+
+1. **Demand response** — a share of a load reduced on request (contracted
+   flexibility, an aggregator), at its price;
+2. **Load relief** — involuntary reduction of the rest, the last resort, at the
+   value of lost load.
+
+The **last resort** options are the **least load reduction** that, with
+redispatch, clears every violation (demand response before any relief) and the
+**cheapest** with loads reduced at their prices — each with the loads it reduces
+(load, bus, MW of demand response and of relief) and checked by a power flow.
+At the 30-bus demo's evening peak with loads at 125 %, 3.9 MW of demand response
+at six loads (Bus_20 to Bus_29) does it, with no relief. CONDUCTOR also
+screens **switching**: single openings an AC power flow found to clear or relieve
+the violations — a screen, not an optimisation; protection and supply are yours
+to check.
+
+The prices — 10 % of every load as demand response at 150 €/MWh and relief at
+3,000 €/MWh, synthetic until you change them — are in the
+[System tab](system-tab.md#costs), per load, or by asking: *Bus_29's load has
+2 MW of demand response at 90 €/MWh.* The default corrective dispatch never
+touches a load; with options, the **With demand response** option shows whether
+demand response would be worth calling at its price.
 
 ### Keeping a line below a share of its rating
 
@@ -199,29 +265,113 @@ options for reference and the secure ones. Then:
   screened *before* its action — the plan is what removes the rest.
 - **Corrective plan** — one row per studied outage: the change each unit makes
   (MW, and a new voltage set-point), or *no action needed* when the dispatch
-  already survives that outage. Each plan is checked by an ordinary AC power flow
-  of the network without the outaged branch: *✓ confirmed*, or *✗* and the first
-  limit still broken.
+  already survives that outage. When moving the units is not enough, the plan
+  also **reduces load after the outage** — demand response first, load relief
+  only beyond it (ask without it: *… with no load reduction*). Each plan is
+  checked by an ordinary AC power flow of the network without the outaged branch:
+  *✓ confirmed*, or *✗* and the first limit still broken.
+- **Switching that may help** — for an outage a dispatch cannot secure, single
+  openings of another line after it that an AC power flow found to clear or
+  relieve what remains.
 
 At the 30-bus demo's evening peak (6 January, 20:00), the cheapest option
 leaves 29 of the 41 outages with violations. The preventive dispatch brings that
-to 16 at 783.83 €/h instead of 26.48 €/h; the corrective one secures more of the
-studied outages, at 281.25 €/h, by acting after them. Some outages cannot be
-secured by any dispatch of the five units — the answer lists them with what
-remains (for example *Bus_23 -> Bus_24 [L32] at 133.2 %*): those need another
-remedy (a topology change, load relief, a new line).
+to 16 at 783.83 €/h instead of 26.48 €/h; it cannot secure five of the eight
+studied outages (for example after L35, *Bus_23 -> Bus_24 [L32] at 132.9 %*), but
+after the loss of L32, opening L13 clears everything. The corrective dispatch, at
+276.38 €/h, secures all eight: four by moving the units, four by also reducing
+load after the outage — after L35, 3.7 MW of relief at Bus_29 with demand
+response at five loads.
 
 **What secure means here.** Secure for the outages studied, at that moment, at
 that load — not for every hour. The screen shows every outage; the study covers
 the most critical. A dispatch is never called N-1 secure beyond what its screen
 shows.
 
+### Over a window: a plan for the peak, and the cost of security
+
+The studies above are for one moment. Two look across a window (*from 17:00 to
+22:00*, or *the next 6 hours*; up to twelve moments, evenly spaced):
+
+**A corrective plan** — *Plan the corrective action from 17:00 to 22:00.* One
+optimisation over every moment, each meeting every limit, linked so that an
+instruction is kept from one moment to the next unless changing it is worth it —
+instead of a separate answer each hour that would call units in and out. Ask for
+it steadier (*steadiness 4*), cheapest rather than least disturbance, or within a
+ramp limit (*units ramp at most 30 % of capacity per hour*). The chart shows each
+unit's change as a step (an instruction holds until it changes); the table, each
+moment checked by a power flow; and the title, how many instructions the plan
+issues against solving each moment on its own — every change of a unit's
+active power counts. At the demo's evening peak: 17 instructions instead of 25
+by default, 13 at steadiness 4.
+
+**The cost of N-1 security** — *What does N-1 security cost this evening, hour by
+hour?* At each moment, the same study a single question gets — the cheapest
+corrective action and the N-1 secure option, preventive, corrective or both —
+then what security costs above the cheapest, and in total over the window — each
+moment weighted by half the time to its neighbours, so 16:00 to midnight counts
+eight hours (an estimate between the moments studied). Compare
+the secure option with the cheapest: where the schedule itself breaks a
+normal-operation limit (the 90 % margin included), it is only a reference — the
+answer says at which moments. Each option's N-1 figure is the full screen (as in
+the chart: outages still with violations, of all those tested); the few outages
+its optimisation studied, and how many it secured, are given apart — secure only
+for those. Each moment is a full study, so the moments run in
+parallel (on an 8-core laptop, nine moments take about 20 seconds), and the
+status line shows how many are done and roughly how long is left.
+From 16:00 to midnight on 6 January, hour by hour (nine moments), preventive
+security costs about 6,100 € above the cheapest, corrective about 3,700 €. The
+window's first and last moments are always studied; with the default of at most
+six, a 15-minute series is sampled every two hours.
+
 ## Key performance indicators
 
 | Study | Ask, for example |
 | --- | --- |
-| **KPIs at one moment** — flexibility needed, margins and similar indicators | *Evaluate the flexibility KPIs for the current operating point.* |
-| **KPIs over the forecast** | *How do the KPIs evolve over the forecast horizon?* |
+| **KPIs at one moment** — the schedule against a corrective action | *Evaluate the KPIs at 20:00.* |
+| **With a chosen option** — before and after it, held from its moment | *What are the KPIs at 21:00 with S3:cheapest?* |
+| **Over a window** — measurements or the forecast | *How do the KPIs evolve this evening, hour by hour?* |
+
+Every answer compares two states of the same moment, each checked by an AC
+power flow: the schedule as it is, and the schedule with a corrective action —
+the cheapest at that moment unless you name an option (at a later moment its
+instructions are held, as in operation). When the schedule needs nothing, the
+answer says so and shows the schedule's own indicators.
+
+- **KPI-1 Target demand flexibility** — the units' spare upward capacity as a
+  share of demand (load and losses).
+- **KPI-2 Flexibility utilisation** — the fewest MW of redispatch that clear the
+  violations (*flexibility required*), as a share of the MW the action moves
+  (*flexibility activated*). A low value means the action moves more than it
+  needs to, usually because that is cheaper.
+- **KPI-3 Prevented violation ratio** — the share of the schedule's violations
+  the action clears. When the schedule breaks no limit there is nothing to
+  prevent, and the answer says that rather than 0 % or 100 %.
+- **Security margins** — violations, the voltage margin to the nearest limit
+  and the loading headroom (negative: outside the limit), and the single
+  outages that leave a violation, of all those tested.
+- **Deliverable flexibility** — how far the units can move up and down within
+  every limit: each unit alone (the others held) and all together. Spare
+  capacity is not the same thing: a unit may have spare MW the network cannot
+  carry, and the chart shows both side by side.
+- **Costs** — the action at the cost table's prices (a negative cost is a
+  saving) and, if you ask for N-1, what N-1 security costs above the cheapest.
+
+A value the study could not compute is shown as unknown, never as zero.
+
+At the demo's evening peak (6 January, 20:00) the schedule breaks two limits.
+The cheapest action clears them for 26.48 €/h and moves 34.4 MW, of which
+9.0 MW are needed, so KPI-2 is 26 %. KPI-1 falls from 31.2 % to 20.7 %; the
+units can still deliver 65.5 MW up and 31.3 MW down within every limit; the
+N-1 screen improves from 41 to 29 outages with violations of 41. Preventive
+N-1 security would cost 757 €/h more.
+
+Over a window, every moment is a full study, run in parallel with its progress
+shown (on an 8-core laptop, nine moments in about 4 seconds). The answer gives
+each indicator's range and worst moment, the actions' cost over the window and
+the MWh activated against the MWh required. From 16:00 to midnight on
+6 January, the actions activate 38.2 MWh where 9.0 MWh are needed; upward
+flexibility is lowest at 20:00 (65.5 MW).
 
 ## Changes to the grid
 

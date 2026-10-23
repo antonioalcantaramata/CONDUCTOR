@@ -507,11 +507,19 @@ def _extract_pg_max(net) -> dict:
     return result
 
 
+def _served(m, l):
+    """The share of a load still supplied: 1 unless the model may reduce loads
+    (`load_flex`) — then less what demand response and load relief take."""
+    if not hasattr(m, "Pdr") or l not in m.LFlex:
+        return 1.0
+    return 1.0 - (m.Pdr[l] + m.Pshed[l]) / m.Pl[l]
+
+
 def active_power_balance_rule(m, bus_idx):
     # --- Contributions from generators, external grids, and shunts ---
     P_inj = sum(m.Pg_new[g] for g in m.G if m.gen_bus[g] == bus_idx) \
           + sum(m.Pext[e] for e in m.Ext if m.ext_bus[e] == bus_idx) \
-          - sum(m.Pl[l] for l in m.L if m.load_bus[l] == bus_idx) \
+          - sum(m.Pl[l] * _served(m, l) for l in m.L if m.load_bus[l] == bus_idx) \
           - sum(m.Ps_nom[s] * m.V[bus_idx] ** 2 for s in m.S if m.shunt_bus[s] == bus_idx)
 
     # --- Branch outflows ---
@@ -536,7 +544,7 @@ def reactive_power_balance_rule(m, bus_idx):
     # --- Contributions from generators, external grids, loads, and shunts ---
     Q_inj = sum(m.Qg_new[g] for g in m.G if m.gen_bus[g] == bus_idx) \
           + sum(m.Qext[e] for e in m.Ext if m.ext_bus[e] == bus_idx) \
-          - sum(m.Ql[l] for l in m.L if m.load_bus[l] == bus_idx) 
+          - sum(m.Ql[l] * _served(m, l) for l in m.L if m.load_bus[l] == bus_idx) 
             #\- sum(m.Qs[s] for s in m.S if m.shunt_bus[s] == bus_idx)
 
     # --- Add shunt reactive injection (voltage-dependent) ---
@@ -613,7 +621,8 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                        fixed_setpoints: dict = None,
                        vm_upper_per_bus: dict = None,
                        vm_lower_per_bus: dict = None,
-                       branch_limits: dict = None):
+                       branch_limits: dict = None,
+                       load_flex: dict = None):
 
     
     # -------------------------
@@ -730,6 +739,22 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     model.Pl = Param(model.L, initialize=load_data_p)       # Active power demand (MW)
     model.Ql = Param(model.L, initialize=load_data_q)       # Reactive power demand (Mvar)
     model.load_bus = Param(model.L, initialize=load_bus_map) # Bus index for each load
+
+    # Loads the model may reduce (`load_flex`: {load index: MW of demand
+    # response available}): demand response up to that, load relief up to the
+    # rest. Both fixed at zero here — this dispatch never touches a load; a
+    # caller frees them (flex_options.last_resort, the demand-response option,
+    # scopf). A load reduced keeps its power factor.
+    if load_flex is not None:
+        flex = [l for l in load_name_list if load_data_p[l] > 1e-6]
+        model.LFlex = Set(initialize=flex)
+        model.Pdr = Var(model.LFlex, bounds=lambda m, l: (0.0, min(max(float(load_flex.get(l, 0.0)), 0.0),
+                                                                    load_data_p[l])), initialize=0.0)
+        model.Pshed = Var(model.LFlex, bounds=lambda m, l: (0.0, load_data_p[l]), initialize=0.0)
+        model.load_flex_total = Constraint(model.LFlex, rule=lambda m, l: m.Pdr[l] + m.Pshed[l] <= m.Pl[l])
+        for l in flex:
+            model.Pdr[l].fix(0.0)
+            model.Pshed[l].fix(0.0)
 
     
     # -------------------------

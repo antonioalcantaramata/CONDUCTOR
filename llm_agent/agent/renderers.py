@@ -66,7 +66,18 @@ OPTION_COLOURS = {"least_disturbance": _C.PRIMARY, "cheapest": _C.TEAL, "fewest_
                   # an N-1 set the least-disturbance, the cheapest and the secure
                   # ones: the validated hues are reused, each once per chart.
                   "near_optimal_1": _C.PURPLE, "near_optimal_2": _C.MAGENTA, "near_optimal_3": _C.OLIVE,
-                  "n1_preventive": _C.PURPLE, "n1_corrective": _C.MAGENTA}
+                  "near_optimal_4": _C.SIENNA, "near_optimal_5": _C.PRIMARY,
+                  "n1_preventive": _C.PURPLE, "n1_corrective": _C.MAGENTA,
+                  # A seventh strategy: no seventh hue passes against the six, so
+                  # it shares most headroom's and carries a hatch (composite encoding).
+                  "demand_response": _C.SIENNA,
+                  # The last resort is its own set: least load reduction, cheapest with it.
+                  "last_resort_least": _C.PRIMARY, "last_resort_cheapest": _C.TEAL}
+OPTION_PATTERNS = {"demand_response": "/"}
+# A horizontal legend whose entries keep their whole label.
+_WIDE_LEGEND = {"orientation": "h", "y": -0.22, "x": 0, "entrywidth": 190, "entrywidthmode": "pixels"}
+# Units in a chart of their own (a plan): the categorical order, then folded to neutral.
+UNIT_COLOURS = (_C.PRIMARY, _C.TEAL, _C.PURPLE, _C.MAGENTA, _C.OLIVE, _C.SIENNA)
 _PRICE_SOURCES = {"case": "the case file", "synthetic": "the synthetic rule", "operator": "your changes"}
 
 
@@ -354,6 +365,10 @@ def render_rsa(result: dict) -> list[go.Figure]:
     # Figure 3: Transformer loading
     # ------------------------------------------------------------------
     all_trafo_loading = result.get("all_trafo_loading", [])
+    if not all_trafo_loading and result.get("all_line_loading"):
+        # A network without transformers (the IEEE 30 demo): nothing to draw, and
+        # "run the analysis first" read as if the assessment had failed.
+        return [fig_v, fig_l]
     if not all_trafo_loading:
         fig_t = _empty_figure("No data — run the analysis first")
     else:
@@ -602,6 +617,13 @@ def _render_options(result: dict) -> list[go.Figure]:
              num(o.get("moved_mw"), ".2f"), num(o.get("moved_mvar"), ".2f"), num(o.get("import_mw"), ".1f"),
              num(o.get("cost_eur_per_h"), ".2f"), num(o.get("above_cheapest_eur_per_h"), "+.2f"),
              num(o.get("min_vm_pu"), ".3f"), num(o.get("max_loading_pct"), ".1f"), checked(o)] for o in options]
+    widths = [1.2, 2.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0, 0.9, 1.0, 1.1]
+    if any(o.get("load_reduction_mw") for o in options):
+        # Load reduced (demand response and relief): beside the units called.
+        headers.insert(3, "Load reduced MW")
+        widths.insert(3, 0.8)
+        for row, o in zip(rows, options):
+            row.insert(3, num(o.get("load_reduction_mw") or 0.0, ".2f"))
     sources = [_PRICE_SOURCES.get(k, k) for k in (result.get("costs") or {}).get("prices_from") or {}]
     kept = list(result.get("held_units") or {})
     after = f" after the outage of {result['outage']['element']}" if (result.get("outage") or {}).get("element") else ""
@@ -611,7 +633,7 @@ def _render_options(result: dict) -> list[go.Figure]:
         held += (" and " if held else " with ") + ", ".join(f"{_tag(n)} at most {p:g} %" for n, p in caps.items())
     study = result.get("n1_study") or {}
     table = go.Figure(go.Table(
-        columnwidth=[1.2, 2.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.0, 0.9, 1.0, 1.1],
+        columnwidth=widths,
         header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
                 "font": {"size": 12}},
         cells={"values": [list(col) for col in zip(*rows)], "align": "left", "height": 26, "font": {"size": 12}},
@@ -625,12 +647,19 @@ def _render_options(result: dict) -> list[go.Figure]:
                 f"outage(s) studied ({' and '.join(study.get('modes') or [])}) · each meets every limit{held} with "
                 f"everything in service · prices from {', '.join(sources) or 'the cost table'}</sup>")
                if result.get("set") == "n1" else
+               (f"Last resort{after} at {when}: options that also reduce load<br><sup>Redispatching the units alone "
+                f"cannot clear the violations · demand response first, load relief only beyond it · each meets "
+                f"every limit{held} · prices from {', '.join(sources) or 'the cost table'}</sup>")
+               if result.get("set") == "last_resort" else
                (f"Corrective options{after} at {when}<br><sup>Each meets every limit{held} · cost of the action, "
                 f"prices from {', '.join(sources) or 'the cost table'}</sup>")),
-        height=140 + 56 * len(rows), **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
+        height=_table_height(headers, rows, widths), **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
     figures = [table]
     if result.get("set") == "n1":
         figures += _n1_tables(options, study, when)
+    figures += _load_reduction_tables(options, when)
+    if result.get("switching"):
+        figures.append(_switching_table(result["switching"], when))
 
     for key, unit, title, threshold in (("dp_mw", "MW", "Change in active power by option", 0.01),
                                         ("dq_mvar", "Mvar", "Change in reactive power by option", 0.05)):
@@ -647,7 +676,9 @@ def _render_options(result: dict) -> list[go.Figure]:
             fig.add_trace(go.Bar(
                 name=o.get("label", o.get("id")), y=_safe_labels(units, "Unit"),
                 x=[by_unit.get(u, 0.0) for u in units], orientation="h",
-                marker={"color": OPTION_COLOURS.get(o.get("id"), _C.NEUTRAL), "cornerradius": 4},
+                marker={"color": OPTION_COLOURS.get(o.get("id"), _C.NEUTRAL), "cornerradius": 4,
+                        **({"pattern": {"shape": OPTION_PATTERNS[o.get("id")], "fgcolor": "white", "size": 6}}
+                           if o.get("id") in OPTION_PATTERNS else {})},
                 hovertemplate="%{y}: %{x:+.2f} " + unit + "<extra>" + str(o.get("label", "")) + "</extra>"))
         fig.update_layout(**CHART_THEME, barmode="group", bargap=0.35, bargroupgap=0.08,
                           title=f"{title} ({unit}) — {when}", xaxis_title="", yaxis_title="",
@@ -656,7 +687,91 @@ def _render_options(result: dict) -> list[go.Figure]:
                                   "entrywidthmode": "pixels"})
         fig.add_vline(x=0, line={"color": _C.INK, "width": 1})
         figures.append(fig)
+    # Last: the app shows charts two to a row, and the two power charts pair best.
+    if result.get("near_optimal_ranges"):
+        figures.append(_ranges_chart(result, when))
     return figures
+
+
+_TABLE_CHARS = 175           # characters across a full-width table at 12 px (about 1250 px)
+
+
+def _table_height(headers: list, rows: list, widths: list) -> int:
+    """A table's height from its text: each row as tall as its longest cell
+    wraps (an exported page shows the figure, which clips; the app shows a
+    data frame, which does not)."""
+    total = sum(widths) or 1.0
+
+    def lines(cells) -> int:
+        return max((math.ceil(len(str(c)) / max(_TABLE_CHARS * w / total - 2, 4)) for c, w in zip(cells, widths)),
+                   default=1)
+    head = 14 + 18 * max(lines(headers), 1)
+    return 110 + head + sum(max(30, 12 + 18 * lines(r)) for r in rows)
+
+
+def _plain_table(headers: list, rows: list, widths: list, title: str, row_height: int | None = None) -> go.Figure:
+    """A copyable table (the app shows it as a data frame), titled."""
+    fig = go.Figure(go.Table(
+        columnwidth=widths,
+        header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
+                "font": {"size": 12}},
+        cells={"values": [list(col) for col in zip(*rows)], "align": "left", "height": 26, "font": {"size": 12}}))
+    extra = 15 * max(title.count("<br>") - 1, 0)            # a subtitle of several lines
+    fig.update_layout(title=title, height=_table_height(headers, rows, widths) + extra,
+                      **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70 + extra, "b": 10}})
+    return fig
+
+
+def _load_reduction_tables(options: list[dict], when: str) -> list[go.Figure]:
+    """Which loads an option reduces, and by how much — instructions to
+    customers (demand response) or involuntary relief."""
+    rows = [[o.get("label", o.get("id")), a.get("load", ""), a.get("bus") or "—",
+             f"{a.get('demand_response_mw', 0):.2f}", f"{a.get('load_relief_mw', 0):.2f}"]
+            for o in options for a in o.get("load_actions") or []]
+    if not rows:
+        return []
+    return [_plain_table(["Option", "Load", "Bus", "Demand response MW", "Load relief MW"], rows,
+                         [1.4, 0.9, 0.9, 1.1, 1.0],
+                         f"Load reductions at {when}<br><sup>Demand response: the share of a load reduced on "
+                         "request, at its price · load relief: involuntary, the last resort (cost table, per load)"
+                         "</sup>")]
+
+
+def _switching_table(candidates: list[dict], when: str, after: str = "") -> go.Figure:
+    rows = [["Open " + c.get("open", ""), "✓ clears every violation" if c.get("clears_all") else
+             f"relieves {c.get('relieves_pct', 0)} %", "; ".join(c.get("remaining") or []) or "—"]
+            for c in candidates]
+    return _plain_table(["Switching", "Power flow", "Still out of limits"], rows, [1.6, 1.2, 2.6],
+                        f"Switching that may help{after} at {when}<br><sup>Single openings an AC power flow found to "
+                        "clear or relieve the violations · a screen, not an optimisation: check protection and "
+                        "supply before switching</sup>")
+
+
+def _ranges_chart(result: dict, when: str) -> go.Figure:
+    """Each unit's range within the near-optimal margin, with where the
+    cheapest puts it and its schedule: what is fixed and what is free."""
+    ranges = result.get("near_optimal_ranges") or []
+    units = [r["unit"] for r in ranges]
+    fig = go.Figure()
+    for r in ranges:
+        fig.add_trace(go.Scatter(x=[r["min_mw"], r["max_mw"]], y=[r["unit"], r["unit"]], mode="lines",
+                                 line={"color": _C.PRIMARY, "width": 10}, showlegend=False,
+                                 hovertemplate=f"{r['unit']}: {r['min_mw']:.1f}–{r['max_mw']:.1f} MW<extra></extra>"))
+    fig.add_trace(go.Scatter(x=[r["schedule_mw"] for r in ranges], y=units, mode="markers", name="Schedule",
+                             marker={"color": "white", "size": 10, "line": {"color": _C.INK, "width": 2}},
+                             hovertemplate="%{y} scheduled: %{x:.1f} MW<extra></extra>"))
+    fig.add_trace(go.Scatter(x=[r["cheapest_mw"] for r in ranges], y=units, mode="markers", name="Cheapest",
+                             marker={"color": OPTION_COLOURS["cheapest"], "size": 11, "symbol": "diamond",
+                                     "line": {"color": "white", "width": 2}},
+                             hovertemplate="%{y} in the cheapest: %{x:.1f} MW<extra></extra>"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", name="Range within the margin",
+                             line={"color": _C.PRIMARY, "width": 10}))
+    fig.update_layout(**CHART_THEME, title=(f"What each unit can do within {result.get('near_optimal_pct', 0):g} % "
+                                            f"of the cheapest — {when}"),
+                      xaxis_title="Active power (MW)", yaxis_title="", height=max(240, 46 * len(units) + 150),
+                      legend={**_WIDE_LEGEND, "y": -0.3},
+                      yaxis={"categoryorder": "array", "categoryarray": units, "autorange": "reversed"})
+    return fig
 
 
 def _tag(name) -> str:
@@ -668,15 +783,8 @@ def _tag(name) -> str:
 def _n1_tables(options: list[dict], study: dict, when: str) -> list[go.Figure]:
     """An N-1 set: each option's N-1 screen and what its study secured, then
     the corrective plan of a corrective option — what to do after each outage."""
-    def table(headers, rows, widths, title, row_height):
-        fig = go.Figure(go.Table(
-            columnwidth=widths,
-            header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
-                    "font": {"size": 12}},
-            cells={"values": [list(col) for col in zip(*rows)], "align": "left", "height": 26, "font": {"size": 12}}))
-        fig.update_layout(title=title, height=118 + row_height * len(rows),
-                          **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
-        return fig
+    def table(headers, rows, widths, title, row_height=None):
+        return _plain_table(headers, rows, widths, title)
 
     studied = study.get("outages_studied") or []
     figures, rows = [], []
@@ -729,14 +837,38 @@ def _n1_tables(options: list[dict], study: dict, when: str) -> list[go.Figure]:
                 return "✓ confirmed"
             first = (p.get("after_action") or ["not confirmed"])[0]
             return "✗ " + (first if len(first) <= 40 else first[:39] + "…")
-        rows = [[p.get("outage", "")] + [cell(p, u) for u in units] + [outcome(p)] for p in plan]
+
+        def loads(p):
+            parts = []
+            for a in p.get("loads") or []:
+                where = a.get("bus") or a.get("load")
+                bits = ([f"−{a['demand_response_mw']:.2f} DR"] if a.get("demand_response_mw") else []) + (
+                    [f"−{a['load_relief_mw']:.2f} relief"] if a.get("load_relief_mw") else [])
+                parts.append(f"{where} {', '.join(bits)}")
+            return "; ".join(parts) or "—"
+        with_loads = any(p.get("loads") for p in plan)
+        rows = [[p.get("outage", "")] + [cell(p, u) for u in units] + ([loads(p)] if with_loads else [])
+                + [outcome(p)] for p in plan]
         reach = study.get("reach_pct")
         figures.append(table(
-            ["After the outage of"] + units + ["Power flow"], rows, [1.6] + [1.0] * len(units) + [1.4],
+            ["After the outage of"] + units + (["Load reduced (MW)"] if with_loads else []) + ["Power flow"], rows,
+            [1.6] + [1.0] * len(units) + ([2.0] if with_loads else []) + [1.4],
             f"Corrective plan of {o.get('label', o.get('id'))} at {when}<br><sup>What to do after each studied "
-            f"outage: active power change{f' (at most {reach:g} % of capacity)' if reach else ''} and voltage "
-            "set-points · each checked by a power flow without the outaged branch</sup>",
+            f"outage: active power change{f' (at most {reach:g} % of capacity)' if reach else ''}, voltage "
+            f"set-points{', load reduced when moving the units is not enough' if with_loads else ''} · each "
+            "checked by a power flow without the outaged branch</sup>",
             48 if any("V " in c for r in rows for c in r[1:-1]) else 28))
+    # What else might help where an outage could not be secured: switching.
+    rows = [[o.get("label", o.get("id")), x.get("outage", ""), "; ".join((x.get("remaining") or [])[:2]),
+             "; ".join(("open " + c["open"] + (" ✓ clears all" if c.get("clears_all") else
+                                               f" (−{c.get('relieves_pct', 0)} %)")) for c in x.get("switching") or [])]
+            for o in options for x in (o.get("n1") or {}).get("not_secured") or [] if x.get("switching")]
+    if rows:
+        figures.append(table(["Option", "Outage not secured", "Still out of limits", "Switching that helps"], rows,
+                             [1.2, 1.5, 2.2, 2.4],
+                             f"Outages the dispatch cannot secure — switching that may help, at {when}<br><sup>Single "
+                             "openings after the outage, each checked by an AC power flow · a screen: check "
+                             "protection and supply before switching</sup>", 40))
     return figures
 
 
@@ -764,7 +896,15 @@ def render_dispatch(result: dict) -> list[go.Figure]:
         reason = result.get("message") or "violations cannot be resolved by local flexibility"
         if str(reason).strip().rstrip(".").lower() == "infeasible":
             reason = "violations cannot be resolved by local flexibility"
-        return [_empty_figure(f"❌ Optimizer did not find a usable dispatch — {reason}", color=_C.VIOLATION)]
+        figures = [_empty_figure(f"❌ Optimizer did not find a usable dispatch — {reason}", color=_C.VIOLATION)]
+        # Beyond redispatch: what reducing load — and switching — would take.
+        rescue = result.get("last_resort") or {}
+        if rescue.get("options"):
+            figures += _render_options({**rescue, "timestamp": result.get("timestamp"),
+                                        "outage": result.get("outage")})
+        elif rescue.get("switching"):
+            figures.append(_switching_table(rescue["switching"], str(result.get("timestamp") or "")[:16]))
+        return figures
 
     resources = result.get("activated_resources", [])
     dispatch_pre_disable = result.get("dispatch_pre_disable")  # dict or None
@@ -1028,238 +1168,269 @@ def render_dispatch(result: dict) -> list[go.Figure]:
 
 
 # ---------------------------------------------------------------------------
-# 4.4 — KPI gauges
+# 4.4 — Key performance indicators: the schedule against a corrective action
 # ---------------------------------------------------------------------------
 
-
-def _make_gauge(
-    value: float,
-    title: str,
-    row: int,
-    col: int,
-    color_thresholds: list[tuple[float, str]],
-) -> go.Indicator:
-    """Build a single gauge indicator."""
-    # Determine color based on thresholds (list of (threshold, color) ascending)
-    bar_color = color_thresholds[0][1]
-    for threshold, color in color_thresholds:
-        if value >= threshold:
-            bar_color = color
-
-    return go.Indicator(
-        mode="gauge+number",
-        value=value,
-        title={"text": title},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": bar_color},
-            "steps": [
-                {"range": [0, 50], "color": "#fee8e8"},
-                {"range": [50, 90], "color": "#fef9e8"},
-                {"range": [90, 100], "color": "#e8fee8"},
-            ],
-        },
-        domain={
-            "row": row,
-            "column": col,
-        },
-    )
+# How each indicator's number reads: (format, suffix).
+_KPI_FORMATS = {"%": (".1f", " %"), "MW": (".1f", " MW"), "p.u.": ("+.3f", " p.u."), "pp": ("+.1f", " pp"),
+                "€/h": (",.2f", " €/h"), "": ("d", "")}
+# The tiles, in reading order: N-0 security, N-1 and what the action prevents,
+# then flexibility (what there is, what is needed, what is used).
+_KPI_TILES = ("violations", "vm_margin_pu", "loading_headroom_pct",
+              "n1_outages_with_violations", "kpi_3_prevented_violation_ratio_pct", "cost_eur_per_h",
+              "kpi_1_target_demand_flex_pct", "deliverable_up_mw", "deliverable_down_mw",
+              "required_mw", "moved_mw", "kpi_2_flex_utilization_pct", "n1_security_eur_per_h")
 
 
-def render_kpis(result: dict) -> go.Figure:
-    """
-    Three (or six) gauge indicators in a single figure.
-    """
-    metrics = result.get("metrics", {})
-    constrained = result.get("constrained_metrics", {})
-    timestamp = result.get("timestamp", result.get("current_timestamp", ""))
+# A tile is a third of a half-width chart: a short name, and what it counts.
+_KPI_TILE_LABELS = {
+    "violations": ("Violations", "N-0 · count"), "vm_margin_pu": ("Voltage margin", "p.u. to the nearest limit"),
+    "loading_headroom_pct": ("Loading headroom", "pp to the limit"),
+    "n1_outages_with_violations": ("N-1 outages", "with violations"),
+    "kpi_3_prevented_violation_ratio_pct": ("KPI-3", "violations prevented"),
+    "cost_eur_per_h": ("Action cost", "€/h, cost table"),
+    "kpi_1_target_demand_flex_pct": ("KPI-1", "target demand flexibility"),
+    "deliverable_up_mw": ("Deliverable up", "MW within limits"),
+    "deliverable_down_mw": ("Deliverable down", "MW within limits"),
+    "required_mw": ("Required", "fewest MW to clear"), "moved_mw": ("Activated", "MW the action moves"),
+    "kpi_2_flex_utilization_pct": ("KPI-2", "flexibility utilisation"),
+    "n1_security_eur_per_h": ("N-1 security", "€/h above the cheapest"),
+}
 
-    if not metrics:
-        return _empty_figure("No KPI data — run evaluate_kpis first")
-    status = str(result.get("status", "success")).lower()
-    if status not in ("success", "optimal"):
-        # A failed evaluation used to be drawn as three red 0 % gauges — read
-        # as measured values. Say it failed, with the backend's reason.
-        reason = result.get("message") or result.get("detail") or status
-        return _empty_figure(f"KPI evaluation did not complete: {reason}", color=_C.VIOLATION)
 
-    kpi1 = _float_or_none(metrics.get("kpi_1_target_demand_flex_pct"))
-    kpi2 = _float_or_none(metrics.get("kpi_2_flex_utilization_pct"))
-    kpi3 = _float_or_none(metrics.get("kpi_3_prevented_violation_ratio_pct"))
+def _kpi_value(value, unit: str) -> str:
+    v = _float_or_none(value)
+    if v is None:
+        return "—"
+    fmt, suffix = _KPI_FORMATS.get(unit, (".2f", f" {unit}"))
+    return f"{(round(v) if fmt == 'd' else round(v, 3)) + 0:{fmt}}{suffix}"
 
-    has_constrained = bool(constrained) and constrained.get("status") == "optimal"
-    n_rows = 2 if has_constrained else 1
 
-    specs = [[{"type": "indicator"}] * 3 for _ in range(n_rows)]
-    subplot_titles = ["KPI-3: Violations prevented", "KPI-2: Flexibility used", "KPI-1: Demand flexibility available"]
-    if has_constrained:
-        slack = constrained.get("slack_max_mw", "?")
-        subplot_titles += [
-            f"KPI-3 (constrained {slack} MW)",
-            f"KPI-2 (constrained {slack} MW)",
-            f"KPI-1 (constrained {slack} MW)",
-        ]
+def _kpi_compared(result: dict) -> str:
+    """What the indicators compare the schedule with, in a few words."""
+    after_is = result.get("after_is")
+    if after_is == "schedule":
+        return "no corrective action needed: the schedule's own indicators"
+    if after_is == "none":
+        return "no corrective action found"
+    held = f", held from {_hhmm(result.get('held_since'))[-5:]}" if result.get("held") else ""
+    return f"schedule → {result.get('after_label', 'the action')} ({result.get('after_ref', '')}){held}"
 
-    from plotly.subplots import make_subplots
 
-    fig = make_subplots(
-        rows=n_rows,
-        cols=3,
-        specs=specs,
-        subplot_titles=subplot_titles,
-    )
-
-    # Row 1: unconstrained
-    fig.add_trace(
-        go.Indicator(
-            mode="gauge+number",
-            value=kpi3,
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {
-                    "color": _NO_DATA_COLOR if kpi3 is None else
-                    (_C.OK if kpi3 == 100 else (_C.WARN if kpi3 > 50 else _C.VIOLATION))
-                },
-            },
-            number={"suffix": "%"},
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Indicator(
-            mode="gauge+number",
-            value=kpi2,
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {
-                    "color": _NO_DATA_COLOR if kpi2 is None else
-                    (_C.OK if kpi2 > 90 else (_C.WARN if kpi2 > 50 else _C.VIOLATION))
-                },
-            },
-            number={"suffix": "%"},
-        ),
-        row=1, col=2,
-    )
-    fig.add_trace(
-        go.Indicator(
-            mode="gauge+number",
-            value=kpi1,
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": _C.PRIMARY},
-            },
-            number={"suffix": "%"},
-        ),
-        row=1, col=3,
-    )
-
-    # Row 2: constrained scenario (optional)
-    if has_constrained:
-        ck1 = _float_or_none(constrained.get("kpi_1_target_demand_flex_pct"))
-        ck2 = _float_or_none(constrained.get("kpi_2_flex_utilization_pct"))
-        ck3 = _float_or_none(constrained.get("kpi_3_prevented_violation_ratio_pct"))
-
-        fig.add_trace(
-            go.Indicator(
-                mode="gauge+number",
-                value=ck3,
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {
-                        "color": _NO_DATA_COLOR if ck3 is None else
-                        (_C.OK if ck3 == 100 else (_C.WARN if ck3 > 50 else _C.VIOLATION))
-                    },
-                },
-                number={"suffix": "%"},
-            ),
-            row=2, col=1,
-        )
-        fig.add_trace(
-            go.Indicator(
-                mode="gauge+number",
-                value=ck2,
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {
-                        "color": _NO_DATA_COLOR if ck2 is None else
-                        (_C.OK if ck2 > 90 else (_C.WARN if ck2 > 50 else _C.VIOLATION))
-                    },
-                },
-                number={"suffix": "%"},
-            ),
-            row=2, col=2,
-        )
-        fig.add_trace(
-            go.Indicator(
-                mode="gauge+number",
-                value=ck1,
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {"color": _C.PRIMARY},
-                },
-                number={"suffix": "%"},
-            ),
-            row=2, col=3,
-        )
-
-    title_text = "System KPIs"
-    if timestamp:
-        title_text += f" — {timestamp}"
-
-    fig.update_layout(
-        title=title_text,
-        height=350 * n_rows,
-        **CHART_THEME,
-    )
-    if constrained and not has_constrained:
-        # The constrained scenario ran and was not optimal; it used to vanish.
-        slack = constrained.get("slack_max_mw", "?")
-        why = constrained.get("message") or constrained.get("status") or "not solved"
-        return [fig, _empty_figure(
-            f"Constrained scenario (±{slack} MW external grid): {why}", color=_C.VIOLATION)]
+def _kpi_tiles(result: dict, rows: list[dict], when: str) -> go.Figure:
+    """One tile per indicator: its value with the action, and the change from
+    the schedule — ▲/▼ coloured by whether that way is better."""
+    by_key = {r["key"]: r for r in rows}
+    tiles = [by_key[k] for k in _KPI_TILES if k in by_key]
+    cols = 3
+    n_rows = max(1, math.ceil(len(tiles) / cols))
+    fig = go.Figure()
+    for i, r in enumerate(tiles):
+        after, before = _float_or_none(r.get("after")), _float_or_none(r.get("before"))
+        fmt, suffix = _KPI_FORMATS.get(r.get("unit", ""), (".2f", ""))
+        good, bad = (_C.OK, _C.VIOLATION)
+        up_good = r.get("better") == "higher"
+        show_delta = (after is not None and before is not None and abs(after - before) > 1e-9
+                      and r["key"] not in ("cost_eur_per_h", "moved_mw"))
+        name, sub = _KPI_TILE_LABELS.get(r["key"], (r["name"], r.get("unit") or "count"))
+        fig.add_trace(go.Indicator(
+            mode="number+delta" if show_delta else "number",
+            value=after if after is not None else float("nan"),
+            number={"valueformat": fmt, "suffix": suffix, "font": {"size": 21, "color": _C.INK}},
+            delta={"reference": before, "valueformat": fmt if fmt != "d" else "d", "relative": False,
+                   "increasing": {"color": good if up_good else bad},
+                   "decreasing": {"color": bad if up_good else good}, "font": {"size": 12}} if show_delta else None,
+            title={"text": f"<b>{name}</b><br><span style='font-size:11px;color:#6B7280'>{sub}"
+                           + ("" if after is not None else " · no result") + "</span>",
+                   "font": {"size": 12}},
+            domain={"row": i // cols, "column": i % cols}))
+    fig.update_layout(**{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 118, "b": 10}},
+                      grid={"rows": n_rows, "columns": cols, "pattern": "independent"},
+                      height=138 + 125 * n_rows,
+                      title=f"Key performance indicators at {when}<br><sup>{_kpi_compared(result)}"
+                            + ("" if result.get("after_is") in ("schedule", "none") else
+                               "<br>with the action · ▲▼ change from the schedule, green better, red worse")
+                            + "</sup>")
     return fig
 
 
-# ---------------------------------------------------------------------------
-# 4.5 — KPI-1 forecast
-# ---------------------------------------------------------------------------
-
-
-def render_kpi_forecast(result: dict) -> go.Figure:
-    """24-hour KPI-1 forecast line chart."""
-    forecast = result.get("forecast", [])
-    if not forecast:
-        return _empty_figure("No forecast data — run forecast_kpis first")
-
-    timestamps = [f.get("timestamp", str(i)) for i, f in enumerate(forecast)]
-    # A failed tick carries None — drawn as a gap, never as 0 % (review 2.11).
-    kpi1_vals = [_float_or_none(f.get("kpi_1_target_demand_flex_pct")) for f in forecast]
-    n_failed = sum(v is None for v in kpi1_vals)
-
-    fig = go.Figure(
-        go.Scatter(
-            x=timestamps,
-            y=kpi1_vals,
-            mode="lines+markers",
-            line={"color": _C.PRIMARY},
-            marker={"size": 5},
-            name="KPI-1 (%)",
-        )
-    )
-    note = (f"<br><sup>{n_failed} of {len(forecast)} tick(s) without a solution — shown as gaps</sup>"
-            if n_failed else "")
-    fig.update_layout(
-        title="24-Hour KPI-1 Forecast — Target Demand Flexibility (%)" + note,
-        xaxis={"title": "Timestamp", "tickangle": 45},
-        yaxis={"title": "KPI-1 (%)", "range": [0, 100]},
-        **CHART_THEME,
-    )
+def _kpi_deliverable_chart(result: dict, when: str) -> go.Figure | None:
+    """How far each unit can move within every limit (each alone, the others
+    held), against the spare capacity it has: what the network lets through."""
+    found = (result.get("deliverable") or {}).get("with_action")
+    if not isinstance(found, dict) or not found.get("units"):
+        return None
+    units = list(found["units"])[::-1]                     # the first unit on top
+    get = lambda u, k: _float_or_none((found["units"][u] or {}).get(k))  # noqa: E731
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=units, x=[get(u, "spare_mw") for u in units], orientation="h",
+                         name="Spare capacity (KPI-1)", marker={"color": "rgba(154,163,178,0.28)",
+                                                                "line": {"color": _C.NEUTRAL, "width": 1}},
+                         hovertemplate="%{y}: %{x:.1f} MW spare<extra></extra>"))
+    fig.add_trace(go.Bar(y=units, x=[get(u, "up_mw") for u in units], orientation="h", name="Up, within limits",
+                         marker={"color": _C.TEAL, "cornerradius": 4}, width=0.45,
+                         text=[_kpi_value(get(u, "up_mw"), "MW") for u in units], textposition="outside",
+                         textfont={"color": _C.INK, "size": 11}, cliponaxis=False,
+                         hovertemplate="%{y}: up %{x:.1f} MW<extra></extra>"))
+    fig.add_trace(go.Bar(y=units, x=[-(get(u, "down_mw") or 0) if get(u, "down_mw") is not None else None
+                                     for u in units], orientation="h", name="Down, within limits",
+                         marker={"color": _C.PURPLE, "cornerradius": 4}, width=0.45,
+                         text=[_kpi_value(get(u, "down_mw"), "MW") for u in units], textposition="outside",
+                         textfont={"color": _C.INK, "size": 11}, cliponaxis=False,
+                         customdata=[get(u, "down_mw") for u in units],
+                         hovertemplate="%{y}: down %{customdata:.1f} MW<extra></extra>"))
+    missing = [u for u in units if get(u, "up_mw") is None]
+    for u in missing:
+        fig.add_annotation(y=u, x=0, text="no range within the limits", showarrow=False, xanchor="left",
+                           font={"size": 11, "color": _C.INK})
+    total = (f"all together +{_kpi_value(found.get('up_mw'), 'MW')} / −{_kpi_value(found.get('down_mw'), 'MW')}"
+             if found.get("up_mw") is not None else "no joint range")
+    fig.add_vline(x=0, line={"color": _C.INK, "width": 1})
+    # Room for the labels outside the bars, on both sides.
+    reach_up = max([get(u, k) or 0 for u in units for k in ("up_mw", "spare_mw")] + [1.0])
+    reach_down = max([get(u, "down_mw") or 0 for u in units] + [1.0])
+    state = (f"with {result['after_label']}" if result.get("after_is") not in ("schedule", "none", None)
+             else "the schedule")
+    fig.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": 95, "l": 90}},
+                      xaxis={"range": [-reach_down * 1.4, reach_up * 1.4], "title": "MW"},
+                      barmode="overlay", height=165 + 46 * len(units), yaxis_title="",
+                      legend=_WIDE_LEGEND,
+                      title=f"How far each unit can move<br><sup>{when} · {state} · within every limit<br>"
+                            f"each alone, the others held · {total}</sup>")
     return fig
 
 
-# ---------------------------------------------------------------------------
-# 4.6 — Time-series (scan_rsa_over_time)
-# ---------------------------------------------------------------------------
+def _kpi_table(result: dict, rows: list[dict], when: str) -> go.Figure:
+    """Every indicator as a copyable table: schedule, with the action, change, what it measures."""
+    body = []
+    for r in rows:
+        b, a = _float_or_none(r.get("before")), _float_or_none(r.get("after"))
+        change = "—" if a is None or b is None else _kpi_value(a - b, r["unit"]) if r["unit"] not in ("", "%") \
+            else (f"{a - b:+.1f} pp" if r["unit"] == "%" else f"{a - b:+g}")
+        body.append([r["name"], _kpi_value(r.get("before"), r["unit"]), _kpi_value(r.get("after"), r["unit"]),
+                     change, r.get("what", "")])
+    notes = [d.get("note") for d in ((result.get("kpi_details") or {}).get(k) or {} for k in ("kpi_2", "kpi_3"))
+             if d.get("note")]
+    return _plain_table(["Indicator", "Schedule", "With the action", "Change", "What it measures"], body,
+                        [1.5, 0.8, 0.9, 0.7, 2.4],
+                        f"Indicators at {when}<br><sup>{_kpi_compared(result)}"
+                        + "".join(f"<br>{n[:1].upper()}{n[1:]}" for n in notes) + "</sup>")
+
+
+def render_kpis(result: dict) -> list[go.Figure]:
+    """The indicators of one moment: tiles (with the action, change from the
+    schedule), each unit's deliverable range against its spare capacity, and
+    the table."""
+    rows = [r for r in result.get("indicators") or [] if isinstance(r, dict) and r.get("key")]
+    if not rows:
+        return [_empty_figure(str(result.get("message") or result.get("error") or
+                                  "No indicators — run evaluate_kpis first"))]
+    when = _hhmm(result.get("timestamp"))
+    figures = [_kpi_tiles(result, rows, when)]
+    deliverable = _kpi_deliverable_chart(result, when)
+    if deliverable is not None:
+        figures.append(deliverable)
+    figures.append(_kpi_table(result, rows, when))
+    return figures
+
+
+def render_kpis_over_time(result: dict) -> list[go.Figure]:
+    """The indicators over a window, each moment with its own corrective
+    action: what the units can deliver, what is required and activated, the
+    three indicators of the project notebook, N-1 security, and the cost."""
+    rows = [r for r in result.get("moments") or [] if isinstance(r, dict) and r.get("timestamp")]
+    if not any(r.get("values") for r in rows):
+        return [_empty_figure(str(result.get("message") or "Nothing to show: no moment has indicators"))]
+    x = _times(r["timestamp"] for r in rows)
+    summary = result.get("summary") or {}
+    totals = summary.get("totals") or {}
+    span = f"{_hhmm(rows[0]['timestamp'])} – {_hhmm(rows[-1]['timestamp'])}"   # the first subtitle line
+
+    def series(key, which=1):
+        return [_float_or_none(((r.get("values") or {}).get(key) or [None, None])[which]) for r in rows]
+
+    def layout(fig, title, sub, unit, height=340):
+        top = 80 + 15 * sub.count("<br>")                    # a subtitle of two lines
+        fig.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": top}},
+                          title=f"{title}<br><sup>{sub}</sup>", xaxis=_TIME_AXIS, yaxis_title=unit,
+                          height=height, legend={**_WIDE_LEGEND, "y": -0.3})   # clear of the dates
+        return fig
+
+    def line(fig, y, name, colour, dash=None, unit="", fmt=".1f"):
+        fig.add_trace(go.Scatter(x=x, y=y, name=name, mode="lines+markers", connectgaps=False,
+                                 line={"color": colour, "width": 2, **({"dash": dash} if dash else {})},
+                                 marker={"size": 7 if not dash else 5},
+                                 hovertemplate="%{x|%d %b %H:%M}: %{y:" + fmt + "} " + unit
+                                               + "<extra>" + name + "</extra>"))
+
+    figures = []
+    # The project notebook's three, with the action.
+    kpis = go.Figure()
+    # KPI-2 where flexibility was required or activated (elsewhere it is a trivial
+    # 100 %); KPI-3 where the schedule breaks a limit (elsewhere it has no value).
+    acted = [(rq or 0) > 0 or (mv or 0) > 0 for rq, mv in zip(series("required_mw"), series("moved_mw"))]
+    line(kpis, series("kpi_1_target_demand_flex_pct"), "KPI-1 Target demand flexibility", _C.PRIMARY, unit="%")
+    line(kpis, [v if a else None for v, a in zip(series("kpi_2_flex_utilization_pct"), acted)],
+         "KPI-2 Flexibility utilisation", _C.MAGENTA, unit="%")
+    line(kpis, series("kpi_3_prevented_violation_ratio_pct"), "KPI-3 Prevented violations", _C.OLIVE, unit="%")
+    kpis.update_layout(yaxis={"range": [-5, 108]})
+    figures.append(layout(kpis, "KPI-1 to KPI-3", f"{span} · with each moment's action<br>KPI-2 where MW move · "
+                                                  "KPI-3 where limits break", "%", height=355))
+    # What the units can deliver within every limit, against the spare capacity they have.
+    deliver = go.Figure()
+    # Spare capacity as a wide band under the deliverable line: where the network
+    # carries all of it, the line runs inside the band; where not, the band shows above.
+    deliver.add_trace(go.Scatter(x=x, y=series("spare_up_mw"), name="Spare upward capacity", mode="lines",
+                                 line={"color": "rgba(154,163,178,0.45)", "width": 9},
+                                 hovertemplate="%{x|%d %b %H:%M}: %{y:.1f} MW spare<extra></extra>"))
+    line(deliver, series("deliverable_up_mw"), "Deliverable up", _C.TEAL, unit="MW")
+    line(deliver, series("deliverable_down_mw"), "Deliverable down", _C.PURPLE, unit="MW")
+    worst = (summary.get("indicators") or {}).get("deliverable_up_mw", {}).get("worst")
+    if worst and worst.get("value") is not None:
+        when = _times([worst["timestamp"]])[0]
+        deliver.add_trace(go.Scatter(x=[when], y=[worst["value"]], mode="markers", showlegend=False,
+                                     marker={"size": 14, "color": "rgba(0,0,0,0)",
+                                             "line": {"color": _C.WARN, "width": 2.5}}, hoverinfo="skip"))
+        deliver.add_annotation(x=when, y=worst["value"], text="least upward", showarrow=False, yshift=-18,
+                               font={"size": 10, "color": _C.INK})
+    figures.append(layout(deliver, "Flexibility the units can deliver",
+                          f"{span} · within every limit<br>grey band: spare capacity, deliverable or not", "MW",
+                          height=355))
+    # What each moment requires, and what its action moves.
+    need = go.Figure()
+    for key, name, colour in (("required_mw", "Required (fewest MW)", _C.PRIMARY),
+                              ("moved_mw", "Activated by the action", _C.MAGENTA)):
+        need.add_trace(go.Bar(x=x, y=series(key), name=name, marker={"color": colour, "cornerradius": 4},
+                              hovertemplate="%{x|%d %b %H:%M}: %{y:.1f} MW<extra>" + name + "</extra>"))
+    need.update_layout(barmode="group", bargap=0.3)
+    moved = (f"<br>{totals['mwh_moved']:.1f} MWh activated, {totals['mwh_required']:.1f} MWh required over the "
+             f"{_window_hours(result)}" if "mwh_moved" in totals and "mwh_required" in totals else "")
+    figures.append(layout(need, "Flexibility required and activated", span + moved, "MW", height=355))
+    # N-1 security, and the schedule's N-0 violations.
+    n1 = go.Figure()
+    line(n1, series("n1_outages_with_violations", 0), "N-1, as scheduled", _C.NEUTRAL, dash="dot", fmt="d")
+    line(n1, series("n1_outages_with_violations"), "N-1, with the action", _C.PRIMARY, fmt="d")
+    n1.add_trace(go.Scatter(x=x, y=[v if v else None for v in series("violations", 0)],
+                            name="N-0 violations, as scheduled", mode="markers",
+                            marker={"symbol": "x", "size": 9, "color": _C.VIOLATION},
+                            hovertemplate="%{x|%d %b %H:%M}: %{y} violations<extra>as scheduled</extra>"))
+    tested = next(((r.get("schedule") or {}).get("n1_outages_tested") for r in rows
+                   if isinstance(r.get("schedule"), dict)), None)
+    figures.append(layout(n1, "Security", f"{span}<br>single outages with violations"
+                                          f"{f', of {tested} tested' if tested else ''}", "count", height=355))
+    # The cost of each moment's action.
+    cost = go.Figure(go.Bar(x=x, y=series("cost_eur_per_h"), name="Cost of the action",
+                            marker={"color": OPTION_COLOURS["cheapest"], "cornerradius": 4},
+                            hovertemplate="%{x|%d %b %H:%M}: %{y:,.2f} €/h<extra></extra>"))
+    cost.add_hline(y=0, line={"color": _C.INK, "width": 1})
+    net = totals.get("cost_eur")
+    figures.append(layout(cost, "Cost of the corrective action",
+                          f"{span} · at the cost table's prices<br>" + (
+                              "not priced" if net is None else
+                              f"{net:,.0f} € over the {_window_hours(result)}" if net >= 0 else
+                              f"{-net:,.0f} € saved over the {_window_hours(result)} (negative: cheaper)"),
+                          "€/h", height=345))
+    return figures
 
 
 def render_time_series(result: dict) -> list[go.Figure]:
@@ -3432,6 +3603,189 @@ def _render_several_comparisons(result: dict) -> list[go.Figure]:
     return figures or [_empty_figure("No figures to compare")]
 
 
+
+def _hhmm(ts) -> str:
+    """"2000-01-06 20:15:00" -> "06 Jan 20:15" (a window inside one week reads so)."""
+    try:
+        import pandas as pd
+        return pd.Timestamp(ts).strftime("%d %b %H:%M")
+    except Exception:  # noqa: BLE001
+        return str(ts)[:16]
+
+
+def _window_hours(result: dict) -> str:
+    """ "8 h window" from a window study's `hours_each` (they sum to the window)."""
+    try:
+        return f"{sum(float(h) for h in result.get('hours_each') or []):g} h window"
+    except (TypeError, ValueError):
+        return "window"
+
+
+def _times(values) -> list:
+    """Timestamps as datetimes, for a real time axis (sparse, readable ticks —
+    17 quarter-hours as categories crowded a half-width chart)."""
+    import pandas as pd
+    try:
+        return [pd.Timestamp(v).to_pydatetime() for v in values]
+    except Exception:  # noqa: BLE001
+        return list(values)
+
+
+# A time axis within a day or two: hours, the date beneath.
+_TIME_AXIS = {"tickformat": "%H:%M\n%d %b", "nticks": 7, "title": ""}
+
+
+def _render_hold(result: dict) -> list[go.Figure]:
+    """A corrective option held over the next hours, against the schedule
+    untouched: the highest loading and the lowest voltage at each moment, the
+    limits, and the first moment it no longer holds."""
+    hours = result.get("hours") or []
+    if not hours:
+        return [_empty_figure("Nothing to show: no moments were studied")]
+    option = result.get("option") or {}
+    limits = result.get("thresholds_used") or {}
+    x = _times(h["timestamp"] for h in hours)
+    fail = result.get("first_failure")
+    until = result.get("holds_until")
+    colour = OPTION_COLOURS.get(str(option.get("ref", "")).split(":")[-1], _C.PRIMARY)
+    # Short: the chart is half a row wide.
+    verdict = f"out of limits from {_hhmm(fail)[-5:]}" if fail else "within limits throughout"
+    figures = []
+    for key, title, unit, limit, fmt in (
+            ("max_line_loading_pct", "Highest line loading", "%", limits.get("max_line_loading_pct"), ".1f"),
+            ("min_vm_pu", "Lowest voltage", "p.u.", limits.get("vm_lower_pu"), ".3f")):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=[h["schedule"].get(key) for h in hours], name="Schedule, untouched",
+                                 mode="lines", line={"color": _C.NEUTRAL, "width": 2, "dash": "dot"},
+                                 hovertemplate="%{x|%H:%M}: %{y:" + fmt + "} " + unit + "<extra>schedule</extra>"))
+        fig.add_trace(go.Scatter(x=x, y=[h["with_option"].get(key) for h in hours],
+                                 name=f"{option.get('label', 'Option')} held", mode="lines+markers",
+                                 line={"color": colour, "width": 2}, marker={"size": 7},
+                                 hovertemplate="%{x|%H:%M}: %{y:" + fmt + "} " + unit + "<extra>held</extra>"))
+        if isinstance(limit, (int, float)):
+            fig.add_hline(y=limit, line={"color": _C.VIOLATION, "width": 1.5, "dash": "dash"},
+                          annotation_text=f"limit {limit:g}", annotation_position="top left",
+                          annotation_font={"color": _C.INK, "size": 11})
+        if fail:
+            when = _times([fail])[0]
+            fig.add_shape(type="line", x0=when, x1=when, y0=0, y1=1, yref="paper",
+                          line={"color": _C.WARN, "width": 1.5})
+            fig.add_annotation(x=when, y=1, yref="paper", text="first out of limits", showarrow=False,
+                               xanchor="left", yanchor="bottom", font={"size": 10, "color": _C.INK})
+        fig.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": 80}},
+                          title=f"{title} ({unit})<br><sup>{option.get('label', 'Option')} ({option.get('ref', '')}) "
+                                f"held from {_hhmm(option.get('timestamp'))[-5:]} · {verdict}</sup>",
+                          xaxis=_TIME_AXIS, yaxis_title="", height=340, legend=_WIDE_LEGEND)
+        figures.append(fig)
+    if any("n1_outages_with_violations" in h["with_option"] for h in hours):
+        fig = go.Figure(go.Bar(x=x, y=[h["with_option"].get("n1_outages_with_violations") for h in hours],
+                               marker={"color": colour, "cornerradius": 4},
+                               hovertemplate="%{x|%H:%M}: %{y} outages with violations<extra></extra>"))
+        fig.update_layout(**CHART_THEME, title="N-1: outages with violations, option held", height=300,
+                          xaxis=_TIME_AXIS, yaxis_title="")
+        figures.append(fig)
+    return figures
+
+
+def _render_security_over_time(result: dict) -> list[go.Figure]:
+    """What N-1 security costs at each moment of a window, above the cheapest
+    corrective action, and the outages each leaves with violations."""
+    rows = [r for r in result.get("moments") or [] if isinstance(r, dict)]
+    if not rows:
+        return [_empty_figure("Nothing to show: no moments were studied")]
+    x = _times(r["timestamp"] for r in rows)
+    modes = result.get("modes") or ["preventive"]
+    series = [("cheapest", "Cheapest (N-0)")] + [(m, f"N-1 {m}") for m in modes]
+
+    def get(r, key, field):
+        part = r.get(key)
+        return part.get(field) if isinstance(part, dict) else None
+    cost = go.Figure()
+    for key, name in series:
+        cost.add_trace(go.Bar(x=x, y=[get(r, key, "cost_eur_per_h") for r in rows], name=name,
+                              marker={"color": OPTION_COLOURS.get("cheapest" if key == "cheapest" else f"n1_{key}"),
+                                      "cornerradius": 4},
+                              hovertemplate="%{x|%d %b %H:%M}: %{y:.2f} €/h<extra>" + name + "</extra>"))
+    totals = result.get("totals") or {}
+    total = " · ".join(f"N-1 {m}: {t['security_cost_eur']:,.0f} € above the cheapest" for m, t in totals.items())
+    cost.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": 80}}, barmode="group",
+                       bargap=0.3, height=360, xaxis=_TIME_AXIS, yaxis_title="€/h",
+                       title=f"Cost of N-1 security, {_hhmm(rows[0]['timestamp'])} – {_hhmm(rows[-1]['timestamp'])}"
+                             f"<br><sup>{total or 'not priced'} over the {_window_hours(result)}</sup>",
+                       legend=_WIDE_LEGEND)
+    cost.add_hline(y=0, line={"color": _C.INK, "width": 1})
+    outages = go.Figure()
+    short = sum(1 for r in rows if r.get("schedule_meets_limits") is False)
+    outages.add_trace(go.Scatter(x=x, y=[r.get("schedule_n1_outages_with_violations") for r in rows],
+                                 name="Schedule (reference)" if short else "Schedule", mode="lines",
+                                 line={"color": _C.NEUTRAL, "dash": "dot", "width": 2}))
+    for key, name in series:
+        outages.add_trace(go.Scatter(
+            x=x, y=[get(r, key, "n1_outages_with_violations") for r in rows], name=name, mode="lines+markers",
+            marker={"size": 8}, line={"width": 2, "color": OPTION_COLOURS.get(
+                "cheapest" if key == "cheapest" else f"n1_{key}")}))
+    tested = next((r.get("outages_tested") for r in rows if r.get("outages_tested")), None)
+    notes = " · ".join(([f"the schedule breaks normal limits at {short} of {len(rows)} moments:"
+                         " compare with the cheapest"] if short else [])
+                       + (["a corrective option before its action"] if "corrective" in modes else []))
+    outages.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": 80}}, height=360,
+                          xaxis=_TIME_AXIS, yaxis_title="outages",
+                          title=f"N-1: outages with violations{f' (of {tested})' if tested else ''}"
+                                + (f"<br><sup>{notes}</sup>" if notes else ""),
+                          legend=_WIDE_LEGEND)
+    return [cost, outages]
+
+
+def _render_plan(result: dict) -> list[go.Figure]:
+    """One corrective plan across a window: each unit's change at each moment,
+    as a step (an instruction holds until the next), and the comparison with
+    solving each moment on its own."""
+    plan = result.get("plan") or {}
+    steps = plan.get("steps") or []
+    units = result.get("units") or []
+    if not steps or not units:
+        return [_empty_figure("Nothing to show: no plan was found")]
+    x = _times(s["timestamp"] for s in steps)
+    fig = go.Figure()
+    for n, unit in enumerate(units):
+        fig.add_trace(go.Scatter(x=x, y=[s["dp_mw"].get(unit, 0.0) for s in steps], name=unit,
+                                 mode="lines+markers", line={"shape": "hv", "width": 2,
+                                                             "color": UNIT_COLOURS[n] if n < len(UNIT_COLOURS)
+                                                             else _C.NEUTRAL},
+                                 marker={"size": 7},
+                                 hovertemplate="%{x|%H:%M}: %{y:+.2f} MW<extra>" + unit + "</extra>"))
+    fig.add_hline(y=0, line={"color": _C.INK, "width": 1})
+    alone = result.get("each_moment_alone") or {}
+    versus = (f"{plan.get('instructions_issued')} instructions against {alone.get('instructions_issued')} solving "
+              "each moment on its own" if alone else f"{plan.get('instructions_issued')} instructions")
+    fig.update_layout(**{**CHART_THEME, "margin": {**CHART_THEME.get("margin", {}), "t": 80}}, height=380,
+                      xaxis=_TIME_AXIS, yaxis_title="Change from schedule (MW)",
+                      title=f"Corrective plan, {_hhmm(steps[0]['timestamp'])} – {_hhmm(steps[-1]['timestamp'])[-5:]}"
+                            f"<br><sup>{versus} · {plan.get('mwh_moved', 0):.1f} MWh moved · "
+                            f"{str(result.get('objective', '')).replace('_', ' ')}"
+                            f"{f' · ramp {result['ramp_pct_per_h']:g} %/h' if result.get('ramp_pct_per_h') else ''}"
+                            "</sup>", legend=_WIDE_LEGEND)
+    rows = [[_hhmm(s["timestamp"])] + [f"{s['dp_mw'].get(u, 0.0):+.2f}" for u in units]
+            + [", ".join(s.get("changed") or []) or "—", f"{s.get('cost_eur_per_h', 0):.2f}",
+               "✓ confirmed" if s.get("power_flow_check") else "✗ not confirmed"] for s in steps]
+    table = _plain_table(["Moment"] + units + ["Instructions changed", "Cost €/h", "Power flow"], rows,
+                         [1.1] + [0.8] * len(units) + [1.8, 0.8, 1.0],
+                         "The plan, moment by moment<br><sup>Change from the schedule, MW · an instruction holds "
+                         "until it changes · each moment checked by a power flow</sup>")
+    return [fig, table]
+
+
+def render_over_time(result: dict) -> list[go.Figure]:
+    """flexibility_over_time: a held option, a plan, or the cost of security."""
+    mode = result.get("mode")
+    if mode == "hold":
+        return _render_hold(result)
+    if mode == "plan":
+        return _render_plan(result)
+    if mode == "security_over_time":
+        return _render_security_over_time(result)
+    return [_empty_figure(str(result.get("message") or "Nothing to show"))]
+
 RENDERER_MAP: dict[str, Callable] = {
     "run_rsa": render_rsa,                              # returns list of 3 figs
     "simulate_contingency": render_contingency_violations,
@@ -3439,7 +3793,7 @@ RENDERER_MAP: dict[str, Callable] = {
     "optimize_flexibility": render_dispatch,
     "optimize_contingency": render_dispatch,
     "evaluate_kpis": render_kpis,
-    "forecast_kpis": render_kpi_forecast,
+    "kpis_over_time": render_kpis_over_time,
     "scan_rsa_over_time": render_time_series,
     "get_current_conditions": render_conditions,
     "compare_results": render_diff,
@@ -3453,6 +3807,7 @@ RENDERER_MAP: dict[str, Callable] = {
     "compute_hosting_capacity": render_hosting_capacity,
     "compute_historical_risk": render_historical_risk,
     "compare_networks": render_network_comparison,
+    "flexibility_over_time": render_over_time,
 }
 
 

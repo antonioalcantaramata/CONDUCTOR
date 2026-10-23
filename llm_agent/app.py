@@ -1222,7 +1222,7 @@ full,,branch_to_trafo,3,33,0,,</pre>
                     <li><strong>Robust Corrective Dispatch (OPF)</strong> — worst-case redispatch with explicit uncertainty margins</li>
                     <li><strong>Flexibility Envelopes</strong> — feasible import/export power bounds per bus or zone</li>
                     <li><strong>Hosting Capacity Analysis</strong> — maximum DER penetration per bus without constraint violations</li>
-                    <li><strong>KPI Evaluation</strong> — composite grid health scores (voltage quality, loading margin, loss index)</li>
+                    <li><strong>Key Performance Indicators</strong> — the schedule against a corrective action: flexibility required, activated and deliverable within limits, N-0/N-1 margins and costs, at a moment or over a window</li>
                     <li><strong>Time-series Scanning</strong> — multi-timestamp horizon sweeps for violations and trend detection</li>
                     <li><strong>Custom Network Loading</strong> — MATPOWER .m, pandapower JSON / Excel, and UCTE files</li>
                     <li><strong>Custom Time-series Data</strong> — CSV upload with per-substation production &amp; consumption</li>
@@ -2768,7 +2768,7 @@ EXAMPLE_QUERIES: list[tuple[str, str]] = [
      ":material/casino:"),
     ("Find a robust corrective dispatch to clear any violations.", ":material/tune:"),
     ("What is the hosting capacity at the most heavily loaded bus?", ":material/solar_power:"),
-    ("Evaluate the flexibility KPIs for the current operating point.", ":material/speed:"),
+    ("Evaluate the KPIs now: what does the corrective action need, use and leave?", ":material/speed:"),
     ("Is the network secure at its nominal operating point, and how do the synthetic data "
      "compare with it?", ":material/push_pin:"),
 ]
@@ -2924,6 +2924,15 @@ def _read_json_file(path: pathlib.Path) -> dict | None:
     return None
 
 
+# Files in systems/ that are not uploads: the bundled demo cases and the
+# backend's saved state.
+PROTECTED_SYSTEM_FILES = frozenset({
+    ".gitkeep", "pglib_opf_case14_ieee.m", "pglib_opf_case30_ieee.m", "pglib_opf_case30_as.m",
+    "pandapower_network_flex.xlsx",
+    "assumptions.json", "scenario.json", "proposals.json", "option_sets.json",
+})
+
+
 def _collect_uploaded_cleanup_groups() -> dict[str, list[pathlib.Path]]:
     """Collect grouped uploaded artifacts that can be safely deleted by user choice."""
     groups: dict[str, list[pathlib.Path]] = {}
@@ -2980,15 +2989,11 @@ def _collect_uploaded_cleanup_groups() -> dict[str, list[pathlib.Path]]:
         if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
             _add("Other uploaded-looking network files", p)
 
-    # Show non-default network files as optional removable artifacts.
-    protected_system_files = {
-        ".gitkeep",
-        "pglib_opf_case14_ieee.m",
-        "pglib_opf_case30_ieee.m",
-        "pandapower_network_flex.xlsx",
-    }
-    for p in sorted(_SYSTEMS_DIR.iterdir()):
-        if not p.is_file() or p.name in protected_system_files:
+    # Show non-default network files as optional removable artifacts — never a
+    # bundled demo case, nor CONDUCTOR's own saved state (settings, scenario,
+    # proposals, option sets), which are JSON beside them.
+    for p in sorted(_SYSTEMS_DIR.iterdir()) if _SYSTEMS_DIR.is_dir() else []:
+        if not p.is_file() or p.name in PROTECTED_SYSTEM_FILES:
             continue
         if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
             _add("Other network files in systems (non-default)", p)
@@ -4423,14 +4428,25 @@ def _render_unit_costs() -> None:
             st.caption("Could not read the costs from the backend.")
             return
         units = {u["unit"]: u for u in data.get("units") or []}
+        loads = {u["unit"]: u for u in data.get("loads") or []}
         if not units:
             st.caption("This network has no units to cost.")
             return
         st.caption("Each figure comes from the network file, a synthetic rule (below) or a change you made. "
                    + str(data.get("used_by") or ""))
-        groups = _sys_table.cost_rows(list(units.values()))
+        groups = _sys_table.cost_rows(list(units.values()) + list(loads.values()))
         for group, rows in groups.items():
             spec = _sys_table.GROUPS[group]
+            if group == "loads":
+                # One row per load: folded away until wanted.
+                changed = sum(1 for r in rows if r["changed"])
+                with st.expander(f"{spec['title']} · {len(rows)} loads" + (f" · {changed} changed" if changed else ""),
+                                 icon=":material/electric_meter:"):
+                    _render_plain_table(f"cost_{group}", "", spec["caption"], spec["columns"], rows,
+                                        lambda name: st.session_state.update(_cost_editing=name),
+                                        widths=spec["widths"])
+                    st.caption(str(data.get("loads_rule") or ""))
+                continue
             _render_plain_table(f"cost_{group}", spec["title"], spec["caption"], spec["columns"], rows,
                                 lambda name: st.session_state.update(_cost_editing=name),
                                 widths=spec["widths"])
@@ -4439,8 +4455,8 @@ def _render_unit_costs() -> None:
             st.rerun()
         st.caption(f"{data.get('synthetic_rule', '')} Kept for this network across restarts.")
         editing = st.session_state.pop("_cost_editing", None)
-        if editing in units:
-            _edit_cost_dialog(units[editing])
+        if editing in units or editing in loads:
+            _edit_cost_dialog({**loads, **units}[editing])
 
 
 @st.dialog("Edit costs", width="medium")
@@ -5452,26 +5468,63 @@ def _screenable_options(msg: dict) -> list[dict]:
         if isinstance(result, dict) and result.get("mode") == "options":
             # An N-1 set was screened at its post-outage limit: the same screen again.
             limit = (result.get("n1_study") or {}).get("emergency_loading_pct")
-            out = [{**o, "screen_limit_pct": limit} if limit else o
+            out = [{**o, **({"screen_limit_pct": limit} if limit else {}), "set_timestamp": result.get("timestamp"),
+                    "after_outage": bool(result.get("outage"))}
                    for o in result.get("options") or [] if isinstance(o, dict) and o.get("ref")]
     return out
 
 
+# What an operator may do with a chosen option next — each a request for CONDUCTOR's box.
+_OPTION_NEXT = {
+    "n1": "N-1 screen with it applied",
+    "assess": "Security assessment with it applied",
+    "hold": "Hold it for the next hours",
+    "kpis": "KPIs before and after it",
+    "next": "Next corrective action, an hour later",
+}
+
+
+def _option_request(action: str, ref: str, label: str, option: dict) -> str:
+    """The request for CONDUCTOR's box: what to do with option `ref`."""
+    if action == "assess":
+        return f"Run the security assessment with option {ref} ({label}) applied."
+    if action == "hold":
+        return f"Hold option {ref} ({label}) for the next 4 hours: until when does it keep every limit?"
+    if action == "kpis":
+        return (f"Evaluate the KPIs with option {ref} ({label}) against the schedule: what it needs, "
+                "uses and leaves.")
+    if action == "next":
+        later = ""
+        try:
+            later = (pd.Timestamp(option.get("set_timestamp")) + pd.Timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass
+        return (f"Starting from option {ref} ({label}), give me the corrective options"
+                + (f" at {later}." if later else " an hour later."))
+    limit = option.get("screen_limit_pct")
+    at = f", with lines and transformers allowed up to {limit:g} % of their rating" if limit else ""
+    return f"Run the N-1 screen with option {ref} ({label}) applied{at}."
+
+
 def _render_screen_an_option(options: list[dict], idx: int) -> None:
-    """N-1 of one option, not of the schedule: the request goes to CONDUCTOR's
-    box, for the operator to send."""
-    with st.popover("N-1 screen of an option", icon=":material/shield:", type="tertiary",
-                    disabled=_ui_busy(),
-                    help="Screens every single outage with the option's dispatch applied, at its own moment "
-                         "(after its outage too, if it had one). A plain N-1 screen runs on the schedule."):
+    """Carry a chosen option forward — its N-1 screen, the assessment with it,
+    holding it over the next hours, the next corrective action from it: the
+    request goes to CONDUCTOR's box, for the operator to send."""
+    with st.popover("Use an option", icon=":material/east:", type="tertiary", disabled=_ui_busy(),
+                    help="Study what follows from one option: its N-1 screen (a plain one screens the schedule), "
+                         "the assessment with it applied, how long it holds, or the next action starting from it."):
+        st.markdown("<span class='gen-head'>Option</span>", unsafe_allow_html=True)
         chosen = st.radio("Option", [o["ref"] for o in options], key=f"n1_pick_{idx}", label_visibility="collapsed",
                           format_func=lambda ref: next(f"{o['label']} · {ref}" for o in options if o["ref"] == ref))
-        label = next(o["label"] for o in options if o["ref"] == chosen)
-        limit = next(o.get("screen_limit_pct") for o in options if o["ref"] == chosen)
-        at = f", with lines and transformers allowed up to {limit:g} % of their rating" if limit else ""
+        option = next(o for o in options if o["ref"] == chosen)
+        # After an outage the OPF from it is the post-outage one: no "next action" here.
+        actions = [a for a in _OPTION_NEXT if not (a in ("next", "kpis") and option.get("after_outage"))]
+        st.markdown("<span class='gen-head'>Then</span>", unsafe_allow_html=True)
+        action = st.radio("Then", actions, key=f"use_what_{idx}", label_visibility="collapsed",
+                          format_func=_OPTION_NEXT.get)
+        request = _option_request(action, chosen, option["label"], option)
         st.button(_RUN_IN_CONDUCTOR, key=f"n1_send_{idx}", type="primary", width="stretch",
-                  on_click=lambda: st.session_state.update(
-                      _box_pending=f"Run the N-1 screen with option {chosen} ({label}) applied{at}."),
+                  on_click=lambda: st.session_state.update(_box_pending=request),
                   help="Puts the request in CONDUCTOR's box — you send it with **Run**.")
 
 
@@ -6046,9 +6099,27 @@ def _process_turn(effective_input: str, work) -> None:
 
         with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
             status_box = st.status("Thinking…", expanded=True)
+            # Lines go into a plain container inside the box: leaving a `with
+            # status_box:` block marks the box finished (✓), so writing there
+            # showed every run as done after its first step.
+            status_body = status_box.container()
+            progress_lines: dict = {}            # tool -> its one line of progress, rewritten in place
 
             def _on_event(event: str, data: dict) -> None:
-                with status_box:
+                with status_body:
+                    if event == "tool_progress":
+                        # A long study as it runs: one line, updated, and the status header.
+                        label = _tools_reg.label(data["name"])
+                        line = progress_lines.get(data["name"])
+                        if line is None:
+                            line = progress_lines[data["name"]] = st.empty()
+                        line.markdown(f"⏳ {label}: {data.get('text', '')}")
+                        status_box.update(label=f"{label}: {data.get('text', '')}", state="running",
+                                          expanded=True)
+                        return
+                    if event == "tool_done" and data["name"] in progress_lines:
+                        progress_lines.pop(data["name"]).empty()
+                        status_box.update(label="Thinking…", state="running", expanded=True)
                     if event == "llm_call":
                         turn = data.get("turn", 1)
                         st.write("⚡ Calling your LLM Orchestrator…" if turn == 1 else f"⚡ LLM Orchestrator reasoning (turn {turn})…")

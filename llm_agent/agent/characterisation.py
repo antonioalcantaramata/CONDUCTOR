@@ -330,6 +330,27 @@ _STUDY_VERDICTS = (
 )
 
 
+# An answer that states an assessment's unfavourable verdict itself ("the
+# base case had four violations", "insecure") ...
+_STATES_INSECURE = re.compile(
+    r"\b(?:insecure|not secure|\d+\s+(?:\w+\s+)?violations?|(?:one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"\s+(?:\w+\s+)?violations?)\b", re.IGNORECASE)
+
+
+def _corrected(record: dict) -> bool:
+    """... in a turn that also found a corrective dispatch meeting every limit:
+    its "no violations" may well be about that corrected state."""
+    for entry in record.get("tool_results") or []:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        if result.get("mode") == "options" and result.get("status") == "options":
+            return True
+        if str(entry.get("name", "")).startswith("optimize_") and result.get("feasible") is True:
+            return True
+    return False
+
+
 def _study_verdicts(record: dict) -> list[tuple[str, Qualifier]]:
     """Unfavourable verdicts each tool result states about itself."""
     out: list[tuple[str, Qualifier]] = []
@@ -406,8 +427,13 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
     split = {field for field, pairs in by_network.items()
              if {value for _, value in pairs} == {True, False}
              and len({network for network, _ in pairs}) > 1}
+    # An answer that says the operating point is insecure and then describes a
+    # corrective dispatch "with no violations" has not called the former fine.
+    acknowledged = _corrected(record) and bool(_STATES_INSECURE.search(text))
     for name, verdict in _study_verdicts(record):
         if verdict.field in seen or verdict.field in split:
+            continue
+        if verdict.field == "secure" and acknowledged:
             continue
         # Judged over the whole answer rather than a sentence: the claim may be
         # a standalone "All clear." with the detail in a neighbouring sentence.

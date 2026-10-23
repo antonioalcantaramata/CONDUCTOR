@@ -390,7 +390,7 @@ class TestTurnConsistency:
     def test_mixing_measurements_and_forecasts_is_caught(self):
         tracker = TurnConsistency()
         tracker.observe("run_rsa", {"data_source": "measurements"})
-        issues = tracker.observe("forecast_kpis", {"data_source": "forecasts"})
+        issues = tracker.observe("kpis_over_time", {"data_source": "forecasts"})
         assert "inconsistent_context" in codes(issues)
         assert "dataset" in issues[0].message
 
@@ -511,7 +511,7 @@ class TestTurnOperatingPoint:
 
     def test_the_dataset_is_carried_too(self):
         point = TurnOperatingPoint()
-        point.resolve("forecast_kpis", {"data_source": "forecasts"}, self.ACCEPTS)
+        point.resolve("kpis_over_time", {"data_source": "forecasts"}, self.ACCEPTS)
         kwargs, _ = point.resolve("attribution", {}, self.ACCEPTS)
         assert kwargs["data_source"] == "forecasts"
 

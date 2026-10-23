@@ -26,6 +26,11 @@ INTERFACE = {
     "q_band_tan_phi": ("Free reactive band (tan φ; 0.4 ≈ pf 0.93)", "Free band tan φ", ".2f"),
     "q_penalty_eur_per_mvarh": ("Beyond the band (€/Mvarh)", "Beyond €/Mvarh", ".2f"),
 }
+LOAD = {
+    "dr_share_pct": ("Demand response: share of the load reducible on request (%)", "DR share %", ".0f"),
+    "dr_eur_per_mwh": ("Demand response price (€/MWh)", "DR €/MWh", ".2f"),
+    "relief_eur_per_mwh": ("Load relief, the last resort (€/MWh)", "Relief €/MWh", ".0f"),
+}
 
 GROUPS = {
     "units": {
@@ -43,6 +48,14 @@ GROUPS = {
         "columns": ["Connection", "Bus", "Import €/MWh", *(c for _, c, _ in INTERFACE.values()), "Source"],
         "widths": [1.1, 0.8, 1.0, 1.0, 1.0, 1.5],
     },
+    "loads": {
+        "title": "Demand response and load relief",
+        "caption": "The remedies after redispatching the units, in order: a share of each load reduced on request "
+                   "(demand response, at its price), then involuntary load relief of the rest (the value of lost "
+                   "load). Used only when asked for, or when redispatch alone cannot clear a violation.",
+        "columns": ["Load", "Bus", *(c for _, c, _ in LOAD.values()), "Source"],
+        "widths": [1.0, 0.9, 0.9, 0.9, 0.9, 1.3],
+    },
 }
 
 SOURCE_LABELS = {"case": "case file", "synthetic": "synthetic", "operator": "changed"}
@@ -58,8 +71,15 @@ def is_grid(unit: dict) -> bool:
     return unit.get("kind") == "external_grid"
 
 
+def is_load(unit: dict) -> bool:
+    return unit.get("kind") == "load"
+
+
 def fields_of(unit: dict) -> dict:
     """The cost fields a row's form shows, in sections: {section: {field: spec}}."""
+    if is_load(unit):
+        return {"Demand response": {k: LOAD[k] for k in ("dr_share_pct", "dr_eur_per_mwh")},
+                "Load relief": {"relief_eur_per_mwh": LOAD["relief_eur_per_mwh"]}}
     if is_grid(unit):
         return {"Import price": {"cost_eur_per_mwh": ("Import price (€/MWh)", "", ".2f")},
                 "Reactive exchange": INTERFACE}
@@ -72,11 +92,14 @@ def _source(unit: dict, keys) -> str:
 
 
 def cost_rows(units: list[dict]) -> dict[str, list[dict]]:
-    """{group: [{"unit", "changed", "cells"}]} for the two cost tables."""
-    out: dict[str, list[dict]] = {"units": [], "grid": []}
+    """{group: [{"unit", "changed", "cells"}]} for the cost tables."""
+    out: dict[str, list[dict]] = {"units": [], "grid": [], "loads": []}
     for u in units:
         bus = str(u.get("bus_name") or u.get("bus"))
-        if is_grid(u):
+        if is_load(u):
+            cells = [u["unit"], bus, *(_num(u.get(k), f) for k, (_, _, f) in LOAD.items()), _source(u, LOAD)]
+            out["loads"].append({"unit": u["unit"], "changed": bool(u.get("changed")), "cells": cells})
+        elif is_grid(u):
             cells = [u["unit"], bus, _num(u.get("cost_eur_per_mwh"), ".2f"),
                      *(_num(u.get(k), f) for k, (_, _, f) in INTERFACE.items()),
                      _source(u, ("cost_eur_per_mwh", *INTERFACE))]

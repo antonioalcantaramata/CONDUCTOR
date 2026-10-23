@@ -43,10 +43,22 @@ def test_rsa_with_unsolved_elements_renders():
     assert figs
 
 
+def test_a_network_without_transformers_gets_no_transformer_chart():
+    """The IEEE 30 demo has none: its assessment showed "No data — run the
+    analysis first", as if the study had failed."""
+    figs = RENDERER_MAP["run_rsa"]({"timestamp": "t", "all_voltages": [{"bus_name": "Bus_0", "vm_pu": 1.0}],
+                                    "all_line_loading": [{"line_name": "L0", "loading_percent": 50.0}],
+                                    "all_trafo_loading": []})
+    assert len(figs) == 2 and not any("No data" in (f.layout.title.text or "") for f in figs)
+
+
 def test_kpis_without_values_render():
-    RENDERER_MAP["evaluate_kpis"]({"metrics": {
-        "kpi_1_target_demand_flex_pct": None, "kpi_2_flex_utilization_pct": None,
-        "kpi_3_prevented_violation_ratio_pct": None}, "timestamp": "t"})
+    figs = RENDERER_MAP["evaluate_kpis"]({"timestamp": "t", "after_is": "none", "indicators": [
+        {"key": k, "name": k, "unit": "%", "better": "higher", "before": None, "after": None}
+        for k in ("kpi_1_target_demand_flex_pct", "kpi_2_flex_utilization_pct",
+                  "kpi_3_prevented_violation_ratio_pct")]})
+    assert len(figs) == 2                                   # the tiles and the table; no unit ranges
+    assert len(RENDERER_MAP["kpis_over_time"]({"moments": [{"timestamp": "t", "status": "error"}]})) == 1
 
 
 def test_conditions_with_unknown_output_render():
@@ -373,8 +385,13 @@ class TestFlexibilityOptions:
         assert "with Gen_bus1 at its schedule and L30 at most 80 %" in title
 
     def test_every_strategy_has_its_own_colour(self):
-        default = [s for s in renderers.OPTION_COLOURS if not s.startswith(("near_optimal", "n1_"))]
-        assert len({renderers.OPTION_COLOURS[s] for s in default}) == len(default) == 6
+        default = [s for s in renderers.OPTION_COLOURS if not s.startswith(("near_optimal", "n1_", "last_resort"))]
+        solid = [s for s in default if s not in renderers.OPTION_PATTERNS]
+        assert len({renderers.OPTION_COLOURS[s] for s in solid}) == len(solid) == 6
+        # The seventh shares a hue, told apart by its hatch.
+        assert len({(renderers.OPTION_COLOURS[s], renderers.OPTION_PATTERNS.get(s)) for s in default}) == 7
+        near = [renderers.OPTION_COLOURS["cheapest"]] + [renderers.OPTION_COLOURS[f"near_optimal_{k}"] for k in range(1, 6)]
+        assert len(set(near)) == 6                       # a near-optimal set: every alternative its own hue
         n1 = ["least_disturbance", "cheapest", "n1_preventive", "n1_corrective"]
         assert len({renderers.OPTION_COLOURS[s] for s in n1}) == 4
 
@@ -419,6 +436,58 @@ class TestFlexibilityOptions:
         assert rows[1] == ("Bus_9 -> Bus_19 [L24]", "—", "—", "✓ no action needed")
         assert len(figs) == 4                     # and the active-power bars
 
+    def test_the_last_resort_shows_the_load_it_reduces(self):
+        option = {**self.option("last_resort_least", "Least load reduction", 9.0), "load_reduction_mw": 3.88,
+                  "load_actions": [{"load": "Load 20", "bus": "Bus_29", "demand_response_mw": 1.44,
+                                    "load_relief_mw": 0.0}]}
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00", "set": "last_resort",
+                  "options": [option], "switching": [{"open": "Bus_8 -> Bus_9 [L13]", "clears_all": True,
+                                                      "relieves_pct": 100, "remaining": []}]}
+        figs = RENDERER_MAP["optimize_flexibility"](result)
+        assert figs[0].layout.title.text.startswith("Last resort at 2000-01-06 20:00: options that also reduce load")
+        headers = [h.replace("<b>", "").replace("</b>", "") for h in figs[0].data[0].header.values]
+        assert headers[3] == "Load reduced MW" and list(figs[0].data[0].cells.values[3]) == ["3.88"]
+        loads = next(f for f in figs if f.layout.title.text.startswith("Load reductions"))
+        assert list(zip(*loads.data[0].cells.values))[0] == ("Least load reduction", "Load 20", "Bus_29", "1.44", "0.00")
+        switching = next(f for f in figs if f.layout.title.text.startswith("Switching that may help"))
+        assert list(switching.data[0].cells.values[1]) == ["✓ clears every violation"]
+
+    def test_a_failed_dispatch_carries_its_last_resort(self):
+        rescue = {"set": "last_resort", "status": "options",
+                  "options": [{**self.option("last_resort_least", "Least load reduction", 9.0),
+                               "load_reduction_mw": 1.0}]}
+        figs = renderers.render_dispatch({"status": "infeasible", "feasible": False, "message": "No dispatch.",
+                                          "timestamp": "2000-01-06 20:00", "last_resort": rescue})
+        assert "did not find a usable dispatch" in figs[0].layout.title.text
+        assert figs[1].layout.title.text.startswith("Last resort at 2000-01-06 20:00")
+
+    def test_demand_response_shares_a_hue_with_a_hatch(self):
+        dr = self.option("demand_response", "With demand response", 4.0)
+        figs = RENDERER_MAP["optimize_flexibility"]({"mode": "options", "status": "options", "timestamp": "t",
+                                                     "options": [self.option("most_headroom", "Most headroom", 3.0),
+                                                                 dr]})
+        bars = {t.name: t.marker for t in figs[1].data}
+        assert bars["With demand response"].color == bars["Most headroom"].color
+        assert bars["With demand response"].pattern.shape == "/" and not bars["Most headroom"].pattern.shape
+
+    def test_the_near_optimal_ranges_chart(self):
+        result = {"mode": "options", "status": "options", "timestamp": "2000-01-06 20:00", "set": "near_optimal",
+                  "near_optimal_pct": 10, "budget_eur_per_h": 29.13, "options": [self.option("cheapest", "Cheapest", 5)],
+                  "near_optimal_ranges": [{"unit": "Gen_bus1", "min_mw": 50.6, "max_mw": 64.0, "cheapest_mw": 54.0,
+                                           "schedule_mw": 46.0},
+                                          {"unit": "Gen_bus10", "min_mw": 17.1, "max_mw": 30.0, "cheapest_mw": 28.8,
+                                           "schedule_mw": 17.2}]}
+        chart = next(f for f in RENDERER_MAP["optimize_flexibility"](result)
+                     if f.layout.title.text.startswith("What each unit can do"))
+        assert "within 10 % of the cheapest" in chart.layout.title.text
+        assert list(chart.layout.yaxis.categoryarray) == ["Gen_bus1", "Gen_bus10"]
+        assert {t.name for t in chart.data if t.name} >= {"Schedule", "Cheapest", "Range within the margin"}
+
+    def test_a_long_cell_makes_its_table_taller(self):
+        short = renderers._table_height(["A", "B"], [["x", "y"]], [1, 1])
+        long_ = renderers._table_height(["A", "B"], [["x", "y " * 200]], [1, 1])
+        assert long_ > short + 40
+
     def test_no_action_needed_is_one_message(self):
         figs = RENDERER_MAP["optimize_flexibility"]({"mode": "options", "status": "no_action_needed",
                                                      "timestamp": "2000-01-03 18:00", "options": []})
@@ -439,3 +508,54 @@ class TestScreenOfAnOption:
         fig = RENDERER_MAP["simulate_all_contingencies"](after)
         fig = fig if not isinstance(fig, list) else fig[-1]
         assert fig.layout.title.text.startswith("N-1-1 screen after the outage of L36, with option S1:cheapest")
+
+
+class TestFlexibilityOverTime:
+    def test_holding_an_option(self):
+        hours = [{"timestamp": t, "held": n > 0,
+                  "schedule": {"violations": 0, "max_line_loading_pct": 95.0, "min_vm_pu": 0.953, "worst": []},
+                  "with_option": {"violations": v, "max_line_loading_pct": 85.0, "min_vm_pu": 0.948 if v else 0.951,
+                                  "worst": ["Bus_29 at 0.948 p.u."] if v else [], "n1_outages_with_violations": 29}}
+                 for n, (t, v) in enumerate((("2000-01-06 18:00:00", 0), ("2000-01-06 18:15:00", 1)))]
+        figs = RENDERER_MAP["flexibility_over_time"]({
+            "mode": "hold", "hours": hours, "holds_until": "2000-01-06 18:00:00", "first_failure": "2000-01-06 18:15:00",
+            "option": {"ref": "S1:cheapest", "label": "Cheapest", "timestamp": "2000-01-06 18:00:00"},
+            "thresholds_used": {"max_line_loading_pct": 100.0, "vm_lower_pu": 0.95}})
+        title = figs[0].layout.title.text
+        assert len(figs) == 3 and title.startswith("Highest line loading (%)<br>")          # short: half a row wide
+        assert "Cheapest (S1:cheapest) held from 18:00" in title and "out of limits from 18:15" in title
+        assert figs[0].layout.xaxis.tickformat.startswith("%H:%M")                         # a time axis
+        assert any(a.text == "first out of limits" for a in figs[0].layout.annotations)
+        assert [t.name for t in figs[0].data] == ["Schedule, untouched", "Cheapest held"]
+        assert figs[2].layout.title.text.startswith("N-1: outages with violations")
+
+    def test_a_plan(self):
+        steps = [{"timestamp": f"2000-01-06 {h}:00:00", "dp_mw": {"Gen_bus1": dp, "Gen_bus4": 0.0},
+                  "changed": ["Gen_bus1"] if dp else [], "cost_eur_per_h": 10.0, "power_flow_check": True}
+                 for h, dp in (("17", 0.0), ("18", 2.0), ("19", 2.0))]
+        figs = RENDERER_MAP["flexibility_over_time"]({
+            "mode": "plan", "objective": "least_disturbance", "units": ["Gen_bus1", "Gen_bus4"],
+            "plan": {"steps": steps, "instructions_issued": 1, "mwh_moved": 4.0},
+            "each_moment_alone": {"instructions_issued": 3}})
+        assert "1 instructions against 3 solving each moment on its own" in figs[0].layout.title.text
+        assert [t.line.shape for t in figs[0].data] == ["hv", "hv"]            # an instruction holds: a step
+        rows = list(zip(*figs[1].data[0].cells.values))
+        assert rows[1] == ("06 Jan 18:00", "+2.00", "+0.00", "Gen_bus1", "10.00", "✓ confirmed")
+
+    def test_the_cost_of_security(self):
+        rows = [{"timestamp": t, "schedule_n1_outages_with_violations": 6, "outages_tested": 41,
+                 "cheapest": {"cost_eur_per_h": -10.0, "n1_outages_with_violations": 22},
+                 "preventive": {"cost_eur_per_h": 180.0, "n1_outages_with_violations": 4,
+                                "security_cost_eur_per_h": 190.0}}
+                for t in ("2000-01-06 23:00:00", "2000-01-07 00:00:00")]
+        figs = RENDERER_MAP["flexibility_over_time"]({
+            "mode": "security_over_time", "modes": ["preventive"], "moments": rows,
+            "totals": {"preventive": {"security_cost_eur": 380.0}}})
+        assert "N-1 preventive: 380 € above the cheapest" in figs[0].layout.title.text
+        assert [t.name for t in figs[0].data] == ["Cheapest (N-0)", "N-1 preventive"]
+        assert [t.name for t in figs[1].data] == ["Schedule", "Cheapest (N-0)", "N-1 preventive"]
+
+    def test_unknown_or_empty_is_one_message(self):
+        assert len(RENDERER_MAP["flexibility_over_time"]({"mode": "hold", "hours": []})) == 1
+        assert len(RENDERER_MAP["flexibility_over_time"]({"message": "?"})) == 1
+

@@ -73,12 +73,71 @@ _LIMIT_KEYS = frozenset({
 })
 
 
+# Studies that run a full study at each of several moments (~10 s each): waited
+# for well past the default request timeout.
+LONG_STUDY_TIMEOUT_S = 900.0
+_SLOW_ENDPOINTS = frozenset({"/api/flexibility/hold", "/api/flexibility/plan",
+                             "/api/flexibility/security_over_time", "/api/kpi/over_time"})
+
+
+def _timeout_for(endpoint: str) -> float:
+    return LONG_STUDY_TIMEOUT_S if endpoint in _SLOW_ENDPOINTS else HTTP_TIMEOUT
+
+
+# Where a long study reports its progress while it runs: set by the agent
+# loop around each tool call (it shows in the app's live status), else None.
+progress_hook = None
+_PROGRESS_POLL_S = 1.0
+
+
+def _say_progress(text: str) -> None:
+    hook = progress_hook
+    if hook is not None:
+        try:
+            hook(text)
+        except Exception:  # noqa: BLE001 — progress is a courtesy, never a failure
+            pass
+
+
+def _post_following(endpoint: str, body: dict, what: str) -> dict:
+    """POST a long study and, while it runs, read its progress (GET
+    /api/progress/{id}) and pass it on: "3 of 9 moments done (19:00)"."""
+    import uuid
+    from concurrent.futures import ThreadPoolExecutor
+    job = uuid.uuid4().hex
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(_post, endpoint, {**body, "progress_id": job})
+        said = None
+        while True:
+            try:
+                return future.result(timeout=_PROGRESS_POLL_S)
+            except TimeoutError:
+                pass
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    seen = client.get(f"{BASE_URL}/api/progress/{job}").json()
+            except Exception:  # noqa: BLE001 — the study goes on; only its progress is unknown
+                continue
+            if not seen.get("known") or not seen.get("total"):
+                continue
+            text = f"{seen.get('done', 0)} of {seen['total']} {what} done"
+            if seen.get("workers", 1) > 1:
+                text += f" · {seen['workers']} in parallel"
+            if seen.get("done"):
+                elapsed = float(seen.get("elapsed_s") or 0)
+                left = elapsed / seen["done"] * (seen["total"] - seen["done"])
+                text += f" · about {max(1, round(left))} s left" if seen["done"] < seen["total"] else ""
+            if text != said:
+                said = text
+                _say_progress(text)
+
+
 def _post(endpoint: str, body: dict) -> dict:
     """Execute a POST request and return parsed JSON or an error dict."""
     body = {k: v for k, v in body.items() if not (k in _LIMIT_KEYS and v is None)}
     url = f"{BASE_URL}{endpoint}"
     try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with httpx.Client(timeout=_timeout_for(endpoint)) as client:
             response = client.post(url, json=body)
             response.raise_for_status()
             return response.json()
@@ -519,116 +578,115 @@ def optimize_flexibility(
     return _record("optimize_flexibility", result)
 
 
+
 # ---------------------------------------------------------------------------
-# 2.8 — Evaluate KPIs
+# 2.7b — Flexibility over time: hold an option, plan a window, security cost
 # ---------------------------------------------------------------------------
 
-def evaluate_kpis(
-    load_scaling_factor: float = 1.0,
-    slack_max_mw: float | None = None,
-    slack_q_max_mvar: float | None = None,
-    vm_upper_pu: float | None = None,
-    vm_lower_pu: float | None = None,
-    opf_lambda_p: float = 0.01,
-    opf_lambda_q: float = 0.001,
-    pg_max_overrides: dict | None = None,
-    pg_min_overrides: dict | None = None,
-    fixed_setpoints: dict | None = None,
-    opf_min_power_factor: float = 0.95,
-    opf_current_safety_margin: float = 0.9,
-    **kwargs,
-) -> dict:
+_OVER_TIME_ENDPOINTS = {"hold": "/api/flexibility/hold", "plan": "/api/flexibility/plan",
+                        "security": "/api/flexibility/security_over_time"}
+
+
+def flexibility_over_time(study: str = "", option: str | None = None, start: str | None = None,
+                          end: str | None = None, hours: float | None = None, moments: int | None = None,
+                          n1: str | None = None, screen_n1: bool | None = None, objective: str | None = None,
+                          steadiness: float | None = None, ramp_pct_per_h: float | None = None,
+                          **kwargs) -> dict:
+    """
+    POST /api/flexibility/hold | /plan | /security_over_time
+
+    study="hold": a corrective option (`option`, its ref) held from its moment
+    over the next `hours` — when it stops keeping the limits (`screen_n1`: the
+    N-1 screen at each moment too). study="plan": one corrective plan over a
+    window (`start`, `end` or `hours`, `moments`), instructions kept from one
+    moment to the next (`steadiness`, `ramp_pct_per_h`), `objective`
+    least_disturbance or cheapest. study="security": the cost of N-1 security
+    (`n1` preventive / corrective / both) at each moment of a window.
+    """
+    endpoint = _OVER_TIME_ENDPOINTS.get(str(study or "").strip().lower())
+    if endpoint is None:
+        return {"error": f"study must be one of {sorted(_OVER_TIME_ENDPOINTS)}; got {study!r}."}
+    unsupported = _unsupported_kwargs_result(
+        "flexibility_over_time", kwargs,
+        supported_extra={"data_source", "network", "load_power_factor", "load_scaling_factor", "hold_units",
+                         "branch_limits", "vm_upper_pu", "vm_lower_pu", "max_line_loading_pct",
+                         "max_trafo_loading_pct"})
+    if unsupported is not None:
+        return unsupported
+    if study == "hold" and not option:
+        return {"error": "study='hold' needs option: the ref of a corrective option (e.g. 'S3:cheapest')."}
+    body = {k: v for k, v in {
+        "option": option if study == "hold" else None, "start": start, "end": end, "hours": hours,
+        "moments": moments, "n1": (bool(screen_n1) if study == "hold" else n1 if study == "security" else None),
+        "objective": objective if study == "plan" else None,
+        "steadiness": steadiness if study == "plan" else None,
+        "ramp_pct_per_h": ramp_pct_per_h if study == "plan" else None, **kwargs}.items() if v is not None}
+    if study == "security":
+        # The slow one: its progress is followed and shown while it runs.
+        result = _post_following(endpoint, body, "moments")
+    else:
+        result = _post(endpoint, body)                # a long timeout: _SLOW_ENDPOINTS
+    return _record("flexibility_over_time", result)
+
+# ---------------------------------------------------------------------------
+# 2.8 — Key performance indicators: at a moment, and over a window
+# ---------------------------------------------------------------------------
+
+# What both KPI tools pass on besides the operating point (timestamp, data
+# source, network, load power factor — forwarded by the loop).
+_KPI_PASSED = {"option", "n1", "hold_units", "branch_limits", "load_scaling_factor", "slack_max_mw",
+               "slack_q_max_mvar", "pg_max_overrides", "pg_min_overrides", "fixed_setpoints",
+               "opf_current_safety_margin", "opf_lambda_p", "opf_lambda_q", "opf_min_power_factor",
+               "max_line_loading_pct", "max_trafo_loading_pct"}
+_KPI_POINT = {"timestamp", "data_source", "network", "load_power_factor"}
+
+
+def _kpi_body(vm_upper_pu, vm_lower_pu, kwargs: dict) -> dict:
+    """The request body: one ceiling, one name — a voltage limit given here
+    judges each state's power flow and bounds the options' OPF alike."""
+    return {k: v for k, v in {"vm_upper_pu": vm_upper_pu, "vm_lower_pu": vm_lower_pu,
+                              "opf_vm_upper": vm_upper_pu, "opf_vm_lower": vm_lower_pu, **kwargs}.items()
+            if v is not None}
+
+
+def evaluate_kpis(vm_upper_pu: float | None = None, vm_lower_pu: float | None = None, **kwargs) -> dict:
     """
     POST /api/kpi/evaluate
 
-    slack_max_mw drives the constrained-scenario solve (external-grid derating).
-    slack_q_max_mvar: separate reactive power cap on the external-grid interface (Mvar). None = same as slack_max_mw.
-    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
-    opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
-    pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
-    fixed_setpoints: pin specific generators/slack at exact MW values.
-    opf_min_power_factor: minimum generator power factor (default 0.95).
-    opf_current_safety_margin: branch current limit safety factor (default 0.9).
-
-    Known future kwargs:
-    # TODO: disabled_generators (list) — substation names forced offline
+    The key performance indicators at one moment: the schedule against a
+    corrective action — the cheapest at that moment, or `option` (a ref,
+    held from its own moment when applied later) — each checked by AC power
+    flow. KPI-1/2/3, N-0 and N-1 margins, the flexibility the units can
+    deliver within every limit, the flexibility required, and costs (`n1`:
+    the cost of N-1 security above the cheapest too).
     """
-    body = {
-        "load_scaling_factor": load_scaling_factor,
-        "slack_max_mw": slack_max_mw,
-        "slack_q_max_mvar": slack_q_max_mvar,
-        # The engine spells these `opf_vm_*`; the tool layer does not, so one
-        # ceiling has one name everywhere the model can see it. Translated
-        # here rather than propagated: an alias the guards have to know about
-        # is a guard that can be forgotten.
-        "opf_vm_upper": vm_upper_pu,
-        "opf_vm_lower": vm_lower_pu,
-        "opf_lambda_p": opf_lambda_p,
-        "opf_lambda_q": opf_lambda_q,
-        "pg_max_overrides": pg_max_overrides or {},
-        "pg_min_overrides": pg_min_overrides or {},
-        "fixed_setpoints": fixed_setpoints or {},
-        "opf_min_power_factor": opf_min_power_factor,
-        "opf_current_safety_margin": opf_current_safety_margin,
-        **kwargs,
-    }
-    result = _post("/api/kpi/evaluate", body)
+    unsupported = _unsupported_kwargs_result("evaluate_kpis", kwargs, supported_extra=_KPI_PASSED | _KPI_POINT)
+    if unsupported is not None:
+        return unsupported
+    result = _post("/api/kpi/evaluate", _kpi_body(vm_upper_pu, vm_lower_pu, kwargs))
     return _record("evaluate_kpis", result)
 
 
-# ---------------------------------------------------------------------------
-# 2.9 — Forecast KPIs (24 h ahead, ~120 s)
-# ---------------------------------------------------------------------------
-
-def forecast_kpis(
-    load_scaling_factor: float = 1.0,
-    slack_max_mw: float | None = None,
-    slack_q_max_mvar: float | None = None,
-    vm_upper_pu: float | None = None,
-    vm_lower_pu: float | None = None,
-    opf_lambda_p: float = 0.01,
-    opf_lambda_q: float = 0.001,
-    pg_max_overrides: dict | None = None,
-    pg_min_overrides: dict | None = None,
-    opf_min_power_factor: float = 0.95,
-    opf_current_safety_margin: float = 0.9,
-    **kwargs,
-) -> dict:
+def kpis_over_time(start: str | None = None, end: str | None = None, hours: float | None = None,
+                   moments: int | None = None, vm_upper_pu: float | None = None,
+                   vm_lower_pu: float | None = None, **kwargs) -> dict:
     """
-    POST /api/kpi/forecast
+    POST /api/kpi/over_time
 
-    Returns 96 × 15-min intervals (24 hours) of KPI-1 forecasts.
-    This is a slow call (~120 s). Only invoke when user explicitly asks for a
-    forecast or "next 24 hours".
-    slack_q_max_mvar: separate reactive power cap on cable (Mvar). None = same as slack_max_mw.
-    vm_upper_pu / vm_lower_pu: voltage bounds enforced inside the AC OPF.
-    opf_lambda_p / opf_lambda_q: objective weights on P and Q deviation.
-    pg_max_overrides / pg_min_overrides: per-substation capacity overrides (MW).
-    opf_min_power_factor: minimum generator power factor (default 0.95).
-    opf_current_safety_margin: branch current limit safety factor (default 0.9).
-
-    Known future kwargs: (none defined yet)
+    The indicators of evaluate_kpis at each moment of a window (`start`,
+    `end` or `hours`, at most `moments`), each with its own corrective action
+    or `option` held: ranges, worst moments, the actions' cost and the MWh
+    moved against the MWh required. The moments run in parallel; the progress
+    is followed and shown while they do.
     """
-    body = {
-        "load_scaling_factor": load_scaling_factor,
-        "slack_max_mw": slack_max_mw,
-        "slack_q_max_mvar": slack_q_max_mvar,
-        # The engine spells these `opf_vm_*`; the tool layer does not, so one
-        # ceiling has one name everywhere the model can see it. Translated
-        # here rather than propagated: an alias the guards have to know about
-        # is a guard that can be forgotten.
-        "opf_vm_upper": vm_upper_pu,
-        "opf_vm_lower": vm_lower_pu,
-        "opf_lambda_p": opf_lambda_p,
-        "opf_lambda_q": opf_lambda_q,
-        "pg_max_overrides": pg_max_overrides or {},
-        "pg_min_overrides": pg_min_overrides or {},
-        "opf_min_power_factor": opf_min_power_factor,
-        "opf_current_safety_margin": opf_current_safety_margin,
-        **kwargs,
-    }
-    result = _post("/api/kpi/forecast", body)
-    return _record("forecast_kpis", result)
+    unsupported = _unsupported_kwargs_result("kpis_over_time", kwargs,
+                                             supported_extra=_KPI_PASSED | _KPI_POINT)
+    if unsupported is not None:
+        return unsupported
+    body = _kpi_body(vm_upper_pu, vm_lower_pu, {"start": start, "end": end, "hours": hours,
+                                                "moments": moments, **kwargs})
+    result = _post_following("/api/kpi/over_time", body, "moments")
+    return _record("kpis_over_time", result)
 
 
 # ---------------------------------------------------------------------------
@@ -1687,7 +1745,8 @@ def set_generator_model(changes: list | None = None, reset: bool = False, **kwar
 
 # The prices /api/costs takes (backend/costs.py FIELDS).
 COST_FIELDS = ("cost_eur_per_mwh", "cost_eur_per_mw2h", "cost_eur_per_h", "up_eur_per_mwh",
-               "down_eur_per_mwh", "q_eur_per_mvarh", "q_band_tan_phi", "q_penalty_eur_per_mvarh")
+               "down_eur_per_mwh", "q_eur_per_mvarh", "q_band_tan_phi", "q_penalty_eur_per_mvarh",
+               "dr_share_pct", "dr_eur_per_mwh", "relief_eur_per_mwh")
 
 
 def _cost_changes(items: list) -> list[dict] | str:

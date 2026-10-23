@@ -235,3 +235,23 @@ class TestNoiseFromRealPayloads:
         assert check_answer(
             "Clearing it by load alone would require 12.411 MW, "
             "which is not an available action.", self._record()) == []
+
+
+class TestAnAnswerThatStatesTheVerdict:
+    """Live: "the base case had four violations … the option: no violations"
+    was flagged as calling the insecure assessment fine."""
+
+    RSA = {"name": "run_rsa", "result": {"secure": False, "total_violations": 4}}
+    OPTIONS = {"name": "optimize_flexibility", "result": {"mode": "options", "status": "options", "feasible": True}}
+
+    def check(self, answer, results):
+        from llm_agent.agent.characterisation import check_study_claims
+        return check_study_claims(answer, {"tool_results": results})
+
+    def test_the_corrected_state_may_have_no_violations(self):
+        answer = "The base case had four violations. The option is confirmed by power flow: no violations."
+        assert self.check(answer, [self.RSA, self.OPTIONS]) == []
+
+    def test_still_caught_without_a_corrective_result_or_without_saying_so(self):
+        assert self.check("The base case had four violations; no violations remain.", [self.RSA])
+        assert self.check("All clear: the grid is secure.", [self.RSA, self.OPTIONS])

@@ -9,8 +9,11 @@ alternatives (and the margin the operator names) when cost matters but another
 way is wanted, holds a line below the share of its rating the operator names
 (`branch_limits`), asks for the N-1 security study (`n1`) when the options must
 stay secure after an outage — corrective when the operator would act after it —
-and says what it could not secure, answers "no action needed" when the schedule
-meets every limit, and leaves the choice to the operator.
+and says what it could not secure, presents the last resort (demand response,
+load relief) when redispatch alone cannot clear the violations, carries a
+chosen option forward (holding it) and plans a peak as one window, answers "no
+action needed" when the schedule meets every limit, and leaves the choice to the
+operator.
 
     python -m evaluation.options list
     python -m evaluation.options run --repeats 10 [--tasks options_peak,rule_out_unit]
@@ -73,6 +76,22 @@ TASKS: tuple[Task, ...] = (
              {"kind": "options", "label": "corrective", "args": {"n1": "corrective"}},
              {"kind": "options", "label": "both", "args": {"n1": "both"}}]},
           {"kind": "mentions", "label": "gave the corrective plan", "any": ["plan", "after the outage of", "after losing"]})),
+    Task("last_resort",
+         (f"At {PEAK} with loads at 125 %, give me options to clear the violations.",),
+         ({"kind": "result", "label": "reached the last resort", "tool": "optimize_flexibility",
+           "fields": {"set": "last_resort"}},
+          {"kind": "mentions", "label": "said redispatch alone is not enough and named demand response",
+           "any": ["demand response"]})),
+    Task("hold_option",
+         ("At 18:00 on 6 January, give me options to clear the violations.",
+          "Hold the cheapest one for the next 4 hours: until when does it keep every limit?"),
+         ({"kind": "tool", "label": "held the chosen option", "name": "flexibility_over_time",
+           "args": {"study": "hold", "option": "S"}},)),
+    Task("plan_peak",
+         ("Plan the corrective action for the evening peak on 6 January, from 17:00 to 22:00, keeping "
+          "instructions steady.",),
+         ({"kind": "tool", "label": "planned the window as one", "name": "flexibility_over_time",
+           "args": {"study": "plan"}},)),
     Task("no_action",
          ("At 03:00 on 6 January, give me corrective options for any violations.",),
          ({"kind": "any", "label": "established that no action is needed", "of": [
