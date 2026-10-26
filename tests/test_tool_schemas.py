@@ -69,6 +69,18 @@ def test_point_tools_offer_the_nominal_point_and_window_tools_do_not():
         assert "'nominal'" not in desc(name)
 
 
+def test_the_shared_arguments_say_what_an_omission_means():
+    """Within one question an omitted network, dataset, moment or power factor
+    is the one an earlier call used, not the default the text used to claim."""
+    def desc(name, arg):
+        fd = next(fd for t in ts.TOOLS for fd in t.function_declarations if fd.name == name)
+        return fd.parameters.properties[arg].description or ""
+    for arg in ("network", "data_source", "timestamp", "load_power_factor"):
+        assert "earlier in this question" in desc("run_rsa", arg), arg
+    assert "(default)" not in desc("run_rsa", "network")
+    assert "earlier in this question" in desc("kpis_over_time", "data_source")
+
+
 def test_the_data_quality_tool_reads_the_data_and_studies_nothing():
     decl = next(fd for t in ts.TOOLS for fd in t.function_declarations if fd.name == "get_data_quality")
     assert not (decl.parameters.properties or {})          # no network, data source or power factor
@@ -98,6 +110,17 @@ class TestFlexibilityOverTime:
         assert sec == "/api/flexibility/security_over_time" and body3 == {"hours": 6, "n1": "both"}
         assert isinstance(job, str) and len(job) <= 64
         assert t1 == tools.LONG_STUDY_TIMEOUT_S and t1 > 120                    # the slow study is waited for
+
+    def test_the_study_name_is_read_however_it_is_written(self, monkeypatch):
+        """The endpoint lookup normalised it and the branches did not: "Hold"
+        reached the hold endpoint without its option."""
+        tools, sent = self.calls(monkeypatch)
+        tools.flexibility_over_time(study=" Hold", option="S3:cheapest", hours=4, screen_n1=True)
+        tools.flexibility_over_time(study="PLAN", hours=6, objective="cheapest", steadiness=2)
+        (hold, body1, _), (plan, body2, _) = sent
+        assert hold == "/api/flexibility/hold" and body1 == {"option": "S3:cheapest", "hours": 4, "n1": True}
+        assert plan == "/api/flexibility/plan" and body2 == {"hours": 6, "objective": "cheapest", "steadiness": 2}
+        assert "needs option" in tools.flexibility_over_time(study="Hold")["error"]
 
     def test_what_is_refused_before_any_call(self, monkeypatch):
         tools, sent = self.calls(monkeypatch)

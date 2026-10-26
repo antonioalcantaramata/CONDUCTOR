@@ -37,14 +37,17 @@ class TestBasicContract:
         assert report["violations"]
 
     def test_counts_its_own_work(self, report):
-        """One base solve, then one per perturbation.
+        """One base solve, one per perturbation, and one to restore the base.
 
         Two per source where both P and Q can be perturbed, but only one for
         `gen` elements: pandapower's gen table has no q_mvar column, because a
         PV generator sets voltage and its reactive output is solved for.
         """
         sources = report["n_sources_tested"]
-        assert sources + 1 <= report["n_power_flows"] <= 2 * sources + 1
+        injections = report["n_power_flows"] - report["n_setpoint_power_flows"]
+        assert sources + 2 <= injections <= 2 * sources + 2
+        # Set-points: one per unit, at most 9 per checked violation (5 at most), one to restore.
+        assert report["n_setpoint_power_flows"] <= 5 + 5 * 9 + 1
 
     def test_states_its_method_and_limits(self, report):
         assert "perturbation" in report["method"]
@@ -126,11 +129,73 @@ class TestVoltageControlledBuses:
                 assert "voltage_controlled_by" not in violation
 
 
+class TestSetpointLevers:
+    """A unit on voltage control has no injection to perturb for reactive
+    power; its lever is its voltage set-point, and a move is only recommended
+    once a full power flow has shown it works."""
+
+    @pytest.fixture(scope="class")
+    def undervoltage(self):
+        # Heavy demand under a 1.0 p.u. floor, with reactive ranges wide enough
+        # that a unit can hold a higher voltage.
+        net = pn.case14()
+        net.load[["p_mw", "q_mvar"]] *= 1.6
+        net.gen["min_q_mvar"], net.gen["max_q_mvar"] = -300.0, 300.0
+        return attribute_violations(net, "t", vm_lower=1.0, vm_upper=1.10)
+
+    def test_an_undervoltage_is_cleared_by_a_checked_setpoint(self, undervoltage):
+        checked = [v for v in undervoltage["violations"]
+                   if v["recommended_action"]["kind"] == "setpoint_change"]
+        assert checked
+        for v in checked:
+            action = v["recommended_action"]
+            lever = v["setpoint_levers"][0]
+            assert lever["unit"] == action["source"] and lever["verified"]
+            assert lever["setpoint_new"] > lever["setpoint_now"]                 # raised
+            assert lever["check"]["value_after"] >= 1.0 and lever["check"]["new_violations"] == []
+            assert "Checked by a power flow" in action["text"]
+
+    def test_the_smallest_checked_move_is_recommended(self, undervoltage):
+        for v in undervoltage["violations"]:
+            ok = [lv for lv in v.get("setpoint_levers", []) if lv["verified"]]
+            if ok:
+                moves = [abs(lv["setpoint_new"] - lv["setpoint_now"]) for lv in ok]
+                assert abs(ok[0]["setpoint_new"] - ok[0]["setpoint_now"]) == min(moves)
+
+    def test_no_setpoint_can_clear_a_band_its_own_buses_violate(self, report):
+        # Under a 1.02 ceiling the units' own buses sit above it: every move
+        # fails a check, says which, and nothing unverified is recommended.
+        for v in report["violations"]:
+            for lv in v.get("setpoint_levers", []):
+                assert lv["verified"] or lv["reason"]
+            assert v["recommended_action"]["kind"] != "setpoint_change"
+
+    def test_a_move_that_fails_a_check_says_why_and_is_not_recommended(self):
+        net = pn.case14()
+        out = attribute_violations(net, "t", vm_lower=0.995, vm_upper=1.07)
+        levers = [lv for v in out["violations"] for lv in v.get("setpoint_levers", [])]
+        for lv in levers:
+            assert lv["verified"] or lv["reason"]
+        for v in out["violations"]:
+            if v["recommended_action"]["kind"] == "setpoint_change":
+                assert any(lv["verified"] and lv["unit"] == v["recommended_action"]["source"]
+                           for lv in v["setpoint_levers"])
+
+    def test_the_setpoints_are_restored(self, violating_case14):
+        before = violating_case14.gen["vm_pu"].copy()
+        attribute_violations(violating_case14, "t", vm_upper=1.02)
+        assert (violating_case14.gen["vm_pu"] == before).all()
+
+    def test_the_external_grid_is_not_offered_as_a_lever(self, report):
+        units = {lv["unit"] for v in report["violations"] for lv in v.get("setpoint_levers", [])}
+        assert not any("ext" in u.lower() for u in units)
+
+
 class TestBudgetAndRobustness:
     def test_source_cap_bounds_the_power_flow_count(self, violating_case14):
         capped = attribute_violations(violating_case14, "t", vm_upper=1.02, top_n_sources=3)
         assert capped["n_sources_tested"] <= 3
-        assert capped["n_power_flows"] <= 7
+        assert capped["n_power_flows"] - capped["n_setpoint_power_flows"] <= 8
 
     def test_driver_cap_is_respected(self, violating_case14):
         """The cap bounds the ranked list, plus any controllable source added

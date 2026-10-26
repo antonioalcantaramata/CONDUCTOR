@@ -10,10 +10,9 @@ load_network(profile)          -> pp.pandapowerNet
     Load a pandapower network from a profile dict.
 
 build_ybus_full(net)           -> db_full (an outage leaves its branch out)
-    Compute the three admittance databases on-the-fly using pandapower's
-    internal pypower representation.  Format is identical to the legacy
-    pre-computed pickle files so all existing flex_engine / main_backend code works
-    without modification.
+    Compute the admittance database on the fly from pandapower's internal
+    pypower representation (one database: an outage is studied by leaving its
+    branch out). Format is identical to the legacy pre-computed pickle files.
 
 Internal helpers
 ----------------
@@ -241,6 +240,20 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
     return net, created_names, kept_condenser_names
 
 
+def keep_own_units(net: pp.pandapowerNet) -> None:
+    """Mark an uploaded network that brings its own units (`gen` or `sgen`
+    rows) so every tick keeps them: the generic path, as after `gen_to_sgen`.
+
+    Only a network with no unit at all is a measured-substation network, its
+    units rebuilt from the loads at each tick. An upload of static generators
+    only (common for distribution grids) took that path for lack of a `gen`
+    table: its units were replaced by one per load, each injecting minus the
+    whole bus's production.
+    """
+    if len(net.gen) or len(net.sgen):
+        net["_gen_to_sgen_applied"] = True
+
+
 # ---------------------------------------------------------------------------
 # On-the-fly Ybus builder
 # ---------------------------------------------------------------------------
@@ -265,7 +278,8 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
     For lines  : tap_key = 1  (matching flex_engine's ``base_t = 1`` convention)
     For trafos : tap_key = tap_neutral  (matching flex_engine's ``t_default`` lookup)
     """
-    from pandapower.pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, TAP, SHIFT, BR_STATUS
+    from pandapower.pypower.idx_brch import (F_BUS, T_BUS, BR_R, BR_X, BR_B, BR_G, BR_R_ASYM, BR_X_ASYM,
+                                             BR_G_ASYM, BR_B_ASYM, TAP, SHIFT, BR_STATUS)
 
     ppc = net._ppc
 
@@ -298,11 +312,10 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
         if float(ppc["branch"][k, BR_STATUS]) == 0.0:
             continue  # out-of-service branch: no admittance (code review 2.9)
 
-        r        = float(ppc["branch"][k, BR_R])
-        x        = float(ppc["branch"][k, BR_X])
-        b_ch     = float(ppc["branch"][k, BR_B])
-        tap      = float(ppc["branch"][k, TAP])
-        shift_deg = float(ppc["branch"][k, SHIFT])
+        row = ppc["branch"][k]
+        r, x = float(row[BR_R]), float(row[BR_X])
+        tap      = float(row[TAP])
+        shift_deg = float(row[SHIFT])
 
         if tap == 0.0:
             tap = 1.0
@@ -310,18 +323,26 @@ def _build_ybus_entry(net: pp.pandapowerNet) -> dict:
         i = ppc2pp[fb_ppc]   # pandapower from_bus
         j = ppc2pp[tb_ppc]   # pandapower to_bus
 
-        # Series admittance (protect against zero impedance branches)
-        ys = (1.0 / complex(r, x)) if (r != 0.0 or x != 0.0) else 0j
-        bc = 1j * b_ch / 2
+        # The π-model as pandapower's own `makeYbus.branch_vectors` builds it:
+        # the shunt admittance is conductance + susceptance (a transformer's
+        # iron losses, a line's conductance), and the to-end may carry the
+        # asymmetric terms. Leaving the conductance out cost ~0.7 kW per end on a
+        # typical distribution transformer.
+        def _series(rr, xx):
+            return (1.0 / complex(rr, xx)) if (rr != 0.0 or xx != 0.0) else 0j  # zero-impedance branch
+        ys_f = _series(r, x)
+        ys_t = _series(r + float(row[BR_R_ASYM]), x + float(row[BR_X_ASYM]))
+        bc_f = complex(float(row[BR_G]), float(row[BR_B])) / 2
+        bc_t = complex(float(row[BR_G]) + float(row[BR_G_ASYM]), float(row[BR_B]) + float(row[BR_B_ASYM])) / 2
 
         # Tap as complex phasor (real tap × phase shift)
         tap_complex = tap * np.exp(1j * shift_deg * np.pi / 180.0)
 
         # Pi-model branch admittance elements
-        Yff = (ys + bc) / abs(tap_complex) ** 2   # from-end self
-        Yft = -ys / np.conj(tap_complex)           # from→to mutual
-        Ytf = -ys / tap_complex                    # to→from mutual
-        Ytt = ys + bc                              # to-end self
+        Yff = (ys_f + bc_f) / abs(tap_complex) ** 2   # from-end self
+        Yft = -ys_f / np.conj(tap_complex)             # from→to mutual
+        Ytf = -ys_t / tap_complex                      # to→from mutual
+        Ytt = ys_t + bc_t                              # to-end self
 
         # Determine tap key and register trafo metadata
         is_trafo = (i, j) in trafo_by_buses or (j, i) in trafo_by_buses

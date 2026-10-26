@@ -46,9 +46,44 @@ TOPOLOGY = {
 }
 
 
+def _net():
+    """The same grid as TOPOLOGY, for the backend's lookup (resolve.py)."""
+    import pandapower as pp
+    net = pp.create_empty_network()
+    for b in TOPOLOGY["buses"]:
+        pp.create_bus(net, vn_kv=b["vn_kv"], name=b["name"], index=b["index"])
+    for br in TOPOLOGY["branches"]:
+        if br["kind"] == "line":
+            pp.create_line(net, br["from_bus"], br["to_bus"], 10, "NA2XS2Y 1x240 RM/25 12/20 kV",
+                           name=br["name"].split(" | ")[0], index=br["index"])
+        else:
+            pp.create_transformer(net, br["from_bus"], br["to_bus"], "25 MVA 110/20 kV", name=br["name"],
+                                  index=br["index"])
+    return net
+
+
+def _backend(topology):
+    """`_get` as the backend answers it: which element a name means
+    (/api/network/resolve, the one lookup every study uses), then the topology."""
+    import resolve as rv
+    from urllib.parse import parse_qs, urlparse
+    net = _net()
+
+    def get(endpoint):
+        if endpoint.startswith("/api/network/resolve"):
+            name = parse_qs(urlparse(endpoint).query)["name"][0]
+            try:
+                found = rv.find(net, name)
+            except rv.ResolveError as exc:
+                return {"error": "Client error", "detail": str(exc)}
+            return {"element_type": found.etype, "index": found.idx, "name": found.label, "how": found.how}
+        return topology
+    return get
+
+
 @pytest.fixture(autouse=True)
 def topology(monkeypatch):
-    monkeypatch.setattr(tools, "_get", lambda endpoint: TOPOLOGY)
+    monkeypatch.setattr(tools, "_get", _backend(TOPOLOGY))
 
 
 class TestResolvingAnElement:
@@ -76,6 +111,11 @@ class TestResolvingAnElement:
     def test_matching_ignores_case(self):
         assert tools.locate_network_element("golf")["bus_index"] == 0
 
+    def test_a_branch_by_its_ends_or_with_a_kind_word(self):
+        # Observed live: "line Bus_8 -> Bus_9" found nothing here and worked in other studies.
+        assert tools.locate_network_element("line Golf -> Hotel")["element_index"] == 7
+        assert tools.locate_network_element("Hotel - Golf")["element_index"] == 7
+
     def test_a_bus_and_its_transformer_bus_are_not_confused(self):
         # "Golf" and "Golf 10 kV" are different buses; an exact match on
         # the shorter name must not sweep in the longer one.
@@ -87,18 +127,16 @@ class TestRefusingToGuess:
         # Bus names repeat on real networks — one has four buses called
         # `Mike A_aux`. Picking one is the error this tool exists to stop.
         result = tools.locate_network_element("Aux")
-        assert "error" in result
-        assert {c["index"] for c in result["candidates"]} == {4, 5}
+        assert "index 4" in result["error"] and "index 5" in result["error"]
 
     def test_an_ambiguous_branch_name_is_refused(self):
+        # Too short to stand for either: both are offered, neither is picked.
         result = tools.locate_network_element("OLS-")
-        assert "error" in result
-        assert len(result["candidates"]) == 2
+        assert "OLS-ØST" in result["error"] and "OLS-ALL" in result["error"]
 
     def test_an_unknown_name_says_so_and_offers_the_real_ones(self):
         result = tools.locate_network_element("Nowhere")
-        assert "error" in result
-        assert "Golf" in result["known_buses"]
+        assert "Golf" in result["error"]
 
     def test_an_empty_name_is_refused(self):
         assert "error" in tools.locate_network_element("  ")
@@ -125,7 +163,7 @@ class TestItAnswersRatherThanDumping:
             {"index": 200 + i, "name": f"L{i}", "from_bus": 0, "to_bus": 100 + i,
              "kind": "line", "in_service": True} for i in range(20)
         ]
-        monkeypatch.setattr(tools, "_get", lambda endpoint: crowded)
+        monkeypatch.setattr(tools, "_get", _backend(crowded))
 
         result = tools.locate_network_element("Golf")
         assert len(result["connected_to"]) == tools._MAX_NEIGHBOURS

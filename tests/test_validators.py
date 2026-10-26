@@ -18,6 +18,7 @@ from llm_agent.agent.validators import (
     REJECT,
     WARN,
     TurnConsistency,
+    compares_power_factors,
     requested_timestamps,
     TurnOperatingPoint,
     annotate,
@@ -164,8 +165,20 @@ class TestWarnsWithoutBlocking:
         assert "unknown_value" in codes(verdict.warnings)
 
     def test_known_enum_values_are_silent(self):
-        for value in ("measurements", "forecasts"):
+        # `nominal` is the case's own operating point, taken by point tools.
+        for value in ("measurements", "forecasts", "nominal"):
             assert not validate_call("run_rsa", {"data_source": value}, GRID).issues
+
+    @pytest.mark.parametrize("value", [0.3, 0.49, 1.01, 1.2])
+    def test_a_load_power_factor_outside_its_range_is_refused(self, value):
+        """The schema says 0.5–1 and the backend accepts nothing else."""
+        verdict = validate_call("run_rsa", {"load_power_factor": value}, GRID)
+        assert verdict.rejected
+        assert verdict.rejections[0].field == "load_power_factor"
+
+    @pytest.mark.parametrize("value", [0.5, 0.9, 1.0])
+    def test_a_load_power_factor_in_range_runs(self, value):
+        assert not validate_call("run_rsa", {"load_power_factor": value}, GRID).issues
 
     def test_unrecognised_parameters_are_ignored(self):
         # Unknown names are the schema's business, not ours.
@@ -536,3 +549,62 @@ class TestTurnOperatingPoint:
         original = {}
         point.resolve("attribution", original, self.ACCEPTS)
         assert original == {}
+
+
+class TestWhatAQuestionComparesIsNotCarried:
+    """Inheritance carries a network, a dataset and a load power factor from
+    one call of a question to the next — unless the question compares two
+    values of that field. Then the call that omits it is the default side of
+    the comparison, and inheriting ran both sides on one network or dataset."""
+
+    ACCEPTS = {"network", "data_source", "load_power_factor", "timestamp"}
+
+    def test_a_proposal_is_carried_when_nothing_is_compared(self):
+        point = TurnOperatingPoint()
+        point.resolve("run_rsa", {"network": "dc_bus9"}, self.ACCEPTS)
+        kwargs, inherited = point.resolve("simulate_all_contingencies", {}, self.ACCEPTS)
+        assert kwargs["network"] == "dc_bus9" and inherited["network"]["from"] == "run_rsa"
+
+    def test_the_base_side_of_a_proposal_comparison_stays_the_base(self):
+        point = TurnOperatingPoint(networks_compared=True)
+        point.resolve("run_rsa", {"network": "dc_bus9", "timestamp": "2000-01-09 18"}, self.ACCEPTS)
+        kwargs, inherited = point.resolve("run_rsa", {}, self.ACCEPTS)
+        assert "network" not in kwargs
+        # Only the compared field: the moment is still the question's.
+        assert kwargs["timestamp"] == "2000-01-09 18" and set(inherited) == {"timestamp"}
+
+    def test_the_dataset_is_carried_when_nothing_is_compared(self):
+        point = TurnOperatingPoint()
+        point.resolve("kpis_over_time", {"data_source": "forecasts"}, self.ACCEPTS)
+        kwargs, _ = point.resolve("find_worst_case_timestamp", {}, self.ACCEPTS)
+        assert kwargs["data_source"] == "forecasts"
+
+    def test_the_measured_side_of_a_forecast_comparison_stays_measured(self):
+        point = TurnOperatingPoint(datasets_compared=True)
+        point.resolve("run_rsa", {"data_source": "forecasts"}, self.ACCEPTS)
+        kwargs, inherited = point.resolve("run_rsa", {}, self.ACCEPTS)
+        assert "data_source" not in kwargs and inherited == {}
+
+    def test_a_load_power_factor_is_carried_to_the_next_study(self):
+        point = TurnOperatingPoint()
+        point.resolve("run_rsa", {"load_power_factor": 0.9}, self.ACCEPTS)
+        kwargs, inherited = point.resolve("simulate_all_contingencies", {}, self.ACCEPTS)
+        assert kwargs["load_power_factor"] == 0.9 and inherited["load_power_factor"]["from"] == "run_rsa"
+
+    def test_a_load_power_factor_only_where_the_schema_takes_it(self):
+        point = TurnOperatingPoint()
+        point.resolve("run_rsa", {"load_power_factor": 0.9}, self.ACCEPTS)
+        kwargs, inherited = point.resolve("get_data_quality", {}, set())
+        assert "load_power_factor" not in kwargs and inherited == {}
+
+    def test_with_and_without_a_power_factor_stay_two_studies(self):
+        point = TurnOperatingPoint(power_factors_compared=True)
+        point.resolve("run_rsa", {"load_power_factor": 0.9}, self.ACCEPTS)
+        kwargs, _ = point.resolve("run_rsa", {}, self.ACCEPTS)
+        assert "load_power_factor" not in kwargs
+
+    def test_the_power_factor_comparison_is_read_from_the_question(self):
+        assert compares_power_factors("What if the loads were at pf 0.90?")
+        assert compares_power_factors("Compare power factor 0.9 with the current setting")
+        assert not compares_power_factors("With loads at pf 0.9, is the grid secure under N-1?")
+        assert not compares_power_factors("What if wind drops by 30%?")

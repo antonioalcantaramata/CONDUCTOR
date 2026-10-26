@@ -44,6 +44,10 @@ class Task(NamedTuple):
     id: str
     turns: tuple[str, ...]
     checks: tuple[dict, ...]
+    # Proposals built before the first turn, each {"proposal": id, "edits": [...]}.
+    setup: tuple[dict, ...] = ()
+    # The first question sent with Deep Research switched on.
+    deep: bool = False
 
 
 # Every task also gets the generic checks in `_ALWAYS`.
@@ -182,8 +186,15 @@ def check(spec: dict, records: list[dict]) -> bool:
         used = any(_on_proposal(r) for _, r in _successful(records))
         return used and not any(PROPOSAL_NOTE_PREFIX in (rec.get("assistant") or "") for rec in records)
     if kind == "mentions":
-        text = " ".join(rec.get("assistant") or "" for rec in records).casefold()
+        # Without bold or code marks: "does **not** establish" is "does not establish" (underscores stay: Bus_29).
+        text = re.sub(r"[*`]+", "", " ".join(rec.get("assistant") or "" for rec in records)).casefold()
         return any(word.casefold() in text for word in spec["any"])
+    if kind == "said_untested":
+        # The answer says something was not tested, in the words the answer checks
+        # recognise (investigation_record) — one rule, not two lists that drift.
+        from llm_agent.agent.investigation_record import _NOT_TESTED_RE
+        text = re.sub(r"[*`]+", "", " ".join(rec.get("assistant") or "" for rec in records))
+        return bool(_NOT_TESTED_RE.search(text))
     if kind == "valid_edits":
         # A question for the operator (needs_operator) is not a refused edit.
         return not any(call.get("name") == "edit_proposal" and isinstance(entry.get("result"), dict)
@@ -212,6 +223,49 @@ def check(spec: dict, records: list[dict]) -> bool:
         # out sent to disabled_generators, which takes it out of service).
         return not any(call.get("name") == spec["tool"] and _arg_matches(spec["value"], (call.get("args") or {}).get(spec["arg"]))
                        for rec in records for call in rec.get("tool_calls") or [])
+    if kind == "hypotheses":
+        # An investigation run on the agent's own hypotheses, naming each element.
+        def named(call):
+            given = (call.get("args") or {}).get("hypotheses") or []
+            return " | ".join(str(e) for h in given if isinstance(h, dict) for e in h.get("elements") or []).casefold()
+        return any(call.get("name") == "investigate" and all(e.casefold() in named(call) for e in spec["elements"])
+                   for call, _ in _successful(records))
+    if kind == "trail":
+        # An accepted investigation record, with a hypothesis meeting the spec:
+        # its verdict, a tool it says is missing, words it mentions.
+        for call, result in _successful(records):
+            if call.get("name") != "record_investigation" or result.get("status") != "recorded":
+                continue
+            for h in result.get("hypotheses") or []:
+                text = f"{h.get('hypothesis', '')} {h.get('finding', '')}".casefold()
+                if spec.get("verdict") and h.get("verdict") != spec["verdict"]:
+                    continue
+                if spec.get("needs_tool") and not h.get("missing_tool"):
+                    continue
+                if spec.get("missing_kind") and h.get("missing_kind") != spec["missing_kind"]:
+                    continue
+                if spec.get("mentions") and not all(m.casefold() in text for m in spec["mentions"]):
+                    continue
+                return True
+        return False
+    if kind == "ran_with":
+        # A successful call of `tool` that set one of `args` (any non-empty value).
+        return any(call.get("name") == spec["tool"]
+                   and any((call.get("args") or {}).get(a) not in (None, "", [], {}, False) for a in spec["args"])
+                   for call, _ in _successful(records))
+    if kind == "deep_judged":
+        # The turn asked with Deep Research, and whether it investigated.
+        return any((rec.get("deep_research") or {}).get("investigated") is spec["investigated"]
+                   and (rec.get("deep_research") or {}).get("requested") for rec in records)
+    if kind == "answer_consistent":
+        # The answer against the investigation record (investigation_record.check_answer):
+        # none of the issue kinds given, in any turn.
+        from llm_agent.agent.investigation_record import check_answer
+        return not any(i.kind in spec["absent"] for rec in records
+                       for i in check_answer(rec.get("assistant") or "", rec))
+    if kind == "not_tool":
+        # No turn called this tool.
+        return not any(call.get("name") == spec["tool"] for rec in records for call in rec.get("tool_calls") or [])
     if kind == "any":
         # Passes when any of the given checks does — two valid ways to the same end.
         return any(check(sub, records) for sub in spec["of"])
@@ -307,6 +361,15 @@ def _backend(method: str, path: str):
         return response.json()
 
 
+def _post_backend(path: str, body: dict):
+    import httpx
+    from llm_agent.agent.config import BASE_URL, HTTP_TIMEOUT
+    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        response = client.post(f"{BASE_URL}{path}", json=body)
+        response.raise_for_status()
+        return response.json()
+
+
 def _clear_proposals() -> None:
     """Each run starts from the loaded network alone."""
     for prop in _backend("get", "/api/proposals").get("proposals") or []:
@@ -318,6 +381,8 @@ def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[d
     from llm_agent.agent import loop, recommender
 
     _clear_proposals()
+    for spec in task.setup:
+        _post_backend("/api/proposals/edit", {**spec, "replace": True})
     records: list[dict] = []
     original = loop._append_to_log
     loop._append_to_log = records.append          # keep runs out of the session logs
@@ -325,9 +390,9 @@ def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[d
         history: list = []
         conversation = f"whatif-{task.id}-{repeat}"
         visible = []
-        for question in task.turns:
+        for i, question in enumerate(task.turns):
             text, history = loop.run_agent_turn(question, history, conversation_id=conversation,
-                                                reflection="off")
+                                                reflection="off", deep=task.deep and i == 0)
             visible += [{"role": "user", "text": question}, {"role": "assistant", "text": text}]
         if follow_suggestion and records:
             proposals = _backend("get", "/api/proposals").get("proposals") or []

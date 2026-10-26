@@ -87,7 +87,8 @@ class TestGenerators:
     def test_minimum_output_and_not_dispatchable(self, net):
         prop, edits = sb.materialise(net, [_gen(kind="dispatchable", control="power_factor", p_min_mw=8,
                                                 dispatchable=False)])
-        assert edits[0]["p_mw"] == 8 and prop.sgen.iloc[-1]["controllable"] is False
+        # With no output given it runs at its rating (30 MW), within its minimum of 8.
+        assert edits[0]["p_mw"] == 30 and edits[0]["p_min_mw"] == 8 and prop.sgen.iloc[-1]["controllable"] is False
         with pytest.raises(sb.EditError, match="at least 8"):
             sb.materialise(net, [_gen(kind="dispatchable", control="power_factor", p_min_mw=8, p_mw=4)])
 

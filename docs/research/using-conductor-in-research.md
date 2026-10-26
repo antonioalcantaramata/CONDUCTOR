@@ -141,6 +141,108 @@ that asks about everything scores as badly as one that guesses. The rule's
 examples in the system prompt are kept apart from the tasks' wording. **`run`
 uses model credit** and asks for confirmation.
 
+## The investigation evaluation
+
+Two parts. The **bench** needs no model and costs nothing. It injects known
+causes into the IEEE 30-bus demo as proposals and asks the
+[investigation](../methods/investigation.md) why the element they affect
+changed, against the base:
+
+- six causes alone: a load scaled up, a data centre added, a unit's output or
+  voltage set-point lowered, a line opened, the external grid's voltage lowered;
+- four pairs of causes, two of them interacting;
+- two with the agent's own hypotheses: two loads the standard grouping joins,
+  and a wrong hypothesis that must be ruled out;
+- two other scopes: the whole grid with two causes, and a cause after an outage;
+- three causes with background, compared with the base an hour earlier, so the
+  demand and the units' schedule moved too.
+
+```bash
+python -m evaluation.investigation bench [--json]
+```
+
+It runs against the running backend and removes the proposals it creates
+(their ids start with `bench_`). Per case it reports:
+
+- whether the main cause is the injected one (for a group, whether its
+  drill-down puts the injected member first);
+- the recall of the injected causes;
+- any other factor blamed;
+- the injected causes' share of the change;
+- whether the two states are reproduced exactly.
+
+It also scores three baselines on the same cases:
+
+- the attribution's top driver, what the agent could say before the
+  investigation existed;
+- undoing each factor alone: its top-1, and what its effects add up to as a
+  share of the change, which exceeds 100 % when the causes interact;
+- the classical linear estimate (sensitivities, LODF for a branch out): its
+  top-1, its mean error against the exact shares, and the cases where it has no
+  estimate for an injected cause.
+
+The **agent suite** spends model credit:
+
+```bash
+python -m evaluation.investigation list
+python -m evaluation.investigation run --repeats 10 [--tasks why_bus29,why_method]
+python -m evaluation.investigation grade <run folder>
+```
+
+Its tasks check that a why about a problem in the grid is investigated (and
+recorded), and that a why about a method, a recommendation or physics, or a
+what-if, is not. Two tasks test the agent's freedom. In one, it must split two
+loads into its own hypotheses and record both as supported. In the other, a
+hypothesis no tool can test (the weather) must be recorded as untested, with
+the tool it would need, and said to be untested in the answer. Others check
+the scopes (an outage, a window, a comfortable reference, the classical views),
+that a recurring problem is investigated episode by episode, and that a question
+about prevention is answered with the prevention check and its warning time.
+One asks what to watch for in the next day of the forecast: it must look ahead,
+say when to decide, and say that the episodes are expected, not observed.
+Two are asked with Deep Research switched on: a *why*, which must go into depth
+(prevention, recurrence, the record), and an options question, which must be
+answered as an analysis.
+
+The tools investigations lacked, across sessions or runs, are ranked by:
+
+```bash
+python -m evaluation.tool_requests                 # the local requests file
+python -m evaluation.tool_requests --logs <folder> # the records of session logs or runs
+```
+
+They are listed in two parts: **tools to build** (an analysis of the grid
+CONDUCTOR could compute and does not, such as a voltage stability margin) and
+**data to integrate** (an input it does not have, such as the weather).
+
+They also check that a symptom that is not there is said rather than
+explained, that several violations with none named lead to a question, and
+that a cause injected through a proposal is found and named.
+
+## The narration evaluation
+
+How to report six studies is not in the system prompt: it comes with each
+study's result (`how_to_report`), so a question pays for it only when the study
+ran. The narration suite checks that the answer follows it, with one task per
+study:
+
+- the hosting capacity with its glossary of reactive modes;
+- the probabilistic assessment leading with the probability of any violation
+  and saying what uncertainty was modelled;
+- the robust dispatch's out-of-sample risk, and what the back-off did or why it
+  fell short;
+- the flexibility envelope at this operating point, with its binding
+  constraint;
+- the historical risk's near misses and worst episodes;
+- the renewable scenario scan against its baseline, with the limits of uniform
+  scaling.
+
+```bash
+python -m evaluation.narration list
+python -m evaluation.narration run --repeats 2 [--tasks hosting,robust]
+python -m evaluation.narration grade <run folder>
+```
+
 ## Comparing models
 
 The launch screen offers free, paid and local models (see

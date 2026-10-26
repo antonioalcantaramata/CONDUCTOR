@@ -39,6 +39,7 @@ MAX_CHARS = 12_000
 MAX_FILE_CHARS = 40_000            # a file larger than this is not a context CONDUCTOR wrote
 _ANSWER_CHARS = 320
 _MAX_PENDING = 6
+_SUMMARY_BULLETS = 8               # the model's summary: at most this many points
 
 CONTEXT_DIR = os.environ.get("CONDUCTOR_CONTEXT_DIR",
                              str(pathlib.Path(__file__).parent.parent / "session_contexts"))
@@ -172,8 +173,8 @@ def parse(text: str, path: str = "") -> Context:
     if not isinstance(text, str) or MARKER not in text:
         raise ContextError("This is not a CONDUCTOR session context (saved with *Save session context*).")
     if len(text) > MAX_FILE_CHARS:
-        raise ContextError(f"This context is {len(text):,} characters; one CONDUCTOR wrote is at most "
-                           f"{MAX_CHARS:,} — it was edited or is not one.")
+        raise ContextError(f"This context is {len(text):,} characters; CONDUCTOR reads one of at most "
+                           f"{MAX_FILE_CHARS:,} — it was edited or is not one.")
     fields = dict(_COMMENT.findall(text))
     name = re.search(r"on \*\*(.+?)\*\*", text)
     turns = len(re.findall(r"^T\d+ · Q:", text, re.MULTILINE))
@@ -237,17 +238,32 @@ def now_label() -> str:
 # The model's summary
 # ---------------------------------------------------------------------------
 
-_SUMMARY_PROMPT = """\
+_SUMMARY_PROMPT = f"""\
 You summarise a CONDUCTOR session for the operator who will continue it later. \
 CONDUCTOR is a decision-support system for power-system operators; its studies \
 are run by validated tools, and the record below lists them.
 
-From the record, write at most 8 short bullet points: what was studied, what \
+From the record, write at most {_SUMMARY_BULLETS} short bullet points: what was studied, what \
 the studies found, what was decided and why, and what remains open. Only what \
 the record says. Copy figures exactly as the record writes them; never compute \
 or estimate one. Name timestamps, elements, proposals and options as written. \
 No recommendations. Return only the bullet points, each starting with "- ".
 """
+
+
+def _first_bullets(lines: list[str], limit: int) -> list[str]:
+    """The lines of the first `limit` bullet points, a bullet's wrapped lines
+    with it; at most `limit` lines when the reply has no bullets at all."""
+    if not any(line.lstrip().startswith("- ") for line in lines):
+        return lines[:limit]
+    kept, bullets = [], 0
+    for line in lines:
+        if line.lstrip().startswith("- "):
+            bullets += 1
+            if bullets > limit:
+                break
+        kept.append(line)
+    return kept
 
 
 def summarize(text: str, records: list[dict], provider=None) -> tuple[str, tuple[str, ...], str]:
@@ -264,7 +280,7 @@ def summarize(text: str, records: list[dict], provider=None) -> tuple[str, tuple
         logger.warning("Session summary call failed.", exc_info=True)
         return "", (), f"The model could not write the summary: {exc}"
     lines = [line.rstrip() for line in (response.text or "").strip().splitlines() if line.strip()]
-    summary = "\n".join(lines[:12])
+    summary = "\n".join(_first_bullets(lines, _SUMMARY_BULLETS))
     if not summary:
         return "", (), "The model returned no summary."
     try:

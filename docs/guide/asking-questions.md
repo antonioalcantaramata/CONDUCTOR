@@ -16,14 +16,65 @@ arguments are in the [tool reference](../reference/tools.md).
 | **Current conditions** — loads, generation and exchange with the grid at one moment | *What is each substation consuming right now?* |
 | **An element over time** — one bus, line or unit across the data | *Show the loading of the Bus_1 – Bus_4 line over the week.* |
 | **Where an element is** — what a bus, line or transformer connects to | *What is connected to Bus 5?* |
-| **What drives a violation** — which loads and units contribute most | *Why is Bus 13 under-voltage at 18:00, and what drives it?* |
+| **Why something is wrong** — what changed since the element was fine, and how much of the change each cause explains | *Why is Bus_29 below its limit at 20:00?* · *What caused the overload of L0 this evening?* · *Why does the proposal overload L7 when the base does not?* · *Why is the grid insecure at 20:00?* · *Why is losing L38 critical at 18:00 and not at 16:00?* · *Why was L0 overloaded for longer today than yesterday?* · *Compared with a quiet moment, why is Bus_29 so close to its limit?* · *Is the undervoltage at Bus_29 a recurring problem this week?* · *Could it have been avoided, and how much warning did we have?* |
+| **What is coming** — the episodes the forecast expects, when to decide, what would prevent each, and whether that holds if the forecast is wrong | *What should I watch for in the next day of the forecast?* · *Anything to act on tomorrow at Bus_29?* |
+| **What to move** — which units and loads move a violated element, and by how much they would have to | *What should I move to clear the undervoltage at Bus 13?* |
+
+A *why* about a problem in the grid is investigated: CONDUCTOR compares the
+element with the nearest earlier moment it was within its limits (or the
+moment, dataset or proposal you name) and says which changes caused the
+difference, with the share of each. If the element is not actually outside
+its limits, the answer says so. If several are and you did not say which, it
+asks. A *why* about how CONDUCTOR worked, about a recommendation or about
+physics is answered directly. See [Investigating a cause](../methods/investigation.md).
+
+When a cause is a measured load or unit that jumps, sits far outside its usual
+range or stays frozen, the answer first says to **check the data**: the cause
+may be a faulty meter rather than something that happened.
+
+Ask what is coming and CONDUCTOR reads the forecast for the next day: each
+episode outside the limits, its cause, the time to decide by, the smallest
+action that would prevent it, and whether that action still holds if the
+forecast errs against it: demand 5 % above it, or renewable output 5 % below it.
+These are expectations, and the answer says so. See
+[What is coming](../methods/investigation.md#what-is-coming-looking-ahead).
+
+### Deep Research
+
+For a *why* that deserves more than a first answer, click the **Deep Research**
+icon (a microscope, beside **Run**) before sending the question. It turns blue
+and shows its name while it is on. CONDUCTOR then investigates in depth:
+
+- it tests its own hypotheses until they explain most of the change;
+- it checks the cause against other moments;
+- it asks whether the episode could have been avoided, and how much warning
+  there was;
+- it looks for whether the problem recurs over the week;
+- it asks where CONDUCTOR's tools stop. One question is which analysis of the
+  grid would settle the cause and does not exist yet (how far the bus is from
+  voltage collapse, whether the units could have ramped in time). The other is
+  what lies behind the cause outside the grid (why demand rose: the weather,
+  the calendar). It cannot test these. The answer says so and names what
+  would test them. The sidebar collects them under **Tools investigations
+  needed**, as tools to build and data to integrate.
+
+It takes one to three minutes. While it works, a card shows where it is and
+what it has found so far; the list of studies stays closed under it.
+
+The switch asks for depth; it does not force an investigation. If the question
+is not a *why* about a problem in the grid (options, a what-if, an
+assessment), CONDUCTOR answers it as usual. The card and the answer say *Deep
+Research not needed — answered as an analysis*. If the investigation is about
+to answer without part of its depth, CONDUCTOR reminds it once. It then either
+does that part or says why it does not apply. The icon turns itself off after
+each question.
 
 ## Contingencies (N-1)
 
 | Study | Ask, for example |
 | --- | --- |
 | **One outage** | *What happens if the line Bus_0 – Bus_1 trips?* |
-| **Every single outage** — each line and transformer out in turn | *Which single N-1 outage is the most critical right now?* · *Is the grid N-1 secure at the worst moment of the week?* |
+| **Every single outage** — each line and transformer out in turn; an outage that breaks a limit, or cuts load off, makes the grid not N-1 secure | *Which single N-1 outage is the most critical right now?* · *Is the grid N-1 secure at the worst moment of the week?* |
 | **Corrective dispatch after an outage** | *If that line trips, can redispatch restore security, and how?* |
 
 ## Over time, scenarios and risk
@@ -78,6 +129,16 @@ column says what it found: *✓ confirmed* (within the voltage band, at most 100
 of every rating, every unit within its reactive limits), or *✗* and the first
 limit it breaks. An option the power flow does not confirm is reported as such.
 
+**How close the cheapest is to the best possible** — the optimisation finds a
+good dispatch, not necessarily the best one. With the options (in the table's
+title, and in the answer), CONDUCTOR states a cost no dispatch of the units can
+beat under the same limits, from a convex relaxation of the same problem: at
+the 30-bus demo's evening peak, *no dispatch
+costs less than 22.48 €/h, none saves more than 4.00 €/h on the cheapest
+(26.48 €/h)*. When the two meet, the cheapest option is called the best
+possible; a larger gap means a cheaper dispatch may exist, not that one does
+([how it is computed](../methods/corrective-options.md#how-close-the-cheapest-is-to-the-best-possible)).
+
 **Units called** are the units that get an instruction: a new active power, a
 new voltage set-point for a unit that holds a voltage, or a new reactive output
 for one that does not. A unit that keeps its set-point still changes its
@@ -104,9 +165,9 @@ puts any of these in CONDUCTOR's box — or ask in your own words:
 
 - **Its N-1 screen** — *Is the cheapest option N-1 secure?* A plain N-1 screen
   runs on the schedule; this one applies the option's dispatch and screens every
-  single outage. Options can differ a lot here: at the 30-bus demo's worst hour
-  the cheapest option leaves 31 of 41 outages with violations, least import all
-  41. An option computed after an outage is screened with that outage kept out —
+  single outage. Options can differ a lot here: at 18:00 on the 30-bus demo the
+  cheapest option leaves 29 of 41 outages with violations, the fewest-units
+  option 17. An option computed after an outage is screened with that outage kept out —
   the **N-1-1** screen.
 - **The assessment with it applied** — *Run the security assessment with option
   S2:cheapest applied*, or one outage with it (*… if L31 trips*).
@@ -236,9 +297,10 @@ are two ways to be secure, and you can ask for either or both:
 - **N-1 corrective** — after each studied outage a quick action of the units
   brings the grid back within limits: each unit may move its active power by at
   most a share of its capacity (20 % unless you say otherwise — what it can
-  deliver soon after an outage) and change its voltage set-point. The dispatch is
-  chosen so that such an action exists for every outage studied, and the answer
-  includes the **corrective plan**: what to do after each outage.
+  deliver soon after an outage) and change its voltage set-point (a unit that
+  does not hold a voltage, its reactive output). The dispatch is chosen so that
+  such an action exists for every outage studied, and the answer includes the
+  **corrective plan**: what to do after each outage.
 
 Corrective is cheaper than preventive — it relies on acting after the outage —
 so ask for both when you want to see the price of each.
@@ -247,8 +309,10 @@ so ask for both when you want to see the price of each.
 least-disturbance option and studies the most critical ones — at most eight at
 once, the worst first; then it screens the new dispatch and adds outages that
 now fail. You can name your own: *… secure against the loss of L31 and L32*.
-An outage that leaves a bus without supply is skipped — no dispatch can supply
-an island — and the answer says so, as it does for the outages beyond the eight.
+An outage that cuts load off is skipped — no dispatch can keep an island's load
+supplied — and the answer says so, as it does for the outages beyond the eight.
+An outage that only disconnects a unit is studied: the other units must cover
+what it produced.
 
 **After an outage** a line may carry up to the network's loading limit — 100 %
 of its rating on the bundled networks, the same limit every N-1 screen uses, not
@@ -276,12 +340,12 @@ options for reference and the secure ones. Then:
 
 At the 30-bus demo's evening peak (6 January, 20:00), the cheapest option
 leaves 29 of the 41 outages with violations. The preventive dispatch brings that
-to 16 at 783.83 €/h instead of 26.48 €/h; it cannot secure five of the eight
-studied outages (for example after L35, *Bus_23 -> Bus_24 [L32] at 132.9 %*), but
-after the loss of L32, opening L13 clears everything. The corrective dispatch, at
-276.38 €/h, secures all eight: four by moving the units, four by also reducing
-load after the outage — after L35, 3.7 MW of relief at Bus_29 with demand
-response at five loads.
+to 18 at 784.00 €/h instead of 26.48 €/h; it cannot secure five of the eight
+studied outages (for example after L35, *Bus_23 -> Bus_24 [L32] at 132.9 %*);
+after the loss of L29, opening L13 relieves most of what remains, leaving L20
+at 107.3 %. The corrective dispatch, at 276.54 €/h, secures all eight: four by
+moving the units, four by also reducing load after the outage — after L35,
+3.7 MW of relief at Bus_29 with demand response at five loads.
 
 **What secure means here.** Secure for the outages studied, at that moment, at
 that load — not for every hour. The screen shows every outage; the study covers
@@ -303,7 +367,7 @@ unit's change as a step (an instruction holds until it changes); the table, each
 moment checked by a power flow; and the title, how many instructions the plan
 issues against solving each moment on its own — every change of a unit's
 active power counts. At the demo's evening peak: 17 instructions instead of 25
-by default, 13 at steadiness 4.
+by default, 14 at steadiness 4.
 
 **The cost of N-1 security** — *What does N-1 security cost this evening, hour by
 hour?* At each moment, the same study a single question gets — the cheapest
@@ -320,7 +384,7 @@ for those. Each moment is a full study, so the moments run in
 parallel (on an 8-core laptop, nine moments take about 20 seconds), and the
 status line shows how many are done and roughly how long is left.
 From 16:00 to midnight on 6 January, hour by hour (nine moments), preventive
-security costs about 6,100 € above the cheapest, corrective about 3,700 €. The
+security costs about 6,400 € above the cheapest, corrective about 3,500 €. The
 window's first and last moments are always studied; with the default of at most
 six, a 15-minute series is sampled every two hours.
 

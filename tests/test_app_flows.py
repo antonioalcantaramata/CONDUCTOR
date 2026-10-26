@@ -141,7 +141,8 @@ def _script(agent, monkeypatch, *, freeze=None, reply="Reply.", studies=()):
             freeze[kind] -= 1
             st.stop()
 
-    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None):
+    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None,
+             reading_check=None, deep=False):
         calls["turn"].append(user_message)
         calls.setdefault("earlier", []).append(earlier_context)
         stop_if("turn")
@@ -232,7 +233,8 @@ def test_the_status_runs_until_the_answer_and_shows_a_long_studys_progress(agent
     import streamlit as st
     _script(agent, monkeypatch)
 
-    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None):
+    def turn(user_message, history, conversation_id=None, on_event=None, reflection=None, earlier_context=None,
+             reading_check=None, deep=False):
         on_event("llm_call", {"turn": 1})
         on_event("tool_start", {"name": "flexibility_over_time"})
         on_event("tool_progress", {"name": "flexibility_over_time", "text": "3 of 9 moments done"})
@@ -344,7 +346,8 @@ def test_each_side_says_what_it_is_for_and_they_hand_over(agent, monkeypatch):
     is, an answer leads to the advisor, and the advisor's studies lead back."""
     calls = _script(agent, monkeypatch, studies=("N-1 now",))
     at = _app(extra={"agent_panel_open": False})
-    assert any("conductor-who'>⚡ CONDUCTOR" in m.value for m in at.markdown)
+    assert any("class='conductor-who'><img src='data:image/svg+xml" in m.value and "/>CONDUCTOR</span>" in m.value
+               for m in at.markdown)
     box = [t for t in at.text_input if str(t.key).startswith("chat_box_")][0]
     assert box.placeholder == "Ask CONDUCTOR to run, compare or explain a study…"
     _button(at, "💬 Discuss with the advisor").click().run()

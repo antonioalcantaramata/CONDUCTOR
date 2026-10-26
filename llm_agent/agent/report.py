@@ -27,12 +27,27 @@ from .trace import seconds as trace_seconds
 # tables, bold / italic / code, links. Everything is escaped first.
 # ---------------------------------------------------------------------------
 
+# A link's target as it may be written: http(s), or relative (no scheme). Any
+# other scheme (javascript:, data:, …) is shown as its text only.
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _link(m: re.Match) -> str:
+    """A Markdown link as HTML. The text arrives escaped for element content
+    only, so the URL is escaped again for the attribute: a `"` in it would
+    otherwise end `href` and let the rest of the URL become markup."""
+    text, url = m.group(1), m.group(2)
+    if _SCHEME_RE.match(url) and not url.lower().startswith(("http://", "https://")):
+        return text
+    return f'<a href="{html.escape(html.unescape(url), quote=True)}">{text}</a>'
+
+
 _INLINE = [
     (re.compile(r"`([^`]+)`"), r"<code>\1</code>"),
     (re.compile(r"\*\*(.+?)\*\*"), r"<strong>\1</strong>"),
     (re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])"), r"<em>\1</em>"),
     (re.compile(r"(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?![\w_])"), r"<em>\1</em>"),
-    (re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)"), r'<a href="\2">\1</a>'),
+    (re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)"), _link),
 ]
 
 
@@ -307,7 +322,7 @@ def build(messages: list[dict], meta: dict, *, charts_html=None, plotly_js: str 
 {f'<script>{plotly_js}</script>' if plotly_js else ''}
 </head><body><main>
 <header class="cover"><h1>{html.escape(title)}</h1>
-<div class="sub">Grid studies with CONDUCTOR — every figure from a solver run, with its evidence under each answer.</div>
+<div class="sub">Grid studies with CONDUCTOR — each answer with the studies it ran and where its figures came from.</div>
 <dl class="meta">{_meta_rows(meta)}</dl></header>
 <section><h2>Assumptions in force</h2><div class="card">{_assumptions_html(meta.get('assumptions'), meta.get('quality'))}</div></section>
 <section><h2>Proposals</h2>{_proposals_html(meta.get('proposals'))}</section>

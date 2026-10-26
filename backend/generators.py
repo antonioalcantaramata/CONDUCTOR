@@ -106,6 +106,20 @@ def _capacity(row) -> float:
     return 0.0
 
 
+def is_condenser(table: str, row) -> bool:
+    """The engine's rule (flex_engine._is_condenser), in one place: a
+    voltage-controlled unit (`gen`) whose declared `max_p_mw` — or, with none
+    declared, its output — is under 1 MW. A small static generator is an
+    ordinary unit to the optimisation: the cost table used to call it a
+    condenser too, with no redispatch price, so it moved for free."""
+    if table != "gen":
+        return False
+    cap = _finite(row.get("max_p_mw"))
+    if cap is None:
+        cap = _finite(row.get("p_mw"), 0.0)
+    return cap < CONDENSER_BELOW_MW
+
+
 def describe(net) -> list[dict]:
     """Every unit of the network (not those a proposal added), as modelled now."""
     out = []
@@ -144,10 +158,10 @@ def describe(net) -> list[dict]:
                 "control": control, "q_mvar": q_set,
                 "vm_pu": vm, "pf": pf, "absorbing": absorbing,
                 "q_min_mvar": qmin, "q_max_mvar": qmax,
-                "dispatchable": False if pmax < CONDENSER_BELOW_MW else (
+                "dispatchable": False if is_condenser(table, row) else (
                     True if ctrl is None or pd.isna(ctrl) else bool(ctrl)),
                 "p_max_mw": round(pmax, 4),
-                "condenser": pmax < CONDENSER_BELOW_MW,
+                "condenser": is_condenser(table, row),
                 "in_service": bool(row.get("in_service", True)),
             })
     return out

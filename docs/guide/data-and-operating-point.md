@@ -57,7 +57,7 @@ format: one row per time step and substation.
 | Column | Required | Meaning |
 | --- | --- | --- |
 | `timestamp` | yes | Any date-time pandas can read, e.g. `2024-01-01 00:15:00`. Any regular interval; 15 minutes recommended |
-| `substation_name` | yes | A bus name of the loaded network. Partial or prefix names are matched |
+| `substation_name` | yes | A bus name of the loaded network (unnamed MATPOWER buses are `Bus_0`, `Bus_1`, …). Consumption is matched to loads by name, prefix or a unique three-letter prefix; production to units by the exact name |
 | `production_mw` | yes | Total generation at that bus, MW (`0.0` for load-only buses) |
 | `consumption_mw` | yes | Total load at that bus, MW (`0.0` for generation-only buses) |
 | `consumption_mvar` | no | Reactive demand, Mvar (positive draws, negative injects) |
@@ -65,10 +65,10 @@ format: one row per time step and substation.
 
 ```
 timestamp,substation_name,production_mw,consumption_mw
-2024-01-01 00:00:00,Bus 1,2.5,1.2
-2024-01-01 00:00:00,Bus 2,0.0,3.4
-2024-01-01 00:15:00,Bus 1,2.3,1.4
-2024-01-01 00:15:00,Bus 2,0.0,3.6
+2024-01-01 00:00:00,Bus_1,2.5,1.2
+2024-01-01 00:00:00,Bus_2,0.0,3.4
+2024-01-01 00:15:00,Bus_1,2.3,1.4
+2024-01-01 00:15:00,Bus_2,0.0,3.6
 ```
 
 **Download a template for this network** in the upload dialog gives a CSV with

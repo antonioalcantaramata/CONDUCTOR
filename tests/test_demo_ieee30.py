@@ -236,3 +236,61 @@ def test_the_envelope_studies_a_voltage_controlled_unit_as_an_injection(client):
                                                             "gen_name": "Gen_bus7"}))
     assert "holds a voltage set-point" in out["unit_studied_as_injection"]
     assert out["n_feasible"] > 0
+    # Its own reactive limits are the capability, not a power factor of 0.9.
+    assert out["unit_q_limits_mvar"] == [-15.0, 60.0] and out["capability"] == "the unit's own reactive limits"
+    lo, hi = out["safe_q_range_at_base_p"]
+    assert -15.0 - 0.1 <= lo <= hi <= 60.0 and "can give between" in out["message"]
+
+
+def test_the_envelope_finds_a_unit_named_by_its_bus_and_lists_the_units_otherwise(client):
+    # Observed live: 'Bus_7' matched nothing and "No generators available in sgen table" came back.
+    out = _ok(client.post("/api/flexibility/envelope", json={"timestamp": "2000-01-01 00:00", "gen_name": "Bus_7",
+                                                            "resolution": 6}))
+    assert out["resolved_gen_name"] == "Gen_bus7"
+    r = client.post("/api/flexibility/envelope", json={"gen_name": "Nope", "resolution": 5})
+    assert r.status_code == 404 and "Gen_bus7" in r.json()["detail"]
+
+
+def test_what_no_output_of_the_unit_clears_is_said_and_set_aside(client):
+    # At the peak the line from the external grid is overloaded whatever Gen_bus7 does.
+    out = _ok(client.post("/api/flexibility/envelope", json={"timestamp": PEAK, "gen_name": "Gen_bus7",
+                                                            "resolution": 8}))
+    assert out["n_feasible"] == 0 and out["violated_everywhere"] == ["Bus_0 -> Bus_1 [L0]"]
+    assert "alone cannot clear it" in out["message"]
+    assert all("violated" in r and "feasible_apart" in r for r in out["envelope"])
+
+
+def test_an_hour_asked_as_one_moment_is_its_first_moment_and_said(client):
+    # The model writes "at 20:00" as "2000-01-06 20", which matches four ticks.
+    out = _ok(client.post("/api/grid/rsa", json={"timestamp": "2000-01-06 20"}))
+    assert out["timestamp"] == "2000-01-06 20:00:00"
+    assert out["timestamp_resolved"] == [{"asked": "2000-01-06 20", "used": "2000-01-06 20:00:00",
+                                          "why": "the first moment of the hour asked for"}]
+    day = _ok(client.post("/api/grid/rsa", json={"timestamp": "2000-01-06"}))
+    assert day["timestamp"] == "2000-01-06 00:00:00" and "day" in day["timestamp_resolved"][0]["why"]
+    exact = _ok(client.post("/api/grid/rsa", json={"timestamp": "2000-01-06 20:15"}))
+    assert "timestamp_resolved" not in exact
+
+
+def test_a_prefix_that_is_not_a_day_or_an_hour_stays_ambiguous(client):
+    assert client.post("/api/grid/rsa", json={"timestamp": "2000-01-06 2"}).status_code == 400
+
+
+def test_a_window_bound_keeps_the_whole_hour(client):
+    out = _ok(client.post("/api/grid/element_timeseries", json={
+        "element_type": "bus", "element_name": "Bus_29",
+        "start_timestamp": "2000-01-06 20", "end_timestamp": "2000-01-06 20"}))
+    assert out["timestamps"] == ["2000-01-06 20:00:00", "2000-01-06 20:15:00", "2000-01-06 20:30:00",
+                                 "2000-01-06 20:45:00"]
+
+
+def test_a_moment_between_the_datas_moments_is_the_one_that_holds_it(client):
+    # Observed live: a window ending at '23:59' on 15-minute data was refused.
+    out = _ok(client.post("/api/grid/element_timeseries", json={
+        "element_type": "bus", "element_name": "Bus_29",
+        "start_timestamp": "2000-01-05 23:07", "end_timestamp": "2000-01-05 23:59"}))
+    assert out["timestamps"][0] == "2000-01-05 23:15:00" and out["timestamps"][-1] == "2000-01-05 23:45:00"
+    assert {n["used"] for n in out["timestamp_resolved"]} == {"2000-01-05 23:15:00", "2000-01-05 23:45:00"}
+    outside = client.post("/api/grid/element_timeseries", json={
+        "element_type": "bus", "element_name": "Bus_29", "start_timestamp": "2001-03-01 10:00"})
+    assert outside.status_code == 404 and "2000-01-01 00:00:00 to 2000-01-07 23:45:00" in outside.json()["detail"]

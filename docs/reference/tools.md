@@ -7,7 +7,7 @@ Everything CONDUCTOR can do, it does through these tools: you ask in plain langu
 Most studies also take the arguments in [Shared arguments](#shared-arguments).
 
 - [Reading the grid and the data](#reading-the-grid-and-the-data): [`locate_network_element`](#locate_network_element), [`get_current_timestamp`](#get_current_timestamp), [`advance_timestamp`](#advance_timestamp), [`get_current_conditions`](#get_current_conditions), [`get_element_timeseries`](#get_element_timeseries), [`get_data_quality`](#get_data_quality)
-- [Security at one moment](#security-at-one-moment): [`run_rsa`](#run_rsa), [`simulate_contingency`](#simulate_contingency), [`simulate_all_contingencies`](#simulate_all_contingencies), [`compute_violation_attribution`](#compute_violation_attribution), [`compare_results`](#compare_results)
+- [Security at one moment](#security-at-one-moment): [`run_rsa`](#run_rsa), [`simulate_contingency`](#simulate_contingency), [`simulate_all_contingencies`](#simulate_all_contingencies), [`compute_violation_attribution`](#compute_violation_attribution), [`investigate`](#investigate), [`test_prevention`](#test_prevention), [`look_ahead`](#look_ahead), [`record_investigation`](#record_investigation), [`compare_results`](#compare_results)
 - [Over time, scenarios and risk](#over-time-scenarios-and-risk): [`scan_rsa_over_time`](#scan_rsa_over_time), [`find_worst_case_timestamp`](#find_worst_case_timestamp), [`scan_scenarios`](#scan_scenarios), [`run_probabilistic_rsa`](#run_probabilistic_rsa), [`compute_historical_risk`](#compute_historical_risk)
 - [Optimisation and flexibility](#optimisation-and-flexibility): [`optimize_flexibility`](#optimize_flexibility), [`optimize_contingency`](#optimize_contingency), [`optimize_robust_flexibility`](#optimize_robust_flexibility), [`compute_flexibility_envelope`](#compute_flexibility_envelope), [`compute_hosting_capacity`](#compute_hosting_capacity), [`flexibility_over_time`](#flexibility_over_time)
 - [Key performance indicators](#key-performance-indicators): [`evaluate_kpis`](#evaluate_kpis), [`kpis_over_time`](#kpis_over_time)
@@ -47,8 +47,8 @@ Return the raw network state at the current timestamp: per-generator active powe
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -69,7 +69,7 @@ Focus tool: scan a time range and plot the evolution of a specific bus voltage (
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+| `data_source` | text | 'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -91,8 +91,8 @@ Run a Real-time Security Assessment (RSA) on the active grid model. Returns volt
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -110,8 +110,8 @@ Simulate a single N-1 contingency (one line or transformer outage). Returns whet
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -127,14 +127,14 @@ Run a full N-1 security sweep across all lines and transformers. Returns whether
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
 ### `compute_violation_attribution`
 
-Explain WHY elements are violating their limits at an operating point, by ranking which generators, renewable units, and loads are driving each violation. Use this after a security assessment reports violations and the user asks why, what is causing them, which unit is responsible, or what to move to fix them. Returns, per violated element, a ranked list of sources with their measured sensitivity (change in bus voltage or branch loading per MW or MVAr of that source) and the movement each would need to clear the violation on its own. Does NOT advance the simulation clock. Prefer this over inferring causes from a violation table.
+Rank which generators, renewable units and loads move each violated element now, at one operating point. Use it when the user asks which unit moves it, or what to move to fix the violations. (For WHY an element is outside its limits — what caused it — use investigate, which compares it with a state where it was fine.) Returns, per violated element, a ranked list of sources with their measured sensitivity (change in bus voltage or branch loading per MW or MVAr of that source) and the movement each would need to clear the violation on its own. Does NOT advance the simulation clock. Prefer this over inferring drivers from a violation table.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
@@ -145,10 +145,83 @@ Explain WHY elements are violating their limits at an operating point, by rankin
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `top_n_sources` | whole number | How many injections to test, largest first. Default 20. Each costs two power flows, so raise it only when the network is large and the expected driver may be a small unit. |
 | `top_n_drivers` | whole number | Ranked drivers returned per violated element. Default 5. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
+
+### `investigate`
+
+WHY an element is outside its limits (element 'all': the grid insecure), or why a voltage or loading changed. Compares it with a reference state where it was fine (default: the nearest earlier moment within limits) and divides the change among what changed — demand near it and elsewhere, units' output, set-points, lines out, a proposal's additions — by Shapley values over AC power flows (the shares add up to the change). Returns each factor's share and verdict (cause, contributes, ruled_out, counteracts), interactions, undo-alone counterfactuals, a cause's members and the levers to act on now. For a problem in the grid only — not a why about a method, a recommendation or physics, nor a what-if.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `element` | text | The bus, line or transformer, named as results name it (e.g. 'Bus_29', 'Bus_0 -> Bus_1 [L0]'). 'all' only when the question is about the grid as a whole (the number of elements outside limits). Omitted: the only element outside its limits; with several, the result lists them — ask which. |
+| `element_type` | text | 'bus', 'line' or 'trafo', if the name is ambiguous. |
+| `reference_timestamp` | text | Compare with this moment (prefix, e.g. '2000-01-06 16') when the operator names one. Omitted: the nearest earlier moment within limits. |
+| `reference_data_source` | text | Compare with the other dataset ('forecasts' or 'measurements'), same moment. |
+| `reference_network` | text | Compare with another network ('base' or a proposal id), same moment. |
+| `recurring` | true/false | Every episode outside the limits in a window (start/end_timestamp; the whole dataset by default), each investigated, and their main causes gathered: is the cause recurring (structural)? Element omitted: the one outside its limits most often. |
+| `check_references` | true/false | Repeat against the other references (within limits, well inside them, the day before) and say whether the main cause holds. Default: on when the reference was chosen automatically. |
+| `classical` | list of `linear` / `tracing` | Classical views beside the exact shares, when useful: 'linear' — each factor estimated from sensitivities (LODF for a branch out), to see where linearity holds; 'tracing' — which sources feed and which loads draw an investigated branch's flow (Bialek). They inform; the verdicts stay the exact ones. |
+| `reference_mode` | `within_limits` / `comfortable` / `previous_day` | How to pick the reference when none is given: the nearest earlier moment within limits (default); 'comfortable' — well inside them, to see why it got close at all; 'previous_day' — the same moment a day earlier. |
+| `outage` | text | A line or transformer out in BOTH states (N-1). 'Why is losing X critical at 18:00 and not at 15:00': outage=X, timestamp=18:00, reference_timestamp=15:00, reference_outage empty. |
+| `reference_outage` | text | Leave empty to keep the same outage in the reference. Only to compare outages at the same moment: another line, or 'none' for the intact network. |
+| `start_timestamp` | text | Only for a window of several moments (why this day or week is worse than the last): its first moment (prefix). Empty for one moment. |
+| `end_timestamp` | text | The window's last moment (prefix, inclusive). |
+| `reference_start_timestamp` | text | The window compared with; omitted, the window of the same length just before. |
+| `reference_end_timestamp` | text | The compared window's last moment. |
+| `hypotheses` | list of object | Your own hypotheses to test (up to 5), instead of the standard grouping: each a name and the elements it covers. A bus name covers the demand at it; a unit name its output and set-point; a line or transformer (name or tag, e.g. 'L38') its state; 'external grid' its voltage; 'demand' or 'units' all of them. Everything else that changed is 'Other changes'. The tool measures each one's share and verdict; one naming nothing that changed is ruled out. |
+| `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
+| `vm_upper_pu` | number | Upper voltage limit, p.u.; default the network's (Grid domain knowledge). |
+| `max_line_loading_pct` | number | Line overload threshold, %. |
+| `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
+| `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
+
+Also takes: `network`, `load_power_factor`.
+
+### `test_prevention`
+
+Could an episode outside the limits have been avoided, and how early was it seen? From a moment in it: the episode, the warning before it (within a small margin of the limit) and, for each action you propose, whether holding it from the warning to the end keeps the element within its limits at every moment (AC power flows; no new violation, the unit within its range) and the smallest share that still does — or what stops it. Actions omitted: the attribution's levers.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `element` | text | The bus, line or transformer; omitted, the only one outside its limits. |
+| `element_type` | text | 'bus', 'line' or 'trafo'. |
+| `actions` | list of object | Up to 4 candidate actions, each with a unit and exactly one of the three changes. |
+| `combine` | true/false | Also try all the actions together. |
+| `warning_margin` | number | How close to the limit counts as a warning (default 0.01 p.u. or 10 points). |
+| `outage` | text | A line or transformer out throughout. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
+
+Also takes: `network`, `load_power_factor`.
+
+### `look_ahead`
+
+What is coming, and what would prevent it. Over the forecast's next hours (24 by default): the episodes outside the limits and, for the most severe, when to decide (the warning's start), the main cause, the smallest sufficient action (AC power flows through the warning and the episode) and whether it holds if the forecast errs (demand higher, renewables lower). Expectations, not facts. For 'what should I watch for', 'anything to act on today'.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `start_timestamp` | text | Where the horizon starts (a prefix). Omitted: the simulation clock, or the forecast's first moment. |
+| `hours` | number | The horizon in hours (default 24, at most 72). |
+| `elements` | list of text | Only these buses, lines or transformers. Omitted: the whole grid. |
+| `uncertainty_pct` | number | Each action is checked again with demand this much above the forecast and renewables this much below it (default 5). |
+| `max_episodes` | whole number | How many of the most severe episodes to work out in full (default 5). |
+| `data_source` | text | 'forecasts' (default: what is expected) or 'measurements'. |
+
+Also takes: `network`, `load_power_factor`.
+
+### `record_investigation`
+
+Record what an investigation tested, before the answer. Once it is done (not when asking the operator first): every hypothesis — supported, refuted or untested. Supported or refuted: name the tools, called successfully in this question, that decide it (and the investigate `factor`; the verdicts must agree). Untested: only what no CONDUCTOR tool can test — say what would (`missing_tool`, `missing_kind`); a study not yet run is not untested. Refused otherwise. Shown to the operator; what untested ones need is collected for the developers.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `symptom` (required) | text | What was investigated, e.g. 'Bus_29 below 0.95 p.u. at 2000-01-06 20:00'. |
+| `hypotheses` (required) | list of object |  |
 
 ### `compare_results`
 
@@ -180,7 +253,7 @@ Also takes: `network`, `load_power_factor`.
 
 ### `find_worst_case_timestamp`
 
-Scan forward through all (or n_steps) timestamps WITHOUT advancing the simulation clock, and find the worst-case operating point for a chosen stress metric. Returns the worst timestamp + value, per-metric worst summary, and a full time-series for charting. The simulation clock is unchanged after the call. Use when the user asks: 'when is the grid most stressed?', 'find the worst case', 'which timestamp has the most violations?', 'peak import moment', 'when is voltage lowest?', 'scan the whole dataset for the worst point'.
+Scan forward through all (or n_steps) timestamps WITHOUT advancing the simulation clock, and find the worst-case operating point for a chosen stress metric. Returns the worst timestamp + value, per-metric worst summary, and a full time-series for charting. The simulation clock is unchanged after the call. Use when the user asks: 'when is the grid most stressed?', 'find the worst case', 'which timestamp has the most violations?', 'peak import moment', 'when is voltage lowest?', 'scan the whole dataset for the worst point'. Not for what a proposal changes at the worst hour: a change can move the worst moment, so compare the two over the window with compare_networks study='scan' instead of taking the base's worst hour.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
@@ -211,7 +284,7 @@ Run RSA across a time range for multiple renewable output scaling factors simult
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+| `data_source` | text | 'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -228,8 +301,8 @@ Run a Monte Carlo probabilistic security assessment at the current timestamp. Dr
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -253,7 +326,7 @@ Computes empirical historical violation and near-miss statistics over a real SCA
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
 | `parallel` | true/false | Enable parallel snapshot evaluation across timestamps. Default false. |
 | `max_workers` | whole number | Optional worker cap when parallel=true. If omitted, backend picks a safe default. |
-| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+| `data_source` | text | 'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -267,7 +340,7 @@ Optimize local generator dispatch to resolve voltage or thermal violations in no
 | --- | --- | --- |
 | `options` | true/false | True: several corrective options to choose from, instead of the one least-disturbance dispatch. |
 | `hold_units` | list of text | Units whose active power stays at its schedule — the operator's conditions ('without Gen 2', 'don't call the battery'). In service, unlike disabled_generators. With options=true, every option respects them. |
-| `near_optimal` | true/false | With options=true: instead of the named strategies, the cheapest option and up to three near-optimal alternatives, each costing at most near_optimal_pct above it and changing other units. |
+| `near_optimal` | true/false | With options=true: instead of the named strategies, the cheapest option and up to near_optimal_count (default 5) near-optimal alternatives, each costing at most near_optimal_pct above it and changing other units. |
 | `near_optimal_pct` | number | How far above the cheapest an alternative may cost, %. Default 10. |
 | `n1` | `preventive` / `corrective` / `both` | Options secure after the critical outages. preventive: nothing to do when one happens; corrective: a quick action after it (plan returned); both. |
 | `n1_outages` | list of text | Outages to secure (names or tags). Default: the critical ones. |
@@ -278,20 +351,20 @@ Optimize local generator dispatch to resolve voltage or thermal violations in no
 | `near_optimal_count` | whole number | Alternatives shown, 1–5 (default 5). |
 | `from_option` | text | Start from a corrective option's ref instead of the schedule (its instructions held to this timestamp). |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
-| `disabled_generators` | list of text | Substations whose generators are forced offline (generator loss, islanding). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `disabled_generators` | list of text | Units forced offline (generator loss, islanding), by unit name (under 'Units' in the system prompt). |
 | `slack_max_mw` | number | External-grid exchange cap, MW, both directions. Omit for the network's own limit; 0.0 = islanded. For islanding or derating questions. |
 | `slack_q_max_mvar` | number | External-grid reactive exchange cap, Mvar. Omit to use slack_max_mw. A cap makes local generators supply more Q. |
 | `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
 | `opf_lambda_p` | number | OPF weight on squared active-power deviation. Default 0.01; higher keeps P closer to its base value. |
 | `opf_lambda_q` | number | OPF weight on squared reactive-power deviation. Default 0.001; higher keeps Q closer to its base value. |
-| `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
-| `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
-| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `pg_max_overrides` | object | Per-unit maximum active power, MW: {unit name: MW}. Others keep their capacity. |
+| `pg_min_overrides` | object | Per-unit minimum active power, MW: {unit name: MW}; positive = must-run. Others keep their minimum. |
+| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are unit names (under 'Units' in the system prompt) or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). |
 | `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |
 | `opf_current_safety_margin` | number | Fraction of rated branch current the OPF may use (0–1). Default 0.9; 1.0 = full rating. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `branch_limits`, `network`, `load_power_factor`.
 
@@ -312,19 +385,19 @@ Compute the corrective flexibility dispatch after a single contingency using AC 
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
 | `opf_lambda_p` | number | OPF weight on squared active-power deviation. Default 0.01; higher keeps P closer to its base value. |
 | `opf_lambda_q` | number | OPF weight on squared reactive-power deviation. Default 0.001; higher keeps Q closer to its base value. |
-| `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
-| `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
-| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `pg_max_overrides` | object | Per-unit maximum active power, MW: {unit name: MW}. Others keep their capacity. |
+| `pg_min_overrides` | object | Per-unit minimum active power, MW: {unit name: MW}; positive = must-run. Others keep their minimum. |
+| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are unit names (under 'Units' in the system prompt) or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). |
 | `opf_min_power_factor` | number | Minimum generator power factor in the OPF. Default 0.95; lower allows more reactive redispatch. |
 | `opf_current_safety_margin` | number | Fraction of rated branch current the OPF may use (0–1). Default 0.9; 1.0 = full rating. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `branch_limits`, `network`, `load_power_factor`.
 
 ### `optimize_robust_flexibility`
 
-Robust OPF with two methods: heuristic constraint tightening (back-off) and scenario-based chance constraints. Combines probabilistic security assessment with optimal power flow to find the minimum-cost dispatch that is secure with a user-specified confidence (e.g. 95% or 99%) under modeled uncertainty. Step 1: runs probabilistic RSA to compute per-bus voltage percentile envelopes. Step 2: computes symmetric per-bus back-offs for upper and lower voltage tails. Step 3: solves OPF with tightened per-bus vm_upper and vm_lower bounds. Step 4: iterates tighten-and-solve using target_p_any, max_iter, and min_improvement. Step 5: reports independent validation risk after OPF. Use for a dispatch that is secure with a stated confidence under uncertainty (robust OPF, back-offs for forecast error). Scenario mode also reports whether its scenario count met the nominal bound (guarantee_met; not a certificate for AC OPF) — the out-of-sample validation risk is the evidence.
+Robust OPF with two methods: heuristic constraint tightening (back-off) and scenario-based chance constraints. Combines probabilistic security assessment with optimal power flow to find the least-change dispatch that is secure with a user-specified confidence (e.g. 95% or 99%) under modeled uncertainty. Step 1: runs probabilistic RSA to compute per-bus voltage percentile envelopes. Step 2: computes symmetric per-bus back-offs for upper and lower voltage tails. Step 3: solves OPF with tightened per-bus vm_upper and vm_lower bounds. Step 4: iterates tighten-and-solve using target_p_any, max_iter, and min_improvement. Step 5: reports independent validation risk after OPF. Use for a dispatch that is secure with a stated confidence under uncertainty (robust OPF, back-offs for forecast error). Scenario mode also reports whether its scenario count met the nominal bound (guarantee_met; not a certificate for AC OPF) — the out-of-sample validation risk is the evidence.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
@@ -350,8 +423,8 @@ Robust OPF with two methods: heuristic constraint tightening (back-off) and scen
 | `allowed_violation_fraction` | number | Optional discard budget fraction in scenario method. Default 0.0 (enforce all scenarios). |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -374,8 +447,8 @@ Computes the secure (P, Q) operating region for a single generator at the curren
 | `load_scaling_factor` | number | Load stress multiplier for the sweep. Default 1.0 (current load). |
 | `reference_state` | text | Reference operating point for the envelope sweep: 'scada' (default), 'post_opf' (latest cached optimization dispatch), or 'custom' (apply dispatch_overrides). |
 | `dispatch_overrides` | object | Custom dispatch setpoints used when reference_state='custom'. Format: {element_name: p_mw} or {element_name: {p_mw, q_mvar}}. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -396,13 +469,13 @@ Computes hosting capacity for an incremental injection at one bus in determinist
 | `load_sigma` | number | Only for probabilistic mode: multiplicative load uncertainty sigma around the active operating point. Default 0.0. |
 | `uncertainty_scope` | text | Only for probabilistic mode: 'added_generation_only' (default) or 'added_generation_plus_load'. Use the latter only when load uncertainty should also be sampled. |
 | `timestamp` | text | Optional timestamp or unambiguous prefix for the operating point. |
-| `p_max_search_mw` | number | Optional upper search bound in MW. If omitted, backend chooses a safe heuristic. |
+| `p_max_search_mw` | number | Optional upper search bound in MW. Omit (or 0) for the backend's own choice. |
 | `tolerance_mw` | number | Bisection tolerance in MW. Default 0.1. |
 | `vm_upper_pu` | number | Upper voltage limit, p.u.; default the network's (Grid domain knowledge). |
 | `vm_lower_pu` | number | Lower voltage limit, p.u.; default the network's. |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `network`, `load_power_factor`.
 
@@ -425,7 +498,7 @@ Flexibility across several moments. study='hold': a corrective option held from 
 | `ramp_pct_per_h` | number | plan: ramp limit, % of capacity per hour. |
 | `load_scaling_factor` | number | Multiplier on all active and reactive loads; 1.0 = as measured. |
 | `hold_units` | list of text | plan, security: units kept at their schedule. |
-| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+| `data_source` | text | 'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `branch_limits`, `network`, `load_power_factor`.
 
@@ -445,12 +518,12 @@ Key performance indicators at one moment: the schedule against a corrective acti
 | `slack_q_max_mvar` | number | External-grid reactive exchange cap, Mvar. Omit to use slack_max_mw. A cap makes local generators supply more Q. |
 | `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
-| `pg_max_overrides` | object | Per-substation maximum active power, MW: {name: MW}. Others keep their capacity. |
-| `pg_min_overrides` | object | Per-substation minimum active power, MW: {name: MW}; positive = must-run. Others keep their minimum. |
-| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are substation names or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). Use the exact substation names listed under 'Substation names' in the system prompt; they describe the network currently loaded. |
+| `pg_max_overrides` | object | Per-unit maximum active power, MW: {unit name: MW}. Others keep their capacity. |
+| `pg_min_overrides` | object | Per-unit minimum active power, MW: {unit name: MW}; positive = must-run. Others keep their minimum. |
+| `fixed_setpoints` | object | Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are unit names (under 'Units' in the system prompt) or the external-grid slack, named under 'Grid domain knowledge' in the system prompt (0.0 isolates the external interface). |
 | `opf_current_safety_margin` | number | Fraction of rated branch current the OPF may use (0–1). Default 0.9; 1.0 = full rating. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `branch_limits`, `network`, `load_power_factor`.
 
@@ -471,7 +544,7 @@ The key performance indicators of evaluate_kpis at each moment of a window (meas
 | `slack_max_mw` | number | External-grid exchange cap, MW, both directions. Omit for the network's own limit; 0.0 = islanded. For islanding or derating questions. |
 | `vm_upper_pu` | number | OPF voltage upper bound, p.u. Default: the network's own upper limit. A tighter bound forces more redispatch. |
 | `vm_lower_pu` | number | OPF voltage lower bound, p.u. Default: the network's own lower limit. Lowering it widens the feasible region. |
-| `data_source` | text | 'measurements' (default, actuals) or 'forecasts' (look-ahead). |
+| `data_source` | text | 'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another was used earlier in this question. |
 
 Also takes: `branch_limits`, `network`, `load_power_factor`.
 
@@ -507,8 +580,8 @@ Run one study on the base network and on a proposal at the SAME operating point 
 | `vm_upper_pu` | number | Upper voltage limit, p.u.; default the network's (Grid domain knowledge). |
 | `max_line_loading_pct` | number | Line overload threshold, %. |
 | `max_trafo_loading_pct` | number | Transformer overload threshold, %. |
-| `data_source` | text | 'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp). |
-| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock. |
+| `data_source` | text | 'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: measurements unless another was used earlier in this question. |
+| `timestamp` | text | Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used earlier in this question. |
 
 Also takes: `load_power_factor`.
 
@@ -565,5 +638,5 @@ Arguments many studies take, with the same meaning everywhere.
 | Argument | Type | Meaning |
 | --- | --- | --- |
 | `branch_limits` | object | Branches held below a share of their rating: {name or tag: %}, e.g. {"L30": 80}. 10–100. |
-| `load_power_factor` | number | Measured loads' power factor (0.5–1, lagging) for THIS study only; omit for the session setting. |
-| `network` | text | 'base' (default) or a proposal id. |
+| `load_power_factor` | number | Measured loads' power factor (0.5–1, lagging) for this question only. Omitted: the session setting unless one was given earlier in this question. |
+| `network` | text | 'base' or a proposal id. Omitted: 'base' unless a proposal was used earlier in this question (pass 'base' to compare with it). |

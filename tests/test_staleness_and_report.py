@@ -110,6 +110,18 @@ class TestMarkdown:
     def test_underscores_in_names_are_not_italics(self):
         assert "Gen_bus1" in report.markdown("Gen_bus1 and load_power_factor")
 
+    def test_a_quote_in_a_link_cannot_leave_the_attribute(self):
+        out = report.markdown('[guide](https://example.org/a"onmouseover="alert(1))')
+        assert 'href="https://example.org/a&quot;onmouseover=&quot;alert(1"' in out
+        assert '"onmouseover="' not in out
+
+    def test_only_web_and_relative_links_become_links(self):
+        assert '<a href="https://example.org/?a=1&amp;b=2">x</a>' in report.markdown(
+            "[x](https://example.org/?a=1&b=2)")
+        assert '<a href="charts/n1.html">screen</a>' in report.markdown("[screen](charts/n1.html)")
+        out = report.markdown("[click](javascript:alert)")
+        assert "<a" not in out and "click" in out
+
 
 class TestReport:
     def _trace(self):
@@ -140,6 +152,13 @@ class TestReport:
     def test_an_empty_session_still_builds(self):
         page = report.build([], {})
         assert "No questions yet." in page and "Not available" in page and "None —" in page
+
+    def test_the_header_describes_and_does_not_certify(self):
+        """"Every figure from a solver run" is what the evidence below measures,
+        not a fact it can state: some figures are derived or untraced."""
+        page = report.build([], {})
+        assert "every figure from a solver run" not in page.lower()
+        assert "where its figures came from" in page
 
 
 def test_a_settings_tool_is_not_a_study():

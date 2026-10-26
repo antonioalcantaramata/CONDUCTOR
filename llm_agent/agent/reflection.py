@@ -75,6 +75,9 @@ from typing import NamedTuple
 
 from .characterisation import Conflict
 from .characterisation import check_answer as check_characterisation
+from .characterisation import check_study_claims
+from .evidence import as_conflicts as overstated_claims
+from .investigation_record import as_conflicts as _investigation_issues
 from .completeness import Gap, format_gaps
 from .completeness import check_answer as check_completeness
 from .provenance import (
@@ -141,6 +144,9 @@ class Reflection(NamedTuple):
     gaps: tuple[Gap, ...] = ()
     revised: bool = False  # did a second answer come back
     final: str | None = None
+    # The message the agent was shown, when it was: the loop takes it out of
+    # the conversation history afterwards, so this is where it is kept.
+    message: str = ""
 
     @property
     def triggered(self) -> bool:
@@ -187,6 +193,7 @@ class Reflection(NamedTuple):
                     "path": c.path,
                     "field": c.field,
                     "detail": c.detail,
+                    "study": c.study,
                 }
                 for c in self.conflicts
             ],
@@ -196,6 +203,7 @@ class Reflection(NamedTuple):
             "derived_rate": round(self.report.derived_rate, 4),
             "draft": self.draft,
             "final": self.final,
+            "message": self.message or None,
         }
 
 
@@ -225,14 +233,19 @@ def check_all(draft: str, record: dict) -> tuple[tuple[ClaimVerdict, ...],
                                                  ProvenanceReport,
                                                  tuple[Conflict, ...],
                                                  tuple[Gap, ...]]:
-    """Both checks over one draft.
+    """Every answer check over one draft: provenance, characterisation (of
+    each figure, and of each study's verdict) and completeness — the checks
+    the audit panel and the offline grader run.
 
     Separate from `check_draft` so the provenance instrument keeps a callable
     of its own: the evaluation compares the two checks against each other, and
     that is easier when neither can only be run through the other.
     """
     findings, report = check_draft(draft, record)
-    conflicts = tuple(check_characterisation(draft or "", record))
+    conflicts = tuple(check_characterisation(draft or "", record)) \
+        + tuple(check_study_claims(draft or "", record)) \
+        + tuple(overstated_claims(draft or "", record)) \
+        + tuple(_investigation_issues(draft or "", record))
     gaps = () if is_clarifying_question(draft or "", record.get("tool_calls") or ()) else \
         tuple(check_completeness(record.get("user") or "", draft or ""))
     return findings, report, conflicts, gaps
@@ -311,6 +324,24 @@ def format_conflicts(conflicts: tuple[Conflict, ...]) -> str:
         "",
     ]
     for conflict in conflicts:
+        if conflict.path == "investigation":
+            # The answer departing from the turn's investigation record.
+            lines.append(f'- "{conflict.context}" — this {conflict.detail}.')
+            continue
+        if conflict.path == "evidence":
+            # A sentence claiming more certainty than the results give.
+            lines.append(
+                f'- "{conflict.context}" — it {conflict.detail}. Word it by what backs it: '
+                "proved only with a certificate in the results (`optimality`, `no_dispatch_check`)."
+            )
+            continue
+        if conflict.study:
+            # No figure: the draft as a whole reads as the favourable verdict.
+            lines.append(
+                f'- The draft reads as reassuring ("{conflict.context}"), but here '
+                f"{conflict.detail} (`{conflict.path}`, `{conflict.field}`)."
+            )
+            continue
         shown = f"{conflict.value:g}" + (f" {conflict.unit}" if conflict.unit else "")
         lines.append(
             f'- {shown} — in "{conflict.context}". Here {conflict.detail} '

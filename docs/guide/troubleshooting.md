@@ -30,7 +30,8 @@ left, on DeepSeek).
 | --- | --- |
 | "The power flow did not converge" | The operating point has no solution: often an extreme load scaling, an islanded part of the network, or a proposal that disconnects something. Try a smaller change or check the proposal |
 | "Nominal point not available" | The network file's own values are incomplete; the message lists what is missing |
-| An optimisation finds no feasible dispatch | No allowed redispatch removes the violations within the limits. Try relaxing a limit, allowing more units to move (generator models), a robust or N-1 variant, or a proposal that adds capacity |
+| An optimisation finds no feasible dispatch | No allowed redispatch removes the violations within the limits. The answer says whether that is **proved** (a convex relaxation of the same problem has no solution either) or only that none was found; where IPOPT missed one, a second start from the relaxation may find it, and the answer then says so. It also says which limit binds: the grid-connection voltage, branch loading, or the exchange with the external grid (the import or export the moment would need against its limit). Try relaxing a limit, allowing more units to move (generator models), a robust or N-1 variant, or a proposal that adds capacity |
+| A study refuses a held unit or a fixed set-point | The set-point lies outside the range the unit has in that study (for example, a maximum you also gave it below its schedule). The message names each one: release the unit, or give it a range that includes the set-point |
 | A load or unit gets no measured values | Its bus name does not match a `substation_name` in the data. Check the data-quality report, or download the data template for this network |
 | A proposal edit is refused | The message says why (e.g. a line between buses of different voltages, a name already in use). CONDUCTOR shows it and suggests what would work |
 

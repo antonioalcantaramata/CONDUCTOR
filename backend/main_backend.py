@@ -7,9 +7,9 @@ simulations against the active network profile.
 
 Overview
 ---------------------------
-1. **Startup (``lifespan``)**: load the measurement database,
-   the pandapower Excel network, and three pre-computed admittance-matrix
-   (``Ybus``) databases into the global app_data array. These loads
+1. **Startup (``lifespan``)**: load the network profile, its measurement
+   and forecast series, and build the admittance-matrix (``Ybus``) database
+   into the global app_data array. These loads
    are time consuming (10-20s) so they happen once at boot to keep per-request
    latency in the ~0.03s range.
 2. **Time control** (``/api/time/*``): advances the simulation clock through
@@ -70,6 +70,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import load_gen_assignment as lg
 import rsa_engine as rs
+import relaxation as rx
+import investigation as inv
 # Never ship a number that would be wrong to state. See backend/withdrawal.py.
 import withdrawal
 # Element naming lives in its own module so rsa_engine spells a name the same
@@ -95,6 +97,7 @@ import costs as uc
 import generators as gm
 import naming
 import nominal as nom
+import resolve as rv
 import sandbox as sb
 
 from dotenv import load_dotenv
@@ -205,37 +208,25 @@ substations: list = []
 
 
 def get_substation_names(net) -> list:
-    """Derive the canonical substation name list from a loaded pandapower network.
+    """The substations: the buses with at least one load, plus the bus of any
+    named generator (every bus when there is no load) — the measurement points
+    the data and most tools are keyed by.
 
-    Reads bus names for buses that carry at least one load, which gives the
-    correct list for substation-style measured networks (one load per substation bus) and
-    a sensible fallback for IEEE / MATPOWER networks (bus names like 'Bus 2').
-    Falls back to all bus names if no loads are present.
-    MATPOWER networks have no bus names — generates 'Bus {id}' labels.
+    Each is named as the data and every result name buses: its name, or
+    `Bus_<index>` when it has none (synthetic_timeseries._bus_name,
+    flex_engine._bus_label). Unnamed buses used to be listed as "Bus 1" while
+    the data said "Bus_1", and a network whose units were named but whose
+    buses were not listed its unit names instead of buses.
     """
-    def _nonempty(vals):
-        return [v for v in vals if v and str(v).strip()]
-
-    if net.load.empty or "name" not in net.bus.columns:
-        raw = net.bus["name"].dropna().tolist()
+    if net.load.empty:
+        buses = list(net.bus.index)
     else:
-        load_bus_ids = net.load["bus"].unique()
-        raw = net.bus.loc[net.bus.index.isin(load_bus_ids), "name"].dropna().tolist()
-        # Also include named generators not already covered (IEEE net.gen).
+        with_load = set(int(b) for b in net.load["bus"])
         if not net.gen.empty and "name" in net.gen.columns:
-            for n in net.gen["name"].dropna().tolist():
-                if n and n not in raw:
-                    raw.append(n)
-
-    # Always text: some networks name their buses with numbers (case33bw: 1, 2, …),
-    # and every consumer — matching, the CSV, the agent's prompt — reads names as text.
-    names = [str(v).strip() for v in _nonempty(raw)]
-    if names:
-        return list(dict.fromkeys(names))
-    # Fallback for MATPOWER / nameless networks: use bus indices of load buses
-    if not net.load.empty:
-        return [f"Bus {i}" for i in sorted(net.load["bus"].unique())]
-    return [f"Bus {i}" for i in net.bus.index]
+            named = net.gen["name"].map(lambda v: isinstance(v, str) and bool(v.strip()))
+            with_load |= set(int(b) for b in net.gen.loc[named, "bus"])
+        buses = [b for b in net.bus.index if int(b) in with_load]
+    return list(dict.fromkeys(fe._bus_label(net, int(b)) for b in buses))
 
 
 def get_pg_max_data(net) -> dict:
@@ -415,6 +406,40 @@ def extract_flexibility_results(model, net_base, ts):
 # and any intermediate value models a degraded / partially-available
 # interconnection.
 # ===================================================================
+def _dispatch_context(request, outage: str | None = None) -> dict:
+    """What a dispatch was computed for, beside its timestamp: the network,
+    the data, the load scaling and any outage."""
+    return {"network": _network_name(request), "data_source": _dataset_label(request),
+            "load_scaling_factor": float(getattr(request, "load_scaling_factor", 1.0) or 1.0),
+            "outage": outage}
+
+
+def _remember_dispatch(rows, ts: str, request, outage: str | None = None) -> None:
+    """Keep a dispatch as "the last one" (the envelope's `post_opf` reference)
+    with what it was computed for. Not for a request with `remember=False`
+    (a check re-running the study under another reading)."""
+    if getattr(request, "remember", True) is False:
+        return
+    app_data["last_dispatch_result"] = rows
+    app_data["last_dispatch_timestamp"] = ts
+    app_data["last_dispatch_context"] = _dispatch_context(request, outage)
+
+
+def _current_margin_within_limits(request) -> float:
+    """The OPF current margin of a study that also states loading limits (the
+    robust dispatch, the window plan): the OPF's usual 0.9, or the request's
+    own limit when that is stricter. A fixed 0.9 let the dispatch plan lines
+    up to 90 % when the request asked for 80 %."""
+    return min(0.9, min(float(request.max_line_loading_pct), float(request.max_trafo_loading_pct)) / 100.0)
+
+
+def _physical_exchange_cap() -> float:
+    """The network's limit on its exchange with the external grid (MW): the
+    profile's `slack_max_mw`, or an upload's external-grid maximum; 999 MW
+    (no practical limit) when neither is known."""
+    return float(app_data.get("slack_max_mw") or 999.0)
+
+
 def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max_mvar: float | None = None, fixed_setpoints: dict = None):
     """Re-solve an existing Pyomo model with the slack capped to ±max_slack_mw.
 
@@ -425,11 +450,13 @@ def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max
         have left them fixed at base values; if the slack now has less
         headroom, local generators may need to pick up the slack
         (literally), so they must be free to move.
-      * Tightens the bounds on every external grid variable to
-        ``(-max_slack_mw, +max_slack_mw)`` for both active and
-        reactive injection. The engine's default is ±200 MW (a
-        modelling artefact); we additionally clamp ``max_slack_mw``
-        to the active profile's physical import/export limit.
+      * Bounds every external grid variable to
+        ``(-max_slack_mw, +max_slack_mw)`` for both active and reactive
+        injection, within the connection's own capacity (the case's
+        external-grid limits as a symmetric capacity, ±200 MW / Mvar when it
+        has none; see ``flex_engine._exchange_bounds``): the cap tightens
+        that capacity, never loosens it. ``max_slack_mw`` is also clamped to
+        the active profile's physical import/export limit.
         ``max_slack_mw == 0`` is the fully-islanded case (the external
         interface carries no power but the bus still provides the angular
         reference for the local grid).
@@ -472,9 +499,12 @@ def solve_constrained_slack_scenario(model_opt, max_slack_mw: float, slack_q_max
 def _cap_exchange(model_opt, max_slack_mw: float, slack_q_max_mvar: float | None = None,
                   fixed_setpoints: dict | None = None) -> None:
     """The external-grid cap on a model (in place): units free, the exchange
-    within ±cap, pinned set-points kept. The capped re-solve's setup, also
-    used by the last resort."""
-    _phys_cap = float(app_data.get("slack_max_mw", 999.0))
+    within ±cap and within the connection's own capacity (the model's
+    `_ext_capacity`; a cap above it used to loosen it, ±999 MW over the
+    30-bus case's 200), pinned set-points kept. The capped re-solve's setup,
+    also used by the last resort. Idempotent: a later, larger cap is applied
+    against the capacity, not against an earlier cap."""
+    _phys_cap = float(_physical_exchange_cap())
     bound = max(0.0, min(float(max_slack_mw), _phys_cap))
     q_bound = max(0.0, min(float(slack_q_max_mvar), _phys_cap)) if slack_q_max_mvar is not None else bound
 
@@ -482,17 +512,19 @@ def _cap_exchange(model_opt, max_slack_mw: float, slack_q_max_mvar: float | None
         model_opt.Pg_new[g].unfix()
         model_opt.Qg_new[g].unfix()
 
+    capacity = getattr(model_opt, "_ext_capacity", {})
     for e in model_opt.Ext:
         # `setlb`/`setub` mutate the bounds on the existing Var; safer
         # than `.fix()` because it lets the optimizer find any value
         # within the new envelope rather than nailing it to a single
         # number.
+        (p_lo, p_hi), (q_lo, q_hi) = capacity.get(e, ((-bound, bound), (-q_bound, q_bound)))
         model_opt.Pext[e].unfix()
         model_opt.Qext[e].unfix()
-        model_opt.Pext[e].setlb(-bound)
-        model_opt.Pext[e].setub(bound)
-        model_opt.Qext[e].setlb(-q_bound)
-        model_opt.Qext[e].setub(q_bound)
+        model_opt.Pext[e].setlb(max(-bound, p_lo))
+        model_opt.Pext[e].setub(min(bound, p_hi))
+        model_opt.Qext[e].setlb(max(-q_bound, q_lo))
+        model_opt.Qext[e].setub(min(q_bound, q_hi))
 
     # Re-apply any fixed setpoints so pinned generators/slack stay at
     # their user-specified values during the constrained re-solve.
@@ -502,6 +534,43 @@ def _cap_exchange(model_opt, max_slack_mw: float, slack_q_max_mvar: float | None
                 model_opt.Pg_new[_name].fix(float(_mw))
             elif _name in model_opt.Ext:
                 model_opt.Pext[_name].fix(float(_mw))
+
+
+def _exchange_of(model) -> dict:
+    """{connection: (MW, Mvar)} at the model's current solution."""
+    return {str(e): (float(value(model.Pext[e])), float(value(model.Qext[e]))) for e in model.Ext}
+
+
+def _exchange_cap_diagnosis(uncapped: dict, capped_model, when: str = "") -> dict:
+    """Why a dispatch that exists without the exchange cap fails with it.
+
+    `uncapped`: the exchange the solve without the cap found (`_exchange_of`);
+    `capped_model`: the model with the cap applied, whose bounds are the
+    limits it failed against. A failed capped solve whose uncapped dispatch
+    already fits is a numerical failure, and is called one.
+    """
+    over, needed = [], []
+    for e, (p, q) in uncapped.items():
+        var_p, var_q = capped_model.Pext[e], capped_model.Qext[e]
+        p_lim, q_lim = (var_p.lb, var_p.ub), (var_q.lb, var_q.ub)
+        p_out = (p_lim[0] is not None and p < p_lim[0] - 1e-3) or (p_lim[1] is not None and p > p_lim[1] + 1e-3)
+        q_out = (q_lim[0] is not None and q < q_lim[0] - 1e-3) or (q_lim[1] is not None and q > q_lim[1] + 1e-3)
+        needed.append({"name": e, "p_mw": round(p, 2), "q_mvar": round(q, 2),
+                       "p_limits_mw": [None if x is None else round(float(x), 2) for x in p_lim],
+                       "q_limits_mvar": [None if x is None else round(float(x), 2) for x in q_lim]})
+        if p_out or q_out:
+            parts = ([f"{'import' if p >= 0 else 'export'} {abs(p):.1f} MW (limit {max(abs(p_lim[0] or 0), abs(p_lim[1] or 0)):.0f} MW)"]
+                     if p_out else []) + ([f"{q:.1f} Mvar (limit {max(abs(q_lim[0] or 0), abs(q_lim[1] or 0)):.0f} Mvar)"]
+                                         if q_out else [])
+            over.append(f"{e} would " + " and ".join(parts))
+    if over:
+        explanation = (f"No dispatch{when} keeps the external-grid exchange within its limit: without that "
+                       f"limit, {'; '.join(over)}.")
+    else:
+        explanation = (f"The solve{when} under the external-grid exchange limit failed, although the dispatch "
+                       "without it stays within that limit: a numerical failure of the solver, not a physical limit.")
+    return {"binding_limit": "exchange_limit" if over else "solver_failure",
+            "explanation": explanation, "exchange_needed": needed}
 
 
 # ``/api/time/advance`` which bumps ``current_index``. is the only write API point
@@ -533,6 +602,7 @@ app_data = {
     "grid_profile": {},   # metadata exposed via GET /api/grid_constants
     "last_dispatch_result": [],
     "last_dispatch_timestamp": None,
+    "last_dispatch_context": None,
     "default_vm_lower": 0.95,  # network-specific defaults, overwritten at load time
     "default_vm_upper": 1.05,
     # Network proposals (sandbox): {id -> {"id", "edits", "hash", ...}} and
@@ -1158,28 +1228,39 @@ def _dispatch_rows_from_overrides(dispatch_overrides):
     return rows
 
 
-def _voltage_unit_as_injection(net, requested: str) -> str | None:
+def _voltage_unit_as_injection(net, requested: str) -> tuple[str, tuple[float, float] | None] | None:
     """If `requested` names a voltage-controlled unit (net.gen) and no static
     generator, replace it in `net` (solved) by a static generator injecting
-    what it injects now; returns a note saying so, else None."""
+    what it injects now. Returns (a note saying so, the unit's own reactive
+    limits (min, max) Mvar when it has them), else None.
+
+    By any name the unit answers to (`resolve.find_unit`) — observed live:
+    'Bus_7' matched nothing, and the envelope of the demo's units failed for
+    want of static generators."""
     if net.gen.empty or not str(requested or "").strip():
         return None
-    want = str(requested).strip().casefold()
-    sgen_names = set(net.sgen["name"].astype(str).str.casefold()) if len(net.sgen) else set()
-    if want in sgen_names:
+    try:
+        rv.find_unit(net, requested, ("sgen",))
+        return None                                   # a static generator: swept as it is
+    except rv.ResolveError:
+        pass
+    try:
+        found = rv.find_unit(net, requested, ("gen",))
+    except rv.ResolveError:
         return None
-    for idx, row in net.gen.iterrows():
-        name = str(row.get("name") or "").strip() or f"Gen_bus{int(row['bus'])}"
-        if want not in (name.casefold(), f"gen_bus{int(row['bus'])}"):
-            continue
-        p, q = float(net.res_gen.at[idx, "p_mw"]), float(net.res_gen.at[idx, "q_mvar"])
-        pp.create_sgen(net, bus=int(row["bus"]), p_mw=p, q_mvar=q, name=name,
-                       max_p_mw=row.get("max_p_mw"), min_p_mw=row.get("min_p_mw"), controllable=True)
-        net.gen.drop(index=idx, inplace=True)
-        pp.runpp(net, algorithm="nr", numba=False)
-        return (f"{name} holds a voltage set-point in operation; for this envelope it is an injection of "
-                f"active and reactive power, from where it runs now ({p:.2f} MW, {q:.2f} Mvar).")
-    return None
+    idx, row = found.idx, net.gen.loc[found.idx]
+    name = found.label
+    p, q = float(net.res_gen.at[idx, "p_mw"]), float(net.res_gen.at[idx, "q_mvar"])
+    q_lo, q_hi = (pd.to_numeric(row.get(k), errors="coerce") for k in ("min_q_mvar", "max_q_mvar"))
+    limits = (float(q_lo), float(q_hi)) if pd.notna(q_lo) and pd.notna(q_hi) and q_lo < q_hi else None
+    pp.create_sgen(net, bus=int(row["bus"]), p_mw=p, q_mvar=q, name=name,
+                   max_p_mw=row.get("max_p_mw"), min_p_mw=row.get("min_p_mw"), controllable=True)
+    net.gen.drop(index=idx, inplace=True)
+    pp.runpp(net, algorithm="nr", numba=False)
+    note = (f"{name} holds a voltage set-point in operation; for this envelope it is an injection of "
+            f"active and reactive power, from where it runs now ({p:.2f} MW, {q:.2f} Mvar)"
+            + (f", within its own reactive limits ({limits[0]:g} to {limits[1]:g} Mvar)." if limits else "."))
+    return note, limits
 
 
 def _apply_dispatch_to_net(net, dispatch_rows):
@@ -1300,7 +1381,6 @@ class AdvanceTimeRequest(BaseModel):
 # Generic limits, used only when no network is loaded to supply its own.
 _STATIC_VM_LOWER = 0.95
 _STATIC_VM_UPPER = 1.05
-_STATIC_MAX_LOADING = 90.0
 
 
 def _network_limits() -> dict[str, float]:
@@ -1374,6 +1454,22 @@ class _NetworkLimitsMixin(BaseModel):
     def _fill_unset_limits(self):
         _fill_network_limits(self)
         return self
+
+    @field_validator("pg_max_overrides", "pg_min_overrides", check_fields=False)
+    @classmethod
+    def _capacities_not_negative(cls, value):
+        return _non_negative_capacities(value)
+
+
+def _non_negative_capacities(value: dict | None) -> dict | None:
+    """A unit's output range is in [0, capacity]: a negative minimum is not
+    curtailment (a minimum of 0 already allows that) but a unit drawing power,
+    and the power-factor cone then admits the mirrored reactive range. The
+    agent's validator refuses it too."""
+    bad = {k: v for k, v in (value or {}).items() if v is not None and float(v) < 0}
+    if bad:
+        raise ValueError(f"unit output limits cannot be negative: {bad}. Use 0 to let a unit be turned down fully.")
+    return value
 
 
 class _TimeseriesRequest(_NetworkLimitsMixin):
@@ -1496,6 +1592,9 @@ class ContingencyOptimizeRequest(_TimeseriesRequest):
     Same fields as :class:`ContingencyRequest` but this endpoint additionally
     runs topological surgery + Pyomo to fix the resulting violations.
     """
+    # False: a check re-running this study under another reading (the agent's
+    # reading check) — nothing is kept: no option set, no "last dispatch".
+    remember: bool = True
     element_type: str
     element_index: int
     load_scaling_factor: float = 1.0
@@ -1527,8 +1626,9 @@ class FlexibilityRequest(_TimeseriesRequest):
     load_scaling_factor : float
         Load multiplier. Defaults to 1.0 (actual current load).
     disabled_generators : list[str]
-        Substation names to remove from the sgen table before solving.
-        The UI currently forwards at most one entry.
+        Units taken offline before solving (static generators and
+        voltage-controlled units, by the names results use); an unknown
+        name is refused. The UI currently forwards at most one entry.
     slack_max_mw : float
         Maximum bidirectional capacity (MW) of the external-grid
         interface. Same semantics and clamp as :class:`KPIRequest`.
@@ -1546,9 +1646,13 @@ class FlexibilityRequest(_TimeseriesRequest):
         Per-substation active power upper bound overrides (MW). Keys are substation names.
         Merged on top of the hardcoded Pg_max_data defaults inside the OPF engine.
     pg_min_overrides : dict[str, float]
-        Per-substation active power lower bound overrides (MW). Negative = allow curtailment.
-        Use positive values for must-run constraints.
+        Per-unit active power lower bound overrides (MW), for must-run
+        constraints. Not negative (refused): every unit's minimum is 0 MW
+        already, so it can be turned down fully.
     """
+    # False: a check re-running this study under another reading (the agent's
+    # reading check) — nothing is kept: no option set, no "last dispatch".
+    remember: bool = True
     load_scaling_factor: float = 1.0
     disabled_generators: list[str] = []
     slack_max_mw: float | None = None
@@ -1572,9 +1676,11 @@ class FlexibilityRequest(_TimeseriesRequest):
     # to avoid violations on chosen branches, or to keep headroom on one that
     # overloads after outages. Replaces the safety margin on those branches.
     branch_limits: dict[str, float] = {}
-    # With options: instead of the named strategies, the cheapest option and
-    # near-optimal alternatives (Hop-Skip-Jump), each within `near_optimal_pct`
-    # of its cost and changing other units.
+    # With options: instead of the named strategies, the cheapest option and up
+    # to `near_optimal_count` near-optimal alternatives, each within
+    # `near_optimal_pct` of its cost, found by `near_optimal_methods`
+    # (Hop-Skip-Jump, unit ranges, other objectives, random directions) and
+    # picked farthest-first (flex_options.generate_near_optimal).
     near_optimal: bool = False
     near_optimal_pct: float = Field(default=10.0, gt=0, le=100)
     # An N-1 security study (scopf.py): the dispatch that stays within limits
@@ -1623,6 +1729,11 @@ class _KPIStudy(BaseModel):
     option: str | None = None
     # Also the cost of N-1 security: a security-constrained OPF at each moment (slower).
     n1: Literal["preventive", "corrective", "both"] | None = None
+
+    @field_validator("pg_max_overrides", "pg_min_overrides")
+    @classmethod
+    def _capacities_not_negative(cls, value):
+        return _non_negative_capacities(value)
 
 
 class KPIRequest(_KPIStudy, _TimeseriesRequest):
@@ -1689,9 +1800,10 @@ class ScanScenariosRequest(_TimeseriesRequest):
     ----------
     sgen_scales : list[float]
         Renewable output scaling factors to compare. Default is
-        ``[0.7, 1.0, 1.3]`` (P10 / P50 / P90 proxy). Each value
-        multiplies all sgen ``p_mw`` and ``q_mvar`` columns before
-        ``pp.runpp`` is called. 1.0 = measured nominal output.
+        ``[0.7, 1.0, 1.3]``: low, as measured, high — fixed multipliers, not
+        percentiles of any distribution. Each value multiplies all sgen
+        ``p_mw`` and ``q_mvar`` columns (each unit keeps its power factor)
+        before ``pp.runpp`` is called. 1.0 = measured output.
     start_timestamp / end_timestamp : str | None
         ISO prefix for time window endpoints. Prefix matching supported.
     n_steps : int | None
@@ -1749,15 +1861,18 @@ class ProbabilisticRSARequest(_TimeseriesRequest):
 class HistoricalRiskRequest(_TimeseriesRequest):
     """Request body for ``POST /api/rsa/historical_risk``.
 
-    First implementation slice focuses on empirical exceedance / near-miss
-    statistics over a historical window, with conditional bins deferred.
+    Empirical exceedance / near-miss statistics over a historical window,
+    with optional conditional bins (`condition`, `n_bins`). A near miss is
+    within `near_miss_band` (p.u.) of a voltage limit or `near_miss_band_pct`
+    (percentage points) of a loading limit.
     """
     target: str = "all"
     window_start: str | None = None
     window_end: str | None = None
     condition: str | None = None
     n_bins: int = 4
-    near_miss_band: float = 0.005
+    near_miss_band: float = 0.005          # p.u., buses
+    near_miss_band_pct: float = Field(default=5.0, ge=0, le=100)   # percentage points, lines and trafos
     worst_n: int = 5
     load_scaling_factor: float = 1.0
     vm_upper_pu: float = 1.05
@@ -1783,14 +1898,15 @@ class FlexibilityEnvelopeRequest(_TimeseriesRequest):
     p_min_mw / p_max_mw : float | None
         Active power sweep range. Defaults to ``[0.0, PG_MAX_DATA[gen_name]]``.
     q_min_mvar / q_max_mvar : float | None
-        Reactive power sweep range. Defaults to ``±Pmax × tan(acos(0.9))``.
+        Reactive power sweep range. Defaults to ``±max(P_base × tan(acos(0.9)), 0.3)``
+        (the PF 0.9 capability at the unit's present output).
     resolution : int
-        Grid resolution: ``resolution × resolution`` power-flow runs. Default 10.
+        Grid resolution: ``resolution × resolution`` power-flow runs. Default 20.
         Capped at 25 to keep response time under ~10 s with parallel execution.
     vm_upper_pu / vm_lower_pu : float
-        Voltage violation thresholds. Default 1.05 / 0.95.
+        Voltage violation thresholds. Unset: the network's own limits.
     max_line_loading_pct / max_trafo_loading_pct : float
-        Thermal overload thresholds. Default 100.0.
+        Thermal overload thresholds. Unset: the network's own limits.
     load_scaling_factor : float
         Load stress multiplier applied before the sweep. Default 1.0.
     """
@@ -2164,7 +2280,8 @@ def _validate_uploaded_admittance(db_full: dict, net) -> None:
       built for a different/larger network);
     - every in-service branch of the active network (lines + trafos) must have
       an admittance entry, otherwise the OPF crashes later with an opaque
-      ``KeyError`` on the first request that touches the uncovered branch.
+      ``KeyError`` on the first request that touches the uncovered branch —
+      in both directions and in all four tables, at the tap the OPF reads.
     """
     yff_keys = db_full.get("Yff_r", {}).keys()
     covered_pairs = {pair for (pair, _tap) in yff_keys}
@@ -2183,7 +2300,29 @@ def _validate_uploaded_admittance(db_full: dict, net) -> None:
         if p not in covered_pairs and (p[1], p[0]) not in covered_pairs
     )
 
+    # The entries the optimisation reads, exactly: both directions of every
+    # in-service branch, at tap 1 for a line and the neutral tap for a
+    # transformer, in each of the four tables. A file with one direction (or
+    # one table short) passed the pair check and failed later with a KeyError.
+    unread = []
+    if not missing_pairs:
+        try:
+            to_trafo = db_full.get("branch_to_trafo") or {}
+            for (i, j) in fe._branch_current_data(net):
+                key = ((i, j), fe._neutral_tap(net, to_trafo[(i, j)]) if (i, j) in to_trafo else 1)
+                if any(key not in db_full.get(table, {}) for table in ("Yff_r", "Yff_i", "Yft_r", "Yft_i")):
+                    unread.append(key)
+        except Exception:  # noqa: BLE001 — the pair check above still stands
+            unread = []
+
     problems = []
+    if unread:
+        shown = ", ".join(f"{i}→{j} (tap {t})" for (i, j), t in unread[:10])
+        problems.append(
+            f"CSV lacks {len(unread)} admittance entr{'y' if len(unread) == 1 else 'ies'} the optimisation reads "
+            f"(each branch in both directions, in all four tables Yff/Yft real/imaginary): {shown}"
+            + (" …" if len(unread) > 10 else "")
+        )
     if unknown_buses:
         shown = ", ".join(map(str, unknown_buses[:10]))
         problems.append(
@@ -2374,6 +2513,7 @@ def _prepare_runtime_reload() -> None:
     app_data["measurements_source"] = "synthetic"
     app_data["last_dispatch_result"] = []
     app_data["last_dispatch_timestamp"] = None
+    app_data["last_dispatch_context"] = None
     app_data["nominal"] = None
     app_data["load_power_factor"] = None
     app_data["generator_model"] = {}
@@ -2437,6 +2577,7 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
         net, created_names, kept_condensers = nl.gen_to_sgen(net)
         if created_names or kept_condensers:
             print(f"[lifespan] gen→sgen: created={created_names}, kept={kept_condensers}")
+    nl.keep_own_units(net)
 
     try:
         pp.runpp(net, algorithm="nr", calculate_voltage_angles=True)
@@ -2821,6 +2962,39 @@ _tick_report = threading.local()
 # The load power factor of the study running in this thread, and whether a
 # tick used it (studies run one at a time, under _STATE_LOCK).
 _study = threading.local()
+_STUDY_MERGE = threading.Lock()
+
+
+def _in_this_study(fn):
+    """`fn` for a worker thread of the study running in this thread.
+
+    `_study` and `_tick_report` are per thread: a worker of a thread pool
+    started without them, so its ticks took the session's load power factor
+    instead of the study's own, and the result said neither which one nor what
+    a proposal's elements injected. The worker now starts with the study's
+    setting and hands back what its ticks used.
+    """
+    study, report = _study.__dict__, _tick_report.__dict__    # this thread's own
+
+    def run(*args, **kwargs):
+        _study.load_pf, _study.pf_used, _study.q_share = study.get("load_pf"), False, None
+        _tick_report.first = None
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            with _STUDY_MERGE:
+                if getattr(_study, "pf_used", False):
+                    study["pf_used"] = True
+                    share = getattr(_study, "q_share", None)
+                    if share:
+                        seen = study.get("q_share") or share
+                        study["q_share"] = (min(seen[0], share[0]), max(seen[1], share[1]))
+                first = getattr(_tick_report, "first", None)
+                if first and report.get("first", "unset") is None:
+                    report["first"] = first
+            _study.load_pf = None
+
+    return run
 
 
 def _echo_power_factor(result):
@@ -2891,12 +3065,17 @@ def _off_event_loop(endpoint):
                 _study.load_pf = getattr(request, "load_power_factor", None)
                 _study.pf_used = False
                 _study.q_share = None
+                _study.tick_resolved = []
                 try:
                     result = asyncio.run(endpoint(*args, **kwargs))
+                    if _study.tick_resolved and isinstance(result, dict):
+                        # A day or an hour asked for as one moment: which moment was used.
+                        result.setdefault("timestamp_resolved", _study.tick_resolved)
                     return _echo_power_factor(_echo_network(result, args, kwargs))
                 finally:
                     _holds_state.active = False
                     _study.load_pf = None
+                    _study.tick_resolved = None
 
         return await anyio.to_thread.run_sync(locked)
 
@@ -2929,6 +3108,32 @@ async def health():
         "network_loaded": app_data.get("net") is not None,
         "ipopt_available": app_data.get("ipopt_available"),
     }
+
+
+@app.get("/api/network/resolve")
+@_off_event_loop
+async def resolve_name(name: str, network: str | None = None, kinds: str = "bus,line,trafo"):
+    """The bus, line, transformer or unit a name means (`resolve.find` /
+    `find_unit`) — the one lookup every study uses, for a caller that has only
+    a name: {element_type, index, name, how}. Nothing found is 404 with the
+    closest names; an ambiguity, or a name that is not an element (the
+    external grid), is 400 saying which or what it is."""
+    import types
+    net = _net_for(types.SimpleNamespace(network=network))
+    wanted = tuple(k.strip() for k in kinds.split(",") if k.strip())
+    branchy = tuple(k for k in wanted if k in rv.KINDS)
+    units = tuple(k for k in wanted if k in rv.UNIT_TABLES)
+    try:
+        found = rv.find(net, name, branchy) if branchy else rv.find_unit(net, name, units)
+    except rv.ResolveError as exc:
+        if exc.reason == "not_found" and branchy and units:
+            try:
+                found = rv.find_unit(net, name, units)
+            except rv.ResolveError:
+                raise _resolution_http(exc) from None
+        else:
+            raise _resolution_http(exc) from None
+    return {"element_type": found.etype, "index": found.idx, "name": found.label, "how": found.how}
 
 
 @app.get("/api/network/topology")
@@ -3018,6 +3223,7 @@ async def network_topology(network: str | None = None):
             "generators": int(len(net.sgen)) + int(len(net.gen)),
         },
         "voltage_levels": sorted({b["vn_kv"] for b in buses}, reverse=True),
+        **({"voltage_note": sb.PLACEHOLDER_KV_NOTE} if sb.placeholder_voltages(net) else {}),
     }
 
 
@@ -3073,6 +3279,11 @@ async def get_grid_constants_endpoint():
         "n_lines": len(net.line),
         "n_trafos": len(net.trafo),
         "substation_names": subs,
+        # The units, named as the optimisation and every result name them: the
+        # keys of `pg_max_overrides`, `fixed_setpoints` and the like (on a
+        # network of voltage-controlled units these are not substation names).
+        "unit_names": [gm.unit_name(net, t, i) for t in ("sgen", "gen") for i in net[t].index
+                       if not lg._proposed_mask(net[t]).loc[i]],
         # The network as loaded: the same after the operator renames elements
         # (the agent keys its conversation on it, and must not reset on a rename).
         "network_id": app_data.get("loaded_fingerprint"),
@@ -3992,13 +4203,14 @@ async def upload_network(
     convert_gen_to_sgen: bool = Form(True),
     tap_policy: str = Form("current"),
 ):
-    """Replace the in-memory pandapower network with a user-supplied MATPOWER .m file.
+    """Replace the in-memory pandapower network with an uploaded one.
 
-    Converts the file with ``pandapower.converter.from_mpc``, runs a base-case
-    power flow to initialise the operating point, and builds a minimal
-    single-timestamp synthetic measurement series from the network's base-case
-    load/generation so that subsequent calls to ``/api/grid/rsa`` (power-flow
-    only) and the LLM network-info tools work immediately.
+    Accepts MATPOWER (.m), pandapower JSON or Excel and UCTE (.uct) files,
+    runs a base-case power flow to initialise the operating point, and
+    generates a synthetic 7-day, 15-minute measurement and forecast series
+    from the network's base-case load and generation, so every study works
+    immediately. A network that brings its own units keeps them at every tick
+    (`network_loader.keep_own_units`).
 
     The admittance database (``db_full``) is rebuilt from the uploaded network;
     contingency optimisation needs no per-outage database (the outaged branch
@@ -4061,6 +4273,7 @@ async def upload_network(
 
     # Optionally convert net.gen (PV-bus) → net.sgen for OPF/flexibility tools.
     gen_conversion_note = ""
+    nl.keep_own_units(net)
     if convert_gen_to_sgen and len(net.gen) > 0:
         net, created_names, kept_condensers = nl.gen_to_sgen(net)
         if created_names or kept_condensers:
@@ -4558,10 +4771,26 @@ def _sgen_names(net) -> pd.Series:
     return pd.Series({idx: _name(idx) for idx in net.sgen.index}, dtype=object)
 
 
-def _drop_disabled_sgens(net, disabled: list) -> None:
-    """Remove the named static generators from `net` (in place)."""
-    keep = ~_sgen_names(net).isin(disabled)
-    net.sgen = net.sgen[keep.reindex(net.sgen.index).fillna(True).values].reset_index(drop=True)
+def _drop_disabled_units(net, disabled: list) -> None:
+    """Take the named units out of `net` (in place), by the names results use.
+
+    Static generators and voltage-controlled units (`gen`) alike: a `gen`
+    named here used to stay in the OPF. An unknown name is refused, as
+    `hold_units` refuses one, instead of being ignored. Indices are kept, so
+    an unnamed unit (`sgen_4`) keeps its name after another is dropped.
+    """
+    wanted = {str(n).strip().casefold() for n in disabled}
+    names = {"sgen": _sgen_names(net),
+             "gen": pd.Series({idx: gm.unit_name(net, "gen", idx) for idx in net.gen.index}, dtype=object)}
+    known = {n.casefold() for series in names.values() for n in series}
+    unknown = sorted(n for n in disabled if str(n).strip().casefold() not in known)
+    if unknown:
+        raise HTTPException(status_code=400, detail=(
+            f"disabled_generators: there is no unit {', '.join(map(repr, unknown))}. Units: "
+            f"{', '.join(sorted(n for series in names.values() for n in series))}."))
+    for table, series in names.items():
+        drop = [idx for idx, name in series.items() if name.casefold() in wanted]
+        net[table] = net[table].drop(index=drop)
 
 
 def _branch_labeller(net):
@@ -4592,8 +4821,9 @@ def _with_last_resort(failed: dict, request, ts: str, model, net, net_base, held
         if cap is not None:
             _cap_exchange(model, cap, getattr(request, "slack_q_max_mvar", None), fixed)
         rescue = _flexibility_options(request, ts, model, net, net_base, cap if cap is not None else float(
-            app_data.get("slack_max_mw", 999.0)), held, outage=outage, caps_shown=caps_shown,
-            last_resort={"why": failed.get("message"), "restart": fe._restart})
+            _physical_exchange_cap()), held, outage=outage, caps_shown=caps_shown,
+            last_resort={"why": failed.get("message"), "restart": fe._restart,
+                         "proved": (failed.get("no_dispatch_check") or {}).get("verdict") == rx.NO_DISPATCH})
         switching = _switching_remedies(net, None, request.opf_vm_lower, request.opf_vm_upper,
                                         _network_limits()["max_line_loading_pct"])
     except Exception:  # noqa: BLE001 — the failure is still the answer
@@ -4604,8 +4834,45 @@ def _with_last_resort(failed: dict, request, ts: str, model, net, net_base, held
     if getattr(request, "options", False) and rescue.get("status") == "options":
         return {**rescue, "redispatch_alone": {**rescue.get("redispatch_alone", {}), "status": failed.get("status"),
                                                **({"diagnosis": failed["infeasibility_diagnosis"]}
-                                                  if failed.get("infeasibility_diagnosis") else {})}}
+                                                  if failed.get("infeasibility_diagnosis") else {}),
+                                               **({"no_dispatch_check": failed["no_dispatch_check"]}
+                                                  if failed.get("no_dispatch_check") else {})}}
     failed["last_resort"] = {k: v for k, v in rescue.items() if k not in ("timestamp", "mode")}
+    return failed
+
+
+# The OPF returns no result when IPOPT itself raised (Fold 2): not a verdict
+# on the grid. It used to surface as a bare 500 with no reason.
+_SOLVER_RAISED = ("The optimisation solver (IPOPT) stopped with an error before returning any result, so "
+                  "nothing is known about whether a dispatch exists; the backend log has the solver's message.")
+
+
+# A dispatch IPOPT found only when restarted from the relaxation's solution.
+_FOUND_BY_RELAXATION = ("IPOPT found no dispatch from the power flow; restarted from the solution of the convex "
+                        "relaxation (relaxation.second_look), it found this one.")
+
+
+def _second_look(model) -> dict:
+    """`relaxation.second_look`, never fatal: a failed check leaves the
+    failure as it was ("not proven")."""
+    if model is None:
+        return {"verdict": rx.NOT_PROVEN, "relaxation": None, "why": "no model", "model": None}
+    try:
+        return rx.second_look(model)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Relaxation check failed.", exc_info=True)
+        return {"verdict": rx.NOT_PROVEN, "relaxation": None, "why": f"the check failed ({str(exc)[:120]})",
+                "model": None}
+
+
+def _with_proof(failed: dict, look: dict, scope: str = "") -> dict:
+    """A failed result with what the relaxation proved (or not); a proof
+    leads the message."""
+    block = rx.proof_block(look, scope)
+    failed["no_dispatch_check"] = block
+    if block["verdict"] == rx.NO_DISPATCH:
+        rest = failed.get("message", "")
+        failed["message"] = block["meaning"] + " " + rest[:1].upper() + rest[1:]
     return failed
 
 
@@ -4672,6 +4939,13 @@ def _thresholds_used(request) -> dict[str, float]:
         "max_line_loading_pct": request.max_line_loading_pct,
         "max_trafo_loading_pct": request.max_trafo_loading_pct,
     }
+
+
+# A value at its limit is judged with the RSA's own tolerance everywhere
+# (rsa_engine.FLOAT_TOL, p.u. and %): a loading of 100.0000001 % is rounding,
+# not a violation. The scans compared strictly, so one state could have a
+# violation in a scan and none in the RSA.
+_LIMIT_TOL = rs.FLOAT_TOL
 
 
 def _effective_thresholds(request) -> tuple[float, float, float, float]:
@@ -4838,12 +5112,22 @@ def _run_rsa_snapshot(timestamp: str, request: GridRequest, applied: tuple | Non
     in_service = net_calculated.sgen["in_service"].astype(bool).reindex(df_sgen["index"]).values
     df_sgen = df_sgen[in_service]
 
+    # Voltage-controlled units (`gen`) too: the default IEEE 30 has all five
+    # there, and its assessment used to list only the external grid and
+    # report 0 MW available.
+    df_gen = net_calculated.res_gen.reset_index()
+    df_gen["gen_name"] = [gm.unit_name(net_calculated, "gen", int(i)) for i in df_gen["index"]]
+    df_gen = df_gen[net_calculated.gen["in_service"].astype(bool).reindex(df_gen["index"]).values]
+    units = pd.concat([df_sgen[["gen_name", "p_mw", "q_mvar"]], df_gen[["gen_name", "p_mw", "q_mvar"]]],
+                      ignore_index=True)
+
     total_available_flex_mw = sum(
-        max(0, pg_max.get(row["gen_name"], row["p_mw"]) - row["p_mw"]) for _, row in df_sgen.iterrows())
+        max(0, pg_max.get(row["gen_name"], row["p_mw"]) - row["p_mw"]) for _, row in units.iterrows()
+        if pd.notna(row["p_mw"]))
 
     gen_dispatch = [
         {"name": row["gen_name"], "Pg_mw": _safe_float(row["p_mw"]), "Qg_mvar": _safe_float(row["q_mvar"])}
-        for _, row in df_sgen.iterrows()
+        for _, row in units.iterrows()
     ]
     total_load_mw = _safe_float(net_calculated.res_load["p_mw"].sum()) if not net_calculated.res_load.empty else 0.0
     slack_import_mw = None
@@ -4935,11 +5219,47 @@ def _resolve_tick(data_source: str = "measurements", requested_ts: str | None = 
                        "data_source='nominal', or use 'measurements' / 'forecasts' for a moment.")
         return nom.NOMINAL
     if requested_ts is not None and str(requested_ts).strip():
-        return _resolve_window_timestamp(requested_ts, "timestamp", timestamps=timestamps)
+        try:
+            return _resolve_window_timestamp(requested_ts, "timestamp", timestamps=timestamps)
+        except HTTPException as exc:
+            first = _first_moment_of(str(requested_ts), timestamps) if exc.status_code == 400 else None
+            if first is None:
+                raise
+            return first
     idx = app_data["current_index"] if label == "measurements" else 0
     if not timestamps:
         raise HTTPException(status_code=500, detail=f"No {label} timestamps loaded.")
     return timestamps[min(idx, len(timestamps) - 1)]
+
+
+# A day ("2000-01-06") or an hour ("2000-01-06 20") asked for as one moment.
+_PERIOD_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}))?$")
+
+
+def _first_moment_of(requested: str, timestamps: list) -> str | None:
+    """The first moment of a day or an hour asked for as a single moment, and
+    a note saying so in the result (`timestamp_resolved`); None for anything
+    else, which stays ambiguous.
+
+    "At 20:00" came back from the model as "2000-01-06 20", which matches
+    20:00, 20:15, 20:30 and 20:45 and was refused, costing a step every time.
+    20:00 is how an hour is named, and the moment that stands for it (a tick's
+    timestamp starts its interval). Only for studies of one moment: a window's
+    bound keeps its prefix meaning (the whole hour or day).
+    """
+    needle = requested.strip()
+    match = _PERIOD_RE.match(needle)
+    if not match:
+        return None
+    within = sorted(ts for ts in timestamps if str(ts).startswith(needle.replace("T", " ")))
+    if not within:
+        return None
+    period = "hour" if match.group(2) else "day"
+    note = {"asked": needle, "used": within[0], "why": f"the first moment of the {period} asked for"}
+    notes = getattr(_study, "tick_resolved", None)
+    if notes is not None and note not in notes:
+        notes.append(note)
+    return within[0]
 
 
 def _resolve_window_timestamp(requested_ts: str | None, label: str, timestamps: list | None = None) -> str | None:
@@ -4950,6 +5270,7 @@ def _resolve_window_timestamp(requested_ts: str | None, label: str, timestamps: 
         return None
     if timestamps is None:
         timestamps = app_data.get("timestamps", []) or []
+    needle = re.sub(r"^(\d{4}-\d{2}-\d{2})T", r"\1 ", needle)       # ISO "T" written as a space
     exact_match = next((ts for ts in timestamps if ts == needle), None)
     if exact_match is not None:
         return exact_match
@@ -4961,10 +5282,45 @@ def _resolve_window_timestamp(requested_ts: str | None, label: str, timestamps: 
             status_code=400,
             detail=f"{label} '{needle}' is ambiguous; provide a longer timestamp prefix.",
         )
+    snapped = _snap_to_tick(needle, label, timestamps)
+    if snapped is not None:
+        return snapped
+    span = f" The data run from {str(timestamps[0])[:16]} to {str(timestamps[-1])[:16]}." if timestamps else ""
     raise HTTPException(
         status_code=404,
-        detail=f"{label} '{needle}' was not found in the available timestamps.",
+        detail=f"{label} '{needle}' was not found in the available timestamps.{span}",
     )
+
+
+_CLOCK_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?$")
+
+
+def _snap_to_tick(needle: str, label: str, timestamps: list) -> str | None:
+    """A moment between two of the data's (observed live: a window ending at
+    '23:59' on 15-minute data, refused): a start takes the first moment at or
+    after it, anything else the moment at or before it — the one whose interval
+    holds it. Said in the result (`timestamp_resolved`). None outside the data,
+    or for anything that is not a clock time."""
+    if not timestamps or not _CLOCK_RE.match(needle):
+        return None
+    try:
+        at = pd.Timestamp(needle)
+        stamps = [pd.Timestamp(t) for t in timestamps]
+    except (ValueError, TypeError):
+        return None
+    if not stamps[0] <= at <= stamps[-1]:
+        return None
+    if "start" in label:
+        k = next(i for i, t in enumerate(stamps) if t >= at)
+        why = "the first moment in the data at or after it"
+    else:
+        k = max(i for i, t in enumerate(stamps) if t <= at)
+        why = "the moment in the data at or before it"
+    note = {"asked": needle, "used": timestamps[k], "why": why}
+    notes = getattr(_study, "tick_resolved", None)
+    if notes is not None and note not in notes:
+        notes.append(note)
+    return timestamps[k]
 
 
 def _parse_historical_target(target: str) -> tuple[str, str | None]:
@@ -5005,7 +5361,7 @@ def _extract_historical_metric(snapshot: dict, target_kind: str, target_name: st
             upper_margin = vm_pu - request.vm_upper_pu
             lower_margin = request.vm_lower_pu - vm_pu
             severity = max(upper_margin, lower_margin)
-            near_miss = (not severity > 0.0) and (severity >= -abs(request.near_miss_band))
+            near_miss = (not severity > _LIMIT_TOL) and (severity >= -abs(request.near_miss_band))
             return {
                 "timestamp": snapshot.get("timestamp"),
                 "target_label": target_name,
@@ -5013,7 +5369,7 @@ def _extract_historical_metric(snapshot: dict, target_kind: str, target_name: st
                 "value": vm_pu,
                 "limit": 0.0,
                 "severity": float(severity),
-                "is_violation": severity > 0.0,
+                "is_violation": severity > _LIMIT_TOL,
                 "near_miss": near_miss,
             }
         raise HTTPException(status_code=404, detail=f"Bus '{target_name}' was not found in RSA output.")
@@ -5026,7 +5382,7 @@ def _extract_historical_metric(snapshot: dict, target_kind: str, target_name: st
             continue
         loading = _safe_float(row.get("loading_percent"))
         severity = loading - loading_limit
-        near_miss = (severity <= 0.0) and (severity >= -5.0)
+        near_miss = (severity <= _LIMIT_TOL) and (severity >= -abs(request.near_miss_band_pct))
         return {
             "timestamp": snapshot.get("timestamp"),
             "target_label": target_name,
@@ -5034,7 +5390,7 @@ def _extract_historical_metric(snapshot: dict, target_kind: str, target_name: st
             "value": loading,
             "limit": float(loading_limit),
             "severity": float(severity),
-            "is_violation": severity > 0.0,
+            "is_violation": severity > _LIMIT_TOL,
             "near_miss": near_miss,
         }
     entity_name = "Line" if target_kind == "line" else "Transformer"
@@ -5209,8 +5565,9 @@ async def run_security_assessment(request: GridRequest):
 async def compute_historical_risk(request: HistoricalRiskRequest):
     """Empirical risk statistics over a historical window.
 
-    First slice: core exceedance / near-miss stats plus a duration curve over
-    a signed limit-margin metric. Conditional binning is deferred.
+    Exceedance / near-miss statistics, the worst episodes, a duration curve
+    (the signed limit margin of one element; the violation count system-wide)
+    and, with `condition`, statistics per bin of hour, load or generation.
     """
     if not 0.0 <= request.near_miss_band <= 1.0:
         raise HTTPException(status_code=400, detail="near_miss_band must be within [0, 1].")
@@ -5307,7 +5664,7 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
         indexed_rows: list[tuple[int, dict, float | int | None]] = []
         with ThreadPoolExecutor(max_workers=effective_max_workers) as pool:
             future_map = {
-                pool.submit(_snapshot, timestamp): idx
+                pool.submit(_in_this_study(_snapshot), timestamp): idx
                 for idx, timestamp in enumerate(selected_timestamps)
             }
             for future in as_completed(future_map):
@@ -5348,10 +5705,14 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
     if metric_rows:
         worst_timestamp = max(metric_rows, key=lambda row: float(row.get("severity", float("-inf"))))["timestamp"]
 
+    # An episode is a run of consecutive ticks of the window in violation. A
+    # tick with no converged power flow ends it: runs over the converged rows
+    # alone merged two episodes across it, and counted it in their duration.
     episode_rows = []
     active_episode = None
-    for row in metric_rows:
-        if row["is_violation"]:
+    by_timestamp = {row["timestamp"]: row for row in metric_rows}
+    for row in (by_timestamp.get(t) for t in selected_timestamps):
+        if row is not None and row["is_violation"]:
             if active_episode is None:
                 active_episode = {
                     "start": row["timestamp"],
@@ -5359,9 +5720,11 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
                     "peak_severity": float(row["severity"]),
                     "peak_value": float(row["value"]),
                     "limit": float(row["limit"]),
+                    "duration_steps": 1,
                 }
             else:
                 active_episode["end"] = row["timestamp"]
+                active_episode["duration_steps"] += 1
                 if float(row["severity"]) > float(active_episode["peak_severity"]):
                     active_episode["peak_severity"] = float(row["severity"])
                     active_episode["peak_value"] = float(row["value"])
@@ -5371,10 +5734,6 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
             active_episode = None
     if active_episode is not None:
         episode_rows.append(active_episode)
-
-    for episode in episode_rows:
-        duration_steps = timestamps.index(episode["end"]) - timestamps.index(episode["start"]) + 1
-        episode["duration_steps"] = int(duration_steps)
 
     episode_rows.sort(key=lambda row: (float(row["peak_severity"]), int(row["duration_steps"])), reverse=True)
     worst_episodes = episode_rows[: request.worst_n]
@@ -5407,8 +5766,10 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
     if normalized_condition is not None:
         conditional_bins = _build_conditional_bins(metric_rows, condition_rows, normalized_condition, request.n_bins)
 
+    curve_metric = "violation_count" if target_kind == "all" else "signed_limit_margin"
     notes = [
-        "First implementation slice uses a signed limit-margin metric for the duration curve.",
+        "The duration curve sorts " + ("the number of violations per tick." if target_kind == "all" else
+                                       "the signed margin to the limit per tick (positive = beyond it)."),
     ]
     if non_converged:
         notes.append(
@@ -5454,7 +5815,8 @@ async def compute_historical_risk(request: HistoricalRiskRequest):
         "worst_episodes": worst_episodes,
         "duration_curve": duration_curve,
         "duration_curve_limit": 0.0,
-        "duration_curve_metric": "signed_limit_margin",
+        "duration_curve_metric": curve_metric,
+        # True when no tick exceeded the limit: the curve then shows margins only.
         "used_margin_fallback": exceedance_count == 0,
         "execution_mode": "parallel" if use_parallel else "sequential",
         "max_workers_used": effective_max_workers if use_parallel else 1,
@@ -5482,10 +5844,12 @@ async def worst_case_scan(request: WorstCaseRequest):
     Metrics available
     -----------------
     violations   : total count of voltage + thermal limit breaches
-    slack_import : external-grid active-power import (MW)
+    slack_import : total external-grid active-power import (MW)
     max_voltage  : highest bus voltage (p.u.)
-    min_voltage  : lowest bus voltage (p.u.) — worst = most negative
-    max_loading  : highest line loading (%)
+    min_voltage  : lowest bus voltage (p.u.)
+    max_loading  : highest line or transformer loading (%)
+
+    A value at its limit is judged with the RSA's tolerance (`_LIMIT_TOL`).
     """
     # Refused rather than guessed: an unknown metric used to scan for
     # "violations" while echoing the requested name, and n_steps <= 0 became
@@ -5508,7 +5872,7 @@ async def worst_case_scan(request: WorstCaseRequest):
 
     series: dict[str, list] = {
         "timestamps": [], "violation_counts": [], "slack_import_mw": [],
-        "min_voltage": [], "max_voltage": [], "max_line_loading": [],
+        "min_voltage": [], "max_voltage": [], "max_line_loading": [], "max_trafo_loading": [],
     }
 
     def _finite_array(values) -> np.ndarray:
@@ -5538,16 +5902,17 @@ async def worst_case_scan(request: WorstCaseRequest):
         vm = _finite_array(vm_series.loc[active_mask].values)
         line_load = _finite_array(net_copy.res_line.get("loading_percent", pd.Series(dtype=float)).values)
         trafo_load = _finite_array(net_copy.res_trafo.get("loading_percent", pd.Series(dtype=float)).values)
-        slack_mw = _safe_float(net_copy.res_ext_grid.iloc[0].get("p_mw"))
+        # Total import: every external grid, not the first one only.
+        slack_mw = _safe_float(net_copy.res_ext_grid["p_mw"].sum()) if len(net_copy.res_ext_grid) else None
 
         # Skip timestamps that produce unusable metrics (typically islanding/non-converged residue).
         if vm.size == 0:
             non_converged.append(ts)
             continue
 
-        v_viol = int(((vm < vlo) | (vm > vhi)).sum())
-        l_viol = int((line_load > mll).sum()) if line_load.size else 0
-        t_viol = int((trafo_load > mtl).sum()) if trafo_load.size else 0
+        v_viol = int(((vm < vlo - _LIMIT_TOL) | (vm > vhi + _LIMIT_TOL)).sum())
+        l_viol = int((line_load > mll + _LIMIT_TOL).sum()) if line_load.size else 0
+        t_viol = int((trafo_load > mtl + _LIMIT_TOL).sum()) if trafo_load.size else 0
 
         series["timestamps"].append(ts)
         series["violation_counts"].append(v_viol + l_viol + t_viol)
@@ -5555,6 +5920,7 @@ async def worst_case_scan(request: WorstCaseRequest):
         series["min_voltage"].append(_safe_float(vm.min()) if vm.size else None)
         series["max_voltage"].append(_safe_float(vm.max()) if vm.size else None)
         series["max_line_loading"].append(_safe_float(line_load.max(), ndigits=2) if line_load.size else 0.0)
+        series["max_trafo_loading"].append(_safe_float(trafo_load.max(), ndigits=2) if trafo_load.size else 0.0)
 
     if not series["timestamps"]:
         raise HTTPException(status_code=500, detail="No timestamps could be scanned.")
@@ -5572,7 +5938,9 @@ async def worst_case_scan(request: WorstCaseRequest):
         "slack_import": _worst("slack_import_mw"),
         "max_voltage": _worst("max_voltage"),
         "min_voltage": _worst("min_voltage", maximize=False),
-        "max_loading": _worst("max_line_loading"),
+        # Lines and transformers, as the violation count has them.
+        "max_loading": max((_worst("max_line_loading"), _worst("max_trafo_loading")),
+                           key=lambda w: -math.inf if w["value"] is None else w["value"]),
     }
 
     primary = worst_per_metric.get(request.metric, worst_per_metric["violations"])
@@ -5653,23 +6021,25 @@ def _scan_one_scenario(
         tick_lines: list[str] = []
         tick_trafos: list[str] = []
         for bus_idx, row in net_copy.res_bus.iterrows():
-            if row["vm_pu"] > vm_upper_pu or row["vm_pu"] < vm_lower_pu:
+            if row["vm_pu"] > vm_upper_pu + _LIMIT_TOL or row["vm_pu"] < vm_lower_pu - _LIMIT_TOL:
                 viol += 1
                 name = _bus_display_name(net_copy, int(bus_idx))
                 if name not in tick_buses:  # a tick count, once per name
                     bus_viol_counts[name] = bus_viol_counts.get(name, 0) + 1
                 tick_buses.append(name)
         for line_idx, row in net_copy.res_line.iterrows():
-            if row["loading_percent"] > max_line_loading_pct:
+            if row["loading_percent"] > max_line_loading_pct + _LIMIT_TOL:
                 viol += 1
                 name = _line_display_name(net_copy, int(line_idx))
-                line_viol_counts[name] = line_viol_counts.get(name, 0) + 1
+                if name not in tick_lines:  # a tick count, once per name
+                    line_viol_counts[name] = line_viol_counts.get(name, 0) + 1
                 tick_lines.append(name)
         for trafo_idx, row in net_copy.res_trafo.iterrows():
-            if row["loading_percent"] > max_trafo_loading_pct:
+            if row["loading_percent"] > max_trafo_loading_pct + _LIMIT_TOL:
                 viol += 1
                 name = _trafo_display_name(net_copy, int(trafo_idx))
-                trafo_viol_counts[name] = trafo_viol_counts.get(name, 0) + 1
+                if name not in tick_trafos:  # a tick count, once per name
+                    trafo_viol_counts[name] = trafo_viol_counts.get(name, 0) + 1
                 tick_trafos.append(name)
 
         if tick_buses or tick_lines or tick_trafos:
@@ -5775,7 +6145,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(
-                _scan_one_scenario,
+                _in_this_study(_scan_one_scenario),
                 scale, indices, all_timestamps,
                 _net_for(request), scenario_measurements, substations,
                 request.load_scaling_factor,
@@ -5854,16 +6224,16 @@ def _run_probabilistic_sample(
             excluded_buses.append(name)
             continue
         bus_vm[name] = round(vm, 5)
-        if vm > vm_upper_pu or vm < vm_lower_pu:
+        if vm > vm_upper_pu + _LIMIT_TOL or vm < vm_lower_pu - _LIMIT_TOL:
             viol_buses.append(name)
 
     for line_idx, row in net_copy.res_line.iterrows():
-        if row["loading_percent"] > max_line_loading_pct:
+        if row["loading_percent"] > max_line_loading_pct + _LIMIT_TOL:
             name = _line_display_name(net_copy, int(line_idx))
             viol_lines.append(name)
 
     for trafo_idx, row in net_copy.res_trafo.iterrows():
-        if row["loading_percent"] > max_trafo_loading_pct:
+        if row["loading_percent"] > max_trafo_loading_pct + _LIMIT_TOL:
             viol_trafos.append(_trafo_display_name(net_copy, int(trafo_idx)))
 
     return {
@@ -5907,13 +6277,21 @@ def _run_envelope_point(
     max_trafo_load = float(_net.res_trafo["loading_percent"].max()) if len(_net.res_trafo) > 0 else 0.0
     max_loading = max(max_line_load, max_trafo_load)
 
-    viol_upper   = max_vm > vm_upper
-    viol_lower   = min_vm < vm_lower
+    viol_upper   = max_vm > vm_upper + _LIMIT_TOL
+    viol_lower   = min_vm < vm_lower - _LIMIT_TOL
+    # Which elements: those outside their limits at every point of the sweep
+    # are no matter of this unit's output (`compute_flexibility_envelope`).
+    vm = _net.res_bus["vm_pu"]
+    violated = [f"bus:{int(i)}" for i in vm.index[(vm > vm_upper + _LIMIT_TOL) | (vm < vm_lower - _LIMIT_TOL)]]
+    for etype, limit in (("line", max_line), ("trafo", max_trafo)):
+        res = _net[f"res_{etype}"]
+        if len(res):
+            violated += [f"{etype}:{int(i)}" for i in res.index[res["loading_percent"] > limit + _LIMIT_TOL]]
     # Lines against the line limit and transformers against the transformer
     # limit. Both against the larger of the two let a line at 90 % pass an
     # 80 % line limit whenever transformers were allowed 100 % (review 2.12).
-    line_over  = max_line_load > max_line
-    trafo_over = max_trafo_load > max_trafo
+    line_over  = max_line_load > max_line + _LIMIT_TOL
+    trafo_over = max_trafo_load > max_trafo + _LIMIT_TOL
     viol_thermal = line_over or trafo_over
     feasible = not (viol_upper or viol_lower or viol_thermal)
     thermal = None
@@ -5942,6 +6320,7 @@ def _run_envelope_point(
         "violations": int(viol_upper) + int(viol_lower) + int(viol_thermal),
         "binding_constraint": binding,
         "thermal": thermal,
+        "violated": violated,
     }
 
 
@@ -6067,16 +6446,14 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
             key=lambda x: x[1], reverse=True,
         ))
 
-    # Voltage P5 / P50 / P95 per bus
+    # Voltage P5 / P50 / P95 per bus — the estimator the robust study uses
+    # (linear interpolation). Picked by index with uneven offsets, P50 was the
+    # lower middle value and P5 and P95 were not symmetric.
     voltage_percentiles: dict[str, dict] = {}
     for bname, vm_list in bus_vm_samples.items():
-        vm_s = sorted(vm_list)
-        n_vm = len(vm_s)
-        voltage_percentiles[bname] = {
-            "p5":  round(vm_s[max(0, int(0.05 * n_vm) - 1)], 5),
-            "p50": round(vm_s[max(0, int(0.50 * n_vm) - 1)], 5),
-            "p95": round(vm_s[min(n_vm - 1, int(0.95 * n_vm))], 5),
-        }
+        p5, p50, p95 = np.percentile(vm_list, [5, 50, 95])
+        voltage_percentiles[bname] = {"p5": round(float(p5), 5), "p50": round(float(p50), 5),
+                                      "p95": round(float(p95), 5)}
 
     max_viol = max(total_viol_dist) if total_viol_dist else 0
     viol_histogram = {k: total_viol_dist.count(k) for k in range(max_viol + 1)}
@@ -6099,9 +6476,15 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
         "data_source": _dataset_label(request),
         "n_samples": n,
         "n_converged": n_converged,
+        "n_non_converged": n - n_converged,
         "excluded_buses": excluded_buses,
         "excluded_bus_count": len(excluded_buses),
-        "p_any_violation": round(any_violation_count / n_converged, 4),
+        # A sample whose power flow does not converge counts as a violation
+        # (most often a voltage collapse); dropped, the risk read lower than the
+        # samples showed. The figures below it are over the converged samples,
+        # where elements can be judged.
+        "p_any_violation": round((any_violation_count + n - n_converged) / n, 4),
+        "per_sample_figures_over": f"the {n_converged} converged samples",
         "expected_violations": round(sum(total_viol_dist) / n_converged, 3),
         "bus_violation_probability": _to_prob(bus_viol_counts),
         "line_violation_probability": _to_prob(line_viol_counts),
@@ -6135,6 +6518,10 @@ def _window_index(timestamps: list, prefix: str | None, label: str, source: str,
     prefix = str(prefix).strip().replace("T", " ")
     matched = [i for i, t in enumerate(timestamps) if t.startswith(prefix)]
     if not matched:
+        # A moment between two of the data's: the one that holds it (said in the result).
+        snapped = _snap_to_tick(prefix, "end" if last else "start", timestamps)
+        if snapped is not None:
+            return timestamps.index(snapped)
         span = f"{timestamps[0]} to {timestamps[-1]}" if timestamps else "no data"
         raise HTTPException(
             status_code=404,
@@ -6150,53 +6537,22 @@ _DISPLAY_NAMES = {
 }
 
 
+def _resolution_http(exc: "rv.ResolveError") -> HTTPException:
+    """A failed lookup as an HTTP error: nothing found is 404; an ambiguity, or
+    a name that is not an element (the external grid), is 400 — the message
+    lists the candidates or the closest names, for the caller to correct."""
+    return HTTPException(status_code=404 if exc.reason == "not_found" else 400, detail=str(exc))
+
+
 def _resolve_element(net, etype: str, tbl, name: str) -> tuple[int, str]:
-    """(index, display name) for a bus, line or transformer named by the agent.
-
-    In order: the display name other tools report ("Bus_3",
-    "Bus_1 -> Bus_2 [L2]"), the raw `name` column, an integer index, and only
-    then a substring — and a substring only when it picks out exactly one
-    element. The previous lookup matched substrings of the raw column first, so
-    the names in every other result (raw names are empty on MATPOWER cases)
-    were never found, and "Oscar" silently resolved to "Oscar A".
-    """
-    wanted = str(name).strip()
-    key = wanted.lower()
-    plural = {"bus": "buses", "line": "lines", "trafo": "transformers"}[etype]
-    display = {int(i): str(_DISPLAY_NAMES[etype](net, int(i))) for i in tbl.index}
-    raw = ({int(i): str(v) for i, v in tbl["name"].items() if isinstance(v, str)}
-           if "name" in tbl.columns else {})
-
-    for names in (display, raw):
-        exact = [i for i, n in names.items() if n.strip().lower() == key]
-        if len(exact) == 1:
-            return exact[0], display[exact[0]]
-        if len(exact) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{len(exact)} {plural} are named {wanted!r} (indices "
-                       f"{exact[:10]}); pass the index instead.",
-            )
+    """(index, display name) for a bus, line or transformer named by the agent
+    — by any name it answers to (`resolve.find`): its label, with or without
+    its tag, the tag alone, its ends, its index."""
     try:
-        idx = int(wanted)
-        if idx in display:
-            return idx, display[idx]
-    except ValueError:
-        pass
-    partial = sorted({i for names in (display, raw) for i, n in names.items()
-                      if key and key in n.lower()})
-    if len(partial) == 1:
-        return partial[0], display[partial[0]]
-    if len(partial) > 1:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{wanted!r} matches {len(partial)} {plural}: "
-                   f"{[display[i] for i in partial[:12]]}. Use the full name.",
-        )
-    raise HTTPException(
-        status_code=404,
-        detail=f"No {etype} named {wanted!r}. First names: {list(display.values())[:20]}",
-    )
+        found = rv.find(net, name, (etype,))
+    except rv.ResolveError as exc:
+        raise _resolution_http(exc) from None
+    return found.idx, found.label
 
 
 @app.post("/api/grid/element_timeseries")
@@ -6358,9 +6714,9 @@ def _supply_lost(net, element_type: str, element_index: int) -> dict:
     # with nothing on it is not an outage anyone notices.
     affected_load_mw = 0.0
     if not net.load.empty and "bus" in net.load.columns:
-        affected_load_mw = float(
-            net.load.loc[net.load["bus"].astype(int).isin(unsupplied), "p_mw"].sum()
-        )
+        cut = net.load[net.load["in_service"].astype(bool) & net.load["bus"].astype(int).isin(unsupplied)]
+        scale = cut["scaling"].fillna(1.0) if "scaling" in cut.columns else 1.0
+        affected_load_mw = float((cut["p_mw"] * scale).sum())
 
     return {
         "unsupplied_buses": named,
@@ -6416,15 +6772,19 @@ async def simulate_contingency(request: ContingencyRequest):
         net_copy.trafo.at[request.element_index, "in_service"] = False
 
     try:
+        # The screen's tolerance (solver precision), so one outage reads the same here and in the screen.
         df_results_ca, _ = ca.contingency_assessment_single(
             net_copy, request.element_type, request.element_index, current_ts,
-            vm_lower=request.vm_lower_pu,
-            vm_upper=request.vm_upper_pu,
-            max_line_loading_pct=request.max_line_loading_pct,
-            max_trafo_loading_pct=request.max_trafo_loading_pct,
+            vm_lower=request.vm_lower_pu - _SCREEN_VM_TOL,
+            vm_upper=request.vm_upper_pu + _SCREEN_VM_TOL,
+            max_line_loading_pct=request.max_line_loading_pct + _SCREEN_LOADING_TOL,
+            max_trafo_loading_pct=request.max_trafo_loading_pct + _SCREEN_LOADING_TOL,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+    supply = _supply_lost(net_copy, request.element_type, request.element_index)
+    # Load cut off is not a limit violation, but the outage is not secure.
+    cuts_load = (supply.get("unsupplied_load_mw") or 0.0) > 1e-6
 
     if isinstance(df_results_ca, list): df_results_ca = pd.DataFrame(df_results_ca)
 
@@ -6439,14 +6799,16 @@ async def simulate_contingency(request: ContingencyRequest):
                            "Treat it as insecure.",
                 "data_source": _dataset_label(request),
                 "thresholds_used": _thresholds_used(request),
-                **_supply_lost(net_copy, request.element_type, request.element_index)})
+                **supply})
 
     if df_results_ca.empty:
-        return echoed({"timestamp": current_ts, "system_secure": True, "total_violations": 0,
+        return echoed({"timestamp": current_ts, "system_secure": not cuts_load, "total_violations": 0,
                 "violations": [],
+                **({"message": f"No limit breaks, but the outage cuts off {supply['unsupplied_load_mw']:g} MW of "
+                               "load: not secure."} if cuts_load else {}),
                 "data_source": _dataset_label(request),
                 "thresholds_used": _thresholds_used(request),
-                **_supply_lost(net_copy, request.element_type, request.element_index)})
+                **supply})
 
     element_names = []
     for _, row in df_results_ca.iterrows():
@@ -6470,10 +6832,28 @@ async def simulate_contingency(request: ContingencyRequest):
             "violations": df_results_ca.to_dict(orient="records"),
             "data_source": _dataset_label(request),
             "thresholds_used": _thresholds_used(request),
-            **_supply_lost(net_copy, request.element_type, request.element_index)})
+            **supply})
 
 
 _SCREEN_VM_TOL, _SCREEN_LOADING_TOL = 1e-4, 0.01      # p.u., % — solver precision, not a violation
+
+
+def _load_cut_off(net) -> tuple[list[str], float]:
+    """After a power flow: the in-service buses it left without a voltage — no
+    path to a source — that carry load, and that load (MW). An unsupplied bus
+    has no voltage to violate, so the violation table alone reads such an
+    outage as harmless."""
+    if net.res_bus.empty or net.load.empty:
+        return [], 0.0
+    live = set(net.bus.index[net.bus["in_service"].astype(bool)])
+    dark = live & set(net.res_bus.index[net.res_bus["vm_pu"].isna()])
+    if not dark:
+        return [], 0.0
+    loads = net.load[net.load["in_service"].astype(bool) & net.load["bus"].isin(dark)]
+    scale = loads["scaling"].fillna(1.0) if "scaling" in loads.columns else 1.0
+    per_bus = (loads["p_mw"] * scale).groupby(loads["bus"]).sum()
+    per_bus = per_bus[per_bus > 1e-6]
+    return [_bus_display_name(net, int(b)) for b in per_bus.index], round(float(per_bus.sum()), 4)
 
 
 def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
@@ -6481,18 +6861,25 @@ def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
     """Every single outage of an in-service line or transformer, one power
     flow each, on `net_copy` as prepared (an operating point, maybe a dispatch
     applied, maybe a branch already out). Returns the counts, the violation
-    rows (each with its `outage_cause`), and the outages that did not converge."""
+    rows (each with its `outage_cause`), the outages that did not converge, and
+    the outages that cut load off (`outages_disconnecting_load`: buses and MW) —
+    not limit violations, but not secure either."""
     all_violations: list[dict] = []
     outages_with_violations = 0
     total_tested = 0
     # Outages after which the power flow did not converge, or the assessment
     # failed. They used to count as zero violations — i.e. as secure.
     non_converged_outages: list[str] = []
+    disconnecting: list[dict] = []
+    live_buses = net_copy.bus.index[net_copy.bus["in_service"].astype(bool)]
 
-    for el_type, table in (("line", net_copy.line), ("trafo", net_copy.trafo)):
+    for el_type, table, ends in (("line", net_copy.line, ("from_bus", "to_bus")),
+                                 ("trafo", net_copy.trafo, ("hv_bus", "lv_bus"))):
         # A branch already out of service is not a contingency. It used to be
         # "tested" and then put back *in* service for the rest of the sweep.
-        for idx in table.index[table["in_service"].astype(bool)]:
+        # Nor is one whose bus is out (an island an earlier outage left, N-1-1).
+        live = table["in_service"].astype(bool) & table[ends[0]].isin(live_buses) & table[ends[1]].isin(live_buses)
+        for idx in table.index[live]:
             total_tested += 1
             table.at[idx, "in_service"] = False
             try:
@@ -6513,12 +6900,17 @@ def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
                     else _trafo_display_name(net_copy, int(idx)))
                 continue
             converged = getattr(net_copy, "converged", True)
+            lost_buses, lost_mw = _load_cut_off(net_copy) if converged else ([], 0.0)
             table.at[idx, "in_service"] = True
             if not converged:
                 non_converged_outages.append(
                     _line_display_name(net_copy, int(idx)) if el_type == "line"
                     else _trafo_display_name(net_copy, int(idx)))
                 continue
+            if lost_buses:
+                disconnecting.append({"outage": _line_display_name(net_copy, int(idx)) if el_type == "line"
+                                      else _trafo_display_name(net_copy, int(idx)),
+                                      "buses": lost_buses, "load_mw": lost_mw})
 
             if isinstance(df_results_ca, list):
                 df_results_ca = pd.DataFrame(df_results_ca)
@@ -6551,7 +6943,8 @@ def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
 
     return {"total_outages_tested": total_tested, "total_outages_causing_violations": outages_with_violations,
             "total_violations": len(all_violations), "violations": all_violations,
-            "non_converged_outages": non_converged_outages}
+            "non_converged_outages": non_converged_outages,
+            "total_outages_disconnecting_load": len(disconnecting), "outages_disconnecting_load": disconnecting}
 
 
 @app.post("/api/contingency/simulate_all")
@@ -6567,15 +6960,11 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
 
     Pipeline
     --------
-    1. Deep-copy the base net and apply measurements + load scaling **once**.
-    2. For each ``idx`` in ``net.line.index``:
-         * flip ``in_service = False``,
-         * call ``ca.contingency_assessment_single(net, "line", idx, ts)``,
-         * flip ``in_service = True`` (restore for next iteration),
-         * tag every returned violation row with ``outage_cause`` so the
-           UI table can show which outage caused which cascade violation.
-    3. Same for ``net.trafo.index``.
-    4. Collect everything into one flat list of violation rows.
+    1. Deep-copy the base net and apply measurements + load scaling **once**
+       (and renewable scaling, then a corrective option if one is named).
+    2. ``_n1_sweep``: for each in-service line and transformer whose buses are
+       in service, switch it out, run the power flow, tag the violations with
+       their ``outage_cause``, note the load the outage cuts off, restore it.
 
     Response shape
     --------------
@@ -6584,7 +6973,9 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
         total_outages_tested: int,
         total_outages_causing_violations: int,
         total_violations: int,
-        system_n1_secure: bool,
+        system_n1_secure: bool,   # no violation, no failed power flow, no load cut off
+        non_converged_outages: [str],
+        outages_disconnecting_load: [ {outage, buses, load_mw} ],
         violations: [ {..., outage_cause: "LINE 3", element_name, value, ...} ]
      }``.
 
@@ -6593,11 +6984,9 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
     * Uses one shared ``net_copy`` and toggles ``in_service`` rather than
       re-copying per iteration. The CA engine is read-only w.r.t.
       anything else on the net, so this is safe.
-    * A single CA iteration may itself crash (e.g. ``LoadflowNotConverged``
-      on a truly islanded topology). We swallow per-iteration exceptions
-      and keep going so one bad outage doesn't abort the whole sweep.
-      The aggregated response will still be accurate for the other
-      iterations; the failed indices simply contribute zero violations.
+    * An outage whose power flow fails (or whose assessment raises) is listed
+      in ``non_converged_outages`` and makes the system not N-1 secure — never
+      counted as zero violations.
     """
     chosen = None
     # Network comparisons call this with a plain GridRequest: no option there.
@@ -6613,6 +7002,11 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
 
     net_copy, _ = _assign_tick(net_copy, measurement_prod_cons, current_ts, _dataset_of(request))
     _scale_loads(net_copy, request.load_scaling_factor)
+    # Renewable scaling first: an option's dispatch, applied next, is the
+    # option's own and is not rescaled.
+    if request.sgen_scaling_factor != 1.0:
+        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
+        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
     screened_with = None
     if chosen:
         stored, option, held = chosen
@@ -6621,25 +7015,24 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
         _apply_stored_option(net_copy, stored, option, held=held)
         screened_with = _option_echo(stored, option, current_ts, held,
                                      screen="N-1-1" if stored.get("outage") else "N-1")
-    # Accepted by the request and the agent's wrapper, but never applied: the
-    # sweep ran at measured renewable output whatever was asked.
-    if request.sgen_scaling_factor != 1.0:
-        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
-        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
 
     sweep = _n1_sweep(net_copy, current_ts, request.vm_lower_pu, request.vm_upper_pu,
                       request.max_line_loading_pct, request.max_trafo_loading_pct)
     all_violations, non_converged_outages = sweep["violations"], sweep["non_converged_outages"]
     total_tested, outages_with_violations = sweep["total_outages_tested"], sweep["total_outages_causing_violations"]
+    disconnecting = sweep["outages_disconnecting_load"]
 
     return {
         "timestamp": current_ts,
         "total_outages_tested": total_tested,
         "total_outages_causing_violations": outages_with_violations,
         "total_violations": len(all_violations),
-        "system_n1_secure": len(all_violations) == 0 and not non_converged_outages,
+        "system_n1_secure": len(all_violations) == 0 and not non_converged_outages and not disconnecting,
         "n_non_converged_outages": len(non_converged_outages),
         "non_converged_outages": non_converged_outages,
+        # Outages that cut load off: no limit breaks on a bus with no supply, but it is lost.
+        "total_outages_disconnecting_load": len(disconnecting),
+        "outages_disconnecting_load": disconnecting,
         "violations": all_violations,
         "data_source": _dataset_label(request),
         "thresholds_used": _thresholds_used(request),
@@ -6651,31 +7044,34 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
 @app.post("/api/contingency/optimize")
 @_off_event_loop
 async def optimize_contingency(request: ContingencyOptimizeRequest):
-    """Sever an element, then run the Pyomo optimizer to cure the blackout.
+    """Take one line or transformer out, then find a dispatch that clears the
+    violations of the grid without it.
 
     Pipeline
-    1. Deep-copy the base network and apply the current measurements.
-    2. Apply ``load_scaling_factor`` and reset transformer taps to
-       neutral — neutral taps are a prerequisite for the optimizer
-       because the pre-computed admittance matrices assumed so.
-    3. **Topological surgery**: call the appropriate
-       ``modify_network`` helper to delete buses / sgens / loads that
-       become orphaned once the element is out. Without this step
-       the matrices would divide-by-zero on islanded nodes.-->crash
-    4. One ``pp.runpp`` to seed the solver with a feasible starting
-       point
-    5. Pull the correct Ybus block from ``db_n1_line`` or
-       ``db_n1_trafo`` (keyed by element index) instead of recomputing.
-    6. Solve with Ipopt via ``flex_engine.optimization_model_base``.
-    7. If the termination condition is ``optimal``, return the
-       extracted dispatch records. Otherwise return the status string
-       and an empty activation list.
+    1. Copy the network, assign the moment's measurements and scale the
+       loads. Transformers stay at the taps of the network as loaded.
+    2. The outage, as the N-1 power flows apply it: the element out of
+       service, and any bus left without a path to a source out with it
+       (its load reported as `load_not_supplied_mw`).
+    3. A power flow of the grid without the element: the state the dispatch
+       moves from, and the solver's starting point.
+    4. The admittances: the intact database without the outaged branch, or
+       rebuilt from the post-outage network when a parallel branch shares its
+       buses (`_outage_admittances`).
+    5. Solve ``flex_engine.optimization_model_base``, then again under the
+       network's exchange cap (`_physical_exchange_cap`), as every other
+       optimisation does.
+    6. Optimal: the dispatch (or the options, with ``options``). Otherwise
+       the status, the diagnosis (the exchange the outage would need when only
+       the cap fails; `_with_infeasibility_diagnosis` otherwise) and the
+       remedies beyond redispatch (`_with_last_resort`).
 
     Raises
-    HTTPException 503
-        If the N-1 admittance databases failed to load at startup.
-    HTTPException 404
-        If no pre-computed matrix exists for the requested element index.
+    HTTPException 400 / 404
+        An element type other than line or trafo, or an unknown index.
+    HTTPException 422
+        Set-points outside their unit's range, or no admittances for the
+        post-outage network.
     HTTPException 500
         If the Ipopt solver itself raises during the solve.
     """
@@ -6691,6 +7087,13 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     # assessments use and the admittance database was built at; the starting
     # point used to come from a neutral-tap power flow (review 2.2).
     net_base = copy.deepcopy(net_copy)
+    # This hour's intact-grid power flow: the fallback "before" when the grid
+    # without the element has none (a failed flow leaves NaN). The tables
+    # otherwise held the stored network's startup flow, another hour's.
+    try:
+        pp.runpp(net_base)
+    except Exception:  # noqa: BLE001 — NaN results: no fallback, said so where used
+        pass
 
     # The outage, as the N-1 power flows apply it: the element switched out of
     # service, and any bus left without a path to a source switched out with
@@ -6704,7 +7107,8 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     islanded = sorted(int(b) for b in pp.topology.unsupplied_buses(modified_net))
     if islanded:
         modified_net.bus.loc[islanded, "in_service"] = False
-    lost_load = round(float(net_copy.load.loc[net_copy.load.bus.isin(islanded), "p_mw"].sum()), 4)
+    cut = net_copy.load[net_copy.load["in_service"].astype(bool) & net_copy.load.bus.isin(islanded)]
+    lost_load = round(float((cut["p_mw"] * (cut["scaling"].fillna(1.0) if "scaling" in cut.columns else 1.0)).sum()), 4)
 
     try:
         pp.runpp(modified_net)
@@ -6719,6 +7123,13 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
     adm = _db_for("full", request)
     if adm is None:
         raise HTTPException(status_code=503, detail="Admittance database not loaded.")
+    # A branch with a parallel circuit between the same buses: the database summed them.
+    try:
+        adm = _outage_admittances(adm, net_copy, modified_net, request.element_type, request.element_index)
+    except RuntimeError:
+        raise HTTPException(status_code=422, detail=(
+            "The outage leaves a parallel circuit whose post-outage admittances could not be built: the power "
+            "flow after the outage does not converge."))
     Yff_r, Yff_i, Yft_r, Yft_i = adm["Yff_r"], adm["Yff_i"], adm["Yft_r"], adm["Yft_i"]
     TAPS, trafo_ranges = adm["TAPS"], adm["trafo_ranges"]
     trafo_defaults, branch_to_trafo = adm["trafo_defaults"], adm["branch_to_trafo"]
@@ -6741,29 +7152,57 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
             branch_limits=caps or None,
             load_flex=_load_flex(modified_net),
         )
+    except fe.PinnedOutsideBounds as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Solver crashed: {str(e)}")
 
-    if results_opt is None: raise HTTPException(status_code=500)
+    if results_opt is None:
+        raise HTTPException(status_code=500, detail=_SOLVER_RAISED)
 
     tc = getattr(results_opt.solver, "termination_condition", None)
     outage = {"element_type": request.element_type, "element_index": request.element_index,
               "element": (_line_display_name if request.element_type == "line" else _trafo_display_name)(
                   net_copy, request.element_index)}
+    # The same exchange limits as every other optimisation: the network's cap
+    # on the connection (the flexibility study solves again under it too).
+    exchange_cap = _physical_exchange_cap()
+    uncapped = None
+    # No dispatch from the power flow: proof that none exists, or a second
+    # start from the convex relaxation (relaxation.second_look).
+    look, found_by_relaxation = None, False
+    if tc != TerminationCondition.optimal:
+        look = _second_look(model_opt)
+        if look["verdict"] == rx.FOUND:
+            model_opt, tc, found_by_relaxation = look["model"], TerminationCondition.optimal, True
+    if tc == TerminationCondition.optimal:
+        uncapped = _exchange_of(model_opt)
+        capped, capped_model = solve_constrained_slack_scenario(model_opt, exchange_cap,
+                                                                fixed_setpoints=fixed_setpoints or None)
+        capped_tc = getattr(getattr(capped, "solver", None), "termination_condition", None)
+        if capped_tc != TerminationCondition.optimal:
+            look = _second_look(capped_model)
+            if look["verdict"] == rx.FOUND:
+                capped_model, capped_tc, found_by_relaxation = look["model"], TerminationCondition.optimal, True
+        if capped_tc == TerminationCondition.optimal:
+            model_opt, uncapped = capped_model, None
+        else:
+            tc = "cap_infeasible"
     if tc == TerminationCondition.optimal and request.options:
         # Options for the corrective action after the outage: priced against
         # the post-outage schedule, each checked by a power flow of the network
         # without the outaged element.
         result = _flexibility_options(request, current_ts, model_opt, modified_net, net_base,
-                                      float(app_data.get("slack_max_mw", 999.0)), held, outage=outage,
-                                      caps_shown=caps_shown)
+                                      exchange_cap, held, outage=outage, caps_shown=caps_shown)
+        if found_by_relaxation:
+            result["found_by_relaxation"] = True
+            result["message"] = result.get("message", "") + " " + _FOUND_BY_RELAXATION
         return {**result, "outage": outage, **islanding}
     if tc == TerminationCondition.optimal:
         # Base values from the post-outage power flow (before redispatch), the
-        # state the OPF starts from. `net_base` carries no results of its own
-        # for this hour: its tables were the stored network's startup power
-        # flow, so the external grid read 245 MW "before" at an hour importing
-        # 186 MW, and a 0.13 MW change was reported as −59 MW.
+        # state the OPF starts from — not `net_base`, the grid with the element
+        # in. (Its tables once held the stored network's startup flow: the
+        # external grid read 245 MW "before" at an hour importing 186 MW.)
         regulation_data = extract_flexibility_results(model_opt, modified_net, current_ts)
         # Issue 1: extract post-OPF bus voltages
         voltage_data = fe.extract_post_opf_voltages(model_opt, modified_net)
@@ -6772,22 +7211,35 @@ async def optimize_contingency(request: ContingencyOptimizeRequest):
         # verdict as booleans. A reader checking whether a dispatch may be
         # described as deliverable should not have to know which of Pyomo's
         # termination strings count as success.
-        result = {"timestamp": current_ts, "status": "optimal", "message": "Optimization successful.",
+        result = {"timestamp": current_ts, "status": "optimal",
+                  "message": "Optimization successful." + (" " + _FOUND_BY_RELAXATION if found_by_relaxation else ""),
+                  **({"found_by_relaxation": True} if found_by_relaxation else {}),
                   "feasible": True, "converged": True,
                   "activated_resources": regulation_data, "outage": outage, **islanding,
                   **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         result.update(voltage_data)
-        app_data["last_dispatch_result"] = regulation_data
-        app_data["last_dispatch_timestamp"] = current_ts
+        _remember_dispatch(regulation_data, current_ts, request,
+                           outage=f"{request.element_type} {request.element_index}")
         return result
     else:
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
                   "feasible": False, "converged": False, "activated_resources": [], "outage": outage, **islanding,
                   **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         rescue = model_opt.clone() if model_opt is not None else None      # the diagnosis changes the model
-        failed = _with_infeasibility_diagnosis(failed, model_opt, modified_net)
+        if uncapped is not None:
+            # Feasible without the exchange limit, not with it: that is the
+            # diagnosis, no re-solve needed.
+            failed["infeasibility_diagnosis"] = _exchange_cap_diagnosis(uncapped, model_opt, " after the outage")
+            failed["message"] = failed["infeasibility_diagnosis"]["explanation"]
+            failed["slack_max_mw"] = exchange_cap
+        else:
+            failed = _with_infeasibility_diagnosis(failed, model_opt, modified_net)
+        if look is not None:
+            scope = (f" after the outage, with the exchange within ±{exchange_cap:.0f} MW" if uncapped is not None
+                     else " after the outage")
+            failed = _with_proof(failed, look, scope)
         out = _with_last_resort(failed, request, current_ts, rescue, modified_net, net_base, held, caps_shown,
-                                fixed_setpoints, cap=None, outage=outage)
+                                fixed_setpoints, cap=exchange_cap, outage=outage)
         return {**out, "outage": outage, **islanding}
 
 
@@ -7023,12 +7475,12 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         bus_over = {
             bus_idx_to_name.get(int(i), str(i))
             for i in _net.bus.index
-            if float(_net.res_bus.at[i, "vm_pu"]) > request.vm_upper_pu
+            if float(_net.res_bus.at[i, "vm_pu"]) > request.vm_upper_pu + _LIMIT_TOL
         }
         bus_under = {
             bus_idx_to_name.get(int(i), str(i))
             for i in _net.bus.index
-            if float(_net.res_bus.at[i, "vm_pu"]) < request.vm_lower_pu
+            if float(_net.res_bus.at[i, "vm_pu"]) < request.vm_lower_pu - _LIMIT_TOL
         }
         bus_viol = bus_over | bus_under
 
@@ -7036,14 +7488,14 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         if len(_net.line.index) > 0 and "loading_percent" in _net.res_line.columns:
             for i in _net.line.index:
                 lp = _net.res_line.at[i, "loading_percent"]
-                if pd.notna(lp) and float(lp) > request.max_line_loading_pct:
+                if pd.notna(lp) and float(lp) > request.max_line_loading_pct + _LIMIT_TOL:
                     line_viol.add(line_idx_to_name.get(int(i), f"Line_{int(i)}"))
 
         trafo_viol = set()
         if len(_net.trafo.index) > 0 and "loading_percent" in _net.res_trafo.columns:
             for i in _net.trafo.index:
                 tp = _net.res_trafo.at[i, "loading_percent"]
-                if pd.notna(tp) and float(tp) > request.max_trafo_loading_pct:
+                if pd.notna(tp) and float(tp) > request.max_trafo_loading_pct + _LIMIT_TOL:
                     trafo_viol.add(trafo_idx_to_name.get(int(i), f"Trafo_{int(i)}"))
         return bus_viol, bus_over, bus_under, line_viol, trafo_viol
 
@@ -7148,10 +7600,16 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         n_conv = len(viol_count_list)
         if n_conv <= 0:
             return None
-
+        # A sample whose power flow does not converge counts as a violation:
+        # most often it is the voltage collapse the study is about. Dropped, it
+        # made the risk look lower than the samples showed (probabilistic
+        # hosting capacity already counted it). Per-element figures stay over
+        # the converged samples, where elements can be judged.
+        n_failed = len(sm_arr) - n_conv
         out = {
             "n_converged": n_conv,
-            "p_any": sum(1 for v in viol_count_list if v > 0) / n_conv,
+            "n_non_converged": n_failed,
+            "p_any": (sum(1 for v in viol_count_list if v > 0) + n_failed) / (n_conv + n_failed),
             "p_any_bus_over": any_bus_over / n_conv,
             "p_any_bus_under": any_bus_under / n_conv,
             "bus_violation_probability": _to_prob_dict(bus_viol_counts, n_conv),
@@ -7230,7 +7688,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             pg_max_overrides=None,
             pg_min_overrides=None,
             min_power_factor=request.opf_min_power_factor,
-            current_safety_margin=0.9,
+            current_safety_margin=_current_margin_within_limits(request),
             fixed_setpoints=None,
             vm_upper_per_bus=None,
             vm_lower_per_bus=None,
@@ -7345,8 +7803,12 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             pg_max_overrides=None,
             pg_min_overrides=None,
             min_power_factor=request.opf_min_power_factor,
-            current_safety_margin=0.9,
+            current_safety_margin=_current_margin_within_limits(request),
             fixed_setpoints=None,
+            # The exchange cap the deterministic study applies: the request's,
+            # within the connection's own capacity. The scenario method had none.
+            max_slack_mw=(_physical_exchange_cap() if request.slack_max_mw is None
+                          else min(float(request.slack_max_mw), _physical_exchange_cap())),
             allowed_violation_fraction=max(0.0, min(float(request.allowed_violation_fraction), 0.5)),
             warm_start={"Pg_new": ws_pg, "Qg_new": ws_qg, "V": ws_v, "theta": ws_theta},
         )
@@ -7489,6 +7951,33 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             display_vm_lower=request.vm_lower_pu,
             display_vm_upper=request.vm_upper_pu,
         )
+        # Voltages and exchange shown at the central forecast (resource and
+        # load multipliers 1): the power flow of the shared dispatch, as the
+        # heuristic shows its own. They were those of training scenario 0, one
+        # random draw.
+        centre = _build_center_net(p_ceiling_after, q_set_after)
+        try:
+            pp.runpp(centre, algorithm="nr", numba=False)
+        except Exception:  # noqa: BLE001
+            post_opf_state = ("training scenario 0 (one random draw): the power flow of the dispatch at the "
+                              "central forecast did not converge")
+        else:
+            post_opf_state = "the central forecast: the power flow of the dispatch with no forecast error"
+            vm_c = centre.res_bus["vm_pu"]
+            voltage_data["bus_voltages_post_opf"] = [
+                {"bus": int(i), "bus_name": bus_idx_to_name.get(int(i), f"Bus_{int(i)}"),
+                 "vm_pu": round(float(vm_c.at[i]), 6)}
+                for i in centre.bus.index if np.isfinite(vm_c.at[i])
+            ]
+            ext_rows = [r for r in activated_resources if r["type"] == "External Grid"]
+            for row, (_, res) in zip(ext_rows, centre.res_ext_grid.iterrows()):
+                p_new, q_new = float(res["p_mw"]), float(res["q_mvar"])
+                row.update({"Pg_new": round(p_new, 4), "Qg_new": round(q_new, 4),
+                            "Pg_up": round(max(p_new - row["Pg_base"], 0.0), 4),
+                            "Pg_down": round(max(row["Pg_base"] - p_new, 0.0), 4),
+                            "Qg_up": round(max(q_new - row["Qg_base"], 0.0), 4),
+                            "Qg_down": round(max(row["Qg_base"] - q_new, 0.0), 4)})
+        voltage_data["post_opf_state"] = post_opf_state
 
         # Curtailment the plan relies on in its scenarios: reported so the
         # operator sees it — the dispatch above is setpoints, not injections.
@@ -7609,14 +8098,15 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             "scenario_xi_oob_count": int(xi_oob_count),
             **response_param_meta,
         }
-        app_data["last_dispatch_result"] = activated_resources
-        app_data["last_dispatch_timestamp"] = current_ts
+        _remember_dispatch(activated_resources, current_ts, request)
         return result
 
-    # Name lookup for applying OPF dispatch back into arrays.
+    # Name lookup for applying OPF dispatch back into arrays: each unit's
+    # position in `net_base.sgen` (the arrays' order). Its index label was
+    # stored, so a network whose sgen index is not 0..n-1 had set-points
+    # written to the wrong unit, or past the end of the array.
     sgen_name_to_idx: dict[str, int] = {}
-    for idx, row in net_base.sgen.iterrows():
-        sidx = int(idx)
+    for sidx, (_, row) in enumerate(net_base.sgen.iterrows()):
         raw_sub = row.get("substation_name", None)
         if pd.notna(raw_sub) and str(raw_sub).strip():
             sgen_name_to_idx[str(raw_sub).strip()] = sidx
@@ -7711,6 +8201,10 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             opf_vm_lower=request.vm_lower_pu,
             opf_lambda_p=request.opf_lambda_p,
             opf_lambda_q=request.opf_lambda_q,
+            # The request's own limits reach the OPF: its minimum power factor
+            # was dropped, and the OPF planned to its default 0.95.
+            opf_min_power_factor=request.opf_min_power_factor,
+            opf_current_safety_margin=_current_margin_within_limits(request),
             vm_upper_per_bus=vm_upper_per_bus,
             vm_lower_per_bus=vm_lower_per_bus,
         )
@@ -8004,9 +8498,71 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         "vm_lower_per_bus_applied": vm_lower_per_bus,
         **response_param_meta,
     }
-    app_data["last_dispatch_result"] = result.get("activated_resources", []) or []
-    app_data["last_dispatch_timestamp"] = current_ts
+    result.update(_largest_back_offs(back_off_upper, back_off_lower, tightened_upper, tightened_lower))
+    if not guarantee_met:
+        result.update(_why_not_met(result, request.risk_target))
+    # In the message, which answers relay: a field of its own was left out (observed live).
+    result["message"] = " ".join(x for x in (str(result.get("message") or "").strip(), result.get("why_not_met", ""),
+                                             result["back_off_summary"]) if x)
+    _remember_dispatch(result.get("activated_resources", []) or [], current_ts, request)
     return result
+
+
+def _why_not_met(result: dict, risk_target) -> dict:
+    """Why the robust dispatch misses its risk target: the back-off tightens
+    voltage limits only, so a thermal risk is beyond its reach, and a voltage
+    risk left after it needs more than a back-off. Observed live: the answer
+    said the target was missed, not why, nor what was tightened."""
+    target = float(risk_target) if risk_target is not None else 0.05
+
+    def over(key: str) -> list[str]:
+        d = result.get(key) or {}
+        return [f"{name} ({100 * p:.1f} %)" for name, p in sorted(d.items(), key=lambda kv: -kv[1]) if p > target]
+    thermal = over("line_violation_probability_after") + over("trafo_violation_probability_after")
+    voltage = over("bus_undervoltage_probability_after") + over("bus_overvoltage_probability_after")
+    parts = []
+    if thermal:
+        parts.append("the back-off tightens voltage limits only, so it cannot lower the overload risk of "
+                     + ", ".join(thermal[:3]))
+    if voltage:
+        parts.append("the voltage risk at " + ", ".join(voltage[:3]) + " remains after it")
+    if not parts:
+        return {}
+    return {"why_not_met": f"The {100 * target:g} % risk target is missed: " + "; and ".join(parts) + ".",
+            "risks_beyond_target": {"thermal": thermal, "voltage": voltage}}
+
+
+_BACK_OFF_SHOWN = 5
+_BACK_OFF_MIN_PU = 1e-4
+
+
+def _largest_back_offs(upper: dict, lower: dict, tightened_upper: dict, tightened_lower: dict) -> dict:
+    """The buses whose voltage limits the robust dispatch tightened most, and a
+    sentence naming them. Observed live: thirty per-bus back-offs, most of them
+    0, and the answer named none — which ones matter is for the result to say."""
+    by_bus: dict[str, dict] = {}
+    for side, d, t in (("upper", upper or {}, tightened_upper or {}), ("lower", lower or {}, tightened_lower or {})):
+        for bus, v in d.items():
+            if v is None or float(v) < _BACK_OFF_MIN_PU:
+                continue
+            row = by_bus.setdefault(bus, {"bus": bus, "back_off_pu": 0.0, "sides": {}})
+            row["sides"][side] = {"back_off_pu": round(float(v), 4),
+                                  **({"tightened_to_pu": round(float(t[bus]), 4)} if bus in t else {})}
+            row["back_off_pu"] = max(row["back_off_pu"], round(float(v), 4))
+    rows = sorted(by_bus.values(), key=lambda r: -r["back_off_pu"])
+    if not rows:
+        return {"largest_back_offs": [], "back_off_summary": "No bus's voltage limits had to be tightened."}
+    shown = rows[:_BACK_OFF_SHOWN]
+
+    def said(r: dict) -> str:
+        band = [f"{side} to {d['tightened_to_pu']:.3f}" for side, d in sorted(r["sides"].items(), reverse=True)
+                if "tightened_to_pu" in d]
+        return f"{r['bus']} (by up to {r['back_off_pu']:.4f} p.u." + (f"; {', '.join(band)} p.u." if band else "") + ")"
+    return {"largest_back_offs": shown,
+            "back_off_summary": (f"Voltage limits tightened at {len(rows)} bus(es), most at "
+                                 + "; ".join(said(r) for r in shown) + "."
+                                 + (f" The largest back-off is {shown[0]['back_off_pu']:.4f} p.u.: a small "
+                                    "margin." if shown[0]["back_off_pu"] < 0.01 else ""))}
 
 
 @app.post("/api/flexibility/envelope")
@@ -8052,6 +8608,15 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
                 "cached_timestamp": cached_ts,
                 "current_timestamp": ts,
             }
+        elif app_data.get("last_dispatch_context") != _dispatch_context(request):
+            # Same moment, another study: a dispatch for a proposal, other
+            # data, another load scaling or after an outage was applied here
+            # whenever the timestamp matched.
+            reference_dispatch_summary = {
+                "reason": "cached_dispatch_context_mismatch",
+                "cached_for": app_data.get("last_dispatch_context"),
+                "requested": _dispatch_context(request),
+            }
         else:
             apply_summary = _apply_dispatch_to_net(net_base, cached_rows)
             reference_dispatch_applied = apply_summary.get("applied", 0) > 0
@@ -8081,61 +8646,17 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     # A voltage-controlled unit (net.gen) is studied as what the envelope
     # sweeps: an injection of active and reactive power, from where it runs
     # now. Only this study's copy changes; the note says so.
-    as_injection = _voltage_unit_as_injection(net_base, request.gen_name)
+    converted = _voltage_unit_as_injection(net_base, request.gen_name)
+    as_injection, unit_q_limits = converted if converted else (None, None)
 
-    # Find target sgen by canonical label with robust fallbacks for uploaded nets.
-    # Some imported MATPOWER networks do not populate ``substation_name`` and
-    # only have ``name`` (e.g., Gen_bus1), while users may ask for "Bus 1".
-    if net_base.sgen.empty:
-        raise HTTPException(status_code=404, detail="No generators available in sgen table.")
-
-    label_col = "substation_name" if "substation_name" in net_base.sgen.columns else (
-        "name" if "name" in net_base.sgen.columns else None
-    )
-    if label_col is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Generator name lookup failed: neither 'substation_name' nor 'name' "
-                f"exists in sgen columns ({list(net_base.sgen.columns)})."
-            ),
-        )
-
-    def _norm(v) -> str:
-        return str(v).strip().casefold()
-
-    def _parse_bus_alias(v) -> int | None:
-        s = str(v).strip().lower().replace("-", "_")
-        if s.startswith("gen_"):
-            s = s[4:]
-        if not s.startswith("bus"):
-            return None
-        tail = s[3:].strip(" _")
-        return int(tail) if tail.isdigit() else None
-
-    requested = _norm(request.gen_name)
-    labels = net_base.sgen[label_col].fillna("").astype(str)
-    sgen_mask = labels.map(_norm) == requested
-
-    # Alias fallback: allow "Bus 1" or "Gen_bus1" to match by bus index.
-    if not sgen_mask.any() and "bus" in net_base.sgen.columns:
-        req_bus = _parse_bus_alias(request.gen_name)
-        if req_bus is not None:
-            sgen_mask = net_base.sgen["bus"].astype(int) == req_bus
-
-    if not sgen_mask.any():
-        known_names = sorted({str(v) for v in labels.tolist() if str(v).strip()})
-        if "bus" in net_base.sgen.columns:
-            known_names.extend(sorted({f"Gen_bus{int(b)}" for b in net_base.sgen["bus"].tolist()}))
-        raise HTTPException(
-            status_code=404,
-            detail=f"Generator '{request.gen_name}' not found. Known names: {known_names}",
-        )
-
-    sgen_idx = int(net_base.sgen[sgen_mask].index[0])
-    resolved_gen_name = str(net_base.sgen.at[sgen_idx, label_col]).strip() or (
-        f"Gen_bus{int(net_base.sgen.at[sgen_idx, 'bus'])}" if "bus" in net_base.sgen.columns else request.gen_name
-    )
+    # The unit swept, by any name it answers to (`resolve.find_unit`).
+    try:
+        target = rv.find_unit(net_base, request.gen_name, ("sgen",))
+    except rv.ResolveError:
+        units = [rv.display(net_base, t, int(i)) for t in ("gen", "sgen") for i in net_base[t].index]
+        raise HTTPException(status_code=404, detail=f"No unit named {request.gen_name!r}. Units: {units[:20]}.")
+    sgen_idx = target.idx
+    resolved_gen_name = target.label
 
     # Base operating point from the power flow result
     pg_base = round(float(net_base.res_sgen.at[sgen_idx, "p_mw"]), 5)
@@ -8155,10 +8676,15 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
     # coarse grid spacing near the actual feasibility boundary — which is always
     # close to the base operating point.  A minimum of 0.3 MVAr ensures a sensible
     # range even for near-zero generators.
-    q_cap_rated = p_max * tan_phi
     q_cap_base  = max(pg_base * tan_phi, 0.3)   # exact capability at base P
     q_min = request.q_min_mvar if request.q_min_mvar is not None else -q_cap_base
     q_max = request.q_max_mvar if request.q_max_mvar is not None else  q_cap_base
+    if unit_q_limits:
+        # A synchronous unit's own reactive limits, not a PF 0.9 arc: what the
+        # grid accepts within what the machine can give (and the base point
+        # is inside them: it ran there).
+        q_min = request.q_min_mvar if request.q_min_mvar is not None else min(unit_q_limits[0], qg_base)
+        q_max = request.q_max_mvar if request.q_max_mvar is not None else max(unit_q_limits[1], qg_base)
 
     resolution = max(5, min(request.resolution, 25))
     # Always include the base operating point in the grid so safe_q_range_at_base_p
@@ -8186,20 +8712,72 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
 
     results.sort(key=lambda r: (round(r["p_mw"], 4), round(r["q_mvar"], 4)))
 
-    # Safe Q range at the closest grid column to pg_base,
-    # clipped to the PF=0.9 capability boundary at the base active power.
-    q_cap_at_base_p = round(pg_base * tan_phi, 5)
+    # Elements outside their limits at every point converged: no output of this
+    # unit clears them. Observed live: at the evening peak the line from the
+    # external grid is overloaded whatever Gen_bus7 does, every point was red,
+    # and the envelope said nothing about what the unit could do.
+    converged_points = [r for r in results if r["converged"]]
+    everywhere = set.intersection(*(set(r.get("violated") or []) for r in converged_points)) \
+        if converged_points else set()
+    for r in results:
+        r["feasible_apart"] = r["converged"] and set(r.get("violated") or []) <= everywhere
+
+    def _element_label(key: str) -> str:
+        etype, idx = key.split(":")
+        return _bus_display_name(net_base, int(idx)) if etype == "bus" else _DISPLAY_NAMES[etype](net_base, int(idx))
+
+    # Safe Q range at the closest grid column to pg_base: the unbroken run of
+    # feasible points around the base Q — a feasible point past an infeasible
+    # one is not reached by moving Q alone, and [min, max] of every feasible Q
+    # spanned such gaps. Clipped to the capability the sweep uses (PF 0.9 at
+    # the base P, at least 0.3 Mvar): without that floor the range of a unit
+    # near 0 MW collapsed to 0, or came out inverted.
+    q_cap_at_base_p = round(q_cap_base, 5)
     p_arr = sorted(set(round(r["p_mw"], 4) for r in results))
     closest_p = min(p_arr, key=lambda p: abs(p - pg_base))
-    q_slice = [r for r in results if round(r["p_mw"], 4) == closest_p and r["feasible"]]
-    safe_q_range = (
-        [round(max(min(r["q_mvar"] for r in q_slice), -q_cap_at_base_p), 5),
-         round(min(max(r["q_mvar"] for r in q_slice),  q_cap_at_base_p), 5)]
-        if q_slice else None
-    )
+    column = sorted((r for r in results if round(r["p_mw"], 4) == closest_p), key=lambda r: r["q_mvar"])
+    cap_lo, cap_hi = (min(unit_q_limits[0], qg_base), max(unit_q_limits[1], qg_base)) if unit_q_limits \
+        else (-q_cap_at_base_p, q_cap_at_base_p)
+
+    def _safe_range(ok: str):
+        feasible_at = [k for k, r in enumerate(column) if r[ok]]
+        if not feasible_at:
+            return None
+        lo_k = hi_k = min(feasible_at, key=lambda k: abs(column[k]["q_mvar"] - qg_base))
+        while lo_k > 0 and column[lo_k - 1][ok]:
+            lo_k -= 1
+        while hi_k < len(column) - 1 and column[hi_k + 1][ok]:
+            hi_k += 1
+        lo = max(column[lo_k]["q_mvar"], cap_lo)
+        hi = min(column[hi_k]["q_mvar"], cap_hi)
+        return [round(lo, 5), round(hi, 5)] if lo <= hi else None
+    safe_q_range = _safe_range("feasible")
+    safe_apart = _safe_range("feasible_apart") if everywhere else None
 
     n_feasible = sum(1 for r in results if r["feasible"])
     n_converged = sum(1 for r in results if r["converged"])
+    unit = resolved_gen_name
+    own = (f" (its own limits: {unit_q_limits[0]:g} to {unit_q_limits[1]:g} Mvar)" if unit_q_limits else "")
+    stuck = sorted(_element_label(k) for k in everywhere)
+    q_step = (q_max - q_min) / max(resolution - 1, 1)
+
+    def _between(rng) -> str:
+        # One point of the sweep is a narrow range, as wide as its step at most.
+        if abs(rng[1] - rng[0]) < 1e-6:
+            return f"only about {rng[0]:.2f} Mvar (the sweep checks every {q_step:.2f} Mvar)"
+        return f"between {rng[0]:.2f} and {rng[1]:.2f} Mvar"
+    if safe_q_range:
+        message = f"At {pg_base:.2f} MW, {unit} can give {_between(safe_q_range)} with every element within its limits{own}."
+    else:
+        message = f"At {pg_base:.2f} MW, no reactive output of {unit} keeps every element within its limits{own}."
+    if stuck:
+        one = len(stuck) == 1
+        message += (f" {', '.join(stuck)} {'is' if one else 'are'} outside {'its' if one else 'their'} limits at every "
+                    f"point of the sweep: {unit} alone cannot clear {'it' if one else 'them'}.")
+        message += (f" Apart from {'it' if one else 'them'}, it can give {_between(safe_apart)} without putting "
+                    "anything else outside its limits." if safe_apart else
+                    f" Apart from {'it' if one else 'them'}, no reactive output keeps everything else within its "
+                    "limits either.")
 
     return {
         "timestamp": ts,
@@ -8212,14 +8790,19 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
         "reference_dispatch_summary": reference_dispatch_summary,
         "p_range": [round(p_min, 5), round(p_max, 5)],
         "q_range": [round(q_min, 5), round(q_max, 5)],
+        "q_step_mvar": round(q_step, 4),
         "resolution": resolution,
         "n_feasible": n_feasible,
         "n_converged": n_converged,
         "n_total": len(results),
         "base_point": {"p_mw": pg_base, "q_mvar": qg_base},
         "safe_q_range_at_base_p": safe_q_range,
+        **({"violated_everywhere": stuck, "safe_q_range_apart_from_them": safe_apart} if stuck else {}),
+        "message": message,
         "q_cap_at_base_p": q_cap_at_base_p,
-        "capability_curve_pf": 0.9,
+        **({"unit_q_limits_mvar": [round(unit_q_limits[0], 5), round(unit_q_limits[1], 5)],
+            "capability": "the unit's own reactive limits"} if unit_q_limits else
+           {"capability_curve_pf": 0.9, "capability": "power factor 0.9 at its present output"}),
         "vm_upper_pu": request.vm_upper_pu,
         "vm_lower_pu": request.vm_lower_pu,
         "envelope": results,
@@ -8227,40 +8810,11 @@ async def compute_flexibility_envelope(request: FlexibilityEnvelopeRequest):
 
 
 def _resolve_hosting_bus(net, bus_input: int | str) -> int:
-    """Resolve bus input (index or name) to a net.bus integer index."""
-    if isinstance(bus_input, int):
-        if bus_input in net.bus.index:
-            return int(bus_input)
-        raise HTTPException(status_code=404, detail=f"Bus index {bus_input} not found.")
-
-    text = str(bus_input).strip()
-    if text.isdigit():
-        bus_idx = int(text)
-        if bus_idx in net.bus.index:
-            return bus_idx
-
-    norm = text.casefold()
-
-    # 1) Exact match on bus name
-    if "name" in net.bus.columns:
-        exact = [int(i) for i, raw in net.bus["name"].items() if str(raw).strip().casefold() == norm]
-        if len(exact) == 1:
-            return exact[0]
-        if len(exact) > 1:
-            raise HTTPException(status_code=400, detail=f"Bus '{text}' is ambiguous; use bus index.")
-
-    # 2) Alias forms like Bus 1, bus_1, Gen_bus1
-    alias = text.lower().replace("-", "_").replace(" ", "_")
-    if alias.startswith("gen_"):
-        alias = alias[4:]
-    if alias.startswith("bus"):
-        tail = alias[3:].strip("_")
-        if tail.isdigit():
-            bus_idx = int(tail)
-            if bus_idx in net.bus.index:
-                return bus_idx
-
-    raise HTTPException(status_code=404, detail=f"Bus '{text}' not found.")
+    """A bus by index or by any name it answers to (`resolve.find`)."""
+    try:
+        return rv.find(net, bus_input, ("bus",)).idx
+    except rv.ResolveError as exc:
+        raise _resolution_http(exc) from None
 
 
 def _hosting_q_target(
@@ -8348,6 +8902,11 @@ def _build_hosting_binding(
     }
 
 
+# Bisection steps of both hosting-capacity searches (deterministic and
+# probabilistic: 40 and 30 before); the tolerance ends either long before.
+_HOSTING_MAX_ITER = 40
+
+
 def _solve_hosting_capacity_mode(
     net_base,
     bus_idx: int,
@@ -8387,7 +8946,7 @@ def _solve_hosting_capacity_mode(
     first_infeasible_diag = None
     last_diag = None
     converged = False
-    max_iter = 40
+    max_iter = _HOSTING_MAX_ITER
 
     for _ in range(max_iter):
         mid = 0.5 * (low + high)
@@ -8664,7 +9223,7 @@ def _solve_hosting_capacity_mode_probabilistic(
     first_infeasible_eval = None
     last_eval = None
     converged = False
-    max_iter = 30
+    max_iter = _HOSTING_MAX_ITER
 
     for _ in range(max_iter):
         mid = 0.5 * (low + high)
@@ -8792,7 +9351,7 @@ def _solve_hosting_capacity_mode_probabilistic(
         binding_source = "best_feasible"
         termination_reason = "converged_feasible"
 
-    return {
+    payload = {
         "q_mode": q_mode,
         "hosting_capacity_mw": round(float(best_p), 4),
         "binding_constraint": binding,
@@ -8809,6 +9368,17 @@ def _solve_hosting_capacity_mode_probabilistic(
             if first_infeasible_p is not None else None
         ),
     }
+    # Withdrawn as the deterministic search withdraws its own: a bisection
+    # that did not converge carries its last iterate, not a capacity.
+    if not converged:
+        withdrawal.mark_unusable(
+            payload,
+            "The hosting-capacity bisection did not converge; the value is the "
+            "last iterate, not a determined capacity.",
+        )
+        payload["hosting_capacity_mw_unconverged"] = payload.pop("hosting_capacity_mw")
+        payload["hosting_capacity_mw"] = None
+    return payload
 
 
 @app.post("/api/flexibility/hosting_capacity")
@@ -8889,34 +9459,22 @@ async def compute_hosting_capacity(request: HostingCapacityRequest):
         raise HTTPException(status_code=400, detail="p_max_search_mw must be > 0.")
 
     def _base_q_for_bus(local_bus_idx: int) -> float:
-        """Reactive baseline of the units already at this bus.
+        """Reactive baseline of the units already at this bus: half of what
+        they inject at this tick, absorbed.
 
-        `res_sgen` holds only the units the power flow actually solved, so an
-        out-of-service sgen is present in `sgen` and absent from `res_sgen`.
-        Indexing the results by the setpoint table's index then raises
-        KeyError and the endpoint 500s — which it did, on a bus with such a
-        unit. The solved rows are used where they exist and the setpoint
-        elsewhere, rather than choosing one table for all of them.
+        Read from the set-points this tick gave them — a static generator
+        injects exactly its set-point, scaled. `res_sgen` held the stored
+        network's last power flow (another tick, as no power flow had run on
+        this copy), and an out-of-service unit counted with its set-point.
         """
-        if "bus" not in net_base.sgen.columns or net_base.sgen.empty:
+        sg = net_base.sgen
+        if sg.empty or "bus" not in sg.columns:
             return 0.0
-        sgen_rows = net_base.sgen[net_base.sgen["bus"].astype(int) == int(local_bus_idx)]
-        if sgen_rows.empty:
+        rows = sg[(sg["bus"].astype(int) == int(local_bus_idx)) & sg["in_service"].astype(bool)]
+        if rows.empty:
             return 0.0
-
-        res = getattr(net_base, "res_sgen", None)
-        solved = sgen_rows.index[:0]
-        total = 0.0
-        if res is not None and "q_mvar" in getattr(res, "columns", []):
-            solved = sgen_rows.index.intersection(res.index)
-            if len(solved):
-                total += float(res.loc[solved, "q_mvar"].sum())
-
-        unsolved = sgen_rows.index.difference(solved)
-        if len(unsolved) and "q_mvar" in sgen_rows.columns:
-            total += float(sgen_rows.loc[unsolved, "q_mvar"].sum())
-
-        return -0.5 * total
+        scaling = rows["scaling"].fillna(1.0) if "scaling" in rows.columns else 1.0
+        return -0.5 * float((rows["q_mvar"].fillna(0.0) * scaling).sum())
 
     bus_targets = (
         [{"bus_index": int(idx), "bus": _bus_display_name(net_base, int(idx))} for idx in net_base.bus.index]
@@ -9443,16 +10001,35 @@ def _outage_net(net, table: str, idx: int):
     return n, islanded
 
 
-def _critical_outages(sweep: dict, limit_pct: float) -> list[tuple]:
+def _outage_admittances(db: dict, net, net_k, table: str, idx: int) -> dict:
+    """The admittances the OPF should use after an outage. The database sums
+    parallel branches between the same pair of buses, and the OPF reads only
+    branches in service, so an outage simply drops its pair — unless another
+    branch joins the same buses: the pair's summed admittance would then stay
+    whole with only the surviving rating. In that case the post-outage
+    network's own database is built (it needs that network's power flow)."""
+    ends = {"line": ("from_bus", "to_bus"), "trafo": ("hv_bus", "lv_bus")}
+    f, s = ends[table]
+    pair = {int(net[table].at[idx, f]), int(net[table].at[idx, s])}
+    for t, (tf, ts) in ends.items():
+        rows = net[t][net[t]["in_service"].astype(bool)]
+        if any((t, j) != (table, idx) and {int(r[tf]), int(r[ts])} == pair for j, r in rows.iterrows()):
+            return nl.build_ybus_full(net_k)
+    return db
+
+
+def _critical_outages(sweep: dict, limit_pct: float, band: tuple = (1.0, 1.0)) -> list[tuple]:
     """The outages a screen found violations after, most severe first:
-    (name, table, index, severity) — severity the summed excess, loading in %
-    and voltage in hundredths of a p.u."""
+    (name, table, index, severity) — severity the summed excess beyond the
+    limits, loading in % and voltage in hundredths of a p.u. beyond the band
+    (`band`, (lower, upper)), as the switching screen measures it."""
     by: dict[tuple, float] = {}
+    lo, hi = band
     for v in sweep.get("violations") or []:
         key = (v.get("outage_cause"), v.get("outage_type"), v.get("outage_element_index"))
         value_ = float(v.get("value") or 0.0)
         excess = (value_ - limit_pct) if v.get("violation_type") in ("line_loading", "trafo_loading") else \
-            100 * max(value_ - 1.0, 1.0 - value_, 0.0)
+            100 * max(value_ - hi, lo - value_, 0.0)
         by[key] = by.get(key, 0.0) + max(excess, 0.01)
     return [(k[0], k[1], int(k[2]), round(s, 3)) for k, s in sorted(by.items(), key=lambda kv: -kv[1])
             if k[0] and k[1] in ("line", "trafo") and k[2] is not None]
@@ -9482,26 +10059,33 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
     reference = screen(first)
     # Which outages: the operator's, or the critical ones after the least-disturbance option.
     if request.n1_outages:
-        index = _branch_index(net)
         wanted, unknown = [], []
         for raw in request.n1_outages:
-            hit = index.get(str(raw).strip().replace("→", "->").casefold())
+            hit = _branch_named(net, raw, "n1_outages")
             (wanted.append((hit[0], hit[2], hit[3], None)) if hit else unknown.append(str(raw)))
         if unknown:
             raise HTTPException(status_code=400, detail=(
                 f"n1_outages: there is no line or transformer {', '.join(map(repr, unknown))}."))
         candidates = list(dict.fromkeys(wanted))
     else:
-        candidates = _critical_outages(reference, emergency)
+        candidates = _critical_outages(reference, emergency, (lo, hi))
+
+    def cuts_load(name, table, idx) -> dict | None:
+        """The skip entry for an outage that cuts load off (no dispatch keeps an
+        island supplied), else None. An outage that only disconnects a unit is
+        studied: the others must cover what it produced."""
+        _, islanded = _outage_net(net, table, idx)
+        loads = net.load[net.load["in_service"].astype(bool) & net.load["bus"].isin(islanded)]
+        if not len(loads) or float(loads["p_mw"].sum()) <= 1e-6:
+            return None
+        return {"outage": name, "reason": (
+            f"it leaves {', '.join(_bus_display_name(net, b) for b in islanded[:4])} without supply: no "
+            "dispatch keeps their load supplied")}
+
     skipped, usable = [], []
     for name, table, idx, _sev in candidates:
-        _, islanded = _outage_net(net, table, idx)
-        if islanded:
-            skipped.append({"outage": name, "reason": (
-                f"it leaves {', '.join(_bus_display_name(net, b) for b in islanded[:4])} without supply: no "
-                "dispatch keeps them supplied")})
-        else:
-            usable.append((name, table, idx))
+        cut = cuts_load(name, table, idx)
+        (skipped.append(cut) if cut else usable.append((name, table, idx)))
     if len(usable) > _N1_MAX_OUTAGES:
         skipped += [{"outage": u[0], "reason": f"beyond the {_N1_MAX_OUTAGES} most severe outages studied at once; "
                                                "the screen still checks it"} for u in usable[_N1_MAX_OUTAGES:]]
@@ -9524,24 +10108,33 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
         scopf.release(base, keep)
         states, built = {}, []
         for name, table, idx in outages:
-            net_k, _ = _outage_net(net, table, idx)
+            net_k, islanded = _outage_net(net, table, idx)
+            # Only units can be on an island studied here (load would have been skipped):
+            # out of service with it, so their output is lost and the others cover it.
+            if islanded:
+                net_k.bus.loc[islanded, "in_service"] = False
             try:
                 pp.runpp(net_k)
             except Exception:  # noqa: BLE001 — the OPF starts from wherever it can
                 pass
             try:
-                _, m_k = fe.optimization_model_base(net_k, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"],
-                                                    db["TAPS"], db["trafo_ranges"], db["trafo_defaults"],
-                                                    db["branch_to_trafo"], **engine_kwargs)
+                db_k = _outage_admittances(db, net, net_k, table, idx)
+                _, m_k = fe.optimization_model_base(net_k, net_base, db_k["Yff_r"], db_k["Yff_i"], db_k["Yft_r"],
+                                                    db_k["Yft_i"], db_k["TAPS"], db_k["trafo_ranges"],
+                                                    db_k["trafo_defaults"], db_k["branch_to_trafo"], **engine_kwargs)
             except Exception:  # noqa: BLE001 — an outage the model cannot be built for is reported
                 skipped.append({"outage": name, "reason": "the post-outage model could not be built"})
                 continue
-            scopf.release(m_k, keep)
+            if m_k is None:
+                skipped.append({"outage": name, "reason": "the post-outage model could not be built"})
+                continue
+            scopf.release(m_k, keep, free_held_q=True)
             scopf.soften(m_k, emergency / 100.0, lo, hi)
             for e in m_k.Ext:                                   # the same grid-connection limits after the outage
                 if e in base.Ext:
-                    m_k.Pext[e].setlb(base.Pext[e].lb)
-                    m_k.Pext[e].setub(base.Pext[e].ub)
+                    for var in ("Pext", "Qext"):
+                        getattr(m_k, var)[e].setlb(getattr(base, var)[e].lb)
+                        getattr(m_k, var)[e].setub(getattr(base, var)[e].ub)
             states[name] = m_k
             built.append((name, table, idx))
         top = scopf.build(base, states, mode, reach, request.opf_lambda_p, request.opf_lambda_q,
@@ -9573,22 +10166,29 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
         top = built = None
         while outages and rounds < _N1_ROUNDS:
             rounds += 1
-            top, built = solve_mode(mode, outages)
-            if top is None:
+            solved, solved_built = solve_mode(mode, outages)
+            if solved is None:
+                rounds -= 1 if top is not None else 0    # a failed second round: the first one's dispatch stands
                 break
+            top, built = solved, solved_built
             if request.n1_outages:
                 break                          # the operator's outages, and only those
-            # Outages the new dispatch fails that were not studied: added.
+            # Outages the new dispatch fails that were not studied: added (or skipped, with the reason).
             sweep = screen(fo.capture(top.base, f"n1_{mode}"))
-            names = {o[0] for o in outages}
-            new = [(n, t, i) for n, t, i, _ in _critical_outages(sweep, emergency)
-                   if n not in names and not _outage_net(net, t, i)[1]]
+            names = {o[0] for o in outages} | {s_["outage"] for s_ in skipped}
+            new = []
+            for n, t, i, _ in _critical_outages(sweep, emergency, (lo, hi)):
+                if n in names:
+                    continue
+                cut = cuts_load(n, t, i)
+                (skipped.append(cut) if cut else new.append((n, t, i)))
             if not new or len(outages) >= _N1_MAX_OUTAGES:
                 break
             outages += new[:_N1_MAX_OUTAGES - len(outages)]
         sid = f"n1_{mode}"
         if not usable:
-            info[sid] = {"not_offered": "no outage to study: the screen found none with violations"}
+            info[sid] = {"not_offered": "no outage to study: the screen found none with violations" if not candidates
+                         else "every critical outage cuts load off, which no dispatch prevents (see skipped)"}
             continue
         if top is None:
             info[sid] = {"not_offered": "the security-constrained OPF found no solution"}
@@ -9625,12 +10225,15 @@ def _n1_study(request, ts: str, model, net, net_base, prices, pext0: dict, qext0
                     dp = round(after.p[g] - option.p[g], 2) + 0.0
                     bus = (option.vc_bus or {}).get(g)
                     dv = abs(after.v.get(bus, 0) - option.v.get(bus, 0)) if bus is not None else 0.0
-                    if abs(dp) < _PLAN_MW and dv < _PLAN_VM:
+                    # A unit held to a power factor may be told a new reactive output after the outage.
+                    dq = round(after.q.get(g, 0.0) - option.q.get(g, 0.0), 2) + 0.0 if bus is None else 0.0
+                    if abs(dp) < _PLAN_MW and dv < _PLAN_VM and abs(dq) < fo.MOVE_MVAR:
                         continue                      # solver residue, not an instruction anyone would issue
                     actions.append({"unit": g, "dp_mw": dp,
                                     **({"setpoint_vm_pu_before": round(option.v.get(bus, 0), 3),
                                         "setpoint_vm_pu_after": round(after.v.get(bus, 0), 3)}
-                                       if bus is not None and dv >= _PLAN_VM else {})})
+                                       if bus is not None and dv >= _PLAN_VM else {}),
+                                    **({"dq_mvar": dq} if abs(dq) >= fo.MOVE_MVAR else {})})
                 loads = _load_actions(net, after)
                 plan.append({"outage": name, "actions": actions, "no_action_needed": False,
                              # When moving the units is not enough: load reduced after the outage.
@@ -9666,7 +10269,7 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
                          last_resort: dict | None = None) -> dict:
     """Several corrective dispatches from the solved, capped least-disturbance
     model, scored the same way. The operator chooses; nothing here ranks them.
-    `last_resort` ({"why", "restart", "fixed"}): unit redispatch alone found no
+    `last_resort` ({"why", "restart"}): unit redispatch alone found no
     dispatch on `model`; the options are those that also reduce load."""
     # The exchange at the studied point (its loads, generation at schedule) —
     # not the unscaled network's, or a load-scaling study would count the extra
@@ -9741,7 +10344,8 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
     else:
         kept, not_offered, cheapest_total = fo.generate(model, prices, pext0, qext0)
     best = next((o for o, _ in kept if o.id == "cheapest"), None)
-    set_id = _remember_options(request, ts, kept, outage, held) if kept else None
+    set_id = (_remember_options(request, ts, kept, outage, held)
+              if kept and getattr(request, "remember", True) is not False else None)
     if set_id:
         common["set_id"] = set_id
 
@@ -9836,9 +10440,22 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
         for k in kinds:
             counts[k] = counts.get(k, 0) + 1
     used_loads = sorted({i for o, _ in kept for i in set(o.dr or {}) | set(o.relief or {})})
+    # How far the cheapest option can be from the best possible: a lower bound
+    # on its cost from a convex relaxation of its own problem (relaxation.py).
+    # Not for the last resort, whose options reduce load.
+    optimality = None
+    if not last_resort and cheapest_total is not None:
+        try:
+            optimality = rx.optimality(rx.cost_lower_bound(model, prices, pext0, qext0), cheapest_total)
+        except Exception as exc:  # noqa: BLE001 — the options stand without it
+            optimality = {"cheapest_eur_per_h": cheapest_total, "lower_bound_eur_per_h": None,
+                          "why": f"the relaxation failed ({str(exc)[:120]})"}
     return {**common, "status": "options", "feasible": True, "converged": True,
-            "message": ((f"Redispatching the units alone cannot clear the violations (why: `redispatch_alone`). "
-                         f"{len(options)} option(s) that also reduce load — demand response first, load relief only "
+            "message": ((("Redispatching the units alone cannot clear the violations — proved by a convex relaxation "
+                          "of the same optimisation (`no_dispatch_check`). "
+                          if last_resort.get("proved") else
+                          "Redispatching the units alone cannot clear the violations (why: `redispatch_alone`). ")
+                         + f"{len(options)} option(s) that also reduce load — demand response first, load relief only "
                          "beyond it — each meeting every limit with nothing else changed; the operator chooses."
                          if last_resort else
                          f"N-1 security study: {len(common['n1_study']['outages_studied'])} critical outage(s) "
@@ -9847,10 +10464,15 @@ def _flexibility_options(request, ts: str, model, net, net_base, slack_cap: floa
                          f"The cheapest option and {len(options) - 1} near-optimal alternative(s), each costing at "
                          f"most {budget:.2f} €/h ({request.near_optimal_pct:g} % above the cheapest) and picked to "
                          "be as different from the others as the margin allows (how each was found is in `how`); "
-                         "each meets every limit; the operator chooses." if request.near_optimal else
+                         "each meets every limit; the operator chooses." if request.near_optimal and budget is not None
+                         else "The cheapest option could not be solved, so there is no budget for near-optimal "
+                              "alternatives: the least-disturbance dispatch is shown alone (`not_offered`)."
+                         if request.near_optimal else
                          f"{len(options)} corrective option(s), each meeting every limit; the operator chooses.")
+                        + rx.sentence(optimality)
                         + " Costs are of the corrective action (doing nothing costs 0)."),
             "options": options, "not_offered": not_offered,
+            **({"optimality": optimality} if optimality else {}),
             "costs": {"currency": "EUR", "prices_from": counts,
                       "meaning": "Prices from the cost table (System tab): the case file, a synthetic rule, or "
                                  "the operator's changes. Say which when quoting a cost.",
@@ -9883,6 +10505,21 @@ def _branch_index(net) -> dict:
     return names
 
 
+def _branch_named(net, raw, field: str) -> tuple | None:
+    """(name, pair of buses, table, index) of the line or transformer named —
+    by any name it answers to (`resolve.find`); None when there is none. An
+    ambiguity is refused with the candidates."""
+    try:
+        found = rv.find(net, raw, ("line", "trafo"))
+    except rv.ResolveError as exc:
+        if exc.reason == "not_found":
+            return None
+        raise HTTPException(status_code=400, detail=f"{field}: {exc}") from None
+    frame = net[found.etype]
+    a, b = ("from_bus", "to_bus") if found.etype == "line" else ("hv_bus", "lv_bus")
+    return found.label, (int(frame.at[found.idx, a]), int(frame.at[found.idx, b])), found.etype, found.idx
+
+
 def _branch_caps(net, raw: dict | None) -> tuple[dict, dict]:
     """`branch_limits` as the engine takes them — {(from bus, to bus): fraction
     of the rating} — and as results show them: {branch name: %}. A branch is
@@ -9894,7 +10531,7 @@ def _branch_caps(net, raw: dict | None) -> tuple[dict, dict]:
     names = _branch_index(net)
     engine, shown, unknown = {}, {}, []
     for key, pct in raw.items():
-        found = names.get(str(key).strip().replace("→", "->").casefold())
+        found = _branch_named(net, key, "branch_limits")
         if found is None:
             unknown.append(str(key))
             continue
@@ -9943,36 +10580,38 @@ def _held_at_schedule(net, request) -> tuple[dict, dict]:
 @app.post("/api/flexibility/optimize")
 @_off_event_loop
 async def optimise_flexibility(request: FlexibilityRequest):
-    """Run the Pyomo AI to find the cheapest dispatch that cures the grid.
+    """Find a dispatch of the local units that clears the violations.
 
     Uses the **intact-grid** admittance database (``db_full``) — this
-    endpoint does not model any outage, only voltage / thermal issues
-    induced by the load-stress slider.
+    endpoint does not model any outage, only the voltage / thermal issues
+    of the moment, optionally under a load scaling.
 
     Pipeline
     --------
-    1. Clone the base network, apply measurements, neutralize taps.
-    2. Optionally drop a single substation's sgens (``disabled_generators``)
-       to simulate a generator forced offline.
-    3. Run a seed power flow (swallowed on failure).
-    4. Build the scaled network (copy + load multiplication).
-    5. Connected solve via ``flex_engine.optimization_model_base`` with
-       the intact Ybus matrices and the engine's default ±200 MW slack.
-    6. **Constrained-slack re-solve** via
-       :func:`solve_constrained_slack_scenario` so the dispatch
-       respects the global Sweden-cable slider (``slack_max_mw``).
-       This makes the table on the *Flexibility Management* tab
-       consistent with the KPI tab — both reflect the same
-       slider-driven cable cap.
-    7. Return the **full** regulation DataFrame from
-       :func:`flex_engine.prepare_regulation_df_rsa` — every generator
-    row plus the external-grid row — so the user
-       can see exactly where the dispatch landed (typically on the
-       slack when it has spare capacity).
+    1. Copy the network, assign the moment's measurements (taps stay as
+       loaded: the OPF reads each transformer at its neutral tap's
+       admittances).
+    2. Optionally take units offline (``disabled_generators``: static and
+       voltage-controlled units, by name; an unknown name is refused).
+    3. Power flow of the moment (swallowed on failure).
+    4. Scale the loads on a copy and run its power flow: the state the
+       dispatch moves from, the external grid's "before" included.
+    5. Solve ``flex_engine.optimization_model_base``: the exchange within
+       the connection's own capacity (``flex_engine._exchange_bounds``).
+       A failed solve is diagnosed (``_with_infeasibility_diagnosis``) and
+       offered the remedies beyond redispatch (``_with_last_resort``).
+    6. **Capped re-solve** (:func:`solve_constrained_slack_scenario`) under
+       ``slack_max_mw``, never above that capacity. If it fails the result
+       is ``cap_infeasible``, with the exchange the moment would need; the
+       uncapped dispatch is attached only as ``uncapped_reference_dispatch``.
+    7. Return the **full** regulation table from
+       :func:`flex_engine.prepare_regulation_df_rsa` (every unit and the
+       external grid), or the options when ``options`` / ``n1`` is asked.
 
-    Two-Fold logic is handled inside ``flex_engine``:
-      * Fold 1 checks if the grid is naturally secure with generators fixed.
-      * Fold 2 unfixes them and minimizes ``|Pg_new - Pg_base|``.
+    Two folds inside ``flex_engine``: Fold 1 checks whether the moment is
+    secure with every unit at its schedule; Fold 2 frees them and minimises
+    the weighted squared change of P and Q
+    (``lambda_p·ΣΔP² + lambda_q·ΣΔQ²``). Prices enter only with ``options``.
     """
     if _db_for("full", request) is None: raise HTTPException(status_code=503)
     start = None
@@ -10016,13 +10655,15 @@ async def optimise_flexibility(request: FlexibilityRequest):
                 names[idx]: round(float(_net_pre.res_sgen.at[idx, 'p_mw']), 4)
                 for idx in _net_pre.sgen.index
             }
+            dispatch_pre_disable.update({gm.unit_name(_net_pre, "gen", idx): round(float(_net_pre.res_gen.at[idx, "p_mw"]), 4)
+                                         for idx in _net_pre.gen.index})
             slack_label = str((app_data.get("grid_profile") or {}).get("slack_name") or "External Grid")
             dispatch_pre_disable[slack_label] = round(
                 float(_net_pre.res_ext_grid['p_mw'].values[0]), 4
             )
         except Exception:
             dispatch_pre_disable = None
-        _drop_disabled_sgens(net_base, disabled_gens)
+        _drop_disabled_units(net_base, disabled_gens)
 
     try:
         pp.runpp(net_base)
@@ -10060,29 +10701,38 @@ async def optimise_flexibility(request: FlexibilityRequest):
             branch_limits=caps or None,
             load_flex=_load_flex(net),
         )
+    except fe.PinnedOutsideBounds as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if results_opt is None: raise HTTPException(status_code=500)
+    if results_opt is None:
+        raise HTTPException(status_code=500, detail=_SOLVER_RAISED)
 
     tc = getattr(results_opt.solver, "termination_condition", None)
+    # No dispatch from the power flow: the convex relaxation either proves that
+    # none exists, or gives IPOPT a second start (relaxation.second_look).
+    look, found_by_relaxation = None, False
     if tc != TerminationCondition.optimal:
-        _phys_cap = app_data.get("slack_max_mw", 70.0)
+        look = _second_look(model_opt)
+        if look["verdict"] == rx.FOUND:
+            model_opt, tc, found_by_relaxation = look["model"], TerminationCondition.optimal, True
+    if tc != TerminationCondition.optimal:
+        _phys_cap = _physical_exchange_cap()
         _reported_cap = float(_phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap))
         failed = {"timestamp": current_ts, "status": str(tc), "message": "Infeasible.",
                   "feasible": False, "converged": False,
                   "activated_resources": [], "slack_max_mw": _reported_cap,
                   **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {})}
         rescue = model_opt.clone() if model_opt is not None else None      # the diagnosis changes the model
-        failed = _with_infeasibility_diagnosis(failed, model_opt, net)
+        failed = _with_proof(_with_infeasibility_diagnosis(failed, model_opt, net), look)
         return echoed(_with_last_resort(failed, request, current_ts, rescue, net, net_base, held, caps_shown,
                                         fixed_setpoints, cap=_reported_cap))
 
-    # Constrained-slack re-solve so the dispatch respects the global
-    # Sweden-cable slider. If the constrained solve fails we fall back
-    # to the connected dispatch so the user always sees *something*,
-    # but flag it in the message so the inconsistency is visible.
-    _phys_cap = app_data.get("slack_max_mw", 70.0)
+    # Capped re-solve so the dispatch respects the exchange cap
+    # (`slack_max_mw`). If it fails the result is `cap_infeasible`, with the
+    # uncapped dispatch only as a labelled reference (below).
+    _phys_cap = _physical_exchange_cap()
     slack_cap = float(max(0.0, _phys_cap if request.slack_max_mw is None else min(request.slack_max_mw, _phys_cap)))
     # Snapshot regulation + voltages from the unconstrained (connected) solve BEFORE
     # solve_constrained_slack_scenario mutates model_opt's Pext bounds.  If the
@@ -10098,10 +10748,16 @@ async def optimise_flexibility(request: FlexibilityRequest):
     # an answer to a question it does not answer).
     cap_respected = True
     cap_failure = ""
+    uncapped = _exchange_of(model_opt)
     try:
         cscen_results, cscen_model = solve_constrained_slack_scenario(model_opt, slack_cap, slack_q_max_mvar=request.slack_q_max_mvar, fixed_setpoints=fixed_setpoints or None)
         cscen_tc = (getattr(cscen_results.solver, "termination_condition", None)
                     if cscen_results is not None else None)
+        cap_look = None
+        if cscen_tc != TerminationCondition.optimal:
+            cap_look = _second_look(cscen_model)
+            if cap_look["verdict"] == rx.FOUND:
+                cscen_model, cscen_tc, found_by_relaxation = cap_look["model"], TerminationCondition.optimal, True
         if cscen_tc == TerminationCondition.optimal:
             df_reg_flex_rsa = fe.prepare_regulation_df_rsa(cscen_model, net, net_base, current_ts)
             voltage_data = fe.extract_post_opf_voltages(cscen_model, net)
@@ -10110,6 +10766,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
             cap_failure = f"the capped solve ended {cscen_tc or 'without a solution'}"
     except Exception as e:
         cap_respected = False
+        cap_look = None
         cap_failure = f"the capped solve failed: {e}"
 
     # ----------------------------------------------------------------------
@@ -10140,9 +10797,9 @@ async def optimise_flexibility(request: FlexibilityRequest):
     if cap_respected:
         msg = f"Grid restored at slack cap ±{slack_cap:.0f} MW."
     else:
-        msg = (f"No dispatch keeps the external-grid exchange within ±{slack_cap:.0f} MW "
-               f"({cap_failure}). The dispatch without the cap is attached only as "
-               "`uncapped_reference_dispatch`; it does not respect the cap.")
+        cap_diagnosis = _exchange_cap_diagnosis(uncapped, model_opt)
+        msg = (f"{cap_diagnosis['explanation']} (cap ±{slack_cap:.0f} MW; {cap_failure}.) The dispatch "
+               "without the cap is attached only as `uncapped_reference_dispatch`; it does not respect the cap.")
     excluded_count = int(voltage_data.get("excluded_bus_count_post_opf") or 0)
     if excluded_count > 0:
         msg += f" Excluded {excluded_count} bus(es) from post-OPF voltage output; see excluded_buses_post_opf for details."
@@ -10172,19 +10829,28 @@ async def optimise_flexibility(request: FlexibilityRequest):
             "feasible": False, "converged": True, "slack_cap_respected": False,
             "activated_resources": [], "slack_max_mw": slack_cap,
             "uncapped_reference_dispatch": regulation_data,
+            "infeasibility_diagnosis": cap_diagnosis,
             **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {}),
         }
+        if cap_look is not None:
+            failed = _with_proof(failed, cap_look, f" with the exchange within ±{slack_cap:.0f} MW")
         return echoed(_with_last_resort(failed, request, current_ts, model_opt.clone(), net, net_base, held,
                                         caps_shown, fixed_setpoints, cap=slack_cap))
+    if found_by_relaxation:
+        msg += " " + _FOUND_BY_RELAXATION
     if request.options or request.n1:          # an N-1 study is a set of options
-        app_data["last_dispatch_result"] = regulation_data
-        app_data["last_dispatch_timestamp"] = current_ts
-        return echoed(_flexibility_options(request, current_ts, cscen_model, net, net_base, slack_cap, held,
-                                           caps_shown=caps_shown))
+        _remember_dispatch(regulation_data, current_ts, request)
+        options = _flexibility_options(request, current_ts, cscen_model, net, net_base, slack_cap, held,
+                                       caps_shown=caps_shown)
+        if found_by_relaxation:
+            options["found_by_relaxation"] = True
+            options["message"] = options.get("message", "") + " " + _FOUND_BY_RELAXATION
+        return echoed(options)
     response = {
         "timestamp": current_ts, "status": "optimal", "message": msg,
         "feasible": True, "converged": True, "slack_cap_respected": True,
         "activated_resources": regulation_data, "slack_max_mw": slack_cap,
+        **({"found_by_relaxation": True} if found_by_relaxation else {}),
         # The operator's conditions: units kept at their schedule, with the MW,
         # and branches held below a share of their rating.
         **({"held_units": held} if held else {}), **({"branch_limits": caps_shown} if caps_shown else {}),
@@ -10194,8 +10860,7 @@ async def optimise_flexibility(request: FlexibilityRequest):
         response["bus_voltages_base"] = bus_voltages_base
     if dispatch_pre_disable is not None:
         response["dispatch_pre_disable"] = dispatch_pre_disable
-    app_data["last_dispatch_result"] = regulation_data
-    app_data["last_dispatch_timestamp"] = current_ts
+    _remember_dispatch(regulation_data, current_ts, request)
     return echoed(response)
 
 
@@ -10603,6 +11268,15 @@ async def security_over_time(request: SecurityOverTimeRequest):
             totals[mode] = {"security_cost_eur": round(sum(c * h for c, h in priced), 2),
                             "moments_priced": len(priced),
                             "highest_eur_per_h": max(c for c, _ in priced)}
+            if len(priced) < len(rows):
+                # Not scaled up: a moment without a price (no secure option,
+                # no options at all, an error) has no cost to extrapolate.
+                # Said, so the total is not read as the whole window's.
+                covered = sum(h for _, h in priced)
+                totals[mode]["hours_priced"] = round(covered, 3)
+                totals[mode]["note"] = (f"Covers {len(priced)} of {len(rows)} moments ({covered:g} of "
+                                        f"{sum(spans):g} h); the others have no security cost (see each "
+                                        "moment's status), so this is not the whole window's.")
     worst = max(rows, key=lambda r: r.get("schedule_n1_outages_with_violations") or 0)
     lines = [f"{len(rows)} moments from {ticks[0]} to {ticks[-1]}"]
     short = [r["timestamp"] for r in rows if r.get("schedule_meets_limits") is False]
@@ -10612,8 +11286,9 @@ async def security_over_time(request: SecurityOverTimeRequest):
     tested = next((r["outages_tested"] for r in rows if r.get("outages_tested")), None)
     for mode, t in totals.items():
         screened = span([(r.get(mode) or {}).get("n1_outages_with_violations") for r in rows])
-        lines.append(f"N-1 {mode}: {t['security_cost_eur']:.2f} € above the cheapest over the window "
-                     f"(at most {t['highest_eur_per_h']:.2f} €/h)"
+        lines.append(f"N-1 {mode}: {t['security_cost_eur']:.2f} € above the cheapest over "
+                     + (f"the {t['moments_priced']} priced moments of the window" if t.get("note") else "the window")
+                     + f" (at most {t['highest_eur_per_h']:.2f} €/h)"
                      + (f", and in the full N-1 screen {screened} of {tested} outages still with violations"
                         if screened and tested else ""))
     if tested:
@@ -10665,7 +11340,7 @@ async def plan_over_time(request: PlanRequest):
     spans, gaps = _weights(ticks), _gaps(ticks)
     lo = request.opf_vm_lower if request.opf_vm_lower is not None else _network_limits()["opf_vm_lower"]
     hi = request.opf_vm_upper if request.opf_vm_upper is not None else _network_limits()["opf_vm_upper"]
-    cap = float(app_data.get("slack_max_mw", 999.0))
+    cap = float(_physical_exchange_cap())
     db = _db_for("full", request)
     blocks, nets, prices_at, ext0 = [], [], [], []
     held_any: dict = {}
@@ -10691,7 +11366,8 @@ async def plan_over_time(request: PlanRequest):
         _res, m = fe.optimization_model_base(
             net, net_base, db["Yff_r"], db["Yff_i"], db["Yft_r"], db["Yft_i"], db["TAPS"], db["trafo_ranges"],
             db["trafo_defaults"], db["branch_to_trafo"], opf_vm_lower=lo, opf_vm_upper=hi,
-            fixed_setpoints=fixed or None, branch_limits=caps or None)
+            fixed_setpoints=fixed or None, branch_limits=caps or None,
+            current_safety_margin=_current_margin_within_limits(request))
         _cap_exchange(m, cap, None, fixed)
         scopf.release(m, set(held))
         blocks.append(m)
@@ -10702,6 +11378,12 @@ async def plan_over_time(request: PlanRequest):
                      {e: float(ref.res_ext_grid["q_mvar"].values[i]) for i, e in enumerate(m.Ext)}))
     units = sorted((g for g in blocks[0].G if all(g in set(b.G) for b in blocks)), key=_natural)
 
+    # Each moment weighs by the hours it stands for, as the reported cost and
+    # MWh do (`_weights`; relative to their mean, so the steadiness weight
+    # keeps its scale). Unweighted, the optimum did not minimise the totals
+    # the plan reports. Every moment still meets every limit.
+    weights = [h / (sum(spans) / len(spans)) for h in spans] if sum(spans) > 0 else [1.0] * len(spans)
+
     def solve_window(link: bool):
         top = ConcreteModel()
         objective = 0.0
@@ -10711,10 +11393,10 @@ async def plan_over_time(request: PlanRequest):
             for obj in list(m.component_objects(Objective, active=True)):
                 obj.deactivate()
             if request.objective == "cheapest":
-                objective += fo.add_cost(m, prices_at[k], *ext0[k]) + 1e-3 * fo._disturbance(m)
+                objective += weights[k] * (fo.add_cost(m, prices_at[k], *ext0[k]) + 1e-3 * fo._disturbance(m))
             else:
-                objective += (0.01 * sum((m.Pg_new[g] - m.Pg_base[g]) ** 2 for g in m.G)
-                              + 0.001 * sum((m.Qg_new[g] - m.Qg_base[g]) ** 2 for g in m.G))
+                objective += weights[k] * (0.01 * sum((m.Pg_new[g] - m.Pg_base[g]) ** 2 for g in m.G)
+                                           + 0.001 * sum((m.Qg_new[g] - m.Qg_base[g]) ** 2 for g in m.G))
         if link and len(copies) > 1:
             # Per MW of change: a 5 MW move at least-disturbance prices ~0.1 at the
             # margin, so the default holds an instruction unless changing it moves
@@ -10736,7 +11418,10 @@ async def plan_over_time(request: PlanRequest):
             objective += weight * sum(top.change[p] for p in pairs)
             pairs = [(k, g) for k in range(1, len(copies)) for g in units]
             if request.ramp_pct_per_h:
-                pmax = {g: float(pv(copies[0].Pg_max[g])) for g in units}
+                # A unit's capacity: its largest Pmax over the window (the
+                # first moment's alone understated a unit whose Pmax follows
+                # its resource).
+                pmax = {g: max(float(pv(c.Pg_max[g])) for c in copies) for g in units}
                 ramp = {(k, g): request.ramp_pct_per_h / 100.0 * pmax[g] * gaps[k - 1] for k, g in pairs}
                 top.ramp_up = Constraint(pairs, rule=lambda t, k, g: (
                     copies[k].Pg_new[g] - copies[k - 1].Pg_new[g] <= ramp[k, g]))
@@ -11377,6 +12062,1489 @@ async def violation_attribution(request: AttributionRequest):
 
 
 # ---------------------------------------------------------------------------
+# Investigation: why something in the grid is what it is (investigation.py).
+# The attribution says what moves an element now; this says what changed since
+# a state where it was fine, and how much of the change is each cause — for
+# one element, for the whole grid, after an outage, or over a window.
+# ---------------------------------------------------------------------------
+
+# The automatic reference is searched for up to a week of 15-minute ticks each
+# way; each tick costs one power flow, and the nearest one is usually close.
+_REFERENCE_SEARCH_TICKS = 672
+# A "comfortable" reference: this far inside the limits.
+_COMFORT_PU, _COMFORT_PCT = 0.01, 10.0
+# A reference this close to the limit explains only the last push over it.
+_NEAR_LIMIT_PU, _NEAR_LIMIT_PCT = 0.005, 5.0
+_REFERENCE_MODES = ("within_limits", "comfortable", "previous_day")
+_GRID = {"all", "grid", "the grid", "network", "system", "everything"}
+_INVESTIGATION_METHOD = (
+    "Every combination of the factors, each at its value now or in the reference state, was solved by "
+    "AC power flow. A factor's share is its Shapley value — its average effect over every order in which "
+    "the changes could have happened — so the shares add up to the change, interactions included.")
+
+
+class InvestigateRequest(_NoOption, GridRequest):
+    """Request body for ``POST /api/investigate``.
+
+    element : str | None
+        The bus, line or transformer, named as other results name it, or "all"
+        for the whole grid (the number of elements outside their limits).
+        Omitted: the only element outside its limits at that moment (several:
+        the result lists them and the caller asks which); over a window, the grid.
+    element_type : str | None
+        "bus", "line" or "trafo", when the name alone is ambiguous.
+    reference_timestamp / reference_data_source / reference_network : str | None
+        The state compared with: another moment, the other dataset at the same
+        moment, another network (the base, a proposal) at the same moment, or a
+        mix. All omitted: chosen by `reference_mode`.
+    reference_mode : str | None
+        "within_limits" (default): the nearest earlier moment within limits.
+        "comfortable": the nearest earlier moment well inside them (0.01 p.u.,
+        10 points of loading), to see why it got close at all. "previous_day":
+        the same moment a day earlier.
+    outage : str | None
+        A line or transformer out of service in both states: why this outage is
+        critical now (and was not then).
+    reference_outage : str | None
+        Another outage in the reference state ("none": the intact network):
+        why this outage is worse than that one.
+    start_timestamp / end_timestamp : str | None
+        Investigate a window instead of a moment (prefixes, inclusive).
+    reference_start_timestamp / reference_end_timestamp : str | None
+        The window compared with; omitted, the window of the same length just before.
+    levers : bool
+        Add what to move now to clear the violation (the sensitivity attribution).
+    hypotheses : list[dict] | None
+        The caller's own factors, each {"name", "elements"} (at most five): a
+        bus name covers the demand at it, a unit its output and set-point, a
+        branch (name or tag, "L38") its state, "external grid" its voltage,
+        "demand" / "units" all of them. Everything else that changed is one more
+        factor, "other changes". The shares and verdicts are measured the same way.
+    classical : list[str] | None
+        Classical views beside the exact shares, when the caller wants them:
+        "linear" (each factor estimated from sensitivities; LODF for a branch
+        out), "tracing" (who feeds and who draws an investigated branch's flow).
+    """
+    element: str | None = None
+    element_type: str | None = None
+    reference_timestamp: str | None = None
+    reference_data_source: str | None = None
+    reference_network: str | None = None
+    reference_mode: str | None = None
+    classical: list[str] | None = None
+    # Repeat the decomposition against the other references and say whether
+    # the main cause holds. None: when the reference was chosen automatically.
+    check_references: bool | None = None
+    # Every episode of the window (by default the whole dataset) outside the
+    # limits, each investigated, and their main causes gathered.
+    recurring: bool = False
+    outage: str | None = None
+    reference_outage: str | None = None
+    start_timestamp: str | None = None
+    end_timestamp: str | None = None
+    reference_start_timestamp: str | None = None
+    reference_end_timestamp: str | None = None
+    levers: bool = True
+    hypotheses: list[dict] | None = None
+
+    @field_validator("hypotheses")
+    @classmethod
+    def _valid_hypotheses(cls, value):
+        given = [h for h in value or [] if isinstance(h, dict) and (h.get("elements") or h.get("name"))]
+        if not given:
+            return None                                   # [] or blanks: the standard grouping
+        if len(given) > inv.MAX_HYPOTHESES:
+            raise ValueError(f"at most {inv.MAX_HYPOTHESES} hypotheses (each is one factor; the rest of the "
+                             "changes form one more).")
+        out = []
+        for h in given:
+            elements = h.get("elements") or []
+            if isinstance(elements, str):
+                elements = [elements]
+            elements = [str(e).strip() for e in elements if str(e).strip()]
+            if not elements:
+                raise ValueError(f"hypothesis {h.get('name')!r} names no element.")
+            out.append({"name": str(h.get("name") or ", ".join(elements)).strip(), "elements": elements})
+        return out
+
+    @field_validator("element", "element_type", "reference_timestamp", "reference_data_source",
+                     "reference_network", "reference_mode", "outage", "reference_outage", "start_timestamp",
+                     "end_timestamp", "reference_start_timestamp", "reference_end_timestamp")
+    @classmethod
+    def _blank_is_not_given(cls, value):
+        # A model filling every optional field sends "" for the ones it means to leave out.
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    @field_validator("classical", mode="before")
+    @classmethod
+    def _known_views(cls, value):
+        if isinstance(value, str):
+            value = [value]
+        views = [str(v).strip().lower() for v in value or [] if str(v).strip()]
+        unknown = [v for v in views if v not in inv.CLASSICAL]
+        if unknown:
+            raise ValueError(f"classical views are {list(inv.CLASSICAL)}, not {unknown}.")
+        return views or None
+
+    @field_validator("reference_mode")
+    @classmethod
+    def _known_mode(cls, value):
+        if value is not None and value not in _REFERENCE_MODES:
+            raise ValueError(f"reference_mode must be one of {list(_REFERENCE_MODES)}.")
+        return value
+
+
+def _outside_limits(net, limits: dict) -> list[dict]:
+    """Every element of a solved network outside its limits, named as the
+    assessment names it."""
+    out = []
+    for idx in net.bus.index:
+        if not bool(net.bus.at[idx, "in_service"]):
+            continue
+        value = inv.measure(net, "bus", int(idx))
+        if value is not None and not inv.within(value, "bus", limits):
+            out.append({"element": _bus_display_name(net, int(idx)), "element_type": "bus", "index": int(idx),
+                        "value": round(value, 5)})
+    for etype in ("line", "trafo"):
+        for idx in net[etype].index:
+            if not bool(net[etype].at[idx, "in_service"]):
+                continue
+            value = inv.measure(net, etype, int(idx))
+            if value is not None and not inv.within(value, etype, limits):
+                out.append({"element": _DISPLAY_NAMES[etype](net, int(idx)), "element_type": etype,
+                            "index": int(idx), "value": round(value, 3)})
+    return out
+
+
+def _investigated_element(net, name: str, etype: str | None, kinds=("bus", "line", "trafo")) -> tuple[str, int, str]:
+    """(type, index, display name) of the element named, among `kinds` (or the
+    type given) — by any name it answers to (`resolve.find`)."""
+    kinds = [etype.strip().lower()] if etype else list(kinds)
+    if any(k not in _DISPLAY_NAMES for k in kinds):
+        raise HTTPException(status_code=400, detail=f"element_type must be 'bus', 'line' or 'trafo', not {etype!r}.")
+    try:
+        found = rv.find(net, name, tuple(kinds))
+    except rv.ResolveError as exc:
+        raise _resolution_http(exc) from None
+    return found.etype, found.idx, found.label
+
+
+def _element_buses(net, etype: str, idx: int) -> set[int]:
+    if etype == "bus":
+        return {idx}
+    a, b = ("from_bus", "to_bus") if etype == "line" else ("hv_bus", "lv_bus")
+    return {int(net[etype].at[idx, a]), int(net[etype].at[idx, b])}
+
+
+def _limit_of(etype: str, value: float, limits: dict) -> tuple[float, str]:
+    """The limit a value is judged against, and how it stands."""
+    if etype == "bus":
+        lo, hi = limits["vm_lower_pu"], limits["vm_upper_pu"]
+        if value < lo - rs.FLOAT_TOL:
+            return lo, "undervoltage"
+        if value > hi + rs.FLOAT_TOL:
+            return hi, "overvoltage"
+        return (lo if value - lo < hi - value else hi), "within"
+    limit = limits["max_line_loading_pct" if etype == "line" else "max_trafo_loading_pct"]
+    return limit, ("overload" if value > limit + rs.FLOAT_TOL else "within")
+
+
+def _margin(etype: str, value: float, limits: dict) -> float:
+    """Distance to the nearest limit: positive inside, negative outside."""
+    if etype == "bus":
+        return min(value - limits["vm_lower_pu"], limits["vm_upper_pu"] - value)
+    return limits["max_line_loading_pct" if etype == "line" else "max_trafo_loading_pct"] - value
+
+
+def _comfortable(etype: str, value: float, limits: dict, margin_now: float) -> bool:
+    """Well inside the limits — 0.01 p.u. or 10 points of loading, and at least
+    twice the margin it has now — a reference that shows why it got close at
+    all. Observed live: an element 0.015 p.u. inside its band met a fixed
+    0.01 p.u. itself, and the "comfortable" reference came 15 minutes earlier."""
+    floor = _COMFORT_PU if etype == "bus" else _COMFORT_PCT
+    return _margin(etype, value, limits) >= max(floor, 2 * margin_now)
+
+
+def _state_label(ts: str, request, outage: str | None = None) -> str:
+    """A state as an operator would name it: its moment, dataset, network and outage."""
+    label = "the nominal point" if ts == nom.NOMINAL else str(ts)[:16]
+    if _dataset_label(request) == "forecasts":
+        label += " (forecast)"
+    if _network_name(request) != BASE_NETWORK:
+        label += f" on proposal {_network_name(request)}"
+    if outage:
+        label += f" after losing {outage}"
+    return label
+
+
+def _outage_of(net, spec: str | None) -> tuple[str, int, str] | None:
+    """(type, index, name) of the line or transformer an outage names; None for
+    none (or "none": the intact network)."""
+    if not spec or spec.strip().lower() in ("none", "intact", "no outage"):
+        return None
+    return _investigated_element(net, spec, None, kinds=("line", "trafo"))
+
+
+def _with_outage(net, outage: tuple[str, int, str] | None):
+    if outage is not None:
+        net[outage[0]].at[outage[1], "in_service"] = False
+    return net
+
+
+def _state_net(ts: str, request, outage):
+    """A study's network at one moment, with the outage applied."""
+    net, _ = _prepared_net(ts, request)
+    return _with_outage(net, outage)
+
+
+def _reference_request(request: InvestigateRequest, ts: str):
+    """The request of the state compared with, and why it is that one; None
+    when what was given names the state investigated itself (a model filling
+    every field with the current moment, dataset and network), which leaves the
+    reference to the automatic search."""
+    source = request.reference_data_source or request.data_source
+    network = request.reference_network or request.network
+    ref_ts = _resolve_tick(source, request.reference_timestamp) if request.reference_timestamp else ts
+    ref = request.model_copy(update={"data_source": source, "network": network, "timestamp": ref_ts})
+    same = [ref_ts == ts, _dataset_label(ref) == _dataset_label(request),
+            _network_name(ref) == _network_name(request), request.reference_outage is None]
+    if all(same):
+        return None
+    why = []
+    if not same[0]:
+        why.append("the moment asked for")
+    if not same[1]:
+        why.append(f"the {_dataset_label(ref)}" + (" for the same moment" if same[0] else ""))
+    if not same[2]:
+        other = "the base network" if _network_name(ref) == BASE_NETWORK else f"proposal {_network_name(ref)}"
+        why.append(other + (" at the same moment" if same[0] else ""))
+    if not same[3]:
+        why.append("the intact network" if request.reference_outage.lower() in ("none", "intact", "no outage")
+                   else f"the outage of {request.reference_outage}")
+    return ref, ref_ts, ", ".join(why)
+
+
+def _search_reference(request, ts: str, target, outage, accept, earlier_only: bool = False):
+    """(moment, direction, first moment outside) of the nearest moment whose
+    value `accept` takes, earlier first; None if none within the search."""
+    timestamps, _dataset, label = _resolve_dataset(request.data_source)
+    if label == nom.NOMINAL or ts not in timestamps:
+        return None
+    pos = timestamps.index(ts)
+    n = _REFERENCE_SEARCH_TICKS
+    sides = [("earlier", range(pos - 1, max(-1, pos - 1 - n), -1))]
+    if not earlier_only:
+        sides.append(("later", range(pos + 1, min(len(timestamps), pos + 1 + n))))
+    for direction, ticks in sides:
+        edge = ts
+        for i in ticks:
+            net = _state_net(timestamps[i], request, outage)
+            value = target.metric(net) if inv._solve(net) else None
+            if value is not None and accept(value):
+                return timestamps[i], direction, (edge if direction == "earlier" else None)
+            edge = timestamps[i]
+    return None
+
+
+def _injection_series(request) -> tuple[list, dict]:
+    """Every load's and unit's active power at every moment of the request's
+    dataset, as the moments assign them (no load scaling), cached per dataset
+    and network: the history a measured change is judged against."""
+    timestamps, dataset, label = _resolve_dataset(request.data_source)
+    key = (label, _network_name(request), id(dataset), len(timestamps),
+           timestamps[0] if timestamps else None, timestamps[-1] if timestamps else None,
+           getattr(_study, "load_pf", None))
+    cache = app_data.setdefault("_injection_series", {})
+    if key not in cache:
+        cache.clear()
+        series: dict[tuple, list] = {}
+        # One copy, given each moment's values in turn: a deep copy per moment
+        # cost most of the time (a week took 8 s; this takes about 2).
+        net = copy.deepcopy(_net_for(request))
+        for ts in timestamps:
+            meas = prepare_measurement_df(_lookup_measurement_df(ts, request.data_source))
+            net, _ = _assign_tick(net, meas, ts, dataset)
+            for table in ("load", "sgen", "gen"):
+                tbl = net[table]
+                for idx in tbl.index:
+                    on = bool(tbl.at[idx, "in_service"])
+                    series.setdefault((table, int(idx)), []).append(float(tbl.at[idx, "p_mw"]) if on else 0.0)
+        cache[key] = (list(timestamps), {k: np.asarray(v) for k, v in series.items()})
+    return cache[key]
+
+
+def _data_inspector(request, ref_request, ts: str, ref_ts: str):
+    """The plausibility check for an investigation comparing two moments of the
+    same data and network; None for any other comparison (a proposal, the other
+    dataset), whose changes are not measurements that could be wrong."""
+    import plausibility
+
+    if (_dataset_label(ref_request) != _dataset_label(request) or _network_name(ref_request) != _network_name(request)
+            or ts == ref_ts or ts == nom.NOMINAL):
+        return None
+    timestamps, series = _injection_series(request)
+    if ts not in timestamps or ref_ts not in timestamps:
+        return None
+    i_cur, i_ref = timestamps.index(ts), timestamps.index(ref_ts)
+
+    def inspect(table: str, idx: int) -> dict | None:
+        values = series.get((table, int(idx)))
+        return None if values is None else plausibility.check(values, i_ref, i_cur)
+    return inspect
+
+
+def _reference_robustness(request, ts: str, cur_net, target, outage, used: str, accept_for, main_row: dict) -> dict:
+    """The decomposition again against the other references (within limits, well
+    inside them, the day before), and whether its main cause holds — compared by
+    kind, since the same demand groups differently against another moment.
+    Shapley shares depend on the reference; this says how much."""
+    timestamps, _dataset, _label = _resolve_dataset(request.data_source)
+    checked = [{"mode": used, "main_cause": main_row.get("factor"), "kind": inv.cause_kind(main_row),
+                "share_pct": main_row.get("share_pct"), "used": True}]
+    for mode in _REFERENCE_MODES:
+        if mode == used:
+            continue
+        if mode == "previous_day":
+            day = (pd.Timestamp(ts) - pd.Timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            ref_ts = day if day in timestamps else None
+        else:
+            accept = accept_for(mode)
+            found = _search_reference(request, ts, target, outage, accept, earlier_only=True) if accept else None
+            ref_ts = found[0] if found else None
+        if ref_ts is None:
+            checked.append({"mode": mode, "available": False})
+            continue
+        dec = inv.decompose(_state_net(ref_ts, request, outage), cur_net, target, hypotheses=request.hypotheses,
+                            drill=False)
+        row = next((f for f in dec.get("factors") or [] if f["factor"] == dec.get("main_cause")), None)
+        checked.append({"mode": mode, "timestamp": ref_ts, "status": dec["status"],
+                        "main_cause": row.get("factor") if row else None, "kind": inv.cause_kind(row),
+                        "share_pct": row.get("share_pct") if row else None})
+    kinds = {c["kind"] for c in checked if c.get("available", True) and c.get("status", "explained") == "explained"}
+    compared = [c for c in checked if c.get("available", True)]
+    holds = len(compared) > 1 and len(kinds) == 1 and None not in kinds
+    word = {"within_limits": "the last moment within limits", "comfortable": "a moment well inside the limits",
+            "previous_day": "the day before", "asked": "the reference asked for"}
+    shown = "; ".join(f"{word[c['mode']]} {c['share_pct']:.0f} %" for c in compared if c.get("share_pct") is not None)
+    if len(compared) < 2:
+        message = "No other reference was available to check the main cause against."
+    elif holds:
+        message = f"The main cause is {next(iter(kinds))} against every reference checked ({shown})."
+    else:
+        message = ("The main cause depends on the reference: " + "; ".join(
+            f"{word[c['mode']]}: {c.get('main_cause') or 'none'}" for c in compared) + ".")
+    return {"holds": holds if len(compared) > 1 else None, "checked": checked, "message": message}
+
+
+def _levers(cur_net, ts: str, etype: str, idx: int, limits: dict) -> dict:
+    """What to move now to clear the violation: the sensitivity attribution's
+    controllable drivers for this element."""
+    import attribution_engine as attr
+
+    found = attr.attribute_violations(
+        copy.deepcopy(cur_net), timestamp=str(ts), vm_lower=limits["vm_lower_pu"], vm_upper=limits["vm_upper_pu"],
+        max_line_loading_pct=limits["max_line_loading_pct"], max_trafo_loading_pct=limits["max_trafo_loading_pct"])
+    entry = next((v for v in found.get("violations") or [] if v["kind"] == etype and v["index"] == idx), None)
+    note = ("What to move now, from the sensitivities at this moment (as compute_violation_attribution). "
+            "What changed since the reference is not necessarily what to move.")
+    if entry is None:
+        return {"drivers": [], "note": "The sensitivity attribution found no lever for this element."}
+    out = {"drivers": [d for d in entry.get("drivers") or [] if d.get("controllable")][:3],
+           "recommended_action": entry.get("recommended_action"), "note": note}
+    if entry.get("setpoint_levers"):
+        out["setpoint_levers"] = entry["setpoint_levers"]
+    if entry.get("voltage_controlled_by"):
+        out["voltage_controlled_by"] = entry["voltage_controlled_by"]
+        out["explanation"] = entry.get("explanation")
+    return out
+
+
+@app.post("/api/investigate")
+@_off_event_loop
+async def investigate(request: InvestigateRequest):
+    """Why something in the grid is what it is.
+
+    The value now — an element's voltage or loading, or the number of elements
+    outside their limits — is compared with a reference state (by default the
+    nearest earlier moment at which it was fine), and the change is divided
+    among the differences between the two states that caused it
+    (investigation.py): exact Shapley values over at most six factors, each
+    share from AC power flows, with a verdict per factor (cause, contributes,
+    ruled out, counteracts) and the pairs that amplify or dampen each other.
+    The levers to act on now are added from the sensitivity attribution.
+
+    With `outage`, both states have that line or transformer out: why the
+    outage is critical now. With `start_timestamp`, a window is compared with
+    another (`_investigate_window`).
+
+    A symptom that is not there is said, not explained: one within its limits
+    with no reference given returns `no_symptom`. Several elements outside
+    their limits and none named returns `choose`.
+
+    Nothing is stored and `app_data["current_index"]` is never moved.
+    """
+    started = time.time()
+    if request.recurring:
+        return _investigate_recurring(request, started)
+    if request.start_timestamp or request.end_timestamp:
+        request = _one_moment_window(request)
+        if request.start_timestamp:
+            return _investigate_window(request, started)
+    limits = _thresholds_used(request)
+    ts = _resolve_tick(request.data_source, request.timestamp)
+    cur_net, _ = _prepared_net(ts, request)
+    outage = _outage_of(cur_net, request.outage)
+    _with_outage(cur_net, outage)
+    outage_name = outage[2] if outage else None
+    solved = copy.deepcopy(cur_net)
+    if not inv._solve(solved):
+        raise HTTPException(status_code=503, detail=f"The power flow does not converge at {ts}"
+                                                    + (f" after losing {outage_name}" if outage else "")
+                                                    + ", so there is no state to investigate.")
+    label_now = _state_label(ts, request, outage_name)
+    base = {"timestamp": ts, "data_source": _dataset_label(request), "thresholds_used": limits,
+            **({"outage": outage_name} if outage else {})}
+
+    whole = bool(request.element) and request.element.strip().lower() in _GRID
+    narrowed = None
+    if whole:
+        outside_now = _outside_limits(solved, limits)
+        if len(outside_now) == 1:
+            # One element outside its limits: the grid's 0 → 1 is that element's
+            # problem, and its own voltage or loading divides the causes far more
+            # finely than a count of one (observed live: "demand 100 %").
+            whole, narrowed = False, outside_now[0]["element"]
+    if narrowed:
+        etype, idx, name = _investigated_element(solved, narrowed, None)
+    elif request.element and not whole:
+        etype, idx, name = _investigated_element(solved, request.element, request.element_type)
+    elif not whole:
+        outside = _outside_limits(solved, limits)
+        if not outside:
+            return {**base, "status": "no_symptom", "violations": [],
+                    "message": f"No element is outside its limits at {label_now}, so there is nothing wrong to "
+                               "investigate. To explain a change, name the element and a reference moment."}
+        if len(outside) > 1:
+            return {**base, "status": "choose", "violations": outside,
+                    "message": f"{len(outside)} elements are outside their limits at {label_now}. Ask the operator "
+                               "which one to investigate — or investigate the grid as a whole (element 'all')."}
+        etype, idx, name = outside[0]["element_type"], outside[0]["index"], outside[0]["element"]
+
+    if whole:
+        etype, idx, name = "grid", None, "the grid"
+        target = inv.violations_target(limits)
+        value = target.metric(solved)
+        symptom = {"timestamp": ts, "data_source": _dataset_label(request), "network": _network_name(request),
+                   "value": value, "limit": 0, "violated": value > 0, "kind": "insecure" if value else "secure",
+                   "label": label_now, "elements": [v["element"] for v in _outside_limits(solved, limits)]}
+        accept = target.within
+    else:
+        target = inv.element_target(etype, idx, name, _element_buses(cur_net, etype, idx), limits)
+        value = inv.measure(solved, etype, idx)
+        if value is None:
+            raise HTTPException(status_code=422, detail=f"{name} has no {('voltage' if etype == 'bus' else 'loading')} "
+                                                        f"at {label_now} (out of service or not supplied).")
+        limit, kind = _limit_of(etype, value, limits)
+        margin_now = _margin(etype, value, limits)
+        symptom = {"timestamp": ts, "data_source": _dataset_label(request), "network": _network_name(request),
+                   "value": round(value, 5), "limit": limit, "violated": kind != "within", "kind": kind,
+                   "label": label_now,
+                   # Distance to the nearest limit: positive inside, negative outside.
+                   "margin": round(margin_now, 5 if etype == "bus" else 2)}
+        accept = (lambda v: _comfortable(etype, v, limits, margin_now)) if request.reference_mode == "comfortable" \
+            else target.within
+    violated = symptom["violated"]
+    head = {**base, "element": name, "element_type": etype, "symptom": symptom,
+            **({"narrowed": f"Asked about the whole grid; {name} is the only element outside its limits, so its "
+                            f"own {'voltage' if etype == 'bus' else 'loading'} was investigated."}
+               if narrowed else {})}
+
+    asked = _reference_request(request, ts) if any(
+        v is not None for v in (request.reference_timestamp, request.reference_data_source,
+                                request.reference_network, request.reference_outage)) else None
+    mode = request.reference_mode or "within_limits"
+    if asked is None and not violated and mode == "within_limits":
+        unit = "p.u." if etype == "bus" else "%"
+        state = (f"No element is outside its limits at {label_now}" if whole else
+                 f"{name} is within its limits at {label_now} ({value:.3f} {unit}; limit {symptom['limit']:g} {unit})")
+        return {**head, "status": "no_symptom",
+                "message": f"{state}, so there is nothing wrong to investigate. To explain a change, give a "
+                           "reference moment to compare with."}
+
+    since = None
+    if asked is not None:
+        ref_request, ref_ts, why = asked
+    elif mode == "previous_day":
+        timestamps, _dataset, _label = _resolve_dataset(request.data_source)
+        day_before = (pd.Timestamp(ts) - pd.Timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        if day_before not in timestamps:
+            raise HTTPException(status_code=404, detail=f"{day_before} is not in the {_label}: there is no "
+                                                        "previous day to compare with.")
+        ref_request, ref_ts, why = request, day_before, "the same moment the previous day"
+    else:
+        found = _search_reference(request, ts, target, outage, accept)
+        if found is None:
+            what = "comfortably inside its limits" if mode == "comfortable" else "within its limits"
+            out = {**head, "status": "no_reference",
+                   "message": f"{name} is not {what} at any moment searched (up to {_REFERENCE_SEARCH_TICKS} ticks "
+                              "each way), so there is no state without the problem to compare with. Give a "
+                              "reference moment to explain a change."}
+            if request.levers and violated and not whole:
+                out["levers"] = _levers(cur_net, ts, etype, idx, limits)
+            return out
+        ref_ts, direction, since = found
+        ref_request = request
+        if mode == "comfortable":
+            why = ("the last moment before it well inside its limits (at least twice today's margin)"
+                   if direction == "earlier" else "the next moment well inside its limits")
+        else:
+            why = ("the last moment before it, within its limits" if direction == "earlier" else
+                   "the next moment within its limits; it was outside them at every earlier moment searched")
+    ref_outage = outage if request.reference_outage is None else _outage_of(cur_net, request.reference_outage)
+    ref_net = _state_net(ref_ts, ref_request, ref_outage)
+    try:
+        dec = inv.decompose(ref_net, cur_net, target, hypotheses=request.hypotheses, classical=request.classical,
+                            inspect=_data_inspector(request, ref_request, ts, ref_ts))
+    except inv.InvestigationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    ref_value = dec.get("reference_value")
+    reference = {"timestamp": ref_ts, "data_source": _dataset_label(ref_request),
+                 "network": _network_name(ref_request),
+                 "value": round(ref_value, 5) if ref_value is not None else None,
+                 "within_limits": target.within(ref_value) if ref_value is not None else None,
+                 "why": why, "label": _state_label(ref_ts, ref_request, ref_outage[2] if ref_outage else None),
+                 **({"outage": ref_outage[2] if ref_outage else "none"} if request.reference_outage else {})}
+    result = {**head, "status": dec["status"], "reference": reference, "reference_mode": mode,
+              **{k: v for k, v in dec.items() if k not in ("value", "reference_value", "status")}}
+    if "change" in result:
+        result["change"] = round(result["change"], target.decimals + 1)
+    if since and since != ts and mode == "within_limits":
+        result["outside_limits_since"] = since
+    if dec["status"] == "not_decomposed" and request.reference_outage and dec.get("reason", "").startswith("Some mixes"):
+        dec["reason"] += (" Here a mix has both outages at once, which the network cannot survive; compare each "
+                          "outage with the intact network instead (reference_outage='none').")
+    if outage and request.reference_outage and request.reference_outage.lower() in ("none", "intact", "no outage") \
+            and ref_ts != ts:
+        result["reference_note"] = (
+            "The reference is another moment without the outage, so the shares mix the outage with what changed "
+            "between the moments. To ask why the outage is critical now and not then, keep the outage in both "
+            "(leave reference_outage empty).")
+    if not whole and ref_value is not None and mode == "within_limits" and asked is None:
+        close = (abs(ref_value - symptom["limit"]) < _NEAR_LIMIT_PU if etype == "bus"
+                 else symptom["limit"] - ref_value < _NEAR_LIMIT_PCT)
+        if close:
+            result["reference_note"] = (
+                "The reference was itself close to the limit, so the shares explain the last push over it. "
+                "To see why it was near the limit at all, compare with a moment well inside it "
+                "(reference_mode='comfortable').")
+    result["message"] = inv.sentence(result) if dec["status"] == "explained" else dec["reason"]
+    doubts = [{"factor": f["factor"], **d} for f in result.get("factors") or []
+              for d in (f.get("data_check") or {}).get("suspicious") or []]
+    if doubts:
+        # A cause that may be a fault in the data: said first, before anyone acts on it.
+        result["data_check"] = {"suspicious": doubts, "message": (
+            "Check the data before acting on this: " + "; ".join(
+                f"{d['member']} shows {d['flags'][0]}" for d in doubts[:3]) + ".")}
+        result["message"] += " " + result["data_check"]["message"]
+    elif any("data_check" in f for f in result.get("factors") or []):
+        result["data_check"] = {"suspicious": [], "message": "The measured changes behind the causes look "
+                                                             "physical: no unusual jump, level or frozen value."}
+    check = request.check_references if request.check_references is not None else asked is None
+    if check and dec["status"] == "explained" and result.get("main_cause") and mode in _REFERENCE_MODES:
+        main_row = next(f for f in result["factors"] if f["factor"] == result["main_cause"])
+
+        def accept_for(m):
+            if m == "comfortable":
+                return None if whole else (lambda v: _comfortable(etype, v, limits, margin_now))
+            return target.within
+        result["reference_robustness"] = _reference_robustness(
+            request, ts, cur_net, target, outage, mode if asked is None else "asked", accept_for, main_row)
+        result["message"] += " " + result["reference_robustness"]["message"]
+    if violated and request.levers and not whole:
+        result["levers"] = _levers(cur_net, ts, etype, idx, limits)
+    result["method"] = _INVESTIGATION_METHOD
+    result["elapsed_s"] = round(time.time() - started, 2)
+    return result
+
+
+def _one_moment_window(request: InvestigateRequest) -> InvestigateRequest:
+    """A "window" of one moment on each side is a comparison of two moments:
+    asked as one, so the element (or the only one outside its limits) is
+    investigated rather than a count over a window. Observed live: a model
+    filling every field sent start = end = 18:00 against 15:00, and the grid's
+    0 → 1 violation was split 50/50 instead of explaining the bus's voltage."""
+    timestamps, _dataset, source = _window_dataset(request.data_source)
+    window = _window_ticks(timestamps, request.start_timestamp, request.end_timestamp, source)
+    if len(window) != 1:
+        return request
+    ref = None
+    if request.reference_start_timestamp or request.reference_end_timestamp:
+        ref_stamps, _rd, ref_source = _window_dataset(request.reference_data_source or request.data_source)
+        ref_window = _window_ticks(ref_stamps, request.reference_start_timestamp, request.reference_end_timestamp,
+                                   ref_source)
+        if len(ref_window) != 1:
+            return request
+        ref = ref_window[0]
+    update = {"timestamp": window[0], "start_timestamp": None, "end_timestamp": None,
+              "reference_start_timestamp": None, "reference_end_timestamp": None}
+    if ref is not None:
+        update["reference_timestamp"] = ref
+    if request.element and request.element.strip().lower() in _GRID and request.element_type:
+        update["element"] = None                          # "all" with an element type: not the grid
+    return request.model_copy(update=update)
+
+
+# ---------------------------------------------------------------------------
+# Recurring causes: every episode of a window, each investigated
+# ---------------------------------------------------------------------------
+
+_RECURRING_MAX_TICKS = 1344        # two weeks of 15-minute data, one power flow each
+_RECURRING_MAX_EVENTS = 10         # the most severe episodes, each a full decomposition
+_RECURRING_SHARE = 0.6             # a cause main in this share of the episodes recurs
+
+
+def _episodes(series: list[tuple[str, float | None]], within) -> list[dict]:
+    """Runs of consecutive moments outside the limits: start, end, the moment
+    just before (the reference) and the worst moment (the peak)."""
+    out, run = [], None
+    for i, (_ts, v) in enumerate(series):
+        bad = v is not None and not within(v)
+        if bad and run is None:
+            run = {"start_i": i}
+        if not bad and run is not None:
+            run["end_i"] = i - 1
+            out.append(run)
+            run = None
+    if run is not None:
+        run["end_i"] = len(series) - 1
+        out.append(run)
+    return out
+
+
+def _investigate_recurring(request: InvestigateRequest, started: float) -> dict:
+    """Every episode of a window outside the limits, each investigated at its
+    worst moment against the moment just before it began, and the main causes
+    gathered by kind: a cause that recurs points to a structural problem (a
+    reinforcement, a contract), not an operating one."""
+    limits = _thresholds_used(request)
+    timestamps, _dataset, source = _window_dataset(request.data_source)
+    window = _window_ticks(timestamps, request.start_timestamp, request.end_timestamp, source) \
+        if (request.start_timestamp or request.end_timestamp) else list(timestamps)
+    if len(window) > _RECURRING_MAX_TICKS:
+        raise HTTPException(status_code=400, detail=f"The window holds {len(window)} moments; recurring causes are "
+                                                    f"searched over at most {_RECURRING_MAX_TICKS} (two weeks of "
+                                                    "15-minute data). Narrow it with start/end_timestamp.")
+    probe, _ = _prepared_net(window[0], request)
+    outage = _outage_of(probe, request.outage)
+    # One pass over the window: every moment solved once, every element judged.
+    solved = []
+    for ts in window:
+        net = _state_net(ts, request, outage)
+        solved.append((ts, net if inv._solve(net) else None))
+    if request.element and request.element.strip().lower() not in _GRID:
+        etype, idx, name = _investigated_element(probe, request.element, request.element_type)
+        picked = None
+    else:
+        counts: dict[tuple, int] = {}
+        for _ts, net in solved:
+            for v in _outside_limits(net, limits) if net is not None else []:
+                key = (v["element_type"], v["index"], v["element"])
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return {"mode": "recurring", "status": "no_symptom", "data_source": source,
+                    "message": f"No element is outside its limits between {window[0][:16]} and {window[-1][:16]}."}
+        (etype, idx, name), n_out = max(counts.items(), key=lambda kv: kv[1])
+        picked = (f"No element named: {name} is the one outside its limits most often in the window "
+                  f"({n_out} moments).")
+    target = inv.element_target(etype, idx, name, _element_buses(probe, etype, idx), limits)
+    series = [(ts, target.metric(net) if net is not None else None) for ts, net in solved]
+    found = _episodes(series, target.within)
+    for e in found:
+        span = series[e["start_i"]:e["end_i"] + 1]
+        worst = max(range(len(span)), key=lambda j: target.excess(span[j][1]) if span[j][1] is not None else -1)
+        e.update(start=series[e["start_i"]][0], end=series[e["end_i"]][0], peak=span[worst][0],
+                 peak_value=span[worst][1], moments=len(span), severity=target.excess(span[worst][1]))
+    hours = 0.25
+    if len(timestamps) > 1:
+        hours = max((pd.Timestamp(timestamps[1]) - pd.Timestamp(timestamps[0])).total_seconds() / 3600, 1e-6)
+    base = {"mode": "recurring", "data_source": source, "thresholds_used": limits, "element": name,
+            "element_type": etype, "window": {"start": window[0], "end": window[-1], "moments": len(window)},
+            **({"picked": picked} if picked else {}), **({"outage": outage[2]} if outage else {})}
+    if not found:
+        return {**base, "status": "no_symptom",
+                "message": f"{name} stays within its limits between {window[0][:16]} and {window[-1][:16]}."}
+    chosen = sorted(found, key=lambda e: -e["severity"])[:_RECURRING_MAX_EVENTS]
+    events = []
+    for e in sorted(chosen, key=lambda e: e["start"]):
+        before = e["start_i"] - 1
+        event = {"start": e["start"], "end": e["end"], "peak": e["peak"],
+                 "peak_value": round(e["peak_value"], target.decimals), "hours_outside": round(e["moments"] * hours, 2)}
+        if before < 0 or series[before][1] is None:
+            events.append({**event, "status": "no_reference", "main_cause": None})
+            continue
+        ref_net = _state_net(series[before][0], request, outage)
+        cur_net = _state_net(e["peak"], request, outage)
+        dec = inv.decompose(ref_net, cur_net, target, hypotheses=request.hypotheses, drill=False)
+        row = next((f for f in dec.get("factors") or [] if f["factor"] == dec.get("main_cause")), None)
+        events.append({**event, "reference": series[before][0], "status": dec["status"],
+                       "main_cause": row.get("factor") if row else None, "kind": inv.cause_kind(row),
+                       "share_pct": row.get("share_pct") if row else None,
+                       "factors": [{"factor": f["factor"], "kind": inv.cause_kind(f), "share_pct": f["share_pct"],
+                                    "verdict": f["verdict"]} for f in dec.get("factors") or []]})
+    explained = [ev for ev in events if ev.get("kind")]
+    causes: dict[str, dict] = {}
+    for ev in explained:
+        c = causes.setdefault(ev["kind"], {"cause": ev["kind"], "episodes": 0, "shares": []})
+        c["episodes"] += 1
+        c["shares"].append(ev["share_pct"])
+    ranked = sorted(causes.values(), key=lambda c: -c["episodes"])
+    for c in ranked:
+        c["share_range_pct"] = [min(c["shares"]), max(c["shares"])]
+        c["main_in_pct"] = round(100 * c["episodes"] / len(explained), 1)
+        del c["shares"]
+    top = ranked[0] if ranked else None
+    recurs = bool(top and len(explained) >= 2 and top["main_in_pct"] >= 100 * _RECURRING_SHARE)
+    span = f"between {window[0][:16]} and {window[-1][:16]}"
+    if recurs:
+        lo, hi = top["share_range_pct"]
+        message = (f"{name} was outside its limits in {len(found)} episode(s) {span}. In {top['episodes']} of the "
+                   f"{len(explained)} investigated, the main cause was {top['cause']} ({lo:.0f}–{hi:.0f} % of the "
+                   "change): a recurring cause, which points to a structural problem rather than an operating one.")
+    else:
+        message = (f"{name} was outside its limits in {len(found)} episode(s) {span}, with no single cause main in "
+                   f"most of them (" + "; ".join(f"{c['cause']} in {c['episodes']}" for c in ranked) + ").")
+    return {**base, "status": "explained", "episodes_found": len(found), "events": events, "causes": ranked,
+            "recurs": recurs, "message": message,
+            "method": ("Each episode is investigated at its worst moment against the moment just before it began "
+                       "(Shapley values over AC power flows); the main causes are gathered by kind."),
+            "elapsed_s": round(time.time() - started, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Prevention: could the episode have been avoided, and how early was it seen
+# ---------------------------------------------------------------------------
+
+_PREVENTION_SEARCH_TICKS = 192      # how far the episode and its warning are followed each way
+_PREVENTION_MOMENTS = 24            # moments of the period an action is checked at, evenly spread
+_PREVENTION_BISECTIONS = 6          # halvings to find the smallest sufficient action
+_PREVENTION_ACTIONS = 4
+_PREVENTION_MAX_SCALE = 4.0         # an action short of enough is tried up to this many times its size
+
+
+class PreventionRequest(_NoOption, GridRequest):
+    """Request body for ``POST /api/investigate/prevention``.
+
+    element : str | None
+        The bus, line or transformer; omitted, the only one outside its limits.
+    actions : list[dict] | None
+        Candidate actions, each one of: {"unit", "setpoint_pu"} (a voltage
+        set-point), {"unit", "setpoint_change"} (p.u.), {"unit", "p_change_mw"}.
+        Omitted: the levers the attribution finds at that moment.
+    warning_margin : float | None
+        How close to the limit counts as a warning: 0.01 p.u. for a voltage, 10
+        points for a loading by default.
+    combine : bool
+        Also try all the actions together, as one more candidate.
+    outage : str | None
+        A line or transformer out throughout (the episode after an outage).
+    """
+    element: str | None = None
+    element_type: str | None = None
+    actions: list[dict] | None = None
+    warning_margin: float | None = None
+    outage: str | None = None
+    combine: bool = False
+
+    @field_validator("element", "element_type", "outage")
+    @classmethod
+    def _blank_is_not_given(cls, value):
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    @field_validator("actions")
+    @classmethod
+    def _valid_actions(cls, value):
+        given = [a for a in value or [] if isinstance(a, dict) and str(a.get("unit") or "").strip()]
+        if len(given) > _PREVENTION_ACTIONS:
+            raise ValueError(f"at most {_PREVENTION_ACTIONS} actions.")
+        for a in given:
+            kinds = [k for k in ("setpoint_pu", "setpoint_change", "p_change_mw") if a.get(k) not in (None, "", 0)]
+            if len(kinds) != 1:
+                raise ValueError(f"action on {a.get('unit')!r}: give exactly one of setpoint_pu, setpoint_change, "
+                                 "p_change_mw.")
+        return given or None
+
+
+def _unit_at(net, name: str) -> tuple[str, int]:
+    """(table, index) of a unit — by its name, 'Gen_bus7' or its bus (`resolve.find_unit`)."""
+    try:
+        found = rv.find_unit(net, name)
+    except rv.ResolveError as exc:
+        raise _resolution_http(exc) from None
+    return found.etype, found.idx
+
+
+def _units_of(action: dict) -> list[str]:
+    return [a["unit"] for a in action["together"]] if "together" in action else [action["unit"]]
+
+
+def _apply_action(net, action: dict, scale: float) -> str | None:
+    """Apply `scale` of an action (or of several together) to a prepared
+    network; a reason if it cannot."""
+    if "together" in action:
+        for part in action["together"]:
+            reason = _apply_action(net, part, scale)
+            if reason:
+                return reason
+        return None
+    table, idx = _unit_at(net, action["unit"])
+    if action.get("setpoint_pu") is not None or action.get("setpoint_change") is not None:
+        if table != "gen":
+            return f"{action['unit']} holds no voltage set-point"
+        now = float(net.gen.at[idx, "vm_pu"])
+        delta = (float(action["setpoint_pu"]) - now) if action.get("setpoint_pu") is not None \
+            else float(action["setpoint_change"])
+        net.gen.at[idx, "vm_pu"] = now + scale * delta
+        return None
+    net[table].at[idx, "p_mw"] = float(net[table].at[idx, "p_mw"]) + scale * float(action["p_change_mw"])
+    return None
+
+
+def _describe_action(action: dict, scale: float = 1.0) -> str:
+    if "together" in action:
+        return "together: " + "; ".join(_describe_action(a, scale) for a in action["together"])
+    if action.get("setpoint_pu") is not None:
+        return f"set {action['unit']}'s voltage set-point to {action['setpoint_pu']:.3f} p.u."
+    if action.get("setpoint_change") is not None:
+        d = scale * float(action["setpoint_change"])
+        frm = action.get("setpoint_from")
+        to = f" (from {frm:.3f} to {frm + d:.3f} p.u.)" if frm is not None else ""
+        return f"{'raise' if d > 0 else 'lower'} {action['unit']}'s voltage set-point by {abs(d):.3f} p.u.{to}"
+    d = scale * float(action["p_change_mw"])
+    return f"{'raise' if d > 0 else 'lower'} {action['unit']}'s output by {abs(d):.1f} MW"
+
+
+def _check_action(moments: list[str], request, outage, target, etype, limits, action: dict, scale: float,
+                  before: dict[str, set]) -> dict:
+    """The action at `scale`, held at every moment: the element within its limits,
+    no element outside its limits that was not before, the unit within its range."""
+    worst, new, problem, values = None, set(), None, []
+    for ts in moments:
+        net = _state_net(ts, request, outage)
+        reason = _apply_action(net, action, scale)
+        if reason:
+            return {"works": False, "reason": reason}
+        if not inv._solve(net):
+            return {"works": False, "reason": f"the power flow does not converge at {ts[:16]}"}
+        value = target.metric(net)
+        if value is None:
+            return {"works": False, "reason": f"{target.label} is not supplied at {ts[:16]}"}
+        excess = target.excess(value)
+        values.append(round(value, target.decimals))
+        worst = value if worst is None or excess > target.excess(worst) else worst
+        now = {v["element"] for v in _outside_limits(net, limits)}
+        new |= now - before[ts] - {target.label}
+        for unit in _units_of(action):
+            table, idx = _unit_at(net, unit)
+            if table == "gen" and problem is None:
+                q = float(net.res_gen.at[idx, "q_mvar"])
+                lo, hi = net.gen.at[idx, "min_q_mvar"], net.gen.at[idx, "max_q_mvar"]
+                if pd.notna(lo) and pd.notna(hi) and not (float(lo) - 1e-6 <= q <= float(hi) + 1e-6):
+                    problem = f"{unit} would need {q:.1f} Mvar at {ts[:16]}, outside {lo:g} to {hi:g} Mvar"
+            p = float(net[table].at[idx, "p_mw"])
+            cap = net[table].at[idx, "max_p_mw"] if "max_p_mw" in net[table].columns else None
+            if problem is None and (p < -1e-6 or (cap is not None and pd.notna(cap) and p > float(cap) + 1e-6)):
+                problem = f"{unit} would produce {p:.1f} MW at {ts[:16]}, outside its range"
+    ok = target.excess(worst) <= 0 and not new and problem is None
+    return {"works": ok, "worst_value": round(worst, target.decimals), "new_violations": sorted(new),
+            "values": values, **({"reason": problem} if problem else {})}
+
+
+@app.post("/api/investigate/prevention")
+@_off_event_loop
+async def investigate_prevention(request: PreventionRequest):
+    """Could an episode outside the limits have been avoided, and how early was it seen?
+
+    From a moment in the episode: the episode itself (the run of moments
+    outside the limits around it), the warning before it (the run of moments
+    just inside, within `warning_margin` of the limit), and, for each candidate
+    action held from the warning to the end of the episode, whether it keeps
+    the element within its limits at every moment — with no element outside
+    its limits that was not before and the unit within its range — and the
+    smallest share of it that still does (bisection). Every moment is checked
+    by an AC power flow (up to `_PREVENTION_MOMENTS`, evenly spread).
+
+    The model is static: an action held from the warning on is the same, at
+    each moment, as one taken just before the episode. What the warning gives
+    is the time there was to decide.
+    """
+    started = time.time()
+    limits = _thresholds_used(request)
+    timestamps, _dataset, source = _window_dataset(request.data_source)
+    ts = _resolve_tick(request.data_source, request.timestamp)
+    probe, _ = _prepared_net(ts, request)
+    outage = _outage_of(probe, request.outage)
+    _with_outage(probe, outage)
+    solved = copy.deepcopy(probe)
+    if not inv._solve(solved):
+        raise HTTPException(status_code=503, detail=f"The power flow does not converge at {ts}.")
+    if request.element:
+        etype, idx, name = _investigated_element(solved, request.element, request.element_type)
+    else:
+        outside = _outside_limits(solved, limits)
+        if len(outside) != 1:
+            return {"status": "choose" if outside else "no_symptom", "violations": outside,
+                    "message": ("Name the element: " + ", ".join(v["element"] for v in outside)) if outside else
+                               f"No element is outside its limits at {ts[:16]}."}
+        etype, idx, name = outside[0]["element_type"], outside[0]["index"], outside[0]["element"]
+    return _prevention(request, ts, etype, idx, name, probe, outage, limits, timestamps, source, started)
+
+
+def _prevention(request, ts: str, etype: str, idx: int, name: str, probe, outage, limits: dict, timestamps: list,
+                source: str, started: float, span: tuple[int, int] | None = None) -> dict:
+    """The prevention check of one element's episode around `ts` (see
+    `investigate_prevention`); also run by `look_ahead` on the forecast, with
+    `span` — the first and last positions of an episode that briefly comes
+    back inside its limits — held as one episode."""
+    target = inv.element_target(etype, idx, name, _element_buses(probe, etype, idx), limits)
+    value_at = {}
+
+    def value_of(i: int) -> float | None:
+        if i not in value_at:
+            net = _state_net(timestamps[i], request, outage)
+            value_at[i] = target.metric(net) if inv._solve(net) else None
+        return value_at[i]
+
+    pos = timestamps.index(ts)
+    if value_of(pos) is None or target.within(value_of(pos)):
+        return {"status": "no_symptom", "element": name,
+                "message": f"{name} is within its limits at {ts[:16]}: there is no episode to prevent."}
+    start = pos
+    while start > 0 and pos - start < _PREVENTION_SEARCH_TICKS and value_of(start - 1) is not None \
+            and not target.within(value_of(start - 1)):
+        start -= 1
+    end = pos
+    while end < len(timestamps) - 1 and end - pos < _PREVENTION_SEARCH_TICKS and value_of(end + 1) is not None \
+            and not target.within(value_of(end + 1)):
+        end += 1
+    if span:
+        start, end = min(start, span[0]), max(end, span[1])
+    margin = request.warning_margin if request.warning_margin is not None else (
+        _COMFORT_PU if etype == "bus" else _COMFORT_PCT)
+    warn = start
+    while warn > 0 and start - warn < _PREVENTION_SEARCH_TICKS and value_of(warn - 1) is not None \
+            and target.within(value_of(warn - 1)) and _margin(etype, value_of(warn - 1), limits) < margin:
+        warn -= 1
+    hours = 0.25
+    if len(timestamps) > 1:
+        hours = max((pd.Timestamp(timestamps[1]) - pd.Timestamp(timestamps[0])).total_seconds() / 3600, 1e-6)
+    period = timestamps[warn:end + 1]
+    moments = [period[i] for i in _thinned(len(period), _PREVENTION_MOMENTS)]
+    before = {}
+    for m in moments:
+        net = _state_net(m, request, outage)
+        before[m] = {v["element"] for v in _outside_limits(net, limits)} if inv._solve(net) else set()
+
+    actions = request.actions
+    source_of_actions = "asked"
+    if not actions:
+        levers = _levers(probe, ts, etype, idx, limits)
+        actions, source_of_actions = [], "the attribution's levers at this moment"
+        for lv in (levers.get("setpoint_levers") or [])[:2]:
+            actions.append({"unit": lv["unit"], "setpoint_change": round(lv["setpoint_new"] - lv["setpoint_now"], 4)})
+        for d in levers.get("drivers") or []:
+            relief = d.get("relief_mw")
+            if relief is not None and len(actions) < 3:
+                actions.append({"unit": d["source"], "p_change_mw": round(relief, 2)})
+    # Every set-point action as a change from the set-point it starts from, so
+    # a share of it is said as the set-point it gives (observed: a share of
+    # "set to 1.011 p.u." was still described as 1.011).
+    def as_change(a: dict) -> dict:
+        out = dict(a)
+        try:
+            table, uidx = _unit_at(probe, a["unit"])
+        except HTTPException:
+            return out
+        if table == "gen" and (a.get("setpoint_pu") is not None or a.get("setpoint_change") is not None):
+            now = float(probe.gen.at[uidx, "vm_pu"])
+            change = (float(a["setpoint_pu"]) - now) if a.get("setpoint_pu") is not None else float(a["setpoint_change"])
+            out.pop("setpoint_pu", None)
+            out.update(setpoint_change=round(change, 4), setpoint_from=round(now, 4))
+        return out
+    actions = [as_change(a) for a in actions]
+    if request.combine and len(actions) > 1:
+        actions = actions + [{"together": [dict(a) for a in actions]}]
+    tested = []
+    for action in actions:
+        full = _check_action(moments, request, outage, target, etype, limits, action, 1.0, before)
+        row = {"action": _describe_action(action), "as_given": full,
+               **{k: action[k] for k in action if k != "together"},
+               **({"together": [_describe_action(a) for a in action["together"]]} if "together" in action else {})}
+        hi = 1.0 if full["works"] else None
+        if not full["works"] and not full.get("reason") and not full.get("new_violations"):
+            # Short of enough, and nothing else wrong: how much more would do.
+            scale = 1.0
+            while scale < _PREVENTION_MAX_SCALE:
+                scale = min(2 * scale, _PREVENTION_MAX_SCALE)
+                bigger = _check_action(moments, request, outage, target, etype, limits, action, scale, before)
+                if bigger["works"]:
+                    hi = scale
+                    break
+                if bigger.get("reason") or bigger.get("new_violations"):
+                    row["larger"] = {"share_of_action": scale, "action": _describe_action(action, scale), **bigger}
+                    break
+        if hi is not None:
+            lo = 0.0 if full["works"] else hi / 2
+            for _ in range(_PREVENTION_BISECTIONS):
+                mid = (lo + hi) / 2
+                if _check_action(moments, request, outage, target, etype, limits, action, mid, before)["works"]:
+                    hi = mid
+                else:
+                    lo = mid
+            row["smallest"] = {"share_of_action": round(hi, 3), "action": _describe_action(action, hi),
+                               **_check_action(moments, request, outage, target, etype, limits, action, hi, before)}
+        tested.append(row)
+    works = [r for r in tested if "smallest" in r]
+    lead = (pd.Timestamp(timestamps[start]) - pd.Timestamp(timestamps[warn])).total_seconds() / 60
+    episode = {"start": timestamps[start], "end": timestamps[end], "moments": end - start + 1,
+               "hours": round((end - start + 1) * hours, 2),
+               "worst_value": round(max((v for i in range(start, end + 1) if (v := value_of(i)) is not None),
+                                        key=target.excess), target.decimals)}
+    warning = {"start": timestamps[warn], "lead_minutes": round(lead), "margin": margin,
+               "seen": warn < start}
+    head = (f"{name} was outside its limits from {episode['start'][:16]} to {episode['end'][:16]} "
+            f"({episode['hours']:g} h). ")
+    head += (f"It came within {margin:g} {'p.u.' if etype == 'bus' else 'points'} of its limit at "
+             f"{warning['start'][:16]}, {warning['lead_minutes']} minutes before. " if warning["seen"] else
+             "It went from comfortably inside its limits to outside them with no warning moment in between. ")
+    if works:
+        best = works[0]
+        head += (f"Held from {period[0][:16]} to {period[-1][:16]}, {best['smallest']['action']} would have "
+                 "kept it within its limits at every moment checked, with no new violation"
+                 + (" — more than the action as given." if best["smallest"]["share_of_action"] > 1 else ".")
+                 + (f" Also sufficient: {'; '.join(r['smallest']['action'] for r in works[1:]).rstrip('.')}."
+                    if works[1:] else ""))
+    else:
+        def obstacle(r: dict) -> str:
+            given = r["as_given"]
+            if given.get("reason"):
+                return given["reason"]
+            if given.get("new_violations"):
+                return f"it puts {', '.join(given['new_violations'])} outside its limits"
+            larger = r.get("larger") or {}
+            more = (f"; {larger['action'].split(':')[0] if larger.get('action') else 'more'} would "
+                    + (larger["reason"] if larger.get("reason") else
+                       f"put {', '.join(larger.get('new_violations') or [])} outside its limits")) if larger else ""
+            return f"it falls short ({name} at {given.get('worst_value')} at worst){more}"
+        head += ("None of the actions tested would have kept it within its limits throughout: "
+                 + "; ".join(f"{r['action']} — {obstacle(r)}" for r in tested[:4]).rstrip(".") + ".")
+    # The element at every moment checked: as it was, and with the first
+    # sufficient action (its smallest share) — or the closest tested.
+    shown = works[0]["smallest"] if works else min(
+        (r["as_given"] for r in tested if r["as_given"].get("values")),
+        key=lambda g: target.excess(g["worst_value"]), default=None)
+    series = {"moments": moments,
+              "without": [round(value_of(timestamps.index(m)), target.decimals) for m in moments],
+              "with": (shown or {}).get("values"),
+              "action": (works[0]["smallest"]["action"] if works else
+                         next((r["action"] for r in tested if r["as_given"] is shown), None)),
+              "sufficient": bool(works),
+              "limit": _limit_of(etype, value_of(pos), limits)[0]}
+    for r in tested:
+        r["as_given"].pop("values", None)
+        if "smallest" in r:
+            r["smallest"].pop("values", None)
+        if "larger" in r:
+            r["larger"].pop("values", None)
+    return {"status": "checked", "element": name, "element_type": etype, "data_source": source,
+            "thresholds_used": limits, "episode": episode, "warning": warning, "series": series,
+            "period_checked": {"start": period[0], "end": period[-1], "moments_checked": len(moments)},
+            "actions_from": source_of_actions, "actions": tested, "message": head,
+            **({"outage": outage[2]} if outage else {}),
+            "method": ("Each action is held from the warning to the end of the episode and checked by an AC power "
+                       "flow at every moment checked: the element within its limits, no element outside its "
+                       "limits that was not before, the unit within its range. The smallest sufficient share "
+                       "of it is found by halving."),
+            "elapsed_s": round(time.time() - started, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Looking ahead: what the forecast says is coming, and what would prevent it
+# ---------------------------------------------------------------------------
+
+_LOOK_AHEAD_MAX_HOURS = 72
+_LOOK_AHEAD_EPISODES = 5
+_LOOK_AHEAD_GAP_H = 1.0     # back inside the limits for at most this long: still one episode
+
+
+class LookAheadRequest(_NoOption, GridRequest):
+    """Request body for ``POST /api/investigate/look_ahead``.
+
+    data_source : str
+        "forecasts" by default: what is expected, not what happened.
+    start_timestamp / hours : str | None, float
+        The horizon: from this moment (default: the simulation clock if the
+        forecast covers it, else the first forecast moment), this many hours
+        (24 by default, 72 at most).
+    elements : list[str] | None
+        Only these buses, lines or transformers.
+    uncertainty_pct : float
+        Each action found is checked again with demand this much above the
+        forecast, and renewable output this much below it (5 % by default):
+        does it still hold?
+    max_episodes : int
+        The most severe episodes worked out in full (5 by default).
+    """
+    data_source: str = "forecasts"
+    start_timestamp: str | None = None
+    hours: float = 24.0
+    elements: list[str] | None = None
+    uncertainty_pct: float = 5.0
+    max_episodes: int = _LOOK_AHEAD_EPISODES
+
+    @field_validator("hours")
+    @classmethod
+    def _horizon(cls, value):
+        if not 0 < value <= _LOOK_AHEAD_MAX_HOURS:
+            raise ValueError(f"hours must be between 0 and {_LOOK_AHEAD_MAX_HOURS}.")
+        return value
+
+    @field_validator("start_timestamp")
+    @classmethod
+    def _blank_start(cls, value):
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _holds_under(case: str, label: str, harder, ts: str, etype: str, idx: int, name: str, limits: dict,
+                 timestamps: list, source: str, positions: tuple[int, int]) -> dict:
+    """Whether an action (its smallest share, in `harder.actions`) still prevents
+    the episode where the forecast errs against it (`harder`'s scaling)."""
+    again = _prevention(harder, ts, etype, idx, name, _prepared_net(ts, harder)[0], None, limits, timestamps,
+                        source, time.time(), positions)
+    out = {"case": case, "label": label}
+    given = ((again.get("actions") or [{}])[0]).get("as_given")
+    if again.get("status") == "no_symptom":
+        return {**out, "holds": True}
+    if given is None:
+        return {**out, "holds": None}
+    out["holds"] = bool(given.get("works"))
+    if not given.get("works"):
+        out["why_not"] = given.get("reason") or (
+            f"it puts {', '.join(given['new_violations'])} outside its limits"
+            if given.get("new_violations") else f"{name} still reaches {given.get('worst_value')}")
+        bigger = again["actions"][0].get("smallest") or {}
+        if bigger:
+            out["enough_then"] = bigger["action"]
+    return out
+
+
+def _scaled_action(action: dict, share: float) -> dict:
+    """An action at a share of its size, as a plain change."""
+    out = {"unit": action["unit"]}
+    if action.get("setpoint_change") is not None:
+        out["setpoint_change"] = round(float(action["setpoint_change"]) * share, 4)
+    elif action.get("p_change_mw") is not None:
+        out["p_change_mw"] = round(float(action["p_change_mw"]) * share, 3)
+    return out
+
+
+@app.post("/api/investigate/look_ahead")
+@_off_event_loop
+async def look_ahead(request: LookAheadRequest):
+    """What is coming, and what would prevent it.
+
+    Over the horizon of the forecast: every moment solved, the episodes outside
+    the limits found element by element, and for the most severe ones — when to
+    decide (the start of the warning, within a small margin of the limit), the
+    main cause (Shapley values against the last comfortable moment before
+    it), and the smallest sufficient action, checked by AC power flows through
+    the warning and the episode — then checked again with demand
+    `uncertainty_pct` above the forecast and renewables as much below it. Expectations from the forecast,
+    not facts: the result says so.
+    """
+    started = time.time()
+    limits = _thresholds_used(request)
+    timestamps, _dataset, source = _window_dataset(request.data_source)
+    moved = None
+    if request.start_timestamp and str(request.start_timestamp) < str(timestamps[0])[:len(request.start_timestamp)]:
+        # The clock before the forecast begins (observed: the model passes the
+        # clock): the horizon starts where the forecast does, and says so.
+        first = timestamps[0]
+        moved = f"{request.start_timestamp} is before {'the forecast' if source == 'forecasts' else 'the data'} begins; the horizon starts at {first[:16]}."
+    elif request.start_timestamp:
+        first = _resolve_window_timestamp(request.start_timestamp, "start_timestamp", timestamps=timestamps)
+    else:
+        clock = app_data["timestamps"][min(app_data["current_index"], len(app_data["timestamps"]) - 1)] \
+            if app_data.get("timestamps") else None
+        first = clock if clock in timestamps else timestamps[0]
+    pos = timestamps.index(first)
+    hours_per = 0.25
+    if len(timestamps) > 1:
+        hours_per = max((pd.Timestamp(timestamps[1]) - pd.Timestamp(timestamps[0])).total_seconds() / 3600, 1e-6)
+    window = timestamps[pos:pos + max(1, int(round(request.hours / hours_per)))]
+    probe, _ = _prepared_net(window[0], request)
+    wanted = None
+    if request.elements:
+        wanted = {(t, i) for t, i, _n in (_investigated_element(probe, e, None) for e in request.elements)}
+    runs: dict[tuple, dict] = {}
+    unsolved = 0
+    for ts in window:
+        net, _ = _prepared_net(ts, request)
+        if not inv._solve(net):
+            unsolved += 1
+            continue
+        for v in _outside_limits(net, limits):
+            key = (v["element_type"], v["index"], v["element"])
+            if wanted is None or key[:2] in wanted:
+                runs.setdefault(key, {})[ts] = v["value"]
+    episodes = []
+    gap = max(1, int(round(_LOOK_AHEAD_GAP_H / hours_per)))
+    for (etype, idx, name), seen in runs.items():
+        # The moments of one element outside its limits, back inside for at
+        # most an hour between them: one episode.
+        moments = list(seen)
+        group = [moments[0]]
+        for ts in moments[1:]:
+            if timestamps.index(ts) - timestamps.index(group[-1]) > gap + 1:
+                episodes.append((etype, idx, name, group, seen))
+                group = []
+            group.append(ts)
+        episodes.append((etype, idx, name, group, seen))
+    basis = "the forecast" if source == "forecasts" else "the measurements"
+    span = f"{window[0][:16]} to {window[-1][:16]}"
+    base = {"mode": "look_ahead", "basis": source, "data_source": source, "thresholds_used": limits,
+            "horizon": {"start": window[0], "end": window[-1], "hours": round(len(window) * hours_per, 2),
+                        "moments": len(window), **({"not_converged": unsolved} if unsolved else {})},
+            "note": f"Expectations from {basis}, not facts: each figure is a power flow of {basis}.",
+            "forecast_errors_checked": (
+                f"each action again with demand {request.uncertainty_pct:g} % above and renewable output "
+                f"{request.uncertainty_pct:g} % below {basis}" if len(probe.sgen) else
+                f"each action again with demand {request.uncertainty_pct:g} % above {basis} (the network has no "
+                "renewable units, so no error in renewable output is checked)"),
+            **({"start_note": moved} if moved else {})}
+    if not episodes:
+        return {**base, "status": "clear", "episodes": [],
+                "message": f"Nothing is expected outside its limits from {span} ({basis}).",
+                "elapsed_s": round(time.time() - started, 2)}
+
+    def severity(ep) -> float:
+        etype, idx, name, group, seen = ep
+        target = inv.element_target(etype, idx, name, _element_buses(probe, etype, idx), limits)
+        return max(target.excess(seen[ts]) for ts in group)
+    chosen = sorted(episodes, key=severity, reverse=True)[:max(1, request.max_episodes)]
+    plain = {"data_source", "network", "load_scaling_factor", "sgen_scaling_factor", "vm_lower_pu", "vm_upper_pu",
+             "max_line_loading_pct", "max_trafo_loading_pct", "load_power_factor"}
+    out = []
+    for etype, idx, name, group, seen in sorted(chosen, key=lambda e: e[3][0]):
+        target = inv.element_target(etype, idx, name, _element_buses(probe, etype, idx), limits)
+        peak = max(group, key=lambda ts: target.excess(seen[ts]))
+        positions = (timestamps.index(group[0]), timestamps.index(group[-1]))
+        entry = {"element": name, "element_type": etype, "start": group[0], "end": group[-1],
+                 "hours_outside": round(len(group) * hours_per, 2), "peak": peak,
+                 "peak_value": round(seen[peak], target.decimals),
+                 **({"beyond_horizon": True} if group[-1] == window[-1] else {})}
+        prev_request = PreventionRequest(**{**request.model_dump(include=plain), "timestamp": peak,
+                                            "element": name, "element_type": etype, "combine": True})
+        prev = _prevention(prev_request, peak, etype, idx, name, _prepared_net(peak, request)[0], None, limits,
+                           timestamps, source, time.time(), positions)
+        warn = prev.get("warning") or {}
+        entry["decide_by"] = warn["start"] if warn.get("seen") else group[0]
+        entry["lead_minutes"] = warn.get("lead_minutes", 0)
+        if entry["decide_by"] <= window[0]:
+            entry["decide_now"] = True
+        # The cause: what changed from the last comfortable moment before it.
+        calm = timestamps.index(entry["decide_by"]) - 1
+        if calm >= 0:
+            dec = inv.decompose(_prepared_net(timestamps[calm], request)[0], _prepared_net(peak, request)[0],
+                                target, drill=False)
+            row = next((f for f in dec.get("factors") or [] if f["factor"] == dec.get("main_cause")), None)
+            if row:
+                entry["cause"] = {"main_cause": row["factor"], "kind": inv.cause_kind(row),
+                                  "share_pct": row["share_pct"], "verdict": row["verdict"],
+                                  "against": timestamps[calm]}
+        sufficient = next((a for a in prev.get("actions") or [] if a.get("smallest")), None)
+        if not sufficient:
+            def obstacle(r: dict) -> str:
+                given = r.get("as_given") or {}
+                return (given.get("reason") or (f"puts {', '.join(given['new_violations'])} outside its limits"
+                                                if given.get("new_violations") else "falls short"))
+            entry["action"] = None
+            entry["no_action"] = ("None of the actions tested keeps it within its limits: " + "; ".join(
+                f"{r['action']} — {obstacle(r)}" for r in (prev.get("actions") or [])[:3]
+                if not r.get("together")) + ".") if prev.get("actions") else prev.get("message", "")
+            out.append(entry)
+            continue
+        share = sufficient["smallest"]["share_of_action"]
+        entry["action"] = {"text": sufficient["smallest"]["action"], "share_of_action": share,
+                           **({"together": sufficient["together"]} if sufficient.get("together") else {})}
+        if sufficient.get("unit"):
+            # The same action, its smallest share, where the forecast errs against
+            # it: demand above forecast, and renewable output below it.
+            cases = [("demand_higher", f"demand {request.uncertainty_pct:g} % higher",
+                      {"load_scaling_factor": request.load_scaling_factor * (1 + request.uncertainty_pct / 100)})]
+            if len(probe.sgen):
+                cases.append(("renewables_lower", f"renewables {request.uncertainty_pct:g} % lower",
+                              {"sgen_scaling_factor": request.sgen_scaling_factor * (1 - request.uncertainty_pct / 100)}))
+            entry["action"]["holds_under"] = [
+                _holds_under(case, label, prev_request.model_copy(update={
+                    **change, "actions": [_scaled_action(sufficient, share)], "combine": False}),
+                    peak, etype, idx, name, limits, timestamps, source, positions)
+                for case, label, change in cases]
+        out.append(entry)
+
+    def line(e: dict) -> str:
+        cause = e.get("cause") or {}
+        when = (f"at {e['start'][:16]}" if e["start"] == e["end"] else
+                f"from {e['start'][:16]} to {e['end'][11:16] if e['end'][:10] == e['start'][:10] else e['end'][:16]}"
+                + (" (and beyond the horizon)" if e.get("beyond_horizon") else ""))
+        what = (f"{e['element']} {when}"
+                + (f" (main cause: {cause['main_cause']}, {cause['share_pct']:.0f} %)" if cause.get("main_cause")
+                   else ""))
+        if not e.get("action"):
+            return f"{what}: no action tested would prevent it"
+        under = e["action"].get("holds_under") or []
+        fails = [h for h in under if h["holds"] is False]
+        tail = ""
+        if fails:
+            tail = ", but not with " + " or ".join(
+                h["label"] + (f" ({h['enough_then']} would)" if h.get("enough_then") else "") for h in fails)
+        elif under and all(h["holds"] for h in under):
+            tail = ", and still does with " + " or ".join(h["label"] for h in under)
+        decide = ("decide now" if e.get("decide_now") else
+                  f"decide by {e['decide_by'][:16]}" if e["lead_minutes"] else
+                  f"no warning moment before it, so decide before {e['start'][:16]}")
+        return (f"{what}: {decide}; {e['action']['text'].rstrip('.')} would prevent it"
+                + tail)
+    message = (f"From {span}, {basis} expects {len(episodes)} episode(s) outside the limits"
+               + (f"; the {len(out)} most severe" if len(episodes) > len(out) else "") + ": "
+               + "; ".join(line(e) for e in out) + ".")
+    return {**base, "status": "expected", "episodes_found": len(episodes), "episodes": out, "message": message,
+            "method": ("Every moment of the horizon solved by AC power flow; each episode's prevention checked "
+                       "through its warning and the episode, the smallest sufficient share found by halving, and "
+                       "checked again with demand above and renewables below the forecast; its main cause by "
+                       "Shapley values against the last "
+                       "comfortable moment before the warning."),
+            "elapsed_s": round(time.time() - started, 2)}
+
+
+def _window_ticks(timestamps: list, start: str | None, end: str | None, source: str) -> list[str]:
+    lo = _window_index(timestamps, start, "start_timestamp", source, last=False, default=0)
+    hi = _window_index(timestamps, end or start, "end_timestamp", source, last=True, default=len(timestamps) - 1)
+    if hi < lo:
+        raise HTTPException(status_code=400, detail=f"The window ends ({timestamps[hi]}) before it starts "
+                                                    f"({timestamps[lo]}).")
+    return timestamps[lo:hi + 1]
+
+
+def _thinned(n: int, most: int) -> list[int]:
+    """At most `most` positions out of n, evenly spread, first and last kept."""
+    if n <= most:
+        return list(range(n))
+    return sorted({round(i * (n - 1) / (most - 1)) for i in range(most)})
+
+
+def _investigate_window(request: InvestigateRequest, started: float) -> dict:
+    """A window compared with another: why an element was outside its limits
+    for longer (or the grid insecure more often) this week than last."""
+    limits = _thresholds_used(request)
+    timestamps, _dataset, source = _window_dataset(request.data_source)
+    window = _window_ticks(timestamps, request.start_timestamp, request.end_timestamp, source)
+    ref_request = request.model_copy(update={"data_source": request.reference_data_source or request.data_source,
+                                             "network": request.reference_network or request.network})
+    ref_stamps, _rd, ref_source = _window_dataset(ref_request.data_source)
+    if request.reference_start_timestamp or request.reference_end_timestamp:
+        ref_window = _window_ticks(ref_stamps, request.reference_start_timestamp, request.reference_end_timestamp,
+                                   ref_source)
+        why = "the window asked for"
+    elif _dataset_label(ref_request) != source or _network_name(ref_request) != _network_name(request):
+        ref_window = [t for t in window if t in ref_stamps]
+        if not ref_window:
+            raise HTTPException(status_code=404, detail=f"None of the window's moments is in the {ref_source}.")
+        window = [t for t in window if t in set(ref_window)]
+        other = (f"the {ref_source}" if _dataset_label(ref_request) != source else
+                 "the base network" if _network_name(ref_request) == BASE_NETWORK else
+                 f"proposal {_network_name(ref_request)}")
+        why = f"{other} over the same window"
+    else:
+        first = ref_stamps.index(window[0]) if window[0] in ref_stamps else None
+        if first is None or first < len(window):
+            raise HTTPException(status_code=400, detail="There is no earlier window of the same length to compare "
+                                                        "with; give reference_start_timestamp and "
+                                                        "reference_end_timestamp.")
+        ref_window = ref_stamps[first - len(window):first]
+        why = "the window of the same length just before"
+    n = min(len(window), len(ref_window))
+    keep = _thinned(n, inv.WINDOW_MAX_MOMENTS)
+    hours = 0.25
+    if len(timestamps) > 1:
+        hours = max((pd.Timestamp(timestamps[1]) - pd.Timestamp(timestamps[0])).total_seconds() / 3600, 1e-6)
+    hours *= n / len(keep)                       # each moment prepared stands for the ones between
+    probe, _ = _prepared_net(window[0], request)
+    outage = _outage_of(probe, request.outage)
+    ref_outage = outage if request.reference_outage is None else _outage_of(probe, request.reference_outage)
+    whole = not request.element or request.element.strip().lower() in _GRID
+    if whole:
+        name, etype = "the grid", "grid"
+        tick = inv.violations_target(limits)
+    else:
+        etype, idx, name = _investigated_element(probe, request.element, request.element_type)
+        tick = inv.element_target(etype, idx, name, _element_buses(probe, etype, idx), limits)
+    pairs = [(_state_net(ref_window[i], ref_request, ref_outage), _state_net(window[i], request, outage))
+             for i in keep]
+    # How many moments each window spent outside the limits (for the grid: with
+    # any element outside), counted on the moments prepared.
+    outside_moments = {"reference": 0, "current": 0}
+    for ref_net, cur_net in pairs:
+        for side, net in (("reference", ref_net), ("current", cur_net)):
+            solo = copy.deepcopy(net)
+            if inv._solve(solo):
+                value = tick.metric(solo)
+                outside_moments[side] += int(value is not None and not tick.within(value))
+    if whole:
+        aggregate, quantity, unit = "violations", "violation_hours", "element-hours outside limits"
+    else:
+        # Exceedance when it was outside its limits in either window; otherwise its average.
+        if outside_moments["reference"] or outside_moments["current"]:
+            aggregate = "exceedance"
+            quantity, unit = (("exceedance_pu_h", "p.u.·h outside limits") if etype == "bus"
+                              else ("exceedance_pct_h", "%·h outside limits"))
+        else:
+            aggregate = "mean"
+            quantity, unit = (("mean_vm_pu", "p.u. (average)") if etype == "bus"
+                              else ("mean_loading_percent", "% (average)"))
+    dec = inv.decompose_window(pairs, tick, aggregate, hours, hypotheses=request.hypotheses)
+    span = lambda w: f"{str(w[0])[:16]} to {str(w[n - 1])[:16]}"  # noqa: E731
+    symptom = {"label": span(window) + (f" after losing {outage[2]}" if outage else ""),
+               "start": window[0], "end": window[n - 1], "value": round(dec.get("value", 0.0), tick.decimals + 1),
+               "violated": aggregate != "mean" and dec.get("value", 0.0) > 1e-9, "data_source": source,
+               "network": _network_name(request), "moments_outside_limits": outside_moments["current"],
+               "hours_outside_limits": round(outside_moments["current"] * hours, 2)}
+    reference = {"label": span(ref_window) + (f" after losing {ref_outage[2]}" if ref_outage else ""),
+                 "start": ref_window[0], "end": ref_window[n - 1], "why": why,
+                 "value": round(dec.get("reference_value", 0.0), tick.decimals + 1), "data_source": ref_source,
+                 "network": _network_name(ref_request), "moments_outside_limits": outside_moments["reference"],
+                 "hours_outside_limits": round(outside_moments["reference"] * hours, 2)}
+    result = {"timestamp": window[0], "data_source": source, "thresholds_used": limits, "mode": "window",
+              "element": name, "element_type": etype, "symptom": symptom, "reference": reference,
+              "quantity": quantity, "unit": unit, "moments_in_window": n,
+              **({"outage": outage[2]} if outage else {}),
+              **{k: v for k, v in dec.items() if k not in ("value", "reference_value", "aggregate")}}
+    if "change" in result:
+        result["change"] = round(result["change"], tick.decimals + 1)
+    solved = result.get("moments_solved", len(keep))
+    if solved < n:
+        result["thinned"] = (f"{solved} of the {n} moment pairs were solved, evenly spread, each standing for the "
+                             "ones around it.")
+    result["message"] = inv.sentence(result) if dec["status"] == "explained" else dec.get("reason", "")
+    if request.classical:
+        result["classical"] = {"not_applicable": "The classical views are computed for one moment, not over a "
+                                                 "window; investigate a moment of the window to see them."}
+    result["method"] = _INVESTIGATION_METHOD + " Over a window, every combination solves every moment pair."
+    result["elapsed_s"] = round(time.time() - started, 2)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Network proposals (sandbox)
 #
 # A proposal is the base network plus an ordered list of edits (`sandbox.py`).
@@ -11537,7 +13705,8 @@ def _assumed_defaults(net, raw_edits: list, canonical: list) -> list[dict]:
     to be stated to the operator, who can change any of them."""
     out = []
     for n, (raw, edit) in enumerate(zip(raw_edits, canonical), start=1):
-        given = set(raw) if isinstance(raw, dict) else set()
+        # A field left blank in a filled-in form is not given: its default is said.
+        given = set(sb._without_blanks(raw)) if isinstance(raw, dict) else set()
         filled = {k: v for k, v in edit.items() if k not in given and k != "op"}
         if filled:
             out.append({"edit": n, "description": sb.describe(net, edit), "defaults": filled})
@@ -11915,7 +14084,8 @@ async def _compare_opf(request: CompareNetworksRequest, name: str) -> dict:
     takes, and how each unit's dispatch differs."""
     ts = _resolve_tick(request.data_source, request.timestamp)
     # The comparison must not leave the proposal's dispatch as "the last one".
-    last = (app_data.get("last_dispatch_result"), app_data.get("last_dispatch_timestamp"))
+    last = (app_data.get("last_dispatch_result"), app_data.get("last_dispatch_timestamp"),
+            app_data.get("last_dispatch_context"))
     results = {}
     try:
         for label, network in (("base", _reference(request)), ("proposal", name)):
@@ -11927,7 +14097,8 @@ async def _compare_opf(request: CompareNetworksRequest, name: str) -> dict:
             results[label] = await optimise_flexibility(req)
             results[label + "_added"] = getattr(_tick_report, "first", None)
     finally:
-        app_data["last_dispatch_result"], app_data["last_dispatch_timestamp"] = last
+        (app_data["last_dispatch_result"], app_data["last_dispatch_timestamp"],
+         app_data["last_dispatch_context"]) = last
     base, prop = _opf_digest(results["base"]), _opf_digest(results["proposal"])
 
     def by_unit(r):

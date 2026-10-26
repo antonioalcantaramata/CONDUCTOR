@@ -71,6 +71,34 @@ class TestExtraction:
     def test_ignores_timestamps(self):
         assert _values("At 2022-01-02 21:45 the network is secure.") == []
 
+    @pytest.mark.parametrize("text", [
+        "At 18:15 the bus is at 1.02 p.u.",
+        "From 16:00 to 23:45:00 the bus is at 1.02 p.u.",
+        "07:45–09:45: the bus is at 1.02 p.u.",
+        "On 6 January the bus is at 1.02 p.u.",
+        "On January 6 the bus is at 1.02 p.u.",
+        "On 6 Jan the bus is at 1.02 p.u.",
+        "On Jan 6 the bus is at 1.02 p.u.",
+        "On 06 Jan 2000 the bus is at 1.02 p.u.",
+        "On January 6, 2000 at 18:15 the bus is at 1.02 p.u.",
+        "On the 6th of January the bus is at 1.02 p.u.",
+        "At 2000\u201101\u201101\u202f00:00:00 the bus is at 1.02 p.u.",
+    ])
+    def test_ignores_dates_and_times_in_prose(self, text):
+        """A clock time or a day and month is not a figure; their digits
+        used to be grounded by a timestamp's, which no longer counts."""
+        assert _values(text) == [1.02]
+
+    def test_a_lowercase_month_word_is_not_a_date(self):
+        assert _values("The 6 may change; 3 units in March 2000.") == [6, 3, 2000]
+
+    def test_ignores_conductors_own_step_limit_note(self):
+        answer = ("The grid had 2 violations.\n\n*CONDUCTOR used all 16 steps allowed for one question "
+                  "(`DT_MAX_AGENT_TURNS`) before finishing; this answer is built from the results so far.*")
+        assert _values(answer) == [2]
+        stuck = "Partial.\n\n⚠️ CONDUCTOR stopped this question: the model kept repeating (Single N-1 contingency)"
+        assert _values(stuck) == []
+
     def test_ignores_ordered_list_markers(self):
         assert _values("1. First point\n2. Second point\n") == []
 
@@ -112,6 +140,33 @@ class TestSources:
     def test_booleans_are_not_numbers(self):
         record = {"tool_results": [{"name": "t", "result": {"converged": True}}]}
         assert collect_sources(record) == []
+
+    def test_a_timestamp_is_not_a_source_of_numbers(self):
+        """Its day, hour and minute grounded small fabricated counts: "9
+        violations" traced to the day of 2000-01-09, "18 buses" to its hour."""
+        record = {
+            "user": "Is the grid secure at 2000-01-09 18:15?",
+            "tool_calls": [{"name": "run_rsa", "args": {"timestamp": "2000-01-09 18"}}],
+            "tool_results": [{"name": "run_rsa", "result": {
+                "timestamp": "2000-01-09 18:15:00", "first_violation_timestamps": ["2000-01-09T18:30:00Z"],
+                "text": "Peak at 19:45 on 9 January", "total_violations": 3}}],
+        }
+        assert {source.value for source in collect_sources(record)} == {3.0}
+
+    def test_a_fabricated_count_is_not_grounded_by_a_timestamp(self):
+        record = {
+            "user": "Is the grid secure?",
+            "tool_calls": [{"name": "run_rsa", "args": {}}],
+            "tool_results": [{"name": "run_rsa", "result": {
+                "timestamp": "2000-01-09 18:15:00", "total_violations": 3}}],
+            "assistant": "At 18:15 on 9 January there are 9 violations across 18 buses; 3 in total.",
+        }
+        verdicts = {v.claim.value: v.status for v in check_turn(record).verdicts}
+        assert verdicts == {9.0: UNGROUNDED, 18.0: UNGROUNDED, 3.0: GROUNDED}
+
+    def test_digits_in_names_still_count(self):
+        record = {"tool_results": [{"name": "t", "result": {"element": "Foxtrot Trf 1", "bus_name": "Bus_18"}}]}
+        assert {source.value for source in collect_sources(record)} == {1.0, 18.0}
 
     def test_nested_paths_are_reported(self):
         record = {"tool_results": [
@@ -371,7 +426,9 @@ class TestMisattribution:
         assert len(report.grounded) == 1
 
     @pytest.mark.parametrize("written", ["Bus_0 -> Bus_1 [L0]", "Bus_0–Bus_1 [L0]", "Bus_0 → Bus_1 [L0]",
-                                         "Bus_0 - Bus_1 [L0]", "Bus_0 to Bus_1 [L0]"])
+                                         "Bus_0 - Bus_1 [L0]", "Bus_0 to Bus_1 [L0]",
+                                         # Its short forms (seen live: "Line L0 (Bus_0–Bus_1)").
+                                         "Line L0 (Bus_0–Bus_1)", "L0", "Bus_0–Bus_1"])
     def test_a_line_is_recognised_however_its_arrow_is_written(self, written):
         # Observed live: "line Bus_0–Bus_1 [L0] at 114.7%" was read as written
         # about Bus_29, the violated bus named just before it.
@@ -387,6 +444,17 @@ class TestMisattribution:
         assert report.misattributed == []
         line = next(v for v in report.verdicts if v.claim.value == 114.7)
         assert line.status == GROUNDED and line.subject == "Bus_0 -> Bus_1 [L0]"
+
+    def test_a_short_form_two_branches_share_names_neither(self):
+        # Parallel lines: "Bus_0–Bus_1" alone does not say which one.
+        record = {"user": "q", "assistant": "Bus_29 at 0.943 p.u.; the line Bus_0–Bus_1 at 114.7%.",
+                  "tool_calls": [{"name": "run_rsa", "args": {}}],
+                  "tool_results": [{"name": "run_rsa", "result": {"violations": [
+                      {"element": "Bus_29", "value": 0.94327, "violated": True},
+                      {"element": "Bus_0 -> Bus_1 [L0]", "value": 114.6644, "violated": True},
+                      {"element": "Bus_0 -> Bus_1 [L1]", "value": 60.0, "violated": True}]}}]}
+        line = next(v for v in check_turn(record).verdicts if v.claim.value == 114.7)
+        assert line.subject == "Bus_29"           # unchanged: the nearest name it can be sure of
 
     def test_misattributed_does_not_count_as_traceable(self):
         record = _attribution_record(
@@ -417,3 +485,17 @@ class TestClarifyingQuestions:
         assert self._p.answer_to_check(text) == "L30 is at 77.9 %. How far below?"
         assert self._p.answer_to_check(text, [{"name": "run_rsa"}]) == text
 
+
+
+@pytest.mark.parametrize("text, values", [
+    ("Bus 7 is at 0.98 p.u.", [0.98]),
+    ("line 12 is at 95 %", [95.0]),
+    ("transformer 1 carries 40 MW", [40.0]),
+    ("an N-0 assessment, not an N-1 check, found 3 violations", [3.0]),
+    ("an N-1-1 screen", []),
+    ("line 95 % loaded", [95.0]),                  # a unit after it: a figure again
+    ("3 lines are out", [3.0]),
+])
+def test_a_name_is_not_a_figure(text, values):
+    # Observed live: the "0" of "N-0" and the "1" of "N-1" graded as figures.
+    assert [c.value for c in extract_claims(text)] == values

@@ -18,7 +18,10 @@ straight away against the base.
   range ±18.6 Mvar" — any of them can be changed.
 - **Notes on modelling.** When a change copies a component that is not physical
   (common in converted per-unit cases) or a value looks unusual, the answer
-  passes the note on.
+  passes the note on. In a converted per-unit case every bus is at 1 kV, which
+  stands for its real voltage. A new transformer to *a 20 kV bus* is built all
+  the same, with its rated voltages taken from the buses it joins and its
+  impedance unchanged, and the answer says so.
 
 Your proposals are listed in the sidebar under **Proposals**: each change with
 a ✕ to remove it, and **Discard proposal**. Proposals are kept for the network
@@ -75,9 +78,12 @@ operating point** on both networks and reports the differences.
 | **Against another proposal** | *Is option B better than option A at the worst moment?* |
 | **Several at once** — up to six against the same reference, ranked in a table | *Rank options A, B and C by violations and lowest voltage at 18:00.* |
 
-A comparison at one moment is a verdict about that moment. For a decision, ask
-for the comparison over time and an N-1 screen at the proposal's worst moment;
-the advisor will remind you when these are missing.
+What a change does depends on the hour, so unless you name one moment,
+CONDUCTOR compares over the period you name (*compare with today*: the day; *at
+the worst hour of the week*: the week) or over the current day. It finds each
+network's worst moment, which the change may move. A comparison at one moment
+is a verdict about that moment. For a decision, ask for an N-1 screen at the
+proposal's worst moment too; the advisor will remind you when it is missing.
 
 ## Proposals in the System tab
 

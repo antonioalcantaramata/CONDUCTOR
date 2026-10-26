@@ -219,7 +219,10 @@ def test_switching_is_offered_where_a_dispatch_cannot_secure_an_outage(client):
     candidates = [s for x in n1["not_secured"] for s in x.get("switching") or []]
     assert candidates and all(s["checked_by_power_flow"] and s["open"] for s in candidates)
     assert all(s["clears_all"] or s["relieves_pct"] >= mb._SWITCH_GAIN_PCT or s["remaining"] for s in candidates)
-    assert any(s["clears_all"] for s in candidates)               # at the peak: opening L13 after losing L32
+    for x in n1["not_secured"]:                                   # at most three, those that clear everything first
+        found = x.get("switching") or []
+        assert len(found) <= mb._SWITCH_SHOWN
+        assert [s["clears_all"] for s in found] == sorted((s["clears_all"] for s in found), reverse=True)
 
 
 # ---------------------------------------------------------------------------

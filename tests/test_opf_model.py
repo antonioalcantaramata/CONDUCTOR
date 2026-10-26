@@ -147,4 +147,4 @@ def test_the_current_margin_is_a_fraction_of_rated_current(default_net):
                     break
             assert value(c[i, j].upper) == pytest.approx(0.8 ** 2 * rating_sq, rel=1e-9)
             checked += 1
-    assert checked == 2 * len(model.Branches)
+    assert checked == len(model.Branches)             # each end once: Branches holds both orientations

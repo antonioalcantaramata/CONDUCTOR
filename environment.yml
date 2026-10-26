@@ -18,6 +18,7 @@ dependencies:
     - pandas>=2.3
     - scipy>=1.13
     - networkx>=3.4
+    - cvxpy>=1.5         # with Clarabel: the semidefinite bound on the cheapest option (relaxation.py)
     # FastAPI backend
     - fastapi>=0.116
     - uvicorn>=0.35

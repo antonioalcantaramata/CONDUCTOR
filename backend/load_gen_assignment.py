@@ -423,6 +423,17 @@ def _capacity_on_bus(gen_df: pd.DataFrame, bus_id) -> tuple[float, int]:
     return cap, len(rows)
 
 
+def _capacities_by_bus(gen_df: pd.DataFrame) -> tuple[dict, dict]:
+    """({bus: total max_p_mw}, {bus: number of units}) of `gen_df` — what
+    `_capacity_on_bus` gives for one bus, for every bus at once."""
+    if not len(gen_df):
+        return {}, {}
+    cap = (gen_df['max_p_mw'].clip(lower=0).fillna(0.0).astype(float) if 'max_p_mw' in gen_df.columns
+           else pd.Series(0.0, index=gen_df.index))
+    grouped = cap.groupby(gen_df['bus'])
+    return {k: float(v) for k, v in grouped.sum().items()}, {k: int(v) for k, v in grouped.size().items()}
+
+
 def _split_between_tables(gen_df: pd.DataFrame, sgen_df: pd.DataFrame,
                           bus_id_to_prod: dict) -> tuple[dict, dict]:
     """Divide each bus's production between net.gen and net.sgen.
@@ -432,9 +443,13 @@ def _split_between_tables(gen_df: pd.DataFrame, sgen_df: pd.DataFrame,
     """
     gen_share: dict = {}
     sgen_share: dict = {}
+    # Capacities by bus, once per call: filtering both tables bus by bus cost
+    # most of every moment's assignment (an hour of a week's scan).
+    caps_g, counts_g = _capacities_by_bus(gen_df)
+    caps_s, counts_s = _capacities_by_bus(sgen_df)
     for bus_id, total in bus_id_to_prod.items():
-        cap_g, n_g = _capacity_on_bus(gen_df, bus_id)
-        cap_s, n_s = _capacity_on_bus(sgen_df, bus_id)
+        cap_g, n_g = caps_g.get(bus_id, 0.0), counts_g.get(bus_id, 0)
+        cap_s, n_s = caps_s.get(bus_id, 0.0), counts_s.get(bus_id, 0)
         if n_g == 0 or n_s == 0:
             gen_share[bus_id] = sgen_share[bus_id] = total
             continue

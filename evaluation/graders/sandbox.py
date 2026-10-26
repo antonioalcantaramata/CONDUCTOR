@@ -4,10 +4,12 @@ Network proposals — how a turn that studied a proposal was assembled.
 The integrity grader already reports a turn that mixed the base and a proposal
 without being asked to, and an answer that did not name its proposal. This one
 reports what a planner would object to in a what-if study, from the record
-alone: an edit the agent built and the backend refused, and a proposal judged
-at a single moment or without an N-1 screen. The last two are warnings, not
-failures — a quick question can legitimately be answered at one moment — but
-their rate is the measurement the AI Agent Suggestion exists to move.
+alone: an edit the agent built and the backend refused, a proposal with
+violations the base does not have, and a proposal judged at a single moment
+or without an N-1 screen. All are warnings, not failures — a quick question
+can legitimately be answered at one moment, and a new violation is a finding
+about the proposal rather than about the answer — but their rate is the
+measurement the AI Agent Suggestion exists to move.
 
 The rules are the ones the live suggestion button lights up on
 (`recommender.proposal_gaps`), so the live system and the grade agree.
@@ -20,6 +22,7 @@ from llm_agent.agent.recommender import proposal_gaps
 from ..session_log import EXECUTION, INTERPRETATION, WARN, Finding
 
 _GAP_CODES = (
+    ("violation(s) the base does not have", "proposal_new_violations"),
     ("judged at a single moment", "proposal_single_moment"),
     ("no N-1 screen", "proposal_without_n1"),
 )

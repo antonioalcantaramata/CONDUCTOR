@@ -1,33 +1,35 @@
 import pytest
 
+import flex_engine as fe
 import main_backend as mb
 
 
 def _fake_db_full(net, drop_pair=None, extra_bus=None):
-    """Build a minimal db_full whose Yff_r covers every in-service branch of *net*.
+    """A minimal db_full with every entry the OPF reads for *net*: each
+    in-service branch in both directions, at tap 1 (line) or the neutral tap
+    (transformer), in all four tables.
 
     Only the keys matter for topology validation; values are dummies.
     """
-    yff_r = {}
+    keys, to_trafo = [], {}
     for _, row in net.line[net.line["in_service"]].iterrows():
         pair = (int(row["from_bus"]), int(row["to_bus"]))
-        yff_r[pair, 1] = 1.0
-        yff_r[(pair[1], pair[0]), 1] = 1.0
-    for _, row in net.trafo[net.trafo["in_service"]].iterrows():
+        keys += [(pair, 1), ((pair[1], pair[0]), 1)]
+    for idx, row in net.trafo[net.trafo["in_service"]].iterrows():
         pair = (int(row["hv_bus"]), int(row["lv_bus"]))
-        yff_r[pair, 0] = 1.0
-        yff_r[(pair[1], pair[0]), 0] = 1.0
+        tap = fe._neutral_tap(net, idx)
+        keys += [(pair, tap), ((pair[1], pair[0]), tap)]
+        to_trafo[pair] = to_trafo[(pair[1], pair[0])] = idx
 
     if drop_pair is not None:
-        yff_r.pop((drop_pair, 0), None)
-        yff_r.pop((drop_pair, 1), None)
         rev = (drop_pair[1], drop_pair[0])
-        yff_r.pop((rev, 0), None)
-        yff_r.pop((rev, 1), None)
+        keys = [k for k in keys if k[0] not in (drop_pair, rev)]
     if extra_bus is not None:
-        yff_r[(0, extra_bus), 1] = 1.0
+        keys.append(((0, extra_bus), 1))
 
-    return {"Yff_r": yff_r}
+    db = {table: {k: 1.0 for k in keys} for table in ("Yff_r", "Yff_i", "Yft_r", "Yft_i")}
+    db["branch_to_trafo"] = to_trafo
+    return db
 
 
 class TestValidateUploadedAdmittance:
@@ -61,11 +63,26 @@ class TestValidateUploadedAdmittance:
         net.line.at[line_idx, "in_service"] = False
         mb._validate_uploaded_admittance(db_full, net)
 
-    def test_reverse_direction_coverage_accepted(self, case14_net):
+    def test_one_direction_only_is_rejected(self, case14_net):
+        """The optimisation reads both directions of every branch: a file with
+        one used to pass and fail later with a KeyError (HTTP 500)."""
         net = case14_net
         db_full = _fake_db_full(net)
-        # Keep only reversed keys for one branch — still counts as covered.
         first_line = net.line[net.line["in_service"]].iloc[0]
         pair = (int(first_line["from_bus"]), int(first_line["to_bus"]))
-        db_full["Yff_r"].pop((pair, 1), None)
-        mb._validate_uploaded_admittance(db_full, net)
+        for table in ("Yff_r", "Yff_i", "Yft_r", "Yft_i"):
+            db_full[table].pop((pair, 1), None)
+        with pytest.raises(mb.HTTPException) as exc_info:
+            mb._validate_uploaded_admittance(db_full, net)
+        assert exc_info.value.status_code == 400
+        assert f"{pair[0]}→{pair[1]} (tap 1)" in exc_info.value.detail
+
+    def test_one_table_short_is_rejected(self, case14_net):
+        db_full = _fake_db_full(case14_net)
+        db_full["Yft_i"].pop(next(iter(db_full["Yft_i"])))
+        with pytest.raises(mb.HTTPException) as exc_info:
+            mb._validate_uploaded_admittance(db_full, case14_net)
+        assert "the optimisation reads" in exc_info.value.detail
+
+    def test_a_generated_database_passes(self, case14_net):
+        mb._validate_uploaded_admittance(mb.nl.build_ybus_full(case14_net), case14_net)

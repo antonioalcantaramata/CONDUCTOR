@@ -65,6 +65,21 @@ class TestTheLiveCase:
         assert check_answer("Reduce 05 AKI Sgen by 0.42 MW.", record) == []
 
 
+class TestTolerance:
+    """Half a unit in the last stated place, as provenance rounds. A whole unit
+    matched "reduce by 7 MW" to an infeasible 6.24."""
+
+    @pytest.mark.parametrize("sentence", ["Reduce 05 AKI Sgen by 6 MW.", "Reduce 05 AKI Sgen by 6.2 MW.",
+                                          "Reduce 05 AKI Sgen by 6.24 MW."])
+    def test_a_rounding_of_the_infeasible_figure_is_caught(self, sentence):
+        assert check_answer(sentence, _attribution())
+
+    @pytest.mark.parametrize("sentence", ["Reduce 05 AKI Sgen by 7 MW.", "Reduce 05 AKI Sgen by 6.3 MW.",
+                                          "Reduce 05 AKI Sgen by 6.26 MW."])
+    def test_a_different_figure_is_not(self, sentence):
+        assert check_answer(sentence, _attribution()) == []
+
+
 class TestNegation:
     """The false-positive cases. Every grader needs these, and this one needs
     them most: it reads words, and the sentences that get the physics right are
@@ -100,6 +115,24 @@ class TestNegation:
         answer can mischaracterise."""
         record = _attribution()
         assert check_answer("The feasibility flag is false.", record) == []
+
+
+class TestCounterfactuals:
+    """A counterfactual about another state does not describe this one.
+    Observed live: "undoing its increase alone would bring Bus_29 just within
+    limits (0.950 p.u.)" was flagged as calling a violated bus within limits."""
+
+    def test_a_counterfactual_state_is_not_a_claim_about_this_one(self):
+        assert check_answer("Undoing that change alone would bring Akirkeby 10.5 kV back within limits "
+                            "(1.05 p.u.).", _attribution()) == []
+
+    def test_the_state_itself_is_still_judged(self):
+        conflicts = check_answer("Akirkeby 10.5 kV is within limits at 1.0512 p.u.", _attribution())
+        assert any(c.field == "violated" for c in conflicts)
+
+    def test_an_action_worded_as_a_counterfactual_is_still_judged(self):
+        conflicts = check_answer("It would clear if you reduce 05 AKI Sgen by 6.24 MW.", _attribution())
+        assert [c.field for c in conflicts] == ["relief_mw_feasible"]
 
 
 class TestOtherQualifiers:
@@ -251,6 +284,14 @@ class TestAnAnswerThatStatesTheVerdict:
     def test_the_corrected_state_may_have_no_violations(self):
         answer = "The base case had four violations. The option is confirmed by power flow: no violations."
         assert self.check(answer, [self.RSA, self.OPTIONS]) == []
+
+    def test_a_decline_that_names_the_result_is_not_a_claim(self):
+        """`usable: false` read "result" and "answer" as calling the study fine."""
+        unusable = {"name": "compute_hosting_capacity", "result": {"usable": False}}
+        assert self.check("The result is that hosting capacity could not be determined.", [unusable]) == []
+        assert self.check("The answer: no hosting capacity figure is available.", [unusable]) == []
+        flagged = self.check("The study succeeded: 12 MW can be hosted.", [unusable])
+        assert [c.field for c in flagged] == ["usable"] and flagged[0].study
 
     def test_still_caught_without_a_corrective_result_or_without_saying_so(self):
         assert self.check("The base case had four violations; no violations remain.", [self.RSA])

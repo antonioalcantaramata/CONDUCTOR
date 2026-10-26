@@ -29,12 +29,14 @@ are always synthetic until changed:
 
 - production: a unit 50 €/MWh, the import 60 €/MWh, a condenser 0;
   a pv or wind unit a proposal added 0;
-- up: 1.2 × the unit's marginal cost at full output (c1 + 2·c2·Pmax) — a
-  premium over its own energy price;
+- up: 1.2 × the unit's marginal cost at full output (c1 + 2·c2·Pmax, at
+  least 0) — a premium over its own energy price;
 - down: 0.5 × that marginal cost — the operator compensates the lost margin,
   the fuel is saved; a pv or wind unit 40 €/MWh (curtailment compensation);
-- condensers and the external grid have no up/down (they are not dispatched
-  for active power), until the operator gives one;
+- condensers (a voltage-controlled unit under 1 MW, the engine's rule) have
+  no up/down until the operator gives one: they have no active power to move;
+- the external grid has none at all, and refuses one: its exchange follows
+  from the units' redispatch, priced by its import price (c1);
 - reactive: 3 €/Mvarh for every unit, condensers included; the external
   grid's free band tan φ 0.4 (pf ≈ 0.93) and 10 €/Mvarh beyond it.
 
@@ -126,7 +128,9 @@ def _redispatch(production: dict, p_max: float, *, renewable: bool, condenser: b
         return {"up_eur_per_mwh": None, "down_eur_per_mwh": None}
     if renewable:
         return {"up_eur_per_mwh": None, "down_eur_per_mwh": CURTAILMENT}
-    marginal = production["cost_eur_per_mwh"] + 2.0 * production["cost_eur_per_mw2h"] * max(p_max, 0.0)
+    # A negative marginal cost (a case's negative energy price) is not a
+    # negative redispatch price: the cheapest option would then be unbounded.
+    marginal = max(production["cost_eur_per_mwh"] + 2.0 * production["cost_eur_per_mw2h"] * max(p_max, 0.0), 0.0)
     return {"up_eur_per_mwh": round(UP_PREMIUM * marginal, 4), "down_eur_per_mwh": round(DOWN_SHARE * marginal, 4)}
 
 
@@ -149,7 +153,7 @@ def defaults(net) -> list[dict]:
             row = tbl.loc[idx]
             proposed = gm._proposed(tbl, idx)
             p_max = gm._capacity(row)
-            condenser = p_max < gm.CONDENSER_BELOW_MW
+            condenser = gm.is_condenser(table, row)
             kind = str(row.get("kind") or "") if proposed and "kind" in tbl.columns else ""
             renewable = kind in RENEWABLE_KINDS
             case = None if proposed else _case_cost(net, table, idx)
@@ -264,6 +268,10 @@ def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict
             raise CostError(f"{name}: leave out {', '.join(wrong)} " + (
                 f"(units only); a load's fields are {', '.join(LOAD)}." if load else
                 f"(loads only); for a unit give {', '.join(PRODUCTION + REDISPATCH + REACTIVE)}."))
+        if grid and any(k in REDISPATCH for k in given):
+            raise CostError(f"{name}: leave out {', '.join(k for k in given if k in REDISPATCH)}: the external "
+                            "grid is not redispatched — its exchange follows from the units', priced by its import "
+                            "price, cost_eur_per_mwh.")
         misplaced = [k for k in given if (k in INTERFACE) != grid and (k in INTERFACE or k in REACTIVE)]
         if misplaced:
             raise CostError(f"{name}: leave out {', '.join(misplaced)} " + (

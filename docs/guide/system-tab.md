@@ -58,6 +58,11 @@ under **Demand response and load relief** — what reducing each load costs.
 | **DR share %, DR €/MWh** | Per load: the share that can be reduced on request (demand response) and its price |
 | **Relief €/MWh** | Per load: involuntary load relief beyond its demand response — the last resort (the value of lost load) |
 
+The external grid has no up or down price, and refuses one: its exchange
+follows from the units' redispatch and is priced at its import price. A
+synchronous condenser (a voltage-controlled unit with under 1 MW of capacity)
+has none until you give one.
+
 **Source** says where each figure comes from: *case* (the network file's own
 generation costs), *synthetic* (a fixed rule, shown under the tables) or
 *changed* (by you or CONDUCTOR). In the Edit form, an emptied field goes back

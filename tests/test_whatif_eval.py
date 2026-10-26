@@ -69,6 +69,21 @@ def test_each_check_kind():
         whatif.check({"kind": "nope"}, [rec])
 
 
+def test_the_answer_is_checked_against_the_investigation_record():
+    rec = {"tool_calls": [{"name": "record_investigation", "args": {}}],
+           "tool_results": [{"name": "record_investigation", "result": {"status": "recorded", "hypotheses": [
+               {"hypothesis": "Hot weather raised demand", "verdict": "untested",
+                "missing_tool": "weather data aligned with the grid"}]}}],
+           "assistant": "Hot weather raised demand, which caused the undervoltage."}
+    spec = {"kind": "answer_consistent", "absent": ["untested_as_finding", "untested_unsaid"]}
+    assert whatif.check({"kind": "trail", "verdict": "untested", "needs_tool": True}, [rec])
+    assert not whatif.check({"kind": "trail", "verdict": "untested", "missing_kind": "analysis"}, [rec])
+    assert not whatif.check(spec, [rec])
+    rec["assistant"] = ("Demand near Bus_29 caused it. Whether hot weather raised that demand was not tested: "
+                        "it would need weather data aligned with the grid.")
+    assert whatif.check(spec, [rec])
+
+
 def test_numbers_match_within_one_percent_and_text_without_case():
     edits = [{"op": "add_load", "bus": 9, "p_mw": 50.2, "profile": "Flat"}]
     rec = {"tool_calls": [{"name": "edit_proposal"}], "tool_results": [{"result": {"edits": edits}}]}
@@ -78,8 +93,11 @@ def test_numbers_match_within_one_percent_and_text_without_case():
 
 
 def test_the_sandbox_grader_on_the_live_session():
-    codes = [f.code for f in grade_sandbox(LIVE)]
-    assert codes == ["proposal_single_moment", "proposal_without_n1"]
+    findings = grade_sandbox(LIVE)
+    assert [f.code for f in findings] == ["proposal_new_violations", "proposal_single_moment", "proposal_without_n1"]
+    # Every gap the live suggestion button lights up on has a code.
+    assert "1 violation(s) the base does not have" in findings[0].detail
+    assert {f.severity for f in findings} == {"warn"}
 
 
 def test_tasks_are_well_formed():
@@ -168,3 +186,13 @@ def test_a_reused_refusal_is_counted_once():
         "tool_results": [{"name": "edit_proposal", "result": refused},
                          {"name": "edit_proposal", "result": {**refused, "reused_from": 1}}]}
     assert [f.code for f in grade_sandbox(record)].count("invalid_edit") == 1
+
+
+def test_mentions_read_through_bold_but_keep_names():
+    rec = {"assistant": "This does **not** establish security; Gen_bus12's set-point and `Bus_29` matter."}
+    assert whatif.check({"kind": "mentions", "any": ["does not establish"]}, [rec])
+    assert whatif.check({"kind": "mentions", "any": ["Gen_bus12"]}, [rec])
+    assert whatif.check({"kind": "mentions", "any": ["Bus_29"]}, [rec])
+    # The words the answer checks recognise for "not tested", in one place.
+    assert whatif.check({"kind": "said_untested"}, [{"assistant": "The data **can't establish** it."}])
+    assert not whatif.check({"kind": "said_untested"}, [{"assistant": "Hot weather caused it."}])

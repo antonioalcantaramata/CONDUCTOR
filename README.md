@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="llm_agent/assets/conductor-mark-reversed.png">
-    <img src="llm_agent/assets/conductor-mark.png" alt="CONDUCTOR logo" width="120">
-  </picture>
+  <img src="llm_agent/assets/conductor-mark.png#gh-light-mode-only" alt="CONDUCTOR logo" width="180">
+  <img src="llm_agent/assets/conductor-mark-reversed.png#gh-dark-mode-only" alt="CONDUCTOR logo" width="180">
 </p>
 
 # CONDUCTOR
@@ -27,7 +25,20 @@ not enough, demand response, then load relief, then switching are offered as a
 last resort. A chosen option can be carried forward — its N-1 screen, how long it
 holds, the next action from it — and a whole peak planned at once, or the cost of
 N-1 security priced hour by hour. When a question leaves open something that
-changes the answer, the agent asks before running. A session can be exported as
+changes the answer, the agent asks before running.
+
+A **why** — why is this bus below its limit, why now and not this morning — is
+**investigated**: the element is compared with a moment it was fine, and the
+change is divided exactly among what changed (Shapley values over AC power
+flows), with each cause's verdict, what undoing it alone would give, whether it
+recurs, whether it could have been avoided and how much warning there was. The
+agent forms and tests its own hypotheses, records what it tested, and says
+what it could not test and the analysis or data that would — collected as tools
+to build and data to integrate. A cause that may be a fault in the data is said
+first. **Looking ahead**, it reads the forecast for what is coming: each
+episode, its cause, when to decide, the smallest action that prevents it and
+whether that holds if the forecast errs. **Deep Research** asks for all of it
+on one question, and a downloadable report holds the whole investigation. A session can be exported as
 a raw record or as a report written by the model, and saved as context to
 continue from later.
 
@@ -174,7 +185,7 @@ also filters to models that report it.
 
 ### What to expect
 
-The agent sends a large prompt — the system instructions plus 29 tool schemas
+The agent sends a large prompt — the system instructions plus 34 tool schemas
 come to roughly **28,000 tokens before any conversation** (measured with
 Gemini's token counter; CONDUCTOR estimates it at startup and refines it from
 the token counts providers report). Hosted models absorb
@@ -194,7 +205,7 @@ isn't the thing that waits. Keeping the model resident (`OLLAMA_KEEP_ALIVE`,
 default 60 min) is what keeps subsequent questions fast.
 
 A smaller model processes the prompt proportionally faster, at some cost to how
-reliably it picks the right tool among twenty-nine.
+reliably it picks the right tool among thirty-four.
 
 ### Context window
 

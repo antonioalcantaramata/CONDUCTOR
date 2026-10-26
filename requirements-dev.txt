@@ -4,7 +4,9 @@
 # import backend/ and llm_agent/agent/ modules and exercise their pure-logic
 # code paths. It deliberately excludes IPOPT (native conda-forge binary,
 # only needed to actually *solve* an OPF — not to import pandapower/Pyomo)
-# and UI-only packages (streamlit, plotly) that the unit tests don't touch.
+# and streamlit (the app's UI). plotly is included: the chart renderers
+# (llm_agent/agent/renderers.py) carry logic of their own, and their tests
+# skip without it — pure Python, it installs in seconds on every runner.
 #
 # For full local development (running the app itself), use environment.yml
 # via `./start.sh` instead.
@@ -13,11 +15,16 @@ pytest>=8.0
 ruff>=0.6
 
 pandapower>=3.0.0
+# As in environment.yml: pandapower's power flow takes the numba path wherever
+# a study does not pass numba=False, so the tests run what users run (and the
+# log is not flooded with "numba cannot be imported").
+numba>=0.60.0
 pyomo>=6.10.0
 numpy>=2.0
 pandas>=2.3
 scipy>=1.13
 networkx>=3.4
+cvxpy>=1.5
 matpowercaseframes
 
 fastapi>=0.116
@@ -27,6 +34,8 @@ requests>=2.33
 python-dotenv>=1.0
 pyyaml>=6.0
 openpyxl>=3.1.0
+
+plotly>=5.20.0
 
 httpx>=0.27.0
 google-genai>=1.0.0

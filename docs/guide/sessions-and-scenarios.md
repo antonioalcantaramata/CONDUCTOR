@@ -94,7 +94,7 @@ any browser.
 - what was loaded — scenario, network, data, model, assumptions, data quality
   and proposals;
 - every question and answer as given, with its interactive charts and the
-  evidence ("How this answer was produced");
+  evidence (what backs each answer);
 - notes on answers computed under other settings.
 
 **Tailored by the model — for readers who were not there** (one model call,
