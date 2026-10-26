@@ -34,6 +34,7 @@ import pandas as pd
 import pandapower as pp
 
 import load_gen_assignment as lg
+import resolve as rv
 from nominal import NOMINAL
 from element_names import (bus_display_name, clean_label, line_display_name, measurement_name,
                            trafo_display_name)
@@ -169,29 +170,14 @@ def _bus_label(net, idx: int) -> str:
 
 
 def resolve_bus(net, bus) -> int:
-    """A bus by index, by its name, or by the `Bus_<i>` / `Bus <i>` label."""
-    if isinstance(bus, (int, np.integer)) and not isinstance(bus, bool):
-        if int(bus) in net.bus.index:
-            return int(bus)
-        raise EditError(f"There is no bus {bus}.")
-    wanted = str(bus).strip()
-    if not wanted:
-        raise EditError("A bus is required.")
-    key = wanted.casefold()
-    hits = [int(i) for i in net.bus.index if _bus_label(net, int(i)).casefold() == key]
-    if not hits:
-        for prefix in ("bus_", "bus "):
-            if key.startswith(prefix) and key[len(prefix):].strip().isdigit():
-                idx = int(key[len(prefix):])
-                if idx in net.bus.index:
-                    hits = [idx]
-        if not hits and key.isdigit() and int(key) in net.bus.index:
-            hits = [int(key)]
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        raise EditError(f"{len(hits)} buses are named {wanted!r}; give the bus index.")
-    raise EditError(f"There is no bus {wanted!r}.")
+    """A bus by index or by any name it answers to (`resolve.find`)."""
+    try:
+        return rv.find(net, bus, ("bus",)).idx
+    except rv.ResolveError as exc:
+        raise EditError(str(exc)) from None
+
+
+_foreign_tail = rv.foreign_tail
 
 
 def _element_labels(net, etype: str, idx: int) -> list[str]:
@@ -231,6 +217,12 @@ def resolve_element(net, etype: str, element, allowed: tuple = SWITCHABLE) -> in
         raise EditError(f"element_type must be one of {list(allowed)}, not {etype!r}.")
     if etype == "bus":
         return resolve_bus(net, element)
+    if etype in ("line", "trafo"):
+        # By its label, tag, ends or index (`resolve.find`), like every other study.
+        try:
+            return rv.find(net, element, (etype,)).idx
+        except rv.ResolveError as exc:
+            raise EditError(str(exc)) from None
     tbl = net[etype]
     if isinstance(element, str) and element.strip().isdigit() and int(element) in tbl.index:
         return int(element)
@@ -397,7 +389,10 @@ def _normalise_trafo_unit(net, edit: dict, out: dict, std: str, like, pair, hv_k
             if _given(edit, k):
                 out[k] = _number(edit, k, low=low, high=high, low_open=low_open)
         for k, bus_kv in (("vn_hv_kv", hv_kv), ("vn_lv_kv", lv_kv)):
-            if _given(edit, k):
+            # In a per-unit case the rating is the buses' own: a kV the operator
+            # gives is the real one (observed live: 20 kV as the low side under a
+            # 1 kV placeholder bus, refused as out of range).
+            if _given(edit, k) and not placeholder_voltages(net):
                 out[k] = _number(edit, k, low=(1 - RATED_KV_TOLERANCE) * bus_kv,
                                  high=(1 + RATED_KV_TOLERANCE) * bus_kv)
         if _given(edit, "tap_side"):
@@ -489,6 +484,9 @@ def _normalise_transformer_site(net, edit: dict) -> dict:
 
     # Optional line first: from connect_to to the substation where the unit stands.
     if any(_given(edit, k) for k in ("length_km", "line_like", "line_std_type")):
+        if not _given(edit, "length_km"):
+            raise EditError(f"{op}: a line to the substation needs length_km. For the transformer at "
+                            f"{_bus_label(net, at)} itself, leave length_km, line_like and line_std_type out.")
         out["length_km"] = _number(edit, "length_km", low=0, high=MAX_CONNECTION_KM, low_open=True)
         out.update(_line_choice(net, edit, "line_like", "line_std_type"))
         sub = substation_bus_name(name, v_at)
@@ -597,7 +595,9 @@ def _normalise_generator(net, edit: dict) -> dict:
            "p_max_mw": _number(edit, "p_max_mw", low=0, high=cap, low_open=True), "kind": kind}
     if kind == "dispatchable":
         out["p_min_mw"] = _number(edit, "p_min_mw", default=0.0, low=0, high=out["p_max_mw"])
-        out["p_mw"] = _number(edit, "p_mw", default=out["p_min_mw"], low=out["p_min_mw"], high=out["p_max_mw"])
+        # At its rating unless told: "a 30 MW generator" is studied producing 30 MW
+        # (observed live: studied at 0 MW, a "secure" that said nothing about it).
+        out["p_mw"] = _number(edit, "p_mw", default=out["p_max_mw"], low=out["p_min_mw"], high=out["p_max_mw"])
 
     control = str(edit.get("control") or "").strip().lower()
     if control and control not in GENERATOR_CONTROLS:
@@ -666,6 +666,52 @@ def upgrade_stored(edits: list[dict]) -> list[dict]:
     return out
 
 
+# Optional fields for which 0 is never a value (each is refused at 0): a model
+# that fills every field of the edit form sends 0 for those it means to leave
+# out. Observed live: vn_kv 0, min_vm_pu 0 and length_km 0 refused an edit
+# that needed none of them.
+_ZERO_IS_UNSET = {"length_km", "vn_kv", "min_vm_pu", "max_vm_pu", "sn_mva", "vk_percent", "parallel",
+                  "max_i_ka", "vn_hv_kv", "vn_lv_kv", "max_loading_percent", "new_sn_mva", "tap_step_percent"}
+
+
+def _without_blanks(raw: dict) -> dict:
+    """The edit without the fields it leaves blank: empty, or 0 where 0 is
+    never a value — so a field is "given" only when it says something."""
+    out = {k: v for k, v in raw.items()
+           if v not in (None, "") and not (k in _ZERO_IS_UNSET and not isinstance(v, bool) and v == 0)}
+    if raw.get("op") == "add_generator" and raw.get("p_mw") == 0 and not isinstance(raw.get("p_mw"), bool):
+        out.pop("p_mw", None)              # an output left blank: the unit runs at its rating
+    if raw.get("op") == "add_bus_with_transformer" and raw.get("length_km") == 0:
+        # A length of 0 is no line to the substation, so no conductor for one
+        # (observed live: line_like 'Bus_9' beside length_km 0).
+        out.pop("line_like", None)
+        out.pop("line_std_type", None)
+    if not any(k in out for k in ("tap_step_percent", "trafo_like", "trafo_std_type")):
+        # No step, and no unit or type to copy one from: no tap changer. A side,
+        # a range of 0 to 0 and a position 0 are the form's defaults, not half of
+        # one (observed live: tap_side 'hv' with zeros refused a plain unit).
+        out.pop("tap_side", None)
+        for k in ("tap_min", "tap_max", "tap_pos"):
+            if out.get(k) == 0 and not isinstance(out.get(k), bool):
+                out.pop(k)
+    return out
+
+
+def placeholder_voltages(net) -> bool:
+    """Whether every bus of the network is at 1 kV: a converted per-unit case
+    (MATPOWER/PGLib) whose voltages are placeholders, not physical levels."""
+    vn = net.bus.loc[~lg._proposed_mask(net.bus), "vn_kv"] if len(net.bus) else []
+    return len(vn) > 1 and bool((pd.Series(vn).astype(float).round(6) == 1.0).all())
+
+
+PLACEHOLDER_KV_NOTE = (
+    "Every bus of this network is at 1 kV: a converted per-unit case, so 1 kV is a placeholder for each "
+    "bus's real voltage, not a physical level. A new transformer at such a bus is modelled in per unit on "
+    "its own rating: its 1 kV side stands for the bus's real voltage, and its impedance (vk %) holds — "
+    "build it with the voltage asked for. Its rated voltages are the buses' (a rated kV given for the real "
+    "network is not used).")
+
+
 def normalise_edit(net, raw: dict) -> dict:
     """Check one edit against `net` (the network it will be applied to) and
     return it in canonical form — every default filled, the bus or element
@@ -675,7 +721,7 @@ def normalise_edit(net, raw: dict) -> dict:
     op = str(raw.get("op") or "").strip()
     if op not in OPS:
         raise EditError(f"Unknown edit {op!r}. Use one of {list(OPS)}.")
-    edit = dict(raw, op=op)
+    edit = dict(_without_blanks(raw), op=op)
 
     if op == "add_load":
         cap = _size_cap(net)
@@ -1412,6 +1458,8 @@ def notes(net, edits: list[dict]) -> list[str]:
                 f"{e['length_km']:g} km of {line_display_name(net, e['line_like'])}'s conductor "
                 f"means {e['length_km']:g}× that line's impedance, not a {e['length_km']:g} km route.")
         if e["op"] in ("add_bus_with_transformer", "add_trafo"):
+            if placeholder_voltages(net) and PLACEHOLDER_KV_NOTE not in out:
+                out.append(PLACEHOLDER_KV_NOTE)
             out.extend(_transformer_notes(net, e))
     return out
 

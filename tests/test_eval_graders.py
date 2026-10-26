@@ -10,6 +10,8 @@ matter and rarely enough to be mistaken for model variance.
 The reference case below is that turn, reproduced from the real log.
 """
 
+import pytest
+
 from evaluation.graders.integrity import grade_composition
 from evaluation.graders.provenance import grade_provenance
 from evaluation.report import grade_record, render_report
@@ -138,6 +140,24 @@ class TestCompositionIntegrity:
         findings = grade_composition(_record(status="completed_with_warning"))
         assert [f.severity for f in findings] == [WARN]
 
+    @pytest.mark.parametrize("status", ["max_turns_summarised", "repeated_failure_summarised"])
+    def test_a_stopped_question_answered_from_its_results_is_a_warning(self, status):
+        """The loop stopped it and the model answered from what it had: an
+        answer exists. It was graded a failure with the code "none"."""
+        findings = grade_composition(_record(status=status, error_classification="none"))
+        assert [(f.severity, f.code) for f in findings] == [(WARN, status)]
+
+    @pytest.mark.parametrize("status", ["max_turns_exceeded", "repeated_failure"])
+    def test_a_stopped_question_without_an_answer_fails_under_its_status(self, status):
+        findings = grade_composition(_record(status=status, error_classification="none"))
+        assert [(f.severity, f.code) for f in findings] == [(FAIL, status)]
+
+    def test_the_cursor_tools_are_the_registry_s(self):
+        from evaluation.graders.integrity import _CURSOR_TOOLS
+        from llm_agent.agent.tool_registry import MOVES_CLOCK, REGISTRY
+        assert _CURSOR_TOOLS == {n for n, t in REGISTRY.items() if t.effect == MOVES_CLOCK}
+        assert {"advance_timestamp", "scan_rsa_over_time"} <= _CURSOR_TOOLS
+
     def test_moving_the_simulation_cursor_is_reported(self):
         # Observed live on a read-only comparison: the agent advanced the clock
         # twice instead of passing timestamps, so a question that only asked to
@@ -252,6 +272,19 @@ class TestReport:
 
     def test_render_handles_an_empty_log(self):
         assert "no turns" in render_report([], source="log.jsonl")
+
+    def test_json_output_carries_every_count(self, tmp_path, capsys):
+        import json
+        from evaluation.__main__ import main
+        log = tmp_path / "s.jsonl"
+        record = _record(assistant="11 violations across 20 tested sources; 11 / 20 = 0.55, "
+                                   "and 7 more. All clear: the grid is secure.")
+        record["tool_results"][0]["result"]["secure"] = False
+        log.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        main([str(log), "--json"])
+        (turn,) = json.loads(capsys.readouterr().out)[0]["turns"]
+        assert turn["figures"]["derived"] == 1 and turn["figures"]["ungrounded"] == 1
+        assert turn["mischaracterised"] == 1 and turn["gaps"] == 0
 
 
 class TestSessionLog:

@@ -143,9 +143,12 @@ def check_answer(question: str, answer: str) -> list[Gap]:
     """Kinds the question asked for that the answer does not contain.
 
     An answer that explicitly declines is complete: saying the figure cannot be
-    produced, and why, is a real answer to the question.
+    produced, and why, is a real answer to the question. CONDUCTOR's own notes
+    (the step limit it stopped at) answer nothing, so they are not read.
     """
-    text = answer or ""
+    from .provenance import without_own_notes  # local, like `check_turn`'s
+
+    text = without_own_notes(answer or "")
     if _DECLINED_RE.search(text):
         return []
     return [

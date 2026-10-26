@@ -632,6 +632,13 @@ def _render_options(result: dict) -> list[go.Figure]:
     if caps:
         held += (" and " if held else " with ") + ", ".join(f"{_tag(n)} at most {p:g} %" for n, p in caps.items())
     study = result.get("n1_study") or {}
+    # The cheapest option against the relaxation's bound (backend relaxation.py).
+    bound = result.get("optimality") or {}
+    bound_note = ""
+    if bound.get("lower_bound_eur_per_h") is not None:
+        bound_note = (f" · no dispatch costs less than {bound['lower_bound_eur_per_h']:.2f} €/h"
+                      + (": the cheapest is the best possible" if bound.get("best_possible")
+                         else f", none saves more than {bound['gap_eur_per_h']:.2f} €/h on the cheapest"))
     table = go.Figure(go.Table(
         columnwidth=widths,
         header={"values": [f"<b>{h}</b>" for h in headers], "fill_color": "#eef1f7", "align": "left",
@@ -641,18 +648,18 @@ def _render_options(result: dict) -> list[go.Figure]:
     table.update_layout(
         title=((f"Near-optimal alternatives{after} at {when}<br><sup>Each meets every limit{held} and costs at most "
                 f"{result.get('budget_eur_per_h', 0):.2f} €/h ({result.get('near_optimal_pct', 0):g} % above the "
-                f"cheapest) · prices from {', '.join(sources) or 'the cost table'}</sup>")
+                f"cheapest) · prices from {', '.join(sources) or 'the cost table'}{bound_note}</sup>")
                if result.get("set") == "near_optimal" else
                (f"Options for N-1 security{after} at {when}<br><sup>{len(study.get('outages_studied') or [])} critical "
                 f"outage(s) studied ({' and '.join(study.get('modes') or [])}) · each meets every limit{held} with "
-                f"everything in service · prices from {', '.join(sources) or 'the cost table'}</sup>")
+                f"everything in service · prices from {', '.join(sources) or 'the cost table'}{bound_note}</sup>")
                if result.get("set") == "n1" else
                (f"Last resort{after} at {when}: options that also reduce load<br><sup>Redispatching the units alone "
                 f"cannot clear the violations · demand response first, load relief only beyond it · each meets "
-                f"every limit{held} · prices from {', '.join(sources) or 'the cost table'}</sup>")
+                f"every limit{held} · prices from {', '.join(sources) or 'the cost table'}{bound_note}</sup>")
                if result.get("set") == "last_resort" else
                (f"Corrective options{after} at {when}<br><sup>Each meets every limit{held} · cost of the action, "
-                f"prices from {', '.join(sources) or 'the cost table'}</sup>")),
+                f"prices from {', '.join(sources) or 'the cost table'}{bound_note}</sup>")),
         height=_table_height(headers, rows, widths), **{**CHART_THEME, "margin": {"l": 10, "r": 10, "t": 70, "b": 10}})
     figures = [table]
     if result.get("set") == "n1":
@@ -2782,12 +2789,14 @@ def render_flexibility_envelope(result: dict) -> list:
     vm_upper        = result.get("vm_upper_pu", 1.05)
     vm_lower        = result.get("vm_lower_pu", 0.95)
     ts              = result.get("timestamp", "")
-    safe_q          = result.get("safe_q_range_at_base_p")
+    safe_q          = result.get("safe_q_range_at_base_p") or result.get("safe_q_range_apart_from_them")
     pf_cap          = result.get("capability_curve_pf", 0.9)
     q_cap_at_base_p = result.get(
         "q_cap_at_base_p",
         base_point.get("p_mw", 0.0) * math.tan(math.acos(pf_cap)) if base_point else None,
     )
+
+    stuck = result.get("violated_everywhere") or []
 
     # Build sorted unique axes
     p_vals = sorted(set(round(r["p_mw"],   4) for r in envelope))
@@ -2807,7 +2816,10 @@ def render_flexibility_envelope(result: dict) -> list:
         if not r.get("converged", True) and not r.get("feasible", False):
             z_feas[qi][pi] = -1          # grey: non-converged
         else:
-            z_feas[qi][pi] = 1 if r.get("feasible") else 0
+            # With elements outside their limits throughout, the map shows what
+            # the unit changes: within limits apart from them.
+            ok = r.get("feasible_apart") if stuck else r.get("feasible")
+            z_feas[qi][pi] = 1 if ok else 0
         z_vm[qi][pi]     = r.get("max_vm_pu")
         z_min_vm[qi][pi] = r.get("min_vm_pu")
 
@@ -2829,13 +2841,31 @@ def render_flexibility_envelope(result: dict) -> list:
     pf_q_pos  = [p * tan_phi for p in cap_p]
     pf_q_neg  = [-q for q in pf_q_pos]
 
-    # Mark grid points outside PF=0.9 grid-code constraint as infeasible (red)
+    # A synchronous unit's capability is its own reactive limits, not a PF arc.
+    unit_q = result.get("unit_q_limits_mvar")
+
+    # Mark grid points outside the capability as infeasible (red)
     for qi, q in enumerate(q_vals):
         for pi, p in enumerate(p_vals):
-            if z_feas[qi][pi] != -1 and abs(q) > p * tan_phi + 1e-6:
+            outside = (not unit_q[0] - 1e-6 <= q <= unit_q[1] + 1e-6) if unit_q else abs(q) > p * tan_phi + 1e-6
+            if z_feas[qi][pi] != -1 and outside:
                 z_feas[qi][pi] = 0
 
     def _add_overlays(fig, star_color="white"):
+        if unit_q:
+            for k, q in enumerate(unit_q):
+                fig.add_trace(go.Scatter(
+                    x=[min(p_vals), max(p_vals)], y=[q, q], mode="lines",
+                    line=dict(color="rgba(80,80,80,0.8)", dash="solid", width=2),
+                    name="Unit's reactive limits", legendgroup="qlim", showlegend=k == 0, hoverinfo="skip",
+                ))
+            if base_point:
+                fig.add_trace(go.Scatter(
+                    x=[base_point.get("p_mw")], y=[base_point.get("q_mvar")], mode="markers",
+                    marker=dict(symbol="star", size=14, color=star_color, line=dict(color=_C.INK, width=1.5)),
+                    name="Base operating point",
+                ))
+            return
         # MVA arc — solid grey, labelled; both pos+neg share a legendgroup so
         # clicking the legend entry toggles both lines simultaneously
         fig.add_trace(go.Scatter(
@@ -2896,7 +2926,7 @@ def render_flexibility_envelope(result: dict) -> list:
     if safe_q and base_point:
         bar_y0 = safe_q[0]
         bar_y1 = safe_q[1]
-        if q_cap_at_base_p is not None:
+        if q_cap_at_base_p is not None and not result.get("unit_q_limits_mvar"):
             bar_y0 = max(bar_y0, -q_cap_at_base_p)
             bar_y1 = min(bar_y1,  q_cap_at_base_p)
         fig1.add_shape(
@@ -2909,13 +2939,22 @@ def render_flexibility_envelope(result: dict) -> list:
     title1 = f"PQ Feasibility Map — {gen_name}"
     if ts:
         title1 += f"<br><sup>{ts}</sup>"
+    if stuck:
+        # Green here means: within limits apart from what no output of the unit clears.
+        title1 += "".join(f"<br><sup>{line}</sup>" for line in _wrapped(
+            f"Green: within limits apart from {', '.join(stuck)}, which is outside its limits at every point "
+            "(this unit cannot clear it)", 80).split("<br>"))
     if safe_q:
-        title1 += f"<br><sup>Safe Q at P={base_point.get('p_mw', '?'):.3f} MW: [{safe_q[0]:.3f}, {safe_q[1]:.3f}] MVAr</sup>"
+        title1 += (f"<br><sup>Safe Q at P={base_point.get('p_mw', '?'):.2f} MW"
+                   + (" (apart from it)" if stuck else "")
+                   + (f": about {safe_q[0]:.2f} Mvar" if abs(safe_q[1] - safe_q[0]) < 1e-6 else
+                      f": {safe_q[0]:.2f} to {safe_q[1]:.2f} Mvar") + "</sup>")
     fig1.update_layout(
-        title=title1,
+        title=_titled(title1),
         xaxis={"title": "P (MW)"},
         yaxis={"title": "Q (MVAr)"},
-        **CHART_THEME,
+        **{**CHART_THEME, "margin": _title_margin(title1)},
+        legend={"orientation": "h", "y": -0.15, "x": 0, "entrywidth": 220, "entrywidthmode": "pixels"},
     )
 
     # ── Figure 2: Max voltage heatmap ──────────────────────────────────────
@@ -3435,6 +3474,368 @@ def render_violation_attribution(result: dict) -> list[go.Figure]:
     return figures
 
 
+def _wrapped(text: str, width: int) -> str:
+    """A label broken into lines of about `width` characters (plotly's <br>),
+    so a long name stays horizontal and whole in a half-width chart."""
+    import textwrap
+    return "<br>".join(textwrap.wrap(str(text), width, break_on_hyphens=False)) or str(text)
+
+
+def _title_margin(title: str) -> dict:
+    """The theme's margins with room above the plot for a title of several
+    lines (subtitle lines included), so it never sits on the first bar, and
+    on the left for a y-axis title beside small-number ticks."""
+    return {**CHART_THEME["margin"], "l": 70, "t": 48 + 21 * (title.count("<br>") + 1)}
+
+
+def _titled(title: str) -> dict:
+    """A title anchored to the chart's left edge rather than the plot's, so a
+    long one is not pushed out of a half-width chart by the y labels."""
+    return {"text": title, "x": 0.03, "xanchor": "left", "xref": "container"}
+
+
+def render_investigation(result: dict) -> list[go.Figure]:
+    """investigate: the change since the reference, step by step.
+
+    A waterfall of the change from the reference state (not of the value
+    itself, so no axis is cut): each factor's Shapley share as a step — teal
+    raises the quantity, purple lowers it — ending at the total change, with
+    the limit drawn as a dashed red line where it sits relative to the
+    reference (named in the subtitle, not on the bars, where it would cover a
+    label). A group that is a cause gets its own chart of how its share
+    divides among its members. Nothing is drawn unless the change was divided
+    (a missing symptom, a choice to make, a state that does not solve are said
+    in the answer).
+    """
+    if result.get("mode") == "recurring":
+        return _render_recurring(result)
+    if result.get("status") != "explained" or not result.get("factors"):
+        return []
+    quantity = result.get("quantity")
+    voltage = quantity == "vm_pu"
+    # How each quantity's values and changes read: (value unit, change unit, axis unit, format).
+    unit, axis_unit, fmt = {
+        "vm_pu": ("p.u.", "p.u.", ".3f"), "loading_percent": ("points", "% of rating", ".1f"),
+        "violations": ("elements", "elements outside limits", ".0f"),
+        "exceedance_pu_h": ("p.u.·h", "p.u.·h outside limits", ".4f"),
+        "exceedance_pct_h": ("%·h", "%·h outside limits", ".1f"),
+        "mean_vm_pu": ("p.u.", "p.u., average", ".4f"), "mean_loading_percent": ("points", "%, average", ".1f"),
+        "violation_hours": ("element-hours", "element-hours outside limits", ".2f"),
+    }.get(quantity, ("", "", ".3g"))
+    value_unit = {"vm_pu": "p.u.", "loading_percent": "%", "violations": "outside limits",
+                  "exceedance_pu_h": "p.u.·h", "exceedance_pct_h": "%·h", "mean_vm_pu": "p.u.",
+                  "mean_loading_percent": "%", "violation_hours": "element-hours"}.get(quantity, "")
+    sym, ref = result.get("symptom") or {}, result.get("reference") or {}
+    factors = result["factors"]
+    change = _coerce_float(result.get("change"), 0.0)
+    labels = [_wrapped(f, 13) for f in _safe_labels([f["factor"] for f in factors], "Factor")]
+
+    fig = go.Figure(go.Waterfall(
+        x=labels + ["Total<br>change"],
+        measure=["relative"] * len(factors) + ["total"],
+        y=[_coerce_float(f.get("effect"), 0.0) for f in factors] + [change],
+        text=[f"{f['share_pct']:.0f} %" for f in factors] + ["100 %"],
+        textposition="auto", cliponaxis=False,
+        customdata=[[f["factor"], f.get("verdict", "").replace("_", " "), f.get("detail") or ""]
+                    for f in factors] + [["Total change", "", ""]],
+        hovertemplate="%{customdata[0]}<br>%{y:+" + (".4f" if voltage else ".3g") + "} " + unit
+                      + " · %{text}<br>%{customdata[1]}<br>%{customdata[2]}<extra></extra>",
+        increasing={"marker": {"color": _C.TEAL}},
+        decreasing={"marker": {"color": _C.PURPLE}},
+        totals={"marker": {"color": _C.NEUTRAL}},
+        connector={"line": {"color": _C.GRID, "width": 1}},
+    ))
+    # A limit line only where the quantity has one in its own units.
+    limit = _float_or_none(sym.get("limit")) if quantity in ("vm_pu", "loading_percent") else None
+    ref_value = _float_or_none(ref.get("value"))
+    sub = []
+    if ref_value is not None:
+        sub.append(f"{ref_value:{fmt}} → {_coerce_float(sym.get('value'), 0.0):{fmt}} {value_unit}")
+    if limit is not None and ref_value is not None:
+        # Under the bars and their labels, so it never strikes through a share.
+        fig.add_hline(y=limit - ref_value, line_dash="dash", line_color=_C.VIOLATION, line_width=1.5,
+                      layer="below")
+        sub.append(f"dashed red: the limit ({limit:g}{' p.u.' if voltage else ' %'})")
+    fig.add_hline(y=0, line_color=_C.INK, line_width=1)
+    # Room above and below the bars for the share labels.
+    ends = [0.0, change] + ([limit - ref_value] if limit is not None and ref_value is not None else [])
+    running, total = [0.0], 0.0
+    for f in factors:
+        total += _coerce_float(f.get("effect"), 0.0)
+        running.append(total)
+    low, high = min(ends + running), max(ends + running)
+    pad = 0.15 * ((high - low) or 1.0)
+    lines = [("compared with " if result.get("mode") == "window" else "since ") + ref.get("label", "the reference")
+             + (f" · {sub[0]}" if sub else "")] + sub[1:]
+    pair = (result.get("interactions") or [None])[0]
+    if pair:
+        a, b = pair["factors"]
+        lines.append(f"{a} and {b} {pair['kind']} each other ({pair['share_pct']:+.0f} %)")
+    title = _wrapped("Why " + str(result.get("element", "?")) + " changed", 38) + "".join(
+        f"<br><sup>{line}</sup>" for line in lines)
+    fig.update_layout(
+        **{**CHART_THEME, "margin": _title_margin(title)},
+        title=_titled(title),
+        xaxis_title="", showlegend=False, height=440,
+        xaxis={"tickangle": 0},
+        yaxis={"range": [low - pad, high + pad], "exponentformat": "none", "automargin": True,
+               "title": {"text": f"Change ({axis_unit})", "standoff": 12}},
+    )
+    figures = [fig]
+
+    for drill in (result.get("drill_down") or [])[:2]:
+        rows = [m for m in drill.get("members") or [] if _float_or_none(m.get("share_of_factor_pct")) is not None]
+        if not rows:
+            continue
+        rows = list(reversed(rows))                        # largest at the top, the merged rest last
+        top = max(m["share_of_factor_pct"] for m in rows)
+        bar = go.Figure(go.Bar(
+            x=[m["share_of_factor_pct"] for m in rows], y=_safe_labels([m["member"] for m in rows], "Member"),
+            orientation="h", marker_color=_C.PRIMARY,
+            text=[f"{m['share_of_factor_pct']:.0f} %" for m in rows], textposition="outside", cliponaxis=False,
+            customdata=[m.get("detail") or "" for m in rows],
+            hovertemplate="%{y}: %{x:.1f} % of the factor<br>%{customdata}<extra></extra>",
+        ))
+        title = _wrapped("Inside: " + str(drill.get("factor", "?")), 38) + \
+            "<br><sup>each member's share of the factor's effect</sup>"
+        bar.update_layout(
+            **{**CHART_THEME, "margin": _title_margin(title)},
+            title=_titled(title),
+            xaxis={"title": "Share of the factor (%)", "range": [0, max(top * 1.22, 10)]},
+            yaxis_title="",
+            height=max(240, 40 * len(rows) + 150),
+        )
+        figures.append(bar)
+    figures += _classical_figures(result)
+    return figures
+
+
+def _classical_figures(result: dict) -> list[go.Figure]:
+    """The classical views the agent asked for, beside the exact shares: each
+    factor's exact share against its linear (sensitivity) estimate — a factor
+    with none says why — and, for a branch, which sources feed its flow and
+    which loads draw it, now and in the reference state."""
+    views = result.get("classical") or {}
+    figures: list[go.Figure] = []
+    linear = views.get("linear") or {}
+    rows = linear.get("factors") or []
+    if rows:
+        names = _safe_labels([_wrapped(r["factor"], 13) for r in rows], "Factor")
+        exact = [_coerce_float(r.get("exact_share_pct"), 0.0) for r in rows]
+        approx = [_float_or_none(r.get("share_pct")) for r in rows]
+        fig = go.Figure([
+            go.Bar(name="Exact (Shapley)", x=names, y=exact, marker_color=_C.PRIMARY,
+                   text=[f"{v:.0f} %" for v in exact], textposition="outside", cliponaxis=False),
+            go.Bar(name="Linear estimate", x=names, y=[a if a is not None else 0.0 for a in approx],
+                   marker_color=_C.PURPLE,
+                   text=[f"{a:.0f} %" if a is not None else "n/a" for a in approx], textposition="outside",
+                   cliponaxis=False,
+                   customdata=[r.get("method") or r.get("why") or "" for r in rows],
+                   hovertemplate="%{x}<br>%{text}<br>%{customdata}<extra></extra>"),
+        ])
+        missing = linear.get("not_estimated") or []
+        sub = ["linear: sensitivities at both ends (LODF for a branch out)",
+               f"it covers {linear.get('covers_pct', 0):.0f} % of the change"
+               + (" · n/a: a switching change has no sensitivity" if missing else "")]
+        title = "Exact shares and the linear estimate" + "".join(f"<br><sup>{s}</sup>" for s in sub)
+        top = max(exact + [a or 0.0 for a in approx] + [10.0])
+        # The legend under the (wrapped, several-line) factor names, not on them.
+        fig.update_layout(**{**CHART_THEME, "margin": {**_title_margin(title), "b": 120}}, title=_titled(title),
+                          barmode="group",
+                          yaxis={"title": "Share of the change (%)", "range": [min(0.0, *exact) - 5, top * 1.18]},
+                          xaxis={"tickangle": 0}, height=460,
+                          legend={"orientation": "h", "y": -0.42, "x": 0, "entrywidth": 140,
+                                  "entrywidthmode": "pixels"})
+        figures.append(fig)
+    tracing = views.get("tracing") or {}
+    now, ref = tracing.get("current"), tracing.get("reference")
+    if isinstance(now, dict):
+        for key, word in (("sources", "Where its flow comes from"), ("sinks", "Where its flow goes")):
+            entries = now.get(key) or []
+            if not entries:
+                continue
+            before = {e["name"]: e["share_pct"] for e in (ref or {}).get(key) or []}
+            names = [e["name"] for e in entries][::-1]
+            fig = go.Figure([
+                go.Bar(name="Now", y=names, x=[e["share_pct"] for e in entries][::-1], orientation="h",
+                       marker_color=_C.PRIMARY, text=[f"{e['share_pct']:.0f} %" for e in entries][::-1],
+                       textposition="outside", cliponaxis=False),
+                go.Bar(name="Reference", y=names, x=[before.get(n, 0.0) for n in names], orientation="h",
+                       marker_color=_C.NEUTRAL),
+            ])
+            title = (f"{word}: {now.get('direction', '')}<br><sup>{now.get('flow_mw', 0):.1f} MW now · "
+                     "proportional sharing (Bialek), lossless</sup>")
+            fig.update_layout(**{**CHART_THEME, "margin": {**_title_margin(title), "l": 120}}, title=_titled(title),
+                              barmode="group", xaxis={"title": "Share of the flow (%)", "range": [0, 118]},
+                              yaxis_title="", height=max(260, 46 * len(names) + 150), legend=_WIDE_LEGEND)
+            figures.append(fig)
+    return figures
+
+
+def _render_recurring(result: dict) -> list[go.Figure]:
+    """investigate (recurring): each episode's change divided by kind of cause,
+    one stacked bar per episode, in time order."""
+    events = [e for e in result.get("events") or [] if e.get("factors")]
+    if result.get("status") != "explained" or not events:
+        return []
+    kinds: list[str] = []
+    for e in events:
+        for f in e["factors"]:
+            if f.get("kind") and f["kind"] not in kinds:
+                kinds.append(f["kind"])
+    # Each episode by its start; its end is in the hover.
+    labels = [f"{str(e['start'])[5:10]} {str(e['start'])[11:16]}" for e in events]
+    fig = go.Figure()
+    for i, kind in enumerate(kinds):
+        shares = [sum(f["share_pct"] for f in e["factors"] if f.get("kind") == kind) for e in events]
+        fig.add_bar(name=kind, x=labels, y=shares, marker_color=UNIT_COLOURS[i % len(UNIT_COLOURS)],
+                    customdata=[str(e["end"])[11:16] for e in events],
+                    hovertemplate="%{x} to %{customdata}<br>" + kind + ": %{y:.0f} %<extra></extra>")
+    top = (result.get("causes") or [{}])[0]
+    sub = (f"{result.get('episodes_found', len(events))} episodes · main cause {top.get('cause', '?')} in "
+           f"{top.get('episodes', 0)} of {len(events)} investigated")
+    title = _wrapped(f"Why {result.get('element', '?')} left its limits, episode by episode", 44) + \
+        f"<br><sup>{sub}</sup>"
+    fig.update_layout(**{**CHART_THEME, "margin": {**_title_margin(title), "b": 130}}, title=_titled(title),
+                      barmode="relative", yaxis={"title": "Share of the change (%)"},
+                      xaxis={"tickangle": -45, "type": "category"}, height=460,
+                      legend={"orientation": "h", "y": -0.5, "x": 0, "entrywidth": 0.5, "entrywidthmode": "fraction"})
+    return [fig]
+
+
+def render_prevention(result: dict) -> list[go.Figure]:
+    """test_prevention: the element through its warning and episode, as it was
+    and with the first sufficient action (or the closest tested), against its
+    limit; the episode shaded, the warning's start marked."""
+    series = result.get("series") or {}
+    moments = series.get("moments") or []
+    if result.get("status") != "checked" or not moments:
+        return []
+    voltage = result.get("element_type") == "bus"
+    x = [str(m)[:16] for m in moments]
+    fig = go.Figure()
+    fig.add_scatter(x=x, y=series.get("without"), name="As it was", mode="lines+markers",
+                    line={"color": _C.NEUTRAL, "width": 2})
+    if series.get("with"):
+        fig.add_scatter(x=x, y=series["with"], mode="lines+markers",
+                        name="With the action" if series.get("sufficient") else "Closest action tested",
+                        line={"color": _C.PRIMARY if series.get("sufficient") else _C.PURPLE, "width": 2})
+    limit = _float_or_none(series.get("limit"))
+    if limit is not None:
+        fig.add_hline(y=limit, line_dash="dash", line_color=_C.VIOLATION, line_width=1.5, layer="below")
+    episode, warning = result.get("episode") or {}, result.get("warning") or {}
+    if episode.get("start"):
+        fig.add_vrect(x0=str(episode["start"])[:16], x1=str(episode["end"])[:16], fillcolor=_C.VIOLATION,
+                      opacity=0.07, line_width=0, layer="below")
+    if warning.get("seen"):
+        fig.add_vline(x=str(warning["start"])[:16], line_color=_C.WARN, line_width=1.5, line_dash="dot")
+    sub = [f"warning {warning.get('lead_minutes', 0)} min before (dotted) · episode shaded · dashed red: the limit"]
+    if series.get("action"):
+        sub.append(("held throughout: " if series.get("sufficient") else "closest tested: ")
+                   + _wrapped(series["action"], 90).replace("<br>", " "))
+    title = _wrapped(f"Could {result.get('element', '?')} have been kept within its limits?", 44) + "".join(
+        f"<br><sup>{s}</sup>" for s in sub)
+    fig.update_layout(**{**CHART_THEME, "margin": {**_title_margin(title), "b": 110}}, title=_titled(title),
+                      yaxis={"title": {"text": "Voltage (p.u.)" if voltage else "Loading (% of rating)",
+                                       "standoff": 12}, "exponentformat": "none", "automargin": True},
+                      xaxis={"tickangle": -30}, height=450,
+                      legend={"orientation": "h", "y": -0.42, "x": 0, "entrywidth": 0.5,
+                              "entrywidthmode": "fraction"})
+    return [fig]
+
+
+def render_look_ahead(result: dict) -> list[go.Figure]:
+    """look_ahead: the forecast's episodes on a timeline, one row each — the
+    warning (amber) leading into the episode outside the limits (red),
+    each marked with whether an action tested prevents it (and still does
+    with higher demand); the action itself and the cause on hover."""
+    import pandas as pd
+
+    episodes = result.get("episodes") or []
+    horizon = result.get("horizon") or {}
+    if result.get("status") != "expected" or not episodes or not horizon.get("start"):
+        return []
+    step_ms = 3.6e6 * float(horizon.get("hours") or 0.25) / max(int(horizon.get("moments") or 1), 1)
+    t0, t1 = pd.Timestamp(horizon["start"]), pd.Timestamp(horizon["end"])
+
+    def ms(a: str, b: str) -> float:
+        return (pd.Timestamp(b) - pd.Timestamp(a)).total_seconds() * 1000
+
+    names = _safe_labels([e["element"] for e in episodes], "Element")
+    # One row per episode: an element twice in the horizon gets two rows.
+    row = [f"{_wrapped(n, 20)}<br><sup>{e['start'][11:16]}–{e['end'][11:16]}</sup>"
+           for n, e in zip(names, episodes)]
+    rows = {id(e): r for e, r in zip(episodes, row)}
+    fig = go.Figure()
+    warn = [e for e in episodes if e.get("lead_minutes")]
+    if warn:
+        fig.add_bar(y=[rows[id(e)] for e in warn], base=[e["decide_by"] for e in warn],
+                    x=[ms(e["decide_by"], e["start"]) for e in warn], orientation="h", name="Warning: time to decide",
+                    marker={"color": _C.WARN, "line": {"width": 0}}, width=0.42,
+                    customdata=[[e["decide_by"][11:16], e["lead_minutes"]] for e in warn],
+                    hovertemplate="Decide by %{customdata[0]} (%{customdata[1]} min of warning)<extra></extra>")
+
+    def plan(e: dict) -> str:
+        action = e.get("action")
+        if not action:
+            return "No action tested prevents it"
+        under = action.get("holds_under") or []
+        tail = "".join(f"<br>{'Holds' if h['holds'] else 'Fails' if h['holds'] is False else 'Unknown'} with "
+                       f"{h['label']}" for h in under)
+        return action["text"].rstrip(".")[0].upper() + action["text"].rstrip(".")[1:] + tail
+
+    def mark(e: dict) -> str:
+        action = e.get("action")
+        if not action:
+            return "No action tested prevents it"
+        under = action.get("holds_under") or []
+        fails = [h["label"] for h in under if h["holds"] is False]
+        if fails:
+            return "Action found · fails with " + " or ".join(fails)
+        return "Action found · holds with forecast errors" if under and all(h["holds"] for h in under) \
+            else "Action found"
+
+    fig.add_bar(y=[rows[id(e)] for e in episodes], base=[e["start"] for e in episodes],
+                x=[ms(e["start"], e["end"]) + step_ms for e in episodes], orientation="h",
+                name="Outside the limits", marker={"color": _C.VIOLATION, "line": {"width": 0}}, width=0.42,
+                customdata=[[e["start"][11:16], e["end"][11:16], e.get("peak_value"),
+                             _wrapped((e.get("cause") or {}).get("main_cause") or "—", 60),
+                             "<br>".join(_wrapped(part, 60) for part in plan(e).split("<br>"))]
+                            for e in episodes],
+                hovertemplate=("%{y}<br>%{customdata[0]}–%{customdata[1]}, worst %{customdata[2]}"
+                               "<br>Main cause: %{customdata[3]}<br>%{customdata[4]}<extra></extra>"))
+    # The marks as text beside each bar (after it, or before it near the
+    # horizon's end): a text trace is anchored by SVG, so it never overlaps
+    # the bar whatever font the browser ends up using.
+    gap = (t1 - t0) * 0.012
+    for side in ("middle right", "middle left"):
+        xs, ys, texts = [], [], []
+        for e in episodes:
+            end = pd.Timestamp(e["end"]) + pd.Timedelta(milliseconds=step_ms)
+            right = (end - t0) / max(t1 - t0, pd.Timedelta(minutes=1)) < 0.6
+            if right != (side == "middle right"):
+                continue
+            first = pd.Timestamp(e["decide_by"] if e.get("lead_minutes") else e["start"])
+            xs.append((end + gap if right else first - gap).isoformat())
+            ys.append(rows[id(e)])
+            texts.append(mark(e))
+        if xs:
+            fig.add_scatter(x=xs, y=ys, text=texts, mode="text", textposition=side, showlegend=False,
+                            hoverinfo="skip", textfont={"size": 12, "color": _C.INK}, cliponaxis=False)
+    title = ("Expected outside the limits"
+             + f"<br><sup>{horizon['start'][:16]} → {horizon['end'][:16]} · "
+               f"{'the forecast' if result.get('basis') == 'forecasts' else 'the measurements'}: "
+               "expectations, not facts · hover for the cause and the action</sup>")
+    fig.update_layout(**{**CHART_THEME, "margin": {**_title_margin(title), "l": 150, "r": 20, "b": 70}},
+                      title=_titled(title), barmode="overlay", height=max(280, 62 * len(rows) + 190),
+                      xaxis={"type": "date", "range": [t0.isoformat(), (t1 + pd.Timedelta(milliseconds=step_ms)).isoformat()],
+                             "tickformat": "%H:%M\n%d %b"},
+                      yaxis={"autorange": "reversed", "automargin": False, "ticklabelstandoff": 8,
+                             "categoryorder": "array", "categoryarray": row},
+                      legend={"orientation": "h", "y": -0.22, "x": 0, "entrywidth": 190, "entrywidthmode": "pixels"})
+    return [fig]
+
+
 def render_network_comparison(result: dict) -> list[go.Figure]:
     """compare_networks: what a proposal changes against the base.
 
@@ -3798,6 +4199,9 @@ RENDERER_MAP: dict[str, Callable] = {
     "get_current_conditions": render_conditions,
     "compare_results": render_diff,
     "compute_violation_attribution": render_violation_attribution,
+    "investigate": render_investigation,
+    "test_prevention": render_prevention,
+    "look_ahead": render_look_ahead,
     "find_worst_case_timestamp": render_worst_case,
     "scan_scenarios": render_scenarios,
     "get_element_timeseries": render_element_timeseries,

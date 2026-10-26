@@ -68,7 +68,10 @@ TASKS: tuple[Task, ...] = (
            "fields": {"set": "n1"}},
           {"kind": "mentions", "label": "said what could not be secured",
            "any": ["not secured", "could not secure", "cannot secure", "cannot be secured", "could not be secured",
-                   "not be secured", "remain"]})),
+                   "not be secured", "remain",
+                   # Observed live, a correct answer: "21 outages were skipped…; this result does not
+                   # establish security for a trip of any line".
+                   "skipped", "not establish", "does not establish"]})),
     Task("n1_corrective",
          (f"At {PEAK}, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, "
           "and what would we do after each?",),
@@ -83,7 +86,9 @@ TASKS: tuple[Task, ...] = (
           {"kind": "mentions", "label": "said redispatch alone is not enough and named demand response",
            "any": ["demand response"]})),
     Task("hold_option",
-         ("At 18:00 on 6 January, give me options to clear the violations.",
+         # At the peak: at 18:00 the base is within its limits, and there is nothing to hold
+         # (observed live: the agent rightly answered that no action was needed).
+         (f"At {PEAK}, give me options to clear the violations.",
           "Hold the cheapest one for the next 4 hours: until when does it keep every limit?"),
          ({"kind": "tool", "label": "held the chosen option", "name": "flexibility_over_time",
            "args": {"study": "hold", "option": "S"}},)),

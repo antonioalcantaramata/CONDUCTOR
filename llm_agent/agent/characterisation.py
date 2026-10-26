@@ -185,6 +185,9 @@ class Conflict(NamedTuple):
     path: str
     field: str
     detail: str
+    # A whole study described against its own verdict (`check_study_claims`):
+    # no figure, `path` is the tool.
+    study: bool = False
 
     def render(self) -> str:
         shown = f"{self.value:g}" + (f" {self.unit}" if self.unit else "")
@@ -259,6 +262,7 @@ def _asserts_favourable(context: str, qualifier: Qualifier) -> bool:
     which is the failure mode that matters most in a guard an agent reads.
     """
     lowered = context.lower()
+    state = qualifier.field in _STATE_FIELDS
     for word in qualifier.asserts:
         # Whole words only. Without the boundary, "move" matched inside
         # "movement" and the engine's own correct sentence — "the smallest
@@ -267,9 +271,23 @@ def _asserts_favourable(context: str, qualifier: Qualifier) -> bool:
         pattern = re.escape(word) if " " in word else rf"\b{re.escape(word)}\b"
         for match in re.finditer(pattern, lowered):
             window = lowered[max(0, match.start() - _NEGATION_WINDOW):match.start()]
-            if not _NEGATION_RE.search(window):
-                return True
+            if _NEGATION_RE.search(window):
+                continue
+            if state and _HYPOTHETICAL_RE.search(lowered[max(0, match.start() - _HYPOTHETICAL_WINDOW):match.start()]):
+                continue
+            return True
     return False
+
+
+# A state's verdict (converged, secure, violated) is not contradicted by a
+# counterfactual about another state. Observed live: "undoing its increase
+# alone would bring Bus_29 just within limits (0.950 p.u.)" was flagged as
+# calling a violated bus within limits. Only for these fields: "reducing Gen_1
+# by 6.24 MW would clear it" is exactly the action claim the movement
+# qualifiers exist to catch.
+_STATE_FIELDS = {"converged", "secure", "violated"}
+_HYPOTHETICAL_RE = re.compile(r"\b(would|undoing|undo|had been|were it|were the)\b")
+_HYPOTHETICAL_WINDOW = 60
 
 
 # Sentence boundaries. A newline ends one too: the model writes its
@@ -316,9 +334,11 @@ _STUDY_VERDICTS = (
         "the study did not converge, so its result is not usable",
     ),
     Qualifier(
+        # Not "result" or "answer": a correct decline uses them too ("the
+        # result is that hosting capacity could not be determined").
         "usable",
         ("secure", "within limits", "no violation", "solved", "converged",
-         "successful", "succeeded", "result", "answer"),
+         "successful", "succeeded"),
         "the study ran but did not produce a usable result",
     ),
     Qualifier(
@@ -410,9 +430,12 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
     anything to attach a finding to — the most obviously wrong answer a reader
     could imagine was the one it could not see.
 
-    Reported with value 0 and no unit: the subject is the study, not a figure.
+    Reported with value 0, no unit and `study=True`: the subject is the
+    study, not a figure. CONDUCTOR's own notes in the answer are not read.
     """
-    text = answer or ""
+    from .provenance import without_own_notes  # local: avoids an import cycle
+
+    text = without_own_notes(answer or "")
     if not text.strip():
         return []
 
@@ -443,13 +466,14 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
                 value=0.0, unit=None,
                 context=" ".join(text.split())[:120],
                 path=name, field=verdict.field, detail=verdict.describe,
+                study=True,
             ))
     return conflicts
 
 
 def check_answer(answer: str, record: dict) -> list[Conflict]:
     """Figures the answer characterises against their own records."""
-    from .provenance import _strip_noise, extract_claims  # local: avoids an import cycle
+    from .provenance import _strip_noise, _tolerance, extract_claims  # local: avoids an import cycle
 
     qualified = qualified_numbers(record)
     if not qualified:
@@ -481,7 +505,9 @@ def check_answer(answer: str, record: dict) -> list[Conflict]:
             # Magnitude only. The 6.24 case was written positive against a
             # negative source, and a check that required the sign to match
             # would have missed exactly the sentence it exists for.
-            if abs(abs(value) - abs(claim.value)) > 10.0 ** -claim.decimals:
+            # Half a unit in the last stated place, as provenance rounds: a
+            # whole unit matched "reduce by 7 MW" to an infeasible 6.24.
+            if abs(abs(value) - abs(claim.value)) > _tolerance(claim.decimals):
                 continue
             matched.extend(
                 (path, q) for path, q in entries if _asserts_favourable(sentence, q)

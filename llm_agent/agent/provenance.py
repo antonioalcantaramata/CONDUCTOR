@@ -26,8 +26,9 @@ Scope, stated plainly:
             engine, and the two guards are complementary rather than
             overlapping.
 
-This is a measuring instrument, not a filter: nothing here modifies an answer
-or is fed back to the model.
+This is a measuring instrument, not a filter: nothing here modifies an answer.
+Its findings are put to the model only in reflection's `inform` mode
+(`reflection.py`); otherwise they are recorded and shown to the operator.
 """
 
 from __future__ import annotations
@@ -87,6 +88,18 @@ _NUMBER_RE = re.compile(
 
 _SIGNED_CURRENCY_RE = re.compile(r"-\s?[€$£]\s?$")
 
+# A security criterion's name: "N-1", "N-0", "N-1-1", "N–2". Its digits are a
+# name, not a figure (observed live: the "0" of "an N-0 assessment" traced to
+# "0 violations", and the "1" of "N-1" marked as an input).
+# An element named by a kind word and a number — "Bus 7", "line 12",
+# "transformer 1", "Gen 2": a name, not a figure. A unit after it ("line 95 %")
+# makes it a figure again.
+ELEMENT_NO_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:bus|line|transformer|trafo|gen|generator|unit|node|feeder|substation|outage)"
+    r"\s?#?\s?\d+(?![\d.,])(?!\s?(?:%|MW|Mvar|MVAr|MVA|kV|p\.?u\.?|€|EUR|h\b|min\b))", re.IGNORECASE)
+
+NK_RE = re.compile(r"(?<![A-Za-z0-9_])[Nn]\s?[-\u2010\u2011\u2013]\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?![\d.])")
+
 # Digit groups anywhere, used to mine numerals out of *strings* in tool
 # results. Element names carry them ("Oscar 10kV", "Foxtrot Trf 1") and the
 # answer quotes them back, so without this every such mention reads as
@@ -98,10 +111,61 @@ _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 _TABLE_RULE_RE = re.compile(r"^\s*\|[\s:|\-]+\|\s*$", re.MULTILINE)
 _LIST_MARKER_RE = re.compile(r"^(\s*)\d+\.(\s)", re.MULTILINE)
-_DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?")
+# The model also writes a date with non-breaking hyphens (U+2010, U+2011) and a
+# no-break space before the time ("2000‑01‑01 00:00").
+_DASH = "[-\u2010\u2011]"
+_DATE_TIME_SEP = "[ T\u00a0\u202f]"
+_DATETIME_RE = re.compile(
+    rf"\d{{4}}{_DASH}\d{{2}}{_DASH}\d{{2}}(?:{_DATE_TIME_SEP}\d{{2}}:\d{{2}}(?::\d{{2}})?)?")
 
-# Words that state which way power is moving. Where the prose names a
-# direction, the sign is carried by the word and the magnitude by the number,
+# Dates and times as prose writes them: "18:15", "18:15:00", "6 January",
+# "January 6", "6 Jan", "06 Jan 2000". Their digits are no more a claim than an
+# ISO timestamp's. Month names are matched capitalised only, so "6 may" in a
+# sentence is left alone.
+# A colon after the time is punctuation ("07:45–09:45: peaks"), not seconds.
+_CLOCK_RE = re.compile(r"(?<![\d:.])\d{1,2}:\d{2}(?::\d{2})?(?!\d|:\d)")
+_MONTH = (r"(?:January|February|March|April|May|June|July|August|September|October|November|December"
+          r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\b\.?")
+_DAY = r"(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?"
+_YEAR = r"(?:,?\s+\d{4}\b)?"
+_DAY_MONTH_RE = re.compile(
+    rf"(?<![\w.]){_DAY}\s+(?:of\s+)?{_MONTH}{_YEAR}"
+    rf"|\b{_MONTH}\s+{_DAY}\b{_YEAR}"
+)
+
+# A timestamp inside a result or argument string, as the tools write it —
+# "2000-01-09 18:15:00", the prefix "2000-01-09 18", an ISO form with
+# fraction or offset. Its digits are not sources: a fabricated "9 violations"
+# was grounded by the day of "2000-01-09 18:15:00", and "18 buses" by its hour.
+_SOURCE_DATETIME_RE = re.compile(
+    rf"\d{{4}}{_DASH}\d{{2}}{_DASH}\d{{2}}(?:{_DATE_TIME_SEP}\d{{2}}(?::\d{{2}}(?::\d{{2}}(?:\.\d+)?)?)?(?!\d))?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?"
+)
+
+# CONDUCTOR's own notes appended to an answer (loop.py): the step limit it
+# stopped at, the call it stopped on, or what re-running the studies under
+# other readings found (robustness.py). They are the system speaking, not the
+# model, and their figures are settings or the re-runs' own, not claims.
+_OWN_NOTE_RE = re.compile(
+    r"CONDUCTOR (?:used all \d+ steps allowed for one question|stopped this question:|"
+    r"re-ran the studies under readings)[^\n]*")
+
+
+def without_own_notes(text: str) -> str:
+    """The answer without the notes CONDUCTOR itself appended to it."""
+    return _OWN_NOTE_RE.sub(" ", text or "")
+
+
+def _without_dates(text: str) -> str:
+    """Text with its dates and clock times removed, ISO or written out."""
+    text = _SOURCE_DATETIME_RE.sub(" ", text)
+    text = _DAY_MONTH_RE.sub(" ", text)
+    return _CLOCK_RE.sub(" ", text)
+
+
+# Words that state which way power is moving, or which way a value changed.
+# Where the prose names a direction, the sign is carried by the word and the
+# magnitude by the number,
 # so a value may legitimately appear negated: the payload reports
 # `slack_import_mw = -1.3146` and the answer says "exporting 1.31 MW". Both
 # describe the same flow, and reading only the signed value called the second
@@ -110,7 +174,10 @@ _DIRECTION_RE = re.compile(
     r"\b(export|exports|exporting|import|imports|importing|inject|injects|"
     r"injecting|injection|absorb|absorbs|absorbing|draw|draws|drawing|"
     r"supply|supplies|supplying|consume|consumes|consuming|deliver|delivers|"
-    r"delivering|withdraw|withdraws|withdrawing|feed|feeds|feeding)\b",
+    r"delivering|withdraw|withdraws|withdrawing|feed|feeds|feeding|"
+    # A change said as a fall: "fell by 0.00165 p.u." over `change: -0.00165`.
+    r"fell|fall|falls|fallen|dropped|drop|drops|declined|declines|decreased|decrease|decreases|"
+    r"lowered|reduced|down by)\b",
     re.IGNORECASE,
 )
 
@@ -217,11 +284,16 @@ def _strip_noise(text: str) -> str:
     # as fabricated. Only U+2212 is converted: the en-dash it resembles is a
     # range separator here ("0.95–1.045") and must not become a sign.
     text = text.replace("\u2212", "-")
+    text = without_own_notes(text)
     text = _FENCED_CODE_RE.sub(" ", text)
     text = _INLINE_CODE_RE.sub(" ", text)
     text = _TABLE_RULE_RE.sub(" ", text)
     text = _LIST_MARKER_RE.sub(r"\1\2", text)
     text = _DATETIME_RE.sub(" ", text)
+    text = _DAY_MONTH_RE.sub(" ", text)
+    text = _CLOCK_RE.sub(" ", text)
+    text = NK_RE.sub(" ", text)
+    text = ELEMENT_NO_RE.sub(" ", text)
     # Emphasis markers sit between a value and its unit ("**3.35 MW**").
     return text.replace("*", "")
 
@@ -319,7 +391,7 @@ def _walk(node: Any, path: str, out: list[Source],
         # Prose fields (`text`, `message`) keep their scope: the engine's
         # resolved sentence is genuinely about its own violation.
         keeps_scope = not path.rsplit(".", 1)[-1].endswith(_NAME_SUFFIXES)
-        for hit in _DIGITS_RE.findall(node):
+        for hit in _DIGITS_RE.findall(_without_dates(node)):
             try:
                 out.append(Source(float(hit), path, scopes if keeps_scope else frozenset()))
             except ValueError:  # pragma: no cover
@@ -414,6 +486,13 @@ def subject_names(record: dict) -> frozenset:
     )
 
 
+# Tools whose content the agent itself wrote (the investigation record: its
+# hypotheses and findings). Their numbers are the answer's own, restated, so
+# they are never a source — or a figure could be "traced" to the agent's note
+# about it.
+AGENT_WRITTEN = frozenset({"record_investigation"})
+
+
 def collect_sources(record: dict) -> list[Source]:
     """Every number the turn had legitimate access to, with what it belongs to.
 
@@ -429,6 +508,8 @@ def collect_sources(record: dict) -> list[Source]:
         if not isinstance(entry, dict):
             continue
         name = entry.get("name", "tool")
+        if name in AGENT_WRITTEN:
+            continue
         _walk(entry.get("result"), name, sources, frozenset(), vocabulary)
 
     # The grid facts the system prompt stated. A figure quoted from them —
@@ -442,6 +523,8 @@ def collect_sources(record: dict) -> list[Source]:
         if not isinstance(call, dict):
             continue
         name = call.get("name", "tool")
+        if name in AGENT_WRITTEN:
+            continue
         _walk(call.get("args"), f"args:{name}", sources)
 
     _walk(record.get("user") or "", "prompt", sources)
@@ -559,7 +642,7 @@ def check_claim(claim: Claim, sources: Iterable[Any], subject: str | None = None
     # The whole answer, not the claim's own window: a percentage is routinely
     # stated a sentence after the division that produced it, and the 55-char
     # context is cut off well before it.
-    derived = _derivation(claim, sources, answer)
+    derived = _derivation(claim, sources, answer) or _share_of(claim, sources, answer)
     if derived is not None:
         return ClaimVerdict(claim, DERIVED, source=derived, nearest=nearest,
                             subject=subject)
@@ -666,6 +749,44 @@ def _derivation(claim: Claim, sources: Iterable[Any],
     return None
 
 
+# "190 of 200 samples": a count written as a share of a total.
+_SHARE_OF_RE = re.compile(r"(\d[\d,]*)\s+(?:of|out of)\s+(\d[\d,]*)\b")
+_PERCENT_NEAR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%|\b(0\.\d+)\b")
+
+
+def _share_of(claim: Claim, sources: Iterable[Any], answer: str | None) -> str | None:
+    """The count `claim` as a written share of a written total: "95 % (190 of
+    200 samples)" — 190 is 0.95 × 200. As narrow as `_derivation`: the claim is
+    the K of "K of N", N traces to a result, and K/N equals a share written
+    within the same stretch of text that also traces (0.95, or 95 %)."""
+    if claim.decimals or not answer:
+        return None
+    values = [(s[0], s[1]) for s in sources]
+
+    def trace(value: float, tol: float) -> str | None:
+        return next((path for v, path in values if abs(v - value) <= tol), None)
+
+    for m in _SHARE_OF_RE.finditer(answer):
+        try:
+            k, n = float(m.group(1).replace(",", "")), float(m.group(2).replace(",", ""))
+        except ValueError:
+            continue
+        if n <= 0 or abs(k - claim.value) > 1e-9:
+            continue
+        n_path = trace(n, 1e-9)
+        if not n_path:
+            continue
+        window = answer[max(0, m.start() - 80):m.end() + 80]
+        for p in _PERCENT_NEAR_RE.finditer(window):
+            share = float(p.group(1)) / 100.0 if p.group(1) else float(p.group(2))
+            if abs(share - k / n) > 0.5 / n + 1e-9:
+                continue
+            share_path = trace(share, 0.5 / n) or trace(share * 100.0, 50.0 / n)
+            if share_path:
+                return f"{share_path} × {n_path}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Subjects — what the prose around a figure is talking about
 # ---------------------------------------------------------------------------
@@ -684,13 +805,70 @@ def _section_start(cleaned: str, position: int) -> int:
     return last
 
 
+def _cell_bounds(line: str, column: int) -> tuple[int, int] | None:
+    """Offsets (within `line`) of the `column`-th cell of a markdown table row."""
+    bars = [i for i, ch in enumerate(line) if ch == "|"]
+    if len(bars) < column + 2:
+        return None
+    return bars[column] + 1, bars[column + 1]
+
+
+def _table_subject(cleaned: str, position: int, occurrences: list[tuple[int, str]]) -> tuple[bool, str | None]:
+    """For a figure in a markdown table cell: (True, the element its column's
+    header names — else the one its row's first cell names — else None).
+    (False, None) outside a table.
+
+    Prose's rule (the element named last before the figure) reads a table
+    wrongly: in "| | Bus_29 voltage | L0 loading |" over "| Forecast | 0.939
+    p.u. | 121.4 % |", the last name before 0.939 is L0, from the header's last
+    column, and a correct voltage was reported as belonging to the line."""
+    start = cleaned.rfind("\n", 0, position) + 1
+    end = cleaned.find("\n", position)
+    end = len(cleaned) if end == -1 else end
+    line = cleaned[start:end]
+    if not line.lstrip().startswith("|"):
+        return False, None
+    column = line[:position - start].count("|") - 1
+    # The table's first row: walk up through its rows and its rule row (which
+    # `_strip_noise` blanks to a single space; a paragraph break is empty).
+    header_start, cursor = start, start
+    while cursor > 0:
+        prev_start = cleaned.rfind("\n", 0, cursor - 1) + 1
+        prev = cleaned[prev_start:cursor - 1]
+        if prev.lstrip().startswith("|"):
+            header_start = prev_start
+        elif prev != " ":
+            break
+        cursor = prev_start
+    header_end = cleaned.find("\n", header_start)
+    header_end = len(cleaned) if header_end == -1 else header_end
+
+    def named_in(line_start: int, text: str, col: int) -> str | None:
+        bounds = _cell_bounds(text, col)
+        if bounds is None:
+            return None
+        lo, hi = line_start + bounds[0], line_start + bounds[1]
+        names = [name for offset, name in occurrences if lo <= offset < hi]
+        return names[-1] if names else None
+
+    if header_start != start:
+        found = named_in(header_start, cleaned[header_start:header_end], column)
+        if found:
+            return True, found
+    return True, named_in(start, line, 0)
+
+
 def _subject_at(cleaned: str, position: int, occurrences: list[tuple[int, str]]) -> str | None:
-    """The element most recently named before this figure, in its own section.
+    """The element most recently named before this figure, in its own section
+    — or, in a table, the element its column or its row names.
 
     Nearest-preceding rather than nearest-either-side: prose introduces its
     subject and then reports figures about it, and a lookahead would attach a
     figure to whatever element the next sentence happens to mention.
     """
+    in_table, subject = _table_subject(cleaned, position, occurrences)
+    if in_table:
+        return subject
     boundary = _section_start(cleaned, position)
     subject = None
     for offset, name in occurrences:
@@ -716,17 +894,47 @@ def _name_pattern(name: str) -> re.Pattern:
     return re.compile(re.escape(left) + _ARROW_RE + re.escape(right))
 
 
+_BRANCH_RE = re.compile(r"^(?:.* \| )?(?P<ends>.+? -> .+?) \[(?P<tag>[LT]\d+)\]$")
+
+
+def _short_patterns(name: str) -> list[tuple[str, re.Pattern]]:
+    """Shorter ways prose names a branch: its ends alone ("Bus_0–Bus_1") or its
+    tag alone ("L0"), as in "Line L0 (Bus_0–Bus_1)". Each is keyed so a form
+    two branches share (parallel lines) can be dropped as ambiguous."""
+    match = _BRANCH_RE.match(name)
+    if not match:
+        return []
+    left, right = match["ends"].split(" -> ", 1)
+    ends = rf"(?<![\w]){re.escape(left)}{_ARROW_RE}{re.escape(right)}(?![\w])"
+    return [(f"ends:{left}|{right}", re.compile(ends)),
+            (f"tag:{match['tag']}", re.compile(rf"\b{match['tag']}\b"))]
+
+
 def _occurrences(cleaned: str, names: Iterable[str]) -> list[tuple[int, str]]:
     """Where each element name appears, longest names first.
 
     Longest-first so "Echo 10kV" is not shadowed by a shorter name it
-    contains; overlapping shorter hits at the same offset are dropped.
+    contains; overlapping shorter hits at the same offset are dropped. A
+    branch's short forms (`_short_patterns`) come after every full name, and
+    only when one branch alone answers to them.
     """
+    names = sorted(names, key=len, reverse=True)
     spans: list[tuple[int, int, str]] = []
-    for name in sorted(names, key=len, reverse=True):
-        for match in _name_pattern(name).finditer(cleaned):
+
+    def add(name: str, pattern: re.Pattern) -> None:
+        for match in pattern.finditer(cleaned):
             if not any(start <= match.start() < end for start, end, _ in spans):
                 spans.append((match.start(), match.end(), name))
+
+    for name in names:
+        add(name, _name_pattern(name))
+    short: dict[str, list[tuple[str, re.Pattern]]] = {}
+    for name in names:
+        for key, pattern in _short_patterns(name):
+            short.setdefault(key, []).append((name, pattern))
+    for owners in short.values():
+        if len(owners) == 1:
+            add(*owners[0])
     return sorted((start, name) for start, _, name in spans)
 
 

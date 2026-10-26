@@ -38,8 +38,12 @@ the others create, so it is reported as context rather than perturbed.
 
 from __future__ import annotations
 
+import math
+
 import pandapower as pp
 from pandapower.powerflow import LoadflowNotConverged
+
+from element_names import bus_display_name, line_display_name, trafo_display_name
 
 # Perturbation sizes. Small enough that the linearisation holds, large enough to
 # stay well clear of the power flow's own convergence tolerance.
@@ -49,6 +53,19 @@ DEFAULT_DELTA_MVAR = 0.1
 # Sources smaller than this cannot meaningfully move anything; skipping them
 # keeps the power-flow count down on networks with many tiny injections.
 _MIN_SOURCE_MW = 0.01
+
+# Voltage set-points (see `_setpoint_levers`): the step that measures each
+# unit's sensitivity, how far inside the limit a new set-point aims (so a
+# rounded set-point does not leave the bus on its edge), how many corrective
+# re-solves the check may take, and how many units are checked per violation.
+DEFAULT_DELTA_VM = 0.005
+_SETPOINT_MARGIN = 0.001
+_SETPOINT_TRIES = 3
+_SETPOINT_CANDIDATES = 3
+# Set-point moves are searched for the worst voltage violations only: the
+# search costs up to 9 power flows each, and a network with dozens of buses
+# over a too-tight band would otherwise spend hundreds.
+_SETPOINT_VIOLATIONS = 5
 
 
 def _safe_runpp(net) -> bool:
@@ -104,12 +121,12 @@ def _collect_violations(net, vm_lower, vm_upper, max_line_loading_pct,
         if vm is None or vm != vm:  # NaN
             continue
         if vm > vm_upper:
-            found.append({"element": _element_name(net, "bus", idx, "Bus"),
+            found.append({"element": bus_display_name(net, idx),
                           "kind": "bus", "index": int(idx), "quantity": "vm_pu",
                           "type": "overvoltage", "value": float(vm),
                           "limit": float(vm_upper), "violated": True})
         elif vm < vm_lower:
-            found.append({"element": _element_name(net, "bus", idx, "Bus"),
+            found.append({"element": bus_display_name(net, idx),
                           "kind": "bus", "index": int(idx), "quantity": "vm_pu",
                           "type": "undervoltage", "value": float(vm),
                           "limit": float(vm_lower), "violated": True})
@@ -123,7 +140,9 @@ def _collect_violations(net, vm_lower, vm_upper, max_line_loading_pct,
             if loading is None or loading != loading:
                 continue
             if loading > limit:
-                found.append({"element": _element_name(net, table, idx, prefix),
+                # Named as the assessment names them, so one answer never calls
+                # a line "Line_0" in one sentence and "Bus_0 -> Bus_1 [L0]" in the next.
+                found.append({"element": (line_display_name if table == "line" else trafo_display_name)(net, idx),
                               "kind": table, "index": int(idx),
                               "quantity": "loading_percent", "type": "overload",
                               "value": float(loading), "limit": float(limit),
@@ -308,7 +327,127 @@ def _reframe_uncontrollable(driver: dict) -> None:
     driver["actionable"] = False
 
 
-def _recommended_action(violation: dict, drivers: list[dict]) -> dict:
+def _setpoint_units(net) -> list[dict]:
+    """Units holding a voltage set-point the operator can move: the in-service
+    `gen` rows. The external grid holds one too, but its voltage is set by the
+    grid it connects to, not by this operator, so it is not offered as a lever."""
+    units = []
+    frame = getattr(net, "gen", None)
+    if frame is None or frame.empty or "vm_pu" not in frame.columns:
+        return units
+    for idx in frame.index:
+        if "in_service" in frame.columns and not bool(frame.at[idx, "in_service"]):
+            continue
+        units.append({"unit": _element_name(net, "gen", idx, "Gen"), "index": int(idx),
+                      "setpoint": float(frame.at[idx, "vm_pu"]), "bus": int(frame.at[idx, "bus"])})
+    return units
+
+
+def _q_range(net, idx: int) -> tuple[float | None, float | None]:
+    out = []
+    for col in ("min_q_mvar", "max_q_mvar"):
+        raw = net.gen.at[idx, col] if col in net.gen.columns else None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = float("nan")
+        out.append(value if value == value else None)
+    return out[0], out[1]
+
+
+def _setpoint_levers(net, violation: dict, sensitivities: dict[int, float], units: list[dict],
+                     before: set[str], vm_lower: float, vm_upper: float, limits: tuple) -> tuple[list[dict], int]:
+    """Voltage set-point moves that clear one voltage violation, each checked
+    by a full AC power flow rather than read off a sensitivity.
+
+    A unit on voltage control has no reactive set-point to perturb, so the
+    injection sensitivities never see its real lever: on the IEEE 30-bus demo
+    every unit holds its voltage, and the only remedy offered for an
+    undervoltage was a 193 MW increase of one unit. The set-point is what an
+    operator moves.
+
+    For the most sensitive units: the set-point that brings the bus just
+    inside its limit (linear, then corrected by re-solving up to
+    `_SETPOINT_TRIES` times), rounded to 0.001 p.u. away from the limit, then
+    applied in a power flow that must show the violation cleared, the unit's
+    own bus within the voltage band, its reactive output within its range, and
+    no element outside its limits that was not before. Returns (levers, power
+    flows used); the network is left as it was.
+    """
+    levers, flows = [], 0
+    value, limit = violation["value"], violation["limit"]
+    target = limit + (_SETPOINT_MARGIN if violation["type"] == "undervoltage" else -_SETPOINT_MARGIN)
+    ranked = sorted((u for u in units if abs(sensitivities.get(u["index"], 0.0)) > 1e-6),
+                    key=lambda u: -abs(sensitivities[u["index"]]))[:_SETPOINT_CANDIDATES]
+    for unit in ranked:
+        idx, now = unit["index"], unit["setpoint"]
+        slope = sensitivities[idx]
+        new, reached = now, value
+        lever = {"unit": unit["unit"], "setpoint_now": round(now, 4),
+                 "d_per_pu_setpoint": round(slope, 6)}
+        try:
+            for _ in range(_SETPOINT_TRIES):
+                step = (target - reached) / slope
+                raw = new + step
+                new = (math.ceil(raw * 1000) if step > 0 else math.floor(raw * 1000)) / 1000
+                net.gen.at[idx, "vm_pu"] = new
+                flows += 1
+                if not _safe_runpp(net):
+                    reached = None
+                    break
+                reached = float(net.res_bus.at[violation["index"], "vm_pu"])
+                if vm_lower <= reached <= vm_upper:
+                    break
+                moved = new - now
+                if abs(moved) > 1e-9 and abs(reached - value) > 1e-9:
+                    slope = (reached - value) / moved     # the secant: a better slope for the next try
+            lever["setpoint_new"] = round(new, 4)
+            if reached is None:
+                lever.update(verified=False, reason="the power flow does not converge with this set-point")
+            else:
+                q = float(net.res_gen.at[idx, "q_mvar"])
+                q_min, q_max = _q_range(net, idx)
+                own = float(net.res_bus.at[unit["bus"], "vm_pu"])
+                after = {v["element"] for v in _collect_violations(net, vm_lower, vm_upper, *limits)}
+                new_violations = sorted(after - before)
+                q_ok = None if q_min is None or q_max is None else q_min - 1e-6 <= q <= q_max + 1e-6
+                lever["check"] = {"value_after": round(reached, 5), "q_mvar_after": round(q, 3),
+                                  "q_range_mvar": [q_min, q_max], "new_violations": new_violations}
+                cleared = vm_lower <= reached <= vm_upper
+                in_band = vm_lower <= new <= vm_upper and vm_lower <= own <= vm_upper
+                problems = ([] if cleared else [f"{violation['element']} stays at {reached:.3f} p.u."]) + \
+                    ([] if in_band else [f"the set-point {new:.3f} p.u. is outside the voltage band"]) + \
+                    ([] if q_ok is not False else [f"{unit['unit']} would need {q:.1f} Mvar, outside "
+                                                     f"{q_min:g} to {q_max:g} Mvar"]) + \
+                    ([f"it puts {', '.join(new_violations)} outside its limits"] if new_violations else [])
+                lever["verified"] = not problems
+                if problems:
+                    lever["reason"] = "; ".join(problems)
+                elif q_ok is None:
+                    lever["note"] = f"{unit['unit']}'s reactive range is not known here."
+        finally:
+            net.gen.at[idx, "vm_pu"] = now
+        levers.append(lever)
+    levers.sort(key=lambda lv: (not lv.get("verified"), "note" in lv,
+                                abs(lv.get("setpoint_new", lv["setpoint_now"]) - lv["setpoint_now"])))
+    return levers, flows
+
+
+def _setpoint_text(violation: dict, lever: dict) -> str:
+    check = lever["check"]
+    verb = "Raise" if lever["setpoint_new"] > lever["setpoint_now"] else "Lower"
+    q_min, q_max = check["q_range_mvar"]
+    q = (f"{lever['unit']} at {check['q_mvar_after']:.1f} Mvar (range {q_min:g} to {q_max:g})"
+         if q_min is not None and q_max is not None else
+         f"{lever['unit']} at {check['q_mvar_after']:.1f} Mvar (its reactive range is not known here)")
+    # The element first: an answer quotes this verbatim, and a figure is read
+    # as being about the element named before it.
+    return (f"To clear {violation['element']}, {verb.lower()} the voltage set-point of {lever['unit']} from "
+            f"{lever['setpoint_now']:.3f} to {lever['setpoint_new']:.3f} p.u. Checked by a power flow: "
+            f"{violation['element']} at {check['value_after']:.3f} p.u., {q}, no new violation.")
+
+
+def _recommended_action(violation: dict, drivers: list[dict], setpoint_levers: list[dict] | None = None) -> dict:
     """
     Resolve the corrective recommendation here, not in the language model.
 
@@ -329,6 +468,16 @@ def _recommended_action(violation: dict, drivers: list[dict]) -> dict:
                 "setpoint instead."
             ),
         }
+
+    # A set-point move checked by a full power flow is preferred to any
+    # movement read off a sensitivity: it costs no energy, and it is not an
+    # extrapolation.
+    checked = [lv for lv in setpoint_levers or [] if lv.get("verified")]
+    if checked:
+        lever = checked[0]
+        return {"kind": "setpoint_change", "source": lever["unit"],
+                "setpoint_now": lever["setpoint_now"], "setpoint_new": lever["setpoint_new"],
+                "unit": "p.u.", "text": _setpoint_text(violation, lever)}
 
     controllable = [d for d in drivers if d["controllable"]]
     if not controllable:
@@ -471,8 +620,30 @@ def attribute_violations(
 
             frame.at[idx, column] = original
 
+    # Each voltage-controlling unit's set-point, for the voltage violations:
+    # setpoint_sens[violation_index][gen index] = d(vm) / d(set-point).
+    units = _setpoint_units(net)
+    setpoint_flows = 0
+    voltage_violations = sorted((i for i, v in enumerate(violations) if v["kind"] == "bus"),
+                                key=lambda i: -abs(violations[i]["value"] - violations[i]["limit"]))
+    voltage_violations = voltage_violations[:_SETPOINT_VIOLATIONS]
+    setpoint_sens: dict[int, dict[int, float]] = {i: {} for i in voltage_violations}
+    if voltage_violations:
+        for unit in units:
+            idx = unit["index"]
+            net.gen.at[idx, "vm_pu"] = unit["setpoint"] + DEFAULT_DELTA_VM
+            ok = _safe_runpp(net)
+            setpoint_flows += 1
+            if ok:
+                moved = _measure(net, violations)
+                for v_i in voltage_violations:
+                    setpoint_sens[v_i][idx] = (moved[v_i] - base_values[v_i]) / DEFAULT_DELTA_VM
+            net.gen.at[idx, "vm_pu"] = unit["setpoint"]
+
     # Restore the base solution so the caller sees an unperturbed network.
     _safe_runpp(net)
+    power_flows += 1
+    before = {v["element"] for v in violations}
 
     reported = []
     for v_i, violation in enumerate(violations):
@@ -532,9 +703,15 @@ def attribute_violations(
                 "sensitivities are zero by construction — the remedy is the "
                 f"setpoint of {controller}, not redispatch of other units."
             )
+        levers = []
+        if v_i in setpoint_sens and not controller:
+            levers, used = _setpoint_levers(net, violation, setpoint_sens[v_i], units, before, vm_lower,
+                                            vm_upper, (max_line_loading_pct, max_trafo_loading_pct))
+            setpoint_flows += used
+            entry["setpoint_levers"] = levers
         # Resolved first: the recommendation needs the raw reliefs to report
         # how far short the best single source falls.
-        entry["recommended_action"] = _recommended_action(entry, drivers)
+        entry["recommended_action"] = _recommended_action(entry, drivers, levers)
 
         for d in drivers:
             # Order matters. Withdrawal reports the most a source *could*
@@ -549,6 +726,12 @@ def attribute_violations(
             _reframe_uncontrollable(d)
 
         reported.append(entry)
+
+    if any("setpoint_levers" in e for e in reported):
+        # The checks re-solved the network with trial set-points: solve it
+        # again as it is, so the caller sees the unperturbed state.
+        _safe_runpp(net)
+        setpoint_flows += 1
 
     notes = [
         "Sensitivities are local finite differences; they support small "
@@ -569,11 +752,17 @@ def attribute_violations(
         "assembling an action from the driver fields.",
         "The external grid is the slack and absorbs the resulting imbalance, so "
         "it is not perturbed.",
+        "For a voltage violation, `setpoint_levers` gives the voltage set-point of each of the most "
+        "sensitive units that would clear it, checked by a full power flow (the violation cleared, the "
+        "unit's bus within the band, its reactive output within its range, no new violation): "
+        "`verified` says whether every check passed. A verified set-point change is the recommended "
+        "action when one exists.",
     ]
     if non_converged:
         notes.append(
             "Power flow did not converge while perturbing: "
-            + ", ".join(non_converged) + ". Those sources are omitted."
+            + ", ".join(non_converged) + ". The sensitivity that failed (to active or reactive power) "
+            "is missing for those sources; one that converged is kept."
         )
 
     return {
@@ -583,7 +772,10 @@ def attribute_violations(
         "delta_mw": delta_mw,
         "delta_mvar": delta_mvar,
         "n_sources_tested": len(sources),
-        "n_power_flows": power_flows,
+        "n_power_flows": power_flows + setpoint_flows,
+        # Of those, the ones spent on voltage set-points (measuring each unit's
+        # sensitivity and checking each move).
+        "n_setpoint_power_flows": setpoint_flows,
         "violations": reported,
         "notes": notes,
     }

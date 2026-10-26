@@ -7,6 +7,8 @@ from typing import NamedTuple
 
 from .graders.characterisation import grade_characterisation
 from .graders.completeness import grade_completeness
+from .graders.evidence import grade_evidence
+from .graders.investigation import grade_investigation
 from .graders.integrity import grade_composition
 from .graders.provenance import grade_provenance
 from .graders.refusal import grade_refusal
@@ -27,6 +29,9 @@ class TurnGrade(NamedTuple):
     n_derived: int = 0
     n_mischaracterised: int = 0
     n_gaps: int = 0
+    # Claims per evidence level (evidence.py), and what the reading check found.
+    evidence: dict | None = None
+    reading_check: dict | None = None
 
     @property
     def failed(self) -> bool:
@@ -38,9 +43,12 @@ def grade_record(record: dict) -> TurnGrade:
     provenance_findings, report = grade_provenance(record)
     characterisation_findings, conflicts = grade_characterisation(record)
     completeness_findings, gaps = grade_completeness(record)
+    evidence_findings, ledger = grade_evidence(record)
     findings = (grade_composition(record) + provenance_findings
                 + characterisation_findings + grade_refusal(record)
-                + completeness_findings + grade_sandbox(record))
+                + completeness_findings + grade_sandbox(record) + evidence_findings
+                + grade_investigation(record))
+    reading = record.get("reading_check") or {}
 
     return TurnGrade(
         turn=record.get("turn", 0),
@@ -55,6 +63,10 @@ def grade_record(record: dict) -> TurnGrade:
         n_derived=len(report.derived),
         n_mischaracterised=len(conflicts),
         n_gaps=len(gaps),
+        evidence={"levels": ledger.counts(), "overstated": len(ledger.overstated)},
+        reading_check=({"headline": reading.get("headline"),
+                        "statuses": [o.get("status") for o in reading.get("outcomes") or [] if isinstance(o, dict)]}
+                       if reading else None),
     )
 
 

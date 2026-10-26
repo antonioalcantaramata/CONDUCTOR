@@ -2,9 +2,11 @@
 tool_schemas.py — Gemini FunctionDeclaration schemas for the digital twin tools.
 
 Every schema here is sent on every request, so description length is a running
-cost: these twenty-two tools are ~11.9k tokens of each prompt (~13.8k before
-the October 2026 trim of repeated OPF parameter advice, "Returns:" field lists
-and example-question lists). This is the compacted form, kept after a trial
+cost: measured when there were twenty-two tools, they were ~11.9k tokens of
+each prompt (~13.8k before the October 2026 trim of repeated OPF parameter
+advice, "Returns:" field lists and example-question lists); there are more
+tools now, and that figure has not been re-measured. This is the compacted
+form, kept after a trial
 against a longer version — descriptions were tightened and grid-specific facts
 (substation names included) removed, deferring to the system prompt,
 which is rebuilt from live backend constants and therefore describes the
@@ -59,8 +61,8 @@ _ELEMENT_TYPE_DESC = (
 )
 
 _DISABLED_GEN_DESC = (
-    "Substations whose generators are forced offline (generator loss, "
-    f"islanding). {_NAMES_FROM_PROMPT}"
+    "Units forced offline (generator loss, islanding), by unit name (under "
+    "'Units' in the system prompt)."
 )
 
 _OPF_VM_UPPER_DESC = (
@@ -85,12 +87,12 @@ _OPF_LAMBDA_Q_DESC = (
 
 _FIXED_SETPOINTS_DESC = (
     "Pins units to exact MW: {name: MW}; the rest redispatch freely. Keys are "
-    f"substation names or {_SLACK_FROM_PROMPT} (0.0 isolates the external "
-    f"interface). {_NAMES_FROM_PROMPT}"
+    f"unit names (under 'Units' in the system prompt) or {_SLACK_FROM_PROMPT} "
+    "(0.0 isolates the external interface)."
 )
 
 _PG_MAX_OVERRIDES_DESC = (
-    "Per-substation maximum active power, MW: {name: MW}. Others keep their "
+    "Per-unit maximum active power, MW: {unit name: MW}. Others keep their "
     "capacity."
 )
 
@@ -99,7 +101,7 @@ _OPTION_DESC = ("A corrective option's `ref` (e.g. 'S2:cheapest'): applied (its 
                 "timestamp, its instructions held.")
 
 _PG_MIN_OVERRIDES_DESC = (
-    "Per-substation minimum active power, MW: {name: MW}; positive = must-run. "
+    "Per-unit minimum active power, MW: {unit name: MW}; positive = must-run. "
     "Others keep their minimum."
 )
 
@@ -450,7 +452,8 @@ _optimize_flexibility = genai.types.FunctionDeclaration(
             "near_optimal": genai.types.Schema(
                 type=genai.types.Type.BOOLEAN,
                 description=("With options=true: instead of the named strategies, the cheapest option and up "
-                             "to three near-optimal alternatives, each costing at most near_optimal_pct above "
+                             "to near_optimal_count (default 5) near-optimal alternatives, each costing at most "
+                             "near_optimal_pct above "
                              "it and changing other units."),
             ),
             "near_optimal_pct": genai.types.Schema(
@@ -902,7 +905,9 @@ _find_worst_case_timestamp = genai.types.FunctionDeclaration(
         "for charting. The simulation clock is unchanged after the call. "
         "Use when the user asks: 'when is the grid most stressed?', 'find the worst case', "
         "'which timestamp has the most violations?', 'peak import moment', "
-        "'when is voltage lowest?', 'scan the whole dataset for the worst point'."
+        "'when is voltage lowest?', 'scan the whole dataset for the worst point'. Not for what a "
+        "proposal changes at the worst hour: a change can move the worst moment, so compare the two over "
+        "the window with compare_networks study='scan' instead of taking the base's worst hour."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1051,7 +1056,7 @@ _optimize_robust_flexibility = genai.types.FunctionDeclaration(
     description=(
         "Robust OPF with two methods: heuristic constraint tightening (back-off) and scenario-based chance constraints. "
         "Combines probabilistic security assessment with optimal power flow to find "
-        "the minimum-cost dispatch that is secure with a user-specified confidence "
+        "the least-change dispatch that is secure with a user-specified confidence "
         "(e.g. 95% or 99%) under modeled uncertainty. "
         "Step 1: runs probabilistic RSA to compute per-bus voltage percentile envelopes. "
         "Step 2: computes symmetric per-bus back-offs for upper and lower voltage tails. "
@@ -1338,7 +1343,7 @@ _compute_hosting_capacity = genai.types.FunctionDeclaration(
             ),
             "p_max_search_mw": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
-                description="Optional upper search bound in MW. If omitted, backend chooses a safe heuristic.",
+                description="Optional upper search bound in MW. Omit (or 0) for the backend's own choice.",
             ),
             "tolerance_mw": genai.types.Schema(
                 type=genai.types.Type.NUMBER,
@@ -1420,15 +1425,15 @@ _compute_historical_risk = genai.types.FunctionDeclaration(
 _compute_violation_attribution = genai.types.FunctionDeclaration(
     name="compute_violation_attribution",
     description=(
-        "Explain WHY elements are violating their limits at an operating point, "
-        "by ranking which generators, renewable units, and loads are driving each "
-        "violation. Use this after a security assessment reports violations and the "
-        "user asks why, what is causing them, which unit is responsible, or what to "
-        "move to fix them. Returns, per violated element, a ranked list of sources "
+        "Rank which generators, renewable units and loads move each violated element "
+        "now, at one operating point. Use it when the user asks which unit moves it, "
+        "or what to move to fix the violations. (For WHY an element is outside its "
+        "limits — what caused it — use investigate, which compares it with a state "
+        "where it was fine.) Returns, per violated element, a ranked list of sources "
         "with their measured sensitivity (change in bus voltage or branch loading per "
         "MW or MVAr of that source) and the movement each would need to clear the "
         "violation on its own. Does NOT advance the simulation clock. Prefer this "
-        "over inferring causes from a violation table."
+        "over inferring drivers from a violation table."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1454,6 +1459,243 @@ _compute_violation_attribution = genai.types.FunctionDeclaration(
                 type=genai.types.Type.INTEGER,
                 description="Ranked drivers returned per violated element. Default 5."),
         },
+    ),
+)
+
+
+_investigate = genai.types.FunctionDeclaration(
+    name="investigate",
+    description=(
+        "WHY an element is outside its limits (element 'all': the grid insecure), or why a voltage or "
+        "loading changed. Compares it with a reference state where it was fine (default: the nearest "
+        "earlier moment within limits) and divides the change among what changed — demand near it and "
+        "elsewhere, units' output, set-points, lines out, a proposal's additions — by Shapley values over "
+        "AC power flows (the shares add up to the change). Returns each factor's share and verdict (cause, "
+        "contributes, ruled_out, counteracts), interactions, undo-alone counterfactuals, a cause's members "
+        "and the levers to act on now. For a problem in the grid only — not a why about a method, a "
+        "recommendation or physics, nor a what-if."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "element": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("The bus, line or transformer, named as results name it (e.g. 'Bus_29', "
+                             "'Bus_0 -> Bus_1 [L0]'). 'all' only when the question is about the grid as a "
+                             "whole (the number of elements outside limits). Omitted: the only element "
+                             "outside its limits; with several, the result lists them — ask which.")),
+            "element_type": genai.types.Schema(
+                type=genai.types.Type.STRING, description="'bus', 'line' or 'trafo', if the name is ambiguous."),
+            "reference_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("Compare with this moment (prefix, e.g. '2000-01-06 16') when the operator "
+                             "names one. Omitted: the nearest earlier moment within limits.")),
+            "reference_data_source": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="Compare with the other dataset ('forecasts' or 'measurements'), same moment."),
+            "reference_network": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="Compare with another network ('base' or a proposal id), same moment."),
+            "recurring": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description=("Every episode outside the limits in a window (start/end_timestamp; the whole "
+                             "dataset by default), each investigated, and their main causes gathered: is the "
+                             "cause recurring (structural)? Element omitted: the one outside its limits most often.")),
+            "check_references": genai.types.Schema(
+                type=genai.types.Type.BOOLEAN,
+                description=("Repeat against the other references (within limits, well inside them, the day "
+                             "before) and say whether the main cause holds. Default: on when the reference "
+                             "was chosen automatically.")),
+            "classical": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(type=genai.types.Type.STRING, enum=["linear", "tracing"]),
+                description=("Classical views beside the exact shares, when useful: 'linear' — each factor "
+                             "estimated from sensitivities (LODF for a branch out), to see where linearity "
+                             "holds; 'tracing' — which sources feed and which loads draw an investigated "
+                             "branch's flow (Bialek). They inform; the verdicts stay the exact ones.")),
+            "reference_mode": genai.types.Schema(
+                type=genai.types.Type.STRING, enum=["within_limits", "comfortable", "previous_day"],
+                description=("How to pick the reference when none is given: the nearest earlier moment "
+                             "within limits (default); 'comfortable' — well inside them, to see why it got "
+                             "close at all; 'previous_day' — the same moment a day earlier.")),
+            "outage": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("A line or transformer out in BOTH states (N-1). 'Why is losing X critical at "
+                             "18:00 and not at 15:00': outage=X, timestamp=18:00, reference_timestamp=15:00, "
+                             "reference_outage empty.")),
+            "reference_outage": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("Leave empty to keep the same outage in the reference. Only to compare outages "
+                             "at the same moment: another line, or 'none' for the intact network.")),
+            "start_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("Only for a window of several moments (why this day or week is worse than the "
+                             "last): its first moment (prefix). Empty for one moment.")),
+            "end_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING, description="The window's last moment (prefix, inclusive)."),
+            "reference_start_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="The window compared with; omitted, the window of the same length just before."),
+            "reference_end_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING, description="The compared window's last moment."),
+            "hypotheses": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                description=("Your own hypotheses to test (up to 5), instead of the standard grouping: each a "
+                             "name and the elements it covers. A bus name covers the demand at it; a unit name "
+                             "its output and set-point; a line or transformer (name or tag, e.g. 'L38') its "
+                             "state; 'external grid' its voltage; 'demand' or 'units' all of them. Everything "
+                             "else that changed is 'Other changes'. The tool measures each one's share and "
+                             "verdict; one naming nothing that changed is ruled out."),
+                items=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "name": genai.types.Schema(type=genai.types.Type.STRING,
+                                                   description="A short name, e.g. 'Demand at Bus_25'."),
+                        "elements": genai.types.Schema(type=genai.types.Type.ARRAY,
+                                                       items=genai.types.Schema(type=genai.types.Type.STRING)),
+                    },
+                    required=["name", "elements"],
+                )),
+            "vm_lower_pu": genai.types.Schema(type=genai.types.Type.NUMBER, description=_VM_LOWER_DESC),
+            "vm_upper_pu": genai.types.Schema(type=genai.types.Type.NUMBER, description=_VM_UPPER_DESC),
+            "max_line_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER, description=_MAX_LINE_LOADING_DESC),
+            "max_trafo_loading_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER, description=_MAX_TRAFO_LOADING_DESC),
+            "load_scaling_factor": genai.types.Schema(
+                type=genai.types.Type.NUMBER, description=_LOAD_SCALING_DESC),
+        },
+    ),
+)
+
+
+
+_test_prevention = genai.types.FunctionDeclaration(
+    name="test_prevention",
+    description=(
+        "Could an episode outside the limits have been avoided, and how early was it seen? From a moment "
+        "in it: the episode, the warning before it (within a small margin of the limit) and, for each "
+        "action you propose, whether holding it from the warning to the end keeps the element within its "
+        "limits at every moment (AC power flows; no new violation, the unit within its range) and the "
+        "smallest share that still does — or what stops it. Actions omitted: the attribution's levers."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "element": genai.types.Schema(type=genai.types.Type.STRING,
+                                          description="The bus, line or transformer; omitted, the only one outside its limits."),
+            "element_type": genai.types.Schema(type=genai.types.Type.STRING, description="'bus', 'line' or 'trafo'."),
+            "actions": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                description="Up to 4 candidate actions, each with a unit and exactly one of the three changes.",
+                items=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "unit": genai.types.Schema(type=genai.types.Type.STRING),
+                        "setpoint_pu": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                                          description="A new voltage set-point (p.u.)."),
+                        "setpoint_change": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                                              description="A change of the voltage set-point (p.u.)."),
+                        "p_change_mw": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                                          description="A change of active output (MW)."),
+                    },
+                    required=["unit"],
+                )),
+            "combine": genai.types.Schema(type=genai.types.Type.BOOLEAN,
+                                          description="Also try all the actions together."),
+            "warning_margin": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description="How close to the limit counts as a warning (default 0.01 p.u. or 10 points)."),
+            "outage": genai.types.Schema(type=genai.types.Type.STRING,
+                                         description="A line or transformer out throughout."),
+        },
+    ),
+)
+
+_look_ahead = genai.types.FunctionDeclaration(
+    name="look_ahead",
+    description=(
+        "What is coming, and what would prevent it. Over the forecast's next hours (24 by default): the "
+        "episodes outside the limits and, for the most severe, when to decide (the warning's start), the "
+        "main cause, the smallest sufficient action (AC power flows through the warning and the episode) "
+        "and whether it holds if the forecast errs (demand higher, renewables lower). Expectations, not "
+        "facts. For 'what should I watch for', 'anything to act on today'."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "start_timestamp": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="Where the horizon starts (a prefix). Omitted: the simulation clock, or the forecast's first moment."),
+            "hours": genai.types.Schema(type=genai.types.Type.NUMBER,
+                                        description="The horizon in hours (default 24, at most 72)."),
+            "elements": genai.types.Schema(
+                type=genai.types.Type.ARRAY, items=genai.types.Schema(type=genai.types.Type.STRING),
+                description="Only these buses, lines or transformers. Omitted: the whole grid."),
+            "uncertainty_pct": genai.types.Schema(
+                type=genai.types.Type.NUMBER,
+                description=("Each action is checked again with demand this much above the forecast and "
+                             "renewables this much below it (default 5).")),
+            "max_episodes": genai.types.Schema(
+                type=genai.types.Type.INTEGER,
+                description="How many of the most severe episodes to work out in full (default 5)."),
+            "data_source": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="'forecasts' (default: what is expected) or 'measurements'."),
+        },
+    ),
+)
+
+_record_investigation = genai.types.FunctionDeclaration(
+    name="record_investigation",
+    description=(
+        "Record what an investigation tested, before the answer. Once it is done (not when asking the "
+        "operator first): every hypothesis — supported, refuted or untested. Supported or refuted: name "
+        "the tools, called successfully in this question, that decide it (and the investigate `factor`; "
+        "the verdicts must agree). Untested: only what no CONDUCTOR tool can test — say what would "
+        "(`missing_tool`, `missing_kind`); a study not yet run is not untested. Refused otherwise. Shown "
+        "to the operator; what untested ones need is collected for the developers."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "symptom": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="What was investigated, e.g. 'Bus_29 below 0.95 p.u. at 2000-01-06 20:00'."),
+            "hypotheses": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "hypothesis": genai.types.Schema(type=genai.types.Type.STRING,
+                                                         description="The possible cause, in one line."),
+                        "verdict": genai.types.Schema(type=genai.types.Type.STRING,
+                                                      enum=["supported", "refuted", "untested"]),
+                        "evidence": genai.types.Schema(
+                            type=genai.types.Type.ARRAY, items=genai.types.Schema(type=genai.types.Type.STRING),
+                            description="Names of the tools whose results decide it (supported or refuted)."),
+                        "finding": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="What those results showed, in one sentence with their figures."),
+                        "missing_tool": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description="Untested only: the tool that would test it — what it would take and return."),
+                        "missing_kind": genai.types.Schema(
+                            type=genai.types.Type.STRING, enum=["analysis", "data"],
+                            description=("Untested only: 'analysis' — a study of the grid CONDUCTOR could compute "
+                                         "from what it has and does not (a tool to build: voltage stability "
+                                         "margin, dynamics, ramps over time, the cost of a cause…); 'data' — an "
+                                         "input it does not have (weather, customer metering, operator or "
+                                         "protection logs).")),
+                        "factor": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            description=("The investigate factor that decides it, if any (its name in the result). "
+                                         "The verdict must agree with that factor's.")),
+                    },
+                    required=["hypothesis", "verdict"],
+                )),
+        },
+        required=["symptom", "hypotheses"],
     ),
 )
 
@@ -1643,7 +1885,7 @@ _edit_proposal = genai.types.FunctionDeclaration(
                             "add_load / add_generator / add_shunt: bus name as results show it, or index.")),
                         "p_mw": _S(type=_T.NUMBER, description=(
                             "add_load: size in MW (its peak). add_generator (dispatchable): "
-                            "output set-point, default p_min_mw.")),
+                            "output in the studies, default its rating p_max_mw (the OPF can move it).")),
                         "pf": _S(type=_T.NUMBER, description=(
                             "add_load: power factor, default 0.95 (lagging unless `leading`). "
                             "add_generator with control='power_factor': its power factor, default 1.0.")),
@@ -1897,6 +2139,10 @@ TOOLS: list = [
             _compute_hosting_capacity,
             _compute_historical_risk,
             _compute_violation_attribution,
+            _investigate,
+            _test_prevention,
+            _look_ahead,
+            _record_investigation,
             _edit_proposal,
             _get_data_quality,
             _set_load_power_factor,
@@ -1913,15 +2159,28 @@ TOOLS: list = [
 # Uniformly expose data_source / timestamp on every timeseries-reading tool.
 # The LLM decides which dataset a query needs; tools default to measurements.
 # Injected programmatically so the set stays consistent as tools are added.
+#
+# An omitted argument is not always the default: within one question the loop
+# carries the value an earlier call used (validators.TurnOperatingPoint),
+# except for the field a question compares (a proposal with the base, the
+# forecast with the measurements, two power factors). The descriptions say so.
 # ---------------------------------------------------------------------------
-_DATA_SOURCE_SCHEMA_DESC = "'measurements' (default, actuals) or 'forecasts' (look-ahead)."
+_DATA_SOURCE_SCHEMA_DESC = (
+    "'measurements' (actuals) or 'forecasts' (look-ahead). Omitted: measurements unless another "
+    "was used earlier in this question.")
 _LOAD_PF_SCHEMA_DESC = (
-    "Measured loads' power factor (0.5–1, lagging) for THIS study only; omit for the session setting.")
+    "Measured loads' power factor (0.5–1, lagging) for this question only. Omitted: the session "
+    "setting unless one was given earlier in this question.")
 # Point-in-time tools also study the network's own operating point as loaded.
 _POINT_DATA_SOURCE_SCHEMA_DESC = (
-    "'measurements' (default), 'forecasts' or 'nominal' (the case's own point; no timestamp).")
-_TIMESTAMP_SCHEMA_DESC = "Timestamp prefix, e.g. '2000-01-09 18'; omit for the current clock."
-_NETWORK_SCHEMA_DESC = "'base' (default) or a proposal id."
+    "'measurements', 'forecasts' or 'nominal' (the case's own point; no timestamp). Omitted: "
+    "measurements unless another was used earlier in this question.")
+_TIMESTAMP_SCHEMA_DESC = (
+    "Timestamp prefix, e.g. '2000-01-09 18'. Omitted: the current clock unless one was used "
+    "earlier in this question.")
+_NETWORK_SCHEMA_DESC = (
+    "'base' or a proposal id. Omitted: 'base' unless a proposal was used earlier in this "
+    "question (pass 'base' to compare with it).")
 
 # Which shared arguments each tool takes is part of its row in `tool_registry`.
 for _tool in TOOLS:
@@ -1977,6 +2236,10 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "compute_hosting_capacity": tools.compute_hosting_capacity,
     "compute_historical_risk": tools.compute_historical_risk,
     "compute_violation_attribution": tools.compute_violation_attribution,
+    "investigate": tools.investigate,
+    "test_prevention": tools.test_prevention,
+    "look_ahead": tools.look_ahead,
+    "record_investigation": tools.record_investigation,
     "edit_proposal": tools.edit_proposal,
     "get_data_quality": tools.get_data_quality,
     "set_load_power_factor": tools.set_load_power_factor,

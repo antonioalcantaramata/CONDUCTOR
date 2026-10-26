@@ -614,3 +614,256 @@ def test_a_scan_moves_the_clock_so_a_later_read_runs_again(stub):
                 "scan_rsa_over_time": lambda **k: {"timestamps": ["a", "b"]}})
     loop_module.run_agent_turn("go", [])
     assert len(reads) == 2
+
+
+class TestComparisonsAreNotInherited:
+    """The loop carries the network and the dataset across a question's calls,
+    except the one the question compares: the side the model leaves empty is
+    then the base (or the measurements), not the proposal used before it."""
+
+    def _run(self, stub, prompt, first, second):
+        seen = []
+        stub([ModelResponse(tool_calls=[ToolCall("run_rsa", first)]),
+              ModelResponse(tool_calls=[ToolCall("simulate_all_contingencies", second)]),
+              ModelResponse(text="done")],
+             tools={"run_rsa": lambda **k: seen.append(k) or {"ok": 1},
+                    "simulate_all_contingencies": lambda **k: seen.append(k) or {"ok": 2}})
+        loop_module.run_agent_turn(prompt, [])
+        return seen
+
+    def test_a_proposal_is_carried_within_a_question_about_it(self, stub):
+        seen = self._run(stub, "Run an N-1 screen on proposal dc_bus9.", {"network": "dc_bus9"}, {})
+        assert seen[1]["network"] == "dc_bus9"
+
+    def test_the_base_is_the_base_when_the_question_compares(self, stub):
+        seen = self._run(stub, "Would the data centre proposal overload anything compared with today?",
+                         {"network": "dc_bus9"}, {})
+        assert "network" not in seen[1]
+
+    def test_the_measurements_when_the_question_compares_with_the_forecast(self, stub):
+        seen = self._run(stub, "How does the forecast compare with what was measured?",
+                         {"data_source": "forecasts"}, {})
+        assert "data_source" not in seen[1]
+
+    def test_a_power_factor_is_carried_within_a_question_that_sets_it(self, stub):
+        seen = self._run(stub, "With loads at pf 0.9, is it secure, and under N-1?",
+                         {"load_power_factor": 0.9}, {})
+        assert seen[1]["load_power_factor"] == 0.9
+
+
+class TestParameterWarningsReachTheResult:
+    """An unusual value runs, and the model and the audit panel are told."""
+
+    def test_the_warning_is_attached_to_the_result_and_logged(self, stub, monkeypatch):
+        records = []
+        stub([ModelResponse(tool_calls=[ToolCall("run_rsa", {"vm_upper_pu": 1.25})]),
+              ModelResponse(text="done")], tools={"run_rsa": lambda **k: {"ok": True}})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        _, history = loop_module.run_agent_turn("go", [])
+
+        sent = history[2]["content"]
+        warnings = [w for w in sent["_integrity_warnings"] if w["code"] == "parameter_warning"]
+        assert warnings and warnings[0]["field"] == "vm_upper_pu" and sent["ok"] is True
+        logged = records[-1]["tool_results"][0]["result"]
+        assert logged["_integrity_warnings"] == sent["_integrity_warnings"]
+
+        from llm_agent.agent import trace
+        assert any("vm_upper_pu=1.25" in c for c in trace.build(records[-1]).concerns)
+
+    def test_the_operator_is_told_while_it_runs(self, stub):
+        """Its own event: the app says "ran with unusual parameters", not that
+        the result contradicted itself."""
+        stub([ModelResponse(tool_calls=[ToolCall("run_rsa", {"vm_upper_pu": 1.25})]),
+              ModelResponse(text="done")], tools={"run_rsa": lambda **k: {"ok": True}})
+        events = []
+        loop_module.run_agent_turn("go", [], on_event=lambda e, d: events.append((e, d)))
+        names = [e for e, _ in events]
+        assert "parameter_warning" in names and "integrity_warning" not in names
+        problems = next(d["problems"] for e, d in events if e == "parameter_warning")
+        assert any("vm_upper_pu=1.25" in p for p in problems)
+
+    def test_a_clean_call_carries_none(self, stub):
+        stub([ModelResponse(tool_calls=[ToolCall("run_rsa", {"vm_upper_pu": 1.05})]),
+              ModelResponse(text="done")], tools={"run_rsa": lambda **k: {"ok": True}})
+        _, history = loop_module.run_agent_turn("go", [])
+        assert "_integrity_warnings" not in history[2]["content"]
+
+
+class TestFiguresTheLoopComputedAreEvidence:
+    """The model is sent a scan's summary (steps, violating steps) that the raw
+    result does not hold; quoting it was reported as a figure from nowhere."""
+
+    SCAN = {"timestamps": ["2000-01-09 18:00:00", "2000-01-09 18:15:00", "2000-01-09 18:30:00",
+                           "2000-01-09 18:45:00", "2000-01-09 19:00:00", "2000-01-09 19:15:00"],
+            "violation_counts": [0, 2, 5, 0, 0, 1], "min_voltage": [0.97] * 6, "max_voltage": [1.04] * 6,
+            "max_line_loading": [55.0] * 6, "max_trafo_loading": [40.0] * 6, "any_violations": True}
+
+    def test_the_scan_summary_is_logged_and_traces(self, stub, monkeypatch):
+        from llm_agent.agent.provenance import check_turn
+        records = []
+        stub([ModelResponse(tool_calls=[ToolCall("scan_rsa_over_time", {"n_steps": 6})]),
+              ModelResponse(text="Violations at 3 of the 6 steps scanned.")],
+             tools={"scan_rsa_over_time": lambda **k: dict(self.SCAN)})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("scan", [])
+
+        logged = records[-1]["tool_results"][0]["result"]
+        assert logged["summary_for_model"]["violating_step_count"] == 3
+        assert logged["summary_for_model"]["n_steps"] == 6
+        assert logged["violation_counts"] == self.SCAN["violation_counts"]      # the raw result is kept
+        assert [v.status for v in check_turn(records[-1]).verdicts] == ["grounded", "grounded"]
+
+    def test_a_series_length_is_logged(self, stub, monkeypatch):
+        records = []
+        series = {"timestamps": ["2000-01-09 18:00:00"] * 7, "series": {"vm_pu": [1.0] * 7}}
+        stub([ModelResponse(tool_calls=[ToolCall("get_element_timeseries", {})]),
+              ModelResponse(text="done")], tools={"get_element_timeseries": lambda **k: series})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("series", [])
+        assert records[-1]["tool_results"][0]["result"]["summary_for_model"]["n_points"] == 7
+
+    def test_a_result_sent_as_is_is_logged_as_is(self, stub, monkeypatch):
+        records = []
+        stub([ModelResponse(tool_calls=[ToolCall("run_rsa", {})]), ModelResponse(text="done")],
+             tools={"run_rsa": lambda **k: {"ok": True}})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("go", [])
+        assert records[-1]["tool_results"][0]["result"] == {"ok": True}
+
+    def test_how_to_report_a_study_reaches_the_model_and_is_not_logged(self, stub, monkeypatch):
+        """Moved out of the system prompt: paid for only when the study ran."""
+        records = []
+        provider = stub([ModelResponse(tool_calls=[ToolCall("compute_hosting_capacity", {})]),
+                         ModelResponse(text="done")],
+                        tools={"compute_hosting_capacity": lambda **k: {"hosting_capacity_mw": 12.5}})
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        loop_module.run_agent_turn("hosting at bus 5?", [])
+        sent = str(provider.calls[-1]["messages"][-1]["content"])
+        assert "how_to_report" in sent and "q-mode glossary" in sent
+        assert records[-1]["tool_results"][0]["result"] == {"hosting_capacity_mw": 12.5}
+        # A failed study gets no note.
+        assert "how_to_report" not in loop_module._prepare_tool_result_for_model(
+            "compute_hosting_capacity", {"error": "no bus"})
+
+    def test_a_zero_count_is_a_field_left_blank(self):
+        from llm_agent.agent.validators import without_form_blanks
+        assert without_form_blanks({"step_size": 0, "n_steps": 0, "study": "rsa", "load_scaling_factor": 0}) == {
+            "study": "rsa", "load_scaling_factor": 0}
+
+    def test_a_failed_scan_reaches_the_model_as_its_error(self):
+        """A summary of the empty scan read as "no violations" and hid it."""
+        failed = {"error": "backend unreachable", "partial_timestamps": []}
+        assert loop_module._prepare_tool_result_for_model("scan_rsa_over_time", failed) is failed
+
+
+def test_the_step_limit_note_is_not_a_figure_of_the_answer(stub, monkeypatch):
+    """"CONDUCTOR used all 16 steps…" is the system speaking; its number is a
+    setting, and was reported as an untraced figure."""
+    from llm_agent.agent.provenance import check_turn
+    records = []
+    monkeypatch.setattr(loop_module, "MAX_AGENT_TURNS", 7)
+    stub([ModelResponse(tool_calls=[ToolCall("t", {"i": i})]) for i in range(7)]
+         + [ModelResponse(text="The grid had 2 violations.")],
+         tools={"t": lambda **k: {"total_violations": 2}})
+    monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+    text, _ = loop_module.run_agent_turn("loop", [])
+    assert "all 7 steps" in text
+    assert [(v.claim.value, v.status) for v in check_turn(records[-1]).verdicts] == [(2.0, "grounded")]
+
+
+class TestTheAuditPanelFindsItsRecordByKey:
+    """The record is matched by the `turn_key` the loop writes, not by the
+    prompt: the same question asked twice must not get the first answer's
+    evidence when the second turn aborted before logging."""
+
+    def _logged(self, stub, monkeypatch):
+        log = []
+        monkeypatch.setattr(loop_module, "session_log", log)
+        stub([ModelResponse(text="ok")])
+        monkeypatch.setattr(loop_module, "_append_to_log", log.append)
+        loop_module.run_agent_turn("Is it secure?", [], conversation_id="conv-key")
+        return log
+
+    def test_the_record_of_this_turn_is_found(self, stub, monkeypatch):
+        log = self._logged(stub, monkeypatch)
+        assert loop_module.latest_record_for("Is it secure?", "conv-key") is log[-1]
+
+    def test_a_stale_record_for_the_same_prompt_is_not(self, stub, monkeypatch):
+        self._logged(stub, monkeypatch)
+        # The same question again, aborted before its record was written.
+        monkeypatch.setitem(loop_module._attempt_counter, "conv-key",
+                            loop_module._attempt_counter["conv-key"] + 1)
+        assert loop_module.latest_record_for("Is it secure?", "conv-key") is None
+
+    def test_another_conversation_is_not(self, stub, monkeypatch):
+        self._logged(stub, monkeypatch)
+        assert loop_module.latest_record_for("Is it secure?", "another") is None
+
+    def test_a_record_without_a_key_is_matched_by_its_prompt(self, monkeypatch):
+        monkeypatch.setattr(loop_module, "session_log", [{"user": "Is it secure?"}])
+        assert loop_module.latest_record_for("Is it secure?", "c") == {"user": "Is it secure?"}
+        assert loop_module.latest_record_for("Something else", "c") is None
+        monkeypatch.setattr(loop_module, "session_log", [])
+        assert loop_module.latest_record_for("Is it secure?", "c") is None
+
+
+class TestDeepResearch:
+    """Deep Research asks for depth for one question; the model still decides
+    whether the question is an investigation, and the record says which."""
+
+    def _run(self, stub, monkeypatch, responses, tools, deep):
+        provider = stub(responses, tools=tools)
+        records = []
+        monkeypatch.setattr(loop_module, "_append_to_log", records.append)
+        monkeypatch.setattr(loop_module, "MAX_AGENT_TURNS", 2)
+        loop_module.run_agent_turn("why?", [], deep=deep, reading_check=False, reflection="off")
+        return provider, records[-1]
+
+    def test_the_note_and_the_steps_are_for_this_question_only(self, stub, monkeypatch):
+        calls = [ModelResponse(tool_calls=[ToolCall("investigate", {})])] * 3 + [ModelResponse(text="done")]
+        violated = {"status": "explained", "symptom": {"violated": True}}
+        provider, record = self._run(stub, monkeypatch, calls, {"investigate": lambda **kw: violated}, deep=True)
+        assert "Deep Research" in provider.calls[0]["system"]
+        # Beyond the usual 2 steps, and one more: the reminder of what depth still lacks.
+        assert len(provider.calls) == 5
+        reminder = provider.calls[-1]["messages"][-1]["content"]
+        assert "test_prevention" in reminder and "recurring" in reminder and "record_investigation" in reminder
+        assert record["deep_research"] == {"requested": True, "investigated": True}
+
+    def test_the_reminder_comes_once_and_leaves_no_trace(self, stub, monkeypatch):
+        calls = [ModelResponse(tool_calls=[ToolCall("investigate", {})]), ModelResponse(text="draft"),
+                 ModelResponse(text="final, and why prevention does not apply")]
+        provider = stub(calls, tools={"investigate": lambda **kw: {"status": "explained"}})
+        monkeypatch.setattr(loop_module, "_append_to_log", lambda r: None)
+        text, history = loop_module.run_agent_turn("why?", [], deep=True, reading_check=False, reflection="off")
+        assert text.startswith("final") and len(provider.calls) == 3
+        assert not any("Deep Research, before you answer" in str(m.get("content")) for m in history)
+        assert "draft" not in [m.get("content") for m in history]
+
+    def test_the_reminder_asks_what_lies_behind_the_cause_until_one_is_recorded(self):
+        point = ({"name": "investigate", "args": {}}, {"result": {"status": "explained"}})
+        recurring = ({"name": "investigate", "args": {"recurring": True}}, {"result": {"mode": "recurring"}})
+
+        def record(*verdicts):
+            return ({"name": "record_investigation", "args": {}},
+                    {"result": {"status": "recorded", "hypotheses": [{"verdict": v} for v in verdicts]}})
+
+        def missing(*pairs):
+            return loop_module._deep_missing([c for c, _ in pairs], [e for _, e in pairs])
+        only_tested = missing(point, recurring, record("supported", "refuted"))
+        assert len(only_tested) == 1 and "analysis of the grid" in only_tested[0] and "record again" in only_tested[0]
+        # Data alone (why demand rose) is not the analysis that would decide the cause.
+        assert len(missing(point, recurring, record("supported", "untested"))) == 1
+        analysis = ({"name": "record_investigation", "args": {}}, {"result": {"status": "recorded", "hypotheses": [
+            {"verdict": "supported"}, {"verdict": "untested", "missing_kind": "analysis"}]}})
+        assert missing(point, recurring, analysis) == []
+        assert any("analysis of the grid" in m and "record again" not in m for m in missing(point, recurring))
+
+    def test_a_question_that_is_not_a_why_is_answered_as_an_analysis(self, stub, monkeypatch):
+        calls = [ModelResponse(tool_calls=[ToolCall("run_rsa", {})]), ModelResponse(text="Answered as an analysis.")]
+        _, record = self._run(stub, monkeypatch, calls, {"run_rsa": lambda **kw: {"secure": True}}, deep=True)
+        assert record["deep_research"] == {"requested": True, "investigated": False}
+
+    def test_without_it_nothing_changes(self, stub, monkeypatch):
+        provider, record = self._run(stub, monkeypatch, [ModelResponse(text="ok")], {}, deep=False)
+        assert "Deep Research" not in provider.calls[0]["system"] and "deep_research" not in record

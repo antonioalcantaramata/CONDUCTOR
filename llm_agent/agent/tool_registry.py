@@ -15,6 +15,9 @@ per tool, and every other module reads it instead of keeping its own list:
 - `over_time`     it studies more than one moment (the advisor's and the
                   graders' "looked beyond one moment" check)
 - `long_series`   its result carries per-tick series the model is not sent
+- `evidence`      what backs a figure from its result (evidence.py): an AC
+                  power flow, an optimiser's local optimum, a statistic over
+                  sampled scenarios, or data read back
 
 Adding a tool: one row here, its schema, its function, and (optionally) a
 renderer. `tests/test_tool_registry.py` fails while any of them is missing.
@@ -36,6 +39,16 @@ EFFECT_TEXT = {
     CHANGES_PROPOSAL: "Creates or changes a proposal; the loaded network is never modified.",
     MOVES_CLOCK: "Moves the simulation clock.",
 }
+
+# What backs a figure a tool returns (evidence.py), strongest first. "proved"
+# is never a tool's default: only certificates inside a result (a relaxation's
+# bound, its proof that no dispatch exists) are proofs.
+PROVED = "proved"
+POWER_FLOW = "power_flow"     # an AC power flow of the network: physics, for the data given
+OPTIMISED = "optimised"       # an optimiser's solution: a local optimum
+ESTIMATED = "estimated"       # a statistic over sampled scenarios
+INPUT = "input"               # read back: data, the network, settings
+EVIDENCE = (PROVED, POWER_FLOW, OPTIMISED, ESTIMATED, INPUT)
 
 # Which datasets a tool can read: none, the measured or forecast series, or
 # also the network's own nominal point (point-in-time studies).
@@ -66,6 +79,7 @@ class Tool(NamedTuple):
     load_pf: bool = False
     over_time: bool = False
     long_series: bool = False
+    evidence: str = INPUT
 
 
 _STUDY = dict(network=True, load_pf=True)                 # every study of a network at an operating point
@@ -81,37 +95,44 @@ REGISTRY: dict[str, Tool] = {
     "get_element_timeseries": Tool("Element time series", GROUPS[0], long_series=True, **_OVER_A_WINDOW),
     "get_data_quality": Tool("Data quality report", GROUPS[0]),
     # Security at one moment
-    "run_rsa": Tool("Security assessment (RSA)", GROUPS[1], **_AT_A_MOMENT),
-    "simulate_contingency": Tool("Single N-1 contingency", GROUPS[1], **_AT_A_MOMENT),
-    "simulate_all_contingencies": Tool("N-1 contingency screen", GROUPS[1], **_AT_A_MOMENT),
-    "compute_violation_attribution": Tool("Violation attribution", GROUPS[1], **_AT_A_MOMENT),
-    "compare_results": Tool("Result comparison", GROUPS[1]),
+    "run_rsa": Tool("Security assessment (RSA)", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "simulate_contingency": Tool("Single N-1 contingency", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "simulate_all_contingencies": Tool("N-1 contingency screen", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "compute_violation_attribution": Tool("Violation attribution", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "investigate": Tool("Investigation (why)", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "test_prevention": Tool("Prevention check", GROUPS[1], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    # The forecast's next hours: what is coming and what would prevent it.
+    "look_ahead": Tool("Look-ahead", GROUPS[1], evidence=POWER_FLOW, **_OVER_A_WINDOW),
+    # The agent's own record of an investigation: it runs no study.
+    "record_investigation": Tool("Investigation record", GROUPS[1]),
+    "compare_results": Tool("Result comparison", GROUPS[1], evidence=POWER_FLOW),
     # Over time, scenarios and risk
     # The scan steps the live clock forward as it goes: measurements only.
     "scan_rsa_over_time": Tool("Security scan over time", GROUPS[2], effect=MOVES_CLOCK, over_time=True,
+                               evidence=POWER_FLOW,
                                **_STUDY),
-    "find_worst_case_timestamp": Tool("Worst-case scan", GROUPS[2], long_series=True, **_OVER_A_WINDOW),
-    "scan_scenarios": Tool("Renewable scenario scan", GROUPS[2], long_series=True, **_OVER_A_WINDOW),
-    "run_probabilistic_rsa": Tool("Probabilistic security assessment", GROUPS[2], over_time=True,
+    "find_worst_case_timestamp": Tool("Worst-case scan", GROUPS[2], evidence=POWER_FLOW, long_series=True, **_OVER_A_WINDOW),
+    "scan_scenarios": Tool("Renewable scenario scan", GROUPS[2], evidence=POWER_FLOW, long_series=True, **_OVER_A_WINDOW),
+    "run_probabilistic_rsa": Tool("Probabilistic security assessment", GROUPS[2], evidence=ESTIMATED, over_time=True,
                                   **_AT_A_MOMENT),
-    "compute_historical_risk": Tool("Historical risk", GROUPS[2], **_OVER_A_WINDOW),
+    "compute_historical_risk": Tool("Historical risk", GROUPS[2], evidence=POWER_FLOW, **_OVER_A_WINDOW),
     # Optimisation and flexibility
-    "optimize_flexibility": Tool("Flexibility OPF (deterministic)", GROUPS[3], **_AT_A_MOMENT),
-    "optimize_contingency": Tool("Post-contingency OPF", GROUPS[3], **_AT_A_MOMENT),
-    "optimize_robust_flexibility": Tool("Robust flexibility OPF", GROUPS[3], **_AT_A_MOMENT),
-    "compute_flexibility_envelope": Tool("Flexibility envelope", GROUPS[3], **_AT_A_MOMENT),
-    "compute_hosting_capacity": Tool("Hosting capacity", GROUPS[3], **_AT_A_MOMENT),
+    "optimize_flexibility": Tool("Flexibility OPF (deterministic)", GROUPS[3], evidence=OPTIMISED, **_AT_A_MOMENT),
+    "optimize_contingency": Tool("Post-contingency OPF", GROUPS[3], evidence=OPTIMISED, **_AT_A_MOMENT),
+    "optimize_robust_flexibility": Tool("Robust flexibility OPF", GROUPS[3], evidence=OPTIMISED, **_AT_A_MOMENT),
+    "compute_flexibility_envelope": Tool("Flexibility envelope", GROUPS[3], evidence=POWER_FLOW, **_AT_A_MOMENT),
+    "compute_hosting_capacity": Tool("Hosting capacity", GROUPS[3], evidence=POWER_FLOW, **_AT_A_MOMENT),
     # Its window is its own (start, end); a held option brings its own moment.
-    "flexibility_over_time": Tool("Flexibility over time", GROUPS[3], **_OVER_A_WINDOW),
+    "flexibility_over_time": Tool("Flexibility over time", GROUPS[3], evidence=OPTIMISED, **_OVER_A_WINDOW),
     # Key performance indicators
-    "evaluate_kpis": Tool("KPI evaluation", GROUPS[4], **_AT_A_MOMENT),
+    "evaluate_kpis": Tool("KPI evaluation", GROUPS[4], evidence=OPTIMISED, **_AT_A_MOMENT),
     # Its window is its own (start, end); a held option brings its own moment.
-    "kpis_over_time": Tool("KPIs over time", GROUPS[4], **_OVER_A_WINDOW),
+    "kpis_over_time": Tool("KPIs over time", GROUPS[4], evidence=OPTIMISED, **_OVER_A_WINDOW),
     # What-if proposals
     "edit_proposal": Tool("Network proposal", GROUPS[5], effect=CHANGES_PROPOSAL),
     # Names its proposals itself, so it takes no `network`.
     "compare_networks": Tool("Base vs proposal", GROUPS[5], data_source=POINT, timestamp=True, load_pf=True,
-                             long_series=True),
+                             long_series=True, evidence=POWER_FLOW),
     # Settings
     "set_load_power_factor": Tool("Load power factor setting", GROUPS[6], effect=CHANGES_SETTINGS),
     "set_generator_model": Tool("Generator model", GROUPS[6], effect=CHANGES_SETTINGS,
@@ -124,6 +145,12 @@ OVER_TIME = frozenset(n for n, t in REGISTRY.items() if t.over_time)
 # Studies of one moment: they take a `timestamp` (and run at the clock without one).
 POINT_IN_TIME = frozenset(n for n, t in REGISTRY.items() if t.timestamp)
 LONG_SERIES = frozenset(n for n, t in REGISTRY.items() if t.long_series)
+
+
+def evidence(name: str) -> str:
+    """What backs a figure this tool returns (before what is inside the result)."""
+    tool = REGISTRY.get(name)
+    return tool.evidence if tool else INPUT
 
 
 def label(name: str) -> str:

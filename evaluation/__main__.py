@@ -63,8 +63,13 @@ def main(argv: list[str] | None = None) -> int:
                             "grounded": g.n_grounded,
                             "imprecise": g.n_imprecise,
                             "misattributed": g.n_misattributed,
+                            "derived": g.n_derived,
                             "ungrounded": g.n_ungrounded,
                         },
+                        "mischaracterised": g.n_mischaracterised,
+                        "gaps": g.n_gaps,
+                        "evidence": g.evidence,
+                        "reading_check": g.reading_check,
                         "findings": [f._asdict() for f in g.findings],
                     }
                     for g in grades

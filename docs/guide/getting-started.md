@@ -73,9 +73,9 @@ loaded):
 - *What if we connect a 20 MW data centre at Bus 9?*
 
 While it works, a status box shows each study as it runs. The answer comes
-with charts and a collapsed panel, **How this answer was produced**, which lists
-what ran and where each figure came from; see
-[Reading an answer](reading-an-answer.md).
+with a card, **What backs this answer** — the evidence behind each claim,
+anything worth checking, and in its details what ran and where each figure
+came from — and its charts; see [Reading an answer](reading-an-answer.md).
 
 ## Stopping
 

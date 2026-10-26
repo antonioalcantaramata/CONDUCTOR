@@ -31,6 +31,60 @@ class TestCharacterisationReadsTheRightSentence:
         assert len(conflicts(answer, ATTRIBUTION)) == 1
 
 
+class TestRobustRiskInputs:
+    """The backend reads a sent `risk_target` as chosen and refuses a
+    `confidence` or `alpha` that disagrees with it, so the wrapper sends each
+    only when the caller gave it."""
+
+    def _sent(self, monkeypatch, **kwargs):
+        sent = {}
+        monkeypatch.setattr(tools, "_post", lambda endpoint, body: sent.update(body) or {"ok": True})
+        tools.optimize_robust_flexibility(**kwargs)
+        return sent
+
+    def test_confidence_alone_is_sent_alone(self, monkeypatch):
+        body = self._sent(monkeypatch, confidence=0.99)
+        assert body["confidence"] == 0.99 and "risk_target" not in body and "target_p_any" not in body
+
+    def test_alpha_alone_is_sent_alone(self, monkeypatch):
+        body = self._sent(monkeypatch, alpha=0.1, robust_method="scenario")
+        assert body["alpha"] == 0.1 and "risk_target" not in body
+
+    def test_what_was_given_is_sent(self, monkeypatch):
+        body = self._sent(monkeypatch, risk_target=0.01, target_p_any=0.02)
+        assert body["risk_target"] == 0.01 and body["target_p_any"] == 0.02
+
+    def test_nothing_given_leaves_the_backend_default(self, monkeypatch):
+        body = self._sent(monkeypatch)
+        assert not {"risk_target", "confidence", "alpha", "target_p_any"} & set(body)
+
+
+class TestScanWithoutVoltages:
+    """A step whose assessment returned no voltage is unknown, not 1.0 p.u."""
+
+    def _scan(self, monkeypatch, rsa):
+        def post(endpoint, body):
+            if endpoint == "/api/time/advance":
+                return {"new_timestamp": "2000-01-09 18:15:00"}
+            return rsa
+        monkeypatch.setattr(tools, "_post", post)
+        return tools.scan_rsa_over_time(n_steps=2)
+
+    def test_no_voltage_is_reported_as_none(self, monkeypatch):
+        result = self._scan(monkeypatch, {"total_violations": 0, "all_voltages": []})
+        assert result["min_voltage"] == [None, None] and result["max_voltage"] == [None, None]
+
+        from llm_agent.agent.loop import _prepare_tool_result_for_model
+        summary = _prepare_tool_result_for_model("scan_rsa_over_time", result)
+        assert summary["min_observed_voltage"] is None and summary["max_observed_voltage"] is None
+        assert summary["n_steps"] == 2
+
+    def test_voltages_that_came_back_are_reported(self, monkeypatch):
+        result = self._scan(monkeypatch, {"total_violations": 0,
+                                          "all_voltages": [{"vm_pu": 0.97}, {"vm_pu": 1.03}]})
+        assert result["min_voltage"] == [0.97, 0.97] and result["max_voltage"] == [1.03, 1.03]
+
+
 class TestCompletenessReadsWhen:
     def test_a_conditional_when_does_not_ask_for_a_time(self):
         assert gaps("What happens to voltages when wind drops 30%?", "They stay within limits.") == []

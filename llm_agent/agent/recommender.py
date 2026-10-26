@@ -217,7 +217,13 @@ hosting capacity — e.g. the same load at another bus, a different profile or \
 size, reinforcing the branch that overloaded, a dispatchable unit near the bus \
 that dropped, or opening/closing a branch. Say what motivates it; never claim \
 the alternative is better — that is for the study to show.
-5. If there is nothing useful to suggest, return an empty list and a one-line \
+5. When the latest turn investigated a cause (its `record_investigation` lists the hypotheses \
+tested), "deeper" should test a hypothesis the record left open or did not consider — a \
+testable alternative cause, written as a request naming how to test it: `investigate` with \
+the operator's elements as `hypotheses`, another reference (a moment well inside the limits, \
+the previous day, the forecast), the same question after an outage or over a window. Never \
+re-propose one recorded as untested: no CONDUCTOR tool can test it.
+6. If there is nothing useful to suggest, return an empty list and a one-line \
 "note" explaining why; still write the comment.
 
 Respond with JSON only, in this format:
@@ -291,14 +297,14 @@ how long it holds ("Hold option <ref> for the next 4 hours") or the next \
 action from it ("Starting from option <ref>, give me the corrective options at \
 <later timestamp>"); a plan for a peak ("A corrective plan from <start> to \
 <end>"). Never claim what such a study will show.
-5. An option that reduces load (load_reduction_mw: demand response, load \
+4. An option that reduces load (load_reduction_mw: demand response, load \
 relief) asks customers, not units, to act: say so, and ask whether the operator \
 can call that demand response (or accept relief) before comparing it.
-6. N-1 secure options (n1_preventive, n1_corrective): secure only for the \
+5. N-1 secure options (n1_preventive, n1_corrective): secure only for the \
 outages their study lists ("n1_study"), at that moment; compare their N-1 screens and what security costs \
 against the cheapest; a corrective option relies on its plan being carried \
 out after the outage — ask whether the operator can.
-4. An option the operator refers to that is not listed does not exist: say so.
+6. An option the operator refers to that is not listed does not exist: say so.
 """
 
 _NOTE_TASK = """\
@@ -417,11 +423,11 @@ def _compact(value: Any, depth: int = 0) -> Any:
 
 def compact_turn(record: dict, max_chars_per_tool: int = 3000) -> dict:
     """The latest turn, reduced to what the suggestion agent needs."""
-    from .loop import _prepare_tool_result_for_model
+    from .loop import _compact_for_model
 
     tools = []
     for call, result in zip(record.get("tool_calls") or [], record.get("tool_results") or []):
-        payload = _prepare_tool_result_for_model(result.get("name", ""), result.get("result"))
+        payload = _compact_for_model(result.get("name", ""), result.get("result"))
         view = _compact(payload)
         text = json.dumps(view, ensure_ascii=False, default=str)
         if len(text) > max_chars_per_tool:
@@ -478,9 +484,10 @@ def answer_concerns(record: dict | None) -> list[str]:
     quantity the question asked for and the answer does not contain.
 
     The same checks as the audit panel and the reflection setting
-    (`reflection.check_all`) — no model is involved. The suggestion agent is
-    given them so it can say what they mean and propose what would settle
-    them; it does not judge the answer itself.
+    (`reflection.check_all`), the study-level verdict check included — no
+    model is involved. The suggestion agent is given them so it can say what
+    they mean and propose what would settle them; it does not judge the
+    answer itself.
     """
     answer = (record or {}).get("assistant") or ""
     if not answer.strip() or not record.get("tool_results"):
@@ -505,8 +512,12 @@ def answer_concerns(record: dict | None) -> list[str]:
             out.append(f"answer check: {shown(v.claim.value, v.claim.unit)} appears in no tool result "
                        "(the agent may have computed or estimated it)")
     for c in conflicts:
-        lead = "" if c.value == 0 and c.unit is None else f"{shown(c.value, c.unit)}: "
-        out.append(f"answer check: {lead}{c.detail}")
+        if c.path in ("evidence", "investigation"):
+            out.append(f"answer check: \"{c.context[:120]}\" {c.detail}")
+        elif c.study:
+            out.append(f"answer check: the answer reads as reassuring, but {c.detail} ({c.path})")
+        else:
+            out.append(f"answer check: {shown(c.value, c.unit)}: {c.detail}")
     out.extend(f"answer check: {g.render()}" for g in gaps)
     return list(dict.fromkeys(out))
 

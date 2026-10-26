@@ -76,11 +76,19 @@ class TestReading:
         assert ctx.network == "PGLib IEEE 30-Bus System (Alsac–Stott)"
         assert ctx.label() == "2026-10-22 18:40 UTC · 2 turns · 1 decision"
 
+    # Short ids: pytest puts the test id in an environment variable (PYTEST_CURRENT_TEST), and on
+    # Windows one longer than 32,767 characters is an error — the 50,000-character text made the id.
     @pytest.mark.parametrize("text, says", [("# Notes\nsome text", "not a CONDUCTOR session context"),
-                                            (sc.MARKER + "x" * 50_000, "characters")])
+                                            (sc.MARKER + "x" * 50_000, "characters")],
+                             ids=["not-a-context", "too-long"])
     def test_other_files_are_refused_with_the_reason(self, text, says):
         with pytest.raises(sc.ContextError, match=says):
             sc.parse(text)
+
+    def test_a_too_long_file_is_refused_against_the_limit_it_broke(self):
+        with pytest.raises(sc.ContextError) as refused:
+            sc.parse(sc.MARKER + "x" * (sc.MAX_FILE_CHARS + 1))
+        assert f"{sc.MAX_FILE_CHARS:,}" in str(refused.value) and f"{sc.MAX_CHARS:,}" not in str(refused.value)
 
     def test_the_agents_get_it_as_background_not_evidence(self):
         ctx = sc.parse(_build())
@@ -139,6 +147,13 @@ class TestSummary:
         assert summary.startswith("- 2 violations") and not error
         assert provider.calls[0]["tools"] == [] and "Copy figures exactly" in provider.calls[0]["system"]
         assert unverified == ("0.12 p.u.",)
+
+    def test_at_most_the_bullets_the_prompt_asks_for(self):
+        reply = "\n".join(f"- point {i}\n  continued" if i == 2 else f"- point {i}" for i in range(1, 12))
+        summary, _, _ = sc.summarize("the record", [], provider=FakeProvider(reply))
+        lines = summary.splitlines()
+        assert lines[0] == "- point 1" and "  continued" in lines and lines[-1] == "- point 8"
+        assert f"at most {sc._SUMMARY_BULLETS} short bullet points" in sc._SUMMARY_PROMPT
 
     def test_a_failed_call_leaves_the_record_without_a_summary(self):
         summary, unverified, error = sc.summarize("the record", [], provider=FakeProvider(raises=RuntimeError("quota")))

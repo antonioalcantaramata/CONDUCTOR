@@ -519,6 +519,15 @@ class TestAnswerChecksForTheSuggestionAgent:
                            question="What percentage of the load does the external grid cover?")
         assert any(c.startswith("answer check: the question asked for") for c in answer_concerns(rec))
 
+    def test_a_study_called_fine_against_its_verdict(self):
+        from llm_agent.agent.recommender import answer_concerns
+        rec = {"user": "Is it secure?", "grid": {}, "tool_calls": [{"name": "run_rsa", "args": {}}],
+               "tool_results": [{"name": "run_rsa", "result": {"secure": False, "total_violations": 2}}],
+               "assistant": "Everything looks fine."}
+        assert answer_concerns(rec) == [
+            "answer check: the answer reads as reassuring, but the assessment recorded this "
+            "operating point as insecure (run_rsa)"]
+
     def test_the_prompt_says_what_answer_checks_are(self):
         from llm_agent.agent.recommender import build_system_prompt
         assert '"answer check:"' in build_system_prompt([])
@@ -713,3 +722,9 @@ class TestDiscussingOptions:
         provider = FakeProvider(text=json.dumps({"decision": "No decision recorded", "chosen_option": "null"}))
         note = recommender.decision_note([], [], _options_record(), [_options_record()], {}, provider=provider)
         assert note.chosen_option is None and note.chosen_unresolved == ""
+
+
+def test_the_options_rules_are_numbered_in_order():
+    import re
+    numbers = [int(n) for n in re.findall(r"^(\d+)\. ", recommender._OPTIONS_TASK, re.MULTILINE)]
+    assert numbers == list(range(1, len(numbers) + 1)) and len(numbers) == 6

@@ -47,6 +47,7 @@ from agent.config import (
     OPENAI_MODEL,
     OPENAI_REASONING_EFFORT,
     OPENAI_REASONING_EFFORTS,
+    READING_CHECK,
 )
 from agent.config import (
     fetch_grid_constants,
@@ -60,6 +61,8 @@ from agent.hardware import num_ctx_warning, recommended_num_ctx
 from agent import loop as _loop_module
 from agent import model_check as _model_check
 from agent import recommender as _recommender
+from agent import investigation_record as _investigation_record
+from agent import investigation_report as _investigation_report
 from agent import update_check as _update_check
 from agent import timeline as _tl
 from agent import generator_table as _gen_table
@@ -70,6 +73,8 @@ from agent import session_context as _sc
 from agent import tailored_report as _tailored
 from agent import tool_registry as _tools_reg
 from agent import trace as _trace
+from agent import evidence as _evidence
+from agent import robustness as _robustness
 from agent import staleness as _staleness
 from agent import report as _report
 from agent.loop import run_agent_turn
@@ -97,6 +102,7 @@ _SYSTEMS_DIR = _REPO_ROOT / "systems"
 # Brand marks (assets/). The colour mark sits on the light app surfaces; the
 # round app icon, legible on light and dark browser chrome, is the tab icon.
 _LOGO_PATH = _APP_DIR / "assets" / "conductor-mark.png"
+_MARK_SVG_PATH = _APP_DIR / "assets" / "conductor-mark.svg"
 _APP_ICON_PATH = _APP_DIR / "assets" / "conductor-app-icon.png"
 # CONDUCTOR answers under its colour mark (the dark round icon looked heavy
 # on the white cards); the operator keeps Streamlit's avatar.
@@ -132,7 +138,12 @@ _BRAND_CAPTION = (
 
 def _image_as_data_uri(path: pathlib.Path) -> str:
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{data}"
+    mime = "image/svg+xml" if path.suffix == ".svg" else "image/png"
+    return f"data:{mime};base64,{data}"
+
+
+# The brand mark, as a vector: crisp beside the chat box at any size.
+_MARK_URI = _image_as_data_uri(_MARK_SVG_PATH)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -491,11 +502,17 @@ st.markdown(
     /* Who each box belongs to: CONDUCTOR (blue) runs studies; the advisor
        (violet, tinted panel) discusses and suggests. */
     .conductor-who {
-        display: inline-block; white-space: nowrap;
-        background: var(--cd-brand-soft); color: var(--cd-brand);
-        border: 1px solid rgba(29, 111, 232, 0.25); border-radius: 0.7rem;
-        padding: 0.2rem 0.6rem; font-size: 0.8rem; font-weight: 700;
+        display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap;
+        color: var(--cd-ink); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em;
+        padding: 0 0.35rem 0 0.1rem;
+        /* The input's container holds room below the box: centred on the box itself. */
+        transform: translateY(0.24rem);
     }
+    .conductor-who img { width: 26px; height: 26px; display: block; }
+    /* Streamlit pulls a markdown block up by a paragraph's margin (-1rem): this
+       one sits beside the box, so it keeps its centre. */
+    [data-testid="stMarkdownContainer"]:has(.conductor-who) { margin-bottom: 0 !important; }
+    [data-testid="stMarkdownContainer"]:has(.conductor-who) p { margin: 0; }
     .st-key-ai_panel {
         background: rgba(107, 79, 216, 0.035);
         border: 1px solid rgba(107, 79, 216, 0.16); border-radius: 14px;
@@ -539,6 +556,216 @@ st.markdown(
         text-transform: uppercase;
         margin-right: 0.4rem;
     }
+    /* ---- Evidence card under an answer (agent/evidence.py, robustness.py) ----
+       One colour per evidence level, from strongest (green) to unsupported (red). */
+    :root {
+        --ev-proved: #0F7B5F;      --ev-proved-bg: #E7F5EF;
+        --ev-power_flow: #1D6FE8;  --ev-power_flow-bg: #EEF4FF;
+        --ev-optimised: #6B4FD8;   --ev-optimised-bg: #F1EDFC;
+        --ev-estimated: #A85F00;   --ev-estimated-bg: #FFF3DD;
+        --ev-input: #5C6272;       --ev-input-bg: #EFF1F5;
+        --ev-derived: #5C6272;     --ev-derived-bg: #F4F5F8;
+        --ev-interpretation: #8A6233; --ev-interpretation-bg: #F7F0E6;
+        --ev-advice: #0E7490;      --ev-advice-bg: #E5F5F8;
+        --ev-unsupported: #C2410C; --ev-unsupported-bg: #FDECE4;
+    }
+    [class*="st-key-evcard_"] {
+        border: 1px solid var(--cd-border); border-radius: 0.75rem; background: var(--cd-surface);
+        padding: 0.6rem 0.85rem 0.35rem; gap: 0.35rem; box-shadow: var(--cd-shadow);
+    }
+    /* The investigation's record: one row per hypothesis, its verdict as a pill. */
+    .inv-card { border: 1px solid var(--cd-border); border-radius: 0.75rem; background: var(--cd-surface);
+                padding: 0.6rem 0.85rem 0.3rem; box-shadow: var(--cd-shadow); margin: 0.35rem 0 0.6rem; }
+    .inv-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.6rem;
+                padding-bottom: 0.4rem; border-bottom: 1px solid var(--cd-border); }
+    .inv-symptom { font-size: 0.86rem; color: var(--cd-ink); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+    .inv-tally { margin-left: auto; font-size: 0.78rem; color: var(--cd-muted); white-space: nowrap; }
+    .inv-row { display: flex; gap: 0.7rem; align-items: flex-start; padding: 0.5rem 0;
+               border-bottom: 1px solid var(--cd-border); }
+    .inv-row:last-child { border-bottom: none; }
+    .inv-pill { flex: 0 0 5.6rem; text-align: center; border-radius: 999px; font-size: 0.74rem; font-weight: 700;
+                padding: 0.14rem 0.4rem; margin-top: 0.05rem; }
+    .inv-supported .inv-pill { color: var(--ev-proved); background: var(--ev-proved-bg); }
+    .inv-refuted .inv-pill { color: var(--ev-input); background: var(--ev-input-bg); }
+    .inv-untested .inv-pill { color: var(--ev-estimated); background: var(--ev-estimated-bg); }
+    .inv-body { flex: 1 1 auto; min-width: 0; }
+    .inv-hyp { font-size: 0.88rem; color: var(--cd-ink); font-weight: 600; line-height: 1.4; }
+    .inv-refuted .inv-hyp { color: var(--cd-muted); }
+    .inv-find { font-size: 0.84rem; color: var(--cd-ink); line-height: 1.45; margin-top: 0.12rem; }
+    .inv-ev { font-size: 0.76rem; color: var(--cd-muted); margin-top: 0.2rem; }
+    .inv-need { font-size: 0.82rem; color: var(--cd-ink); margin-top: 0.2rem; padding: 0.25rem 0.5rem;
+                border-left: 3px solid var(--ev-estimated); background: var(--ev-estimated-bg);
+                border-radius: 0 0.35rem 0.35rem 0; }
+    @media (max-width: 640px) { .inv-pill { flex-basis: 4.6rem; } .inv-tally { margin-left: 0; } }
+    /* Deep Research switch: an icon beside Run, outlined and named when on (not solid, so it
+       is never read as a second Run); a bubble on hover. */
+    [class*="st-key-deep_"] { position: relative; }
+    [class*="st-key-deep_"] button[data-variant="pills"] { border-radius: 999px; min-height: 2.25rem;
+        padding: 0 0.6rem; border: 1px solid var(--cd-border); background: transparent; color: var(--cd-muted); }
+    [class*="st-key-deep_"] button[data-variant="pills"]:hover { color: var(--cd-brand); border-color: var(--cd-brand); }
+    [class*="st-key-deep_"] button[aria-checked="true"],
+    [class*="st-key-deep_"] button[aria-checked="true"] * { background: var(--cd-brand-soft) !important;
+        border-color: var(--cd-brand) !important; color: var(--cd-brand) !important; }
+    [class*="st-key-deep_"] button[aria-checked="true"] { border-width: 1.5px !important; }
+    [class*="st-key-deep_"]:has(button[aria-checked="true"]):hover::before { display: none; }
+    [class*="st-key-deep_"] button[aria-checked="true"]::after { content: "Deep Research"; font-size: 0.8rem;
+        font-weight: 600; margin-left: 0.3rem; }
+    [class*="st-key-deep_"]:hover::before { content: "Deep Research — for why questions"; position: absolute;
+        bottom: calc(100% + 6px); right: 0; white-space: nowrap; font-size: 0.75rem; color: var(--cd-ink);
+        background: var(--cd-surface); border: 1px solid var(--cd-border); border-radius: 0.4rem;
+        padding: 0.2rem 0.5rem; box-shadow: var(--cd-shadow); z-index: 10; pointer-events: none; }
+    /* Deep Research: the card while the operator waits, and the answer's badge. */
+    .dr-card { border: 1px solid var(--cd-border); border-radius: 0.75rem; background: var(--cd-surface);
+               padding: 0.7rem 0.9rem 0.55rem; box-shadow: var(--cd-shadow); margin: 0.2rem 0 0.6rem; max-width: 46rem; }
+    .dr-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.35rem; }
+    .dr-title { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+                color: var(--cd-brand); }
+    .dr-clock { font-size: 0.78rem; color: var(--cd-muted); font-variant-numeric: tabular-nums; }
+    .dr-row { display: flex; align-items: center; gap: 0.55rem; padding: 0.28rem 0; font-size: 0.88rem;
+              color: var(--cd-ink); flex-wrap: wrap; }
+    .dr-row .dr-label { min-width: 17.5rem; }
+    .dr-todo .dr-label, .dr-skip .dr-label { color: var(--cd-muted); }
+    .dr-detail { font-size: 0.78rem; color: var(--cd-muted); }
+    .dr-dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; border: 1.5px solid var(--cd-border);
+              display: inline-block; margin: 0 0.18rem; }
+    .dr-ok { color: var(--ev-proved); font-weight: 700; width: 0.9rem; text-align: center; }
+    .dr-skip { color: var(--cd-muted); width: 0.9rem; text-align: center; }
+    .dr-spin { width: 0.8rem !important; height: 0.8rem !important; }
+    .dr-known { margin-top: 0.45rem; padding: 0.4rem 0.6rem; border-left: 3px solid var(--cd-brand);
+                background: var(--cd-brand-soft); border-radius: 0 0.35rem 0.35rem 0; font-size: 0.84rem;
+                color: var(--cd-ink); }
+    .dr-note { font-size: 0.86rem; color: var(--cd-ink); line-height: 1.45; }
+    .dr-badge { display: inline-block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+                color: var(--cd-brand); background: var(--cd-brand-soft); border-radius: 999px;
+                padding: 0.12rem 0.55rem; margin-bottom: 0.3rem; }
+    .dr-badge-off { color: var(--cd-muted); background: #EFF1F5; font-weight: 600; }
+    .tr-row { display: flex; gap: 0.5rem; align-items: flex-start; padding: 0.35rem 0;
+              border-bottom: 1px solid var(--cd-border); }
+    .tr-row:last-child { border-bottom: none; }
+    .tr-n { flex: 0 0 auto; font-size: 0.74rem; font-weight: 700; color: var(--ev-estimated);
+            background: var(--ev-estimated-bg); border-radius: 999px; padding: 0.05rem 0.4rem; }
+    .tr-tool { font-size: 0.82rem; color: var(--cd-ink); line-height: 1.4; }
+    .tr-for { font-size: 0.74rem; color: var(--cd-muted); margin-top: 0.1rem; }
+    .tr-head { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+               color: var(--cd-muted); margin: 0.6rem 0 0.1rem; }
+    [class*="st-key-evcard_"] [data-testid="stMarkdownContainer"] p { margin-bottom: 0; }
+    /* Streamlit pulls each markdown block up by a paragraph's margin (-1rem);
+       these blocks have none, so the pull made the next row overlap them. */
+    [class*="st-key-evcard_"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+    [class*="st-key-evhead_"] { align-items: center; }
+    [class*="st-key-evhead_"] [data-testid="stCheckbox"] label p,
+    [class*="st-key-evhead_"] [data-testid="stWidgetLabel"] p { font-size: 0.78rem; color: var(--cd-muted); }
+    .ev-title { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+                color: var(--cd-muted); margin-right: 0.5rem; }
+    .ev-chips { display: flex; flex-wrap: wrap; gap: 0.3rem 0.35rem; align-items: center; }
+    .ev-title { display: inline-flex; align-items: center; }
+    /* The (?) after a heading, drawn like Streamlit's help icon; its tip opens below. */
+    .ev-help { position: relative; display: inline-flex; align-items: center; justify-content: center;
+               width: 0.95rem; height: 0.95rem; margin-left: 0.35rem; border: 1.3px solid #9AA0AE;
+               border-radius: 50%; color: #7A8090; font-size: 0.62rem; font-weight: 700; letter-spacing: 0;
+               text-transform: none; cursor: help; outline: none; }
+    .ev-help:hover, .ev-help:focus { border-color: var(--cd-brand); color: var(--cd-brand); }
+    .ev-tip { visibility: hidden; opacity: 0; transition: opacity 0.12s ease; position: absolute; top: 1.35rem;
+              left: -0.6rem; z-index: 1000; width: min(33rem, 78vw); padding: 0.7rem 0.9rem;
+              background: var(--cd-surface); color: var(--cd-ink); border: 1px solid var(--cd-border);
+              border-radius: 0.55rem; box-shadow: 0 10px 28px rgba(16, 24, 40, 0.14);
+              font-size: 0.82rem; font-weight: 400; line-height: 1.5; letter-spacing: normal;
+              text-transform: none; text-align: left; white-space: normal; cursor: default; }
+    .ev-tip ul { margin: 0.35rem 0 0.45rem 1.1rem; padding: 0; }
+    .ev-tip li { margin: 0.12rem 0; }
+    .ev-help:hover .ev-tip, .ev-help:focus .ev-tip, .ev-help:focus-within .ev-tip { visibility: visible; opacity: 1; }
+    .ev-chip { display: inline-flex; align-items: center; gap: 0.3rem; border-radius: 999px;
+               padding: 0.08rem 0.55rem; font-size: 0.78rem; font-weight: 600; line-height: 1.5;
+               white-space: nowrap; }
+    .ev-chip .ev-n { font-variant-numeric: tabular-nums; }
+    .ev-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; display: inline-block; }
+    .ev-reading { display: flex; gap: 0.5rem; align-items: center; font-size: 0.86rem; color: var(--cd-ink);
+                  line-height: 1.45; min-height: 2rem; }
+    .ev-reading > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+    [class*="st-key-evrow_"] [data-testid="stColumn"]:last-child label p { white-space: nowrap; }
+    /* Narrow: the switch moves to its own line, on the right, rather than crowd the text. */
+    [class*="st-key-evrow_"] [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; row-gap: 0.1rem;
+                                                                 column-gap: 1rem; }
+    [class*="st-key-evrow_"] [data-testid="stColumn"]:first-child { flex: 1 1 20rem !important; min-width: 0 !important; }
+    [class*="st-key-evrow_"] [data-testid="stColumn"]:last-child { flex: 0 0 auto !important; width: auto !important;
+                                                                   min-width: max-content !important; margin-left: auto; }
+    [class*="st-key-evrow_"] { border-top: 1px solid var(--cd-border); padding-top: 0.3rem; margin-top: 0.05rem; }
+    .ev-figs { display: flex; flex-wrap: wrap; gap: 0.25rem 0.3rem; }
+    .ev-fig { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 0.8rem; color: var(--cd-ink);
+              background: #F6F7FA; border: 1px solid var(--cd-border); border-radius: 0.35rem;
+              padding: 0.02rem 0.4rem; white-space: nowrap; cursor: help; }
+    .ev-fig.ev-flag { border-color: var(--ev-unsupported); color: var(--ev-unsupported); background: var(--ev-unsupported-bg); }
+    .ev-table td:first-child { width: 8.5rem; white-space: nowrap; }
+    .ev-table td.ev-src { width: 30%; }
+    .ev-reading .ev-title { flex-shrink: 0; }
+    .ev-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin: 0.2rem 0 0.6rem; }
+    .ev-table td { padding: 0.32rem 0.45rem; border-bottom: 1px solid var(--cd-border); vertical-align: top; }
+    .ev-table tr:last-child td { border-bottom: none; }
+    .ev-table .ev-src { color: var(--cd-muted); font-size: 0.76rem; }
+    .ev-table .ev-what { color: var(--cd-ink); }
+    .ev-table .ev-arrow { color: var(--cd-muted); padding: 0 0.25rem; }
+    .ev-sub { font-size: 0.74rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+              color: var(--cd-muted); margin: 0.35rem 0 0.1rem; }
+    .ev-legend { font-size: 0.76rem; color: var(--cd-muted); margin-bottom: 0.4rem; }
+    /* The switch sits on the right edge of the reading-check row. */
+    [class*="st-key-evrow_"] [data-testid="stColumn"]:last-child [data-testid="stElementContainer"] {
+        display: flex; justify-content: flex-end; }
+    [class*="st-key-evrow_"] [data-testid="stColumn"]:last-child label { gap: 0.4rem; }
+    .ev-concern { color: var(--ev-unsupported); background: var(--ev-unsupported-bg); }
+    .ev-none { font-size: 0.8rem; color: var(--cd-muted); font-style: italic; }
+    /* Details: anything worth checking first, then the tabs. */
+    .ev-concerns { border-left: 3px solid var(--ev-unsupported); background: var(--ev-unsupported-bg);
+                   border-radius: 0.5rem; padding: 0.45rem 0.75rem 0.3rem; margin: 0.1rem 0 0.6rem; }
+    .ev-concerns .ev-sub { margin-top: 0; color: var(--ev-unsupported); }
+    .ev-concerns ul { margin: 0.15rem 0 0.2rem 1.1rem; padding: 0; }
+    .ev-concerns li { font-size: 0.84rem; color: var(--cd-ink); margin: 0.1rem 0; line-height: 1.45; }
+    [class*="st-key-evcard_"] [data-baseweb="tab-list"] { gap: 1.1rem; }
+    [class*="st-key-evcard_"] [data-baseweb="tab"] p { font-size: 0.84rem; font-weight: 600; }
+    [class*="st-key-evcard_"] [data-baseweb="tab-panel"] { padding-top: 0.6rem; }
+    .ev-step { display: flex; gap: 0.6rem; align-items: flex-start; padding: 0.45rem 0;
+               border-bottom: 1px solid var(--cd-border); }
+    .ev-step:last-child { border-bottom: none; }
+    .ev-stepno { flex: 0 0 1.4rem; height: 1.4rem; border-radius: 50%; background: var(--cd-brand-soft);
+                 color: var(--cd-brand); font-size: 0.74rem; font-weight: 700; display: inline-flex;
+                 align-items: center; justify-content: center; margin-top: 0.05rem; }
+    .ev-stepbody { flex: 1 1 auto; min-width: 0; }
+    .ev-steptitle { display: flex; align-items: center; gap: 0.45rem; font-size: 0.86rem; color: var(--cd-ink); }
+    .ev-ok { color: var(--ev-proved); font-weight: 700; }
+    .ev-bad { color: var(--ev-unsupported); font-weight: 700; }
+    .ev-dur { color: var(--cd-muted); font-size: 0.78rem; }
+    .ev-args { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.3rem; }
+    code.ev-arg { font-size: 0.74rem; color: var(--cd-ink); background: #F6F7FA; border: 1px solid var(--cd-border);
+                  border-radius: 0.3rem; padding: 0.02rem 0.35rem; white-space: nowrap; }
+    .ev-carried, .ev-err { font-size: 0.78rem; color: var(--cd-muted); margin-top: 0.3rem;
+                           display: flex; flex-wrap: wrap; gap: 0.25rem; align-items: center; }
+    .ev-err { color: var(--ev-unsupported); }
+    .ev-limits { margin: 0 0 0.3rem 1.1rem; padding: 0; }
+    .ev-limits li { font-size: 0.82rem; color: var(--cd-muted); margin: 0.15rem 0; line-height: 1.45; }
+    /* Figures marked in the answer text. */
+    .cd-ev { border-bottom: 2px solid currentColor; padding: 0 0.08rem; border-radius: 0.15rem; cursor: help; }
+    .cd-ev-proved, .ev-chip-proved { color: var(--ev-proved); background: var(--ev-proved-bg); }
+    .ev-chip-proved .ev-dot { background: var(--ev-proved); }
+    .cd-ev-power_flow, .ev-chip-power_flow { color: var(--ev-power_flow); background: var(--ev-power_flow-bg); }
+    .ev-chip-power_flow .ev-dot { background: var(--ev-power_flow); }
+    .cd-ev-optimised, .ev-chip-optimised { color: var(--ev-optimised); background: var(--ev-optimised-bg); }
+    .ev-chip-optimised .ev-dot { background: var(--ev-optimised); }
+    .cd-ev-estimated, .ev-chip-estimated { color: var(--ev-estimated); background: var(--ev-estimated-bg); }
+    .ev-chip-estimated .ev-dot { background: var(--ev-estimated); }
+    .cd-ev-input, .ev-chip-input { color: var(--ev-input); background: var(--ev-input-bg); }
+    .ev-chip-input .ev-dot { background: var(--ev-input); }
+    .cd-ev-derived, .ev-chip-derived { color: var(--ev-derived); background: var(--ev-derived-bg); }
+    .ev-chip-derived .ev-dot { background: var(--ev-derived); }
+    .cd-ev-interpretation, .ev-chip-interpretation { color: var(--ev-interpretation); background: var(--ev-interpretation-bg); }
+    .ev-chip-interpretation .ev-dot { background: var(--ev-interpretation); }
+    .cd-ev-advice, .ev-chip-advice { color: var(--ev-advice); background: var(--ev-advice-bg); }
+    .ev-chip-advice .ev-dot { background: var(--ev-advice); }
+    .cd-ev-unsupported, .ev-chip-unsupported { color: var(--ev-unsupported); background: var(--ev-unsupported-bg); }
+    .ev-chip-unsupported .ev-dot { background: var(--ev-unsupported); }
+    /* Green holds, grey shifts, amber depends on the reading; red stays for what needs checking. */
+    .ev-holds { color: var(--ev-proved); background: var(--ev-proved-bg); }
+    .ev-shifts { color: var(--ev-input); background: var(--ev-input-bg); }
+    .ev-changes { color: var(--ev-estimated); background: var(--ev-estimated-bg); }
+    .ev-failed { color: var(--ev-input); background: var(--ev-input-bg); }
     @media (max-width: 900px) {
         .conductor-brand-title {
             font-size: 2rem;
@@ -1217,10 +1444,10 @@ full,,branch_to_trafo,3,33,0,,</pre>
                 <div class="cb-info-label" style="margin-bottom:0.3rem">Capabilities</div>
                 <ul class="cb-cap-list">
                     <li><strong>Deterministic Security Assessment</strong> — N-0 power-flow, voltage &amp; loading checks at the current operating point</li>
-                    <li><strong>N-1 Contingency Analysis</strong> — single-outage screening for lines, transformers, and generators</li>
-                    <li><strong>Probabilistic Risk Assessment</strong> — Monte Carlo risk indices (ENS, LOLP, overload probability) under uncertainty</li>
-                    <li><strong>Robust Corrective Dispatch (OPF)</strong> — worst-case redispatch with explicit uncertainty margins</li>
-                    <li><strong>Flexibility Envelopes</strong> — feasible import/export power bounds per bus or zone</li>
+                    <li><strong>N-1 Contingency Analysis</strong> — single-outage screening of every line and transformer</li>
+                    <li><strong>Probabilistic Risk Assessment</strong> — Monte Carlo violation probabilities (any violation, per element, voltage percentiles) under load and generation uncertainty</li>
+                    <li><strong>Robust Corrective Dispatch (OPF)</strong> — a dispatch that keeps the violation risk under a target, by tightened voltage bounds or sampled scenarios</li>
+                    <li><strong>Flexibility Envelopes</strong> — the active and reactive set-points one unit can take within every limit</li>
                     <li><strong>Hosting Capacity Analysis</strong> — maximum DER penetration per bus without constraint violations</li>
                     <li><strong>Key Performance Indicators</strong> — the schedule against a corrective action: flexibility required, activated and deliverable within limits, N-0/N-1 margins and costs, at a moment or over a window</li>
                     <li><strong>Time-series Scanning</strong> — multi-timestamp horizon sweeps for violations and trend detection</li>
@@ -3926,6 +4153,47 @@ with st.sidebar:
         if _research_mode and not st.session_state.get("answer_review"):
             st.caption("Research setting active: findings are recorded silently "
                        "(CONDUCTOR_REFLECTION=warn).")
+        st.toggle(
+            "Check other readings of the question",
+            value=bool(st.session_state.get("reading_check", READING_CHECK)), key="reading_check",
+            help=(
+                "After each answer, its decisive studies are re-run under what the question left "
+                "open — the load power factor, the loading limit, the voltage band, measured or "
+                "forecast data — and the conclusions compared. If one changes, CONDUCTOR says so "
+                "under the answer. Costs a few seconds of studies, no model call."
+            ),
+        )
+
+    # The tools investigations needed and CONDUCTOR did not have, across
+    # sessions: what to build next, from real questions. Never findings.
+    _needed = _investigation_record.summarise_requests(_investigation_record.read_requests())
+    with st.expander(f"Tools investigations needed · {len(_needed)}", icon=":material/construction:",
+                     key="sb_tool_requests"):
+        st.caption("When an investigation meets a cause no CONDUCTOR tool can test, what it would need is "
+                   "noted here, most needed first: an analysis to build, or data to integrate. Nothing here is "
+                   "a finding: those causes were not tested.")
+        if not _needed:
+            st.caption("None yet.")
+        def _short(text: str, n: int) -> str:
+            return text if len(text) <= n else text[:n - 1].rsplit(" ", 1)[0] + "…"
+        for _kind, _title in ((_investigation_record.ANALYSIS, "Tools to build"),
+                              (_investigation_record.DATA, "Data to integrate")):
+            _rows = [_r for _r in _needed if _r["kind"] == _kind]
+            if not _rows:
+                continue
+            st.markdown(f'<div class="tr-head">{_title}</div>', unsafe_allow_html=True)
+            for _req in _rows[:5]:
+                _for = _req.get("for") or (_req["hypotheses"][0] if _req["hypotheses"] else "")
+                # The need first when it has one; the agent's own words shortened
+                # beneath it, the full text on hover.
+                _head = (f'<b>{html.escape(_req["need"])}</b> · {html.escape(_short(_req["tool"], 90))}'
+                         if _req.get("need") else html.escape(_short(_req["tool"], 120)))
+                st.markdown(f'<div class="tr-row" title="{html.escape(_req["tool"], quote=True)}">'
+                            f'<span class="tr-n">{_req["count"]}×</span><div><div class="tr-tool">'
+                            f'{_head}</div><div class="tr-for">for: '
+                            f'{html.escape(_short(_for, 80))}</div></div></div>', unsafe_allow_html=True)
+            if len(_rows) > 5:
+                st.caption(f"…and {len(_rows) - 5} more: python -m evaluation.tool_requests")
 
     # AI Agent Suggestion. On demand by default: suggestions nobody asked for
     # are more to read, which is the opposite of what they are for.
@@ -4684,101 +4952,379 @@ _render_main_hero(compact=bool(st.session_state.messages))
 # The input box stays outside the tabs on purpose: `st.chat_input` pins itself
 # to the bottom of the viewport only at the top level, and inside a tab it
 # would render inline and appear on one pane only. Out here it stays pinned and
-def _render_trace(trace, key: str) -> None:
-    """The audit panel under an answer: what ran, where the numbers came from,
-    and what was not checked.
+# in view whichever tab is open.
 
-    Collapsed by default — an operator who trusts the answer never opens it —
-    but the label always carries the concern count, because a panel nobody
-    opens cannot warn anybody.
+# ---------------------------------------------------------------------------
+# Evidence card — under an answer: what backs each of its claims
+# (agent/evidence.py), and whether its conclusion depends on how the question
+# was read (agent/robustness.py). Both are computed in code from the turn
+# record; nothing on the card is model output.
+# ---------------------------------------------------------------------------
 
-    Deliberately describes rather than certifies. "12 figures traced" is a
-    statement about where numbers came from; it is not a claim that the answer
-    is correct, and the limits block at the bottom says so explicitly.
-    """
-    # `concerns` is in the guard deliberately. A turn can answer from memory —
-    # no tools, no figures — and still raise a completeness gap or a
-    # characterisation conflict, and that is precisely the answer that must not
-    # render without its warning.
-    if trace is None or not (trace.steps or trace.figures or trace.concerns):
+# The (?) right after each of the card's two headings: what they mean, for a
+# first reading. Drawn here rather than with Streamlit's `help`, which puts its
+# icon at the far end of the row — away from the heading it explains, and
+# beside the "Mark figures" switch's own.
+_EVIDENCE_HELP = (
+    "<b>What backs this answer.</b> Each claim in the answer, counted by the kind of evidence behind it, "
+    "strongest first:<ul>"
+    "<li><b>Proved</b> — a mathematical certificate: true for every possible dispatch.</li>"
+    "<li><b>Power flow</b> — computed by an AC power flow of the network (physics, for the data given).</li>"
+    "<li><b>Optimised</b> — found by the optimiser: a good solution, not proved to be the best.</li>"
+    "<li><b>Estimated</b> — a statistic over sampled scenarios.</li>"
+    "<li><b>Input</b> — your question, the data, or a setting the study used.</li>"
+    "<li><b>Interpretation / Advice</b> — the agent's own reading, or a recommendation.</li>"
+    "<li><b>Unsupported</b> — in no result, or worded more certainly than its evidence.</li></ul>"
+    "It says what stands behind a claim, not that the claim is true. <b>Details</b> lists each claim "
+    "with its source."
+)
+_READING_HELP = (
+    "<b>Reading check.</b> Your question did not settle everything — the load power factor, the loading "
+    "limit, the voltage band, measured or forecast data — so the studies used the defaults. CONDUCTOR "
+    "re-ran them with other plausible values and compared the conclusions:<ul>"
+    "<li>✓ <b>Holds</b> — the same conclusion with every other value.</li>"
+    "<li>↗ <b>Shifts</b> — the same conclusion, but a figure moves by more than 10 %.</li>"
+    "<li>⚠ <b>Changes</b> — another conclusion with that value: for example secure at the default power "
+    "factor 0.95, not secure at 1.00.</li></ul>"
+    "When it changes, the answer depends on that assumption: say which value applies to your case, or ask "
+    "again with it. The <b>Readings</b> tab in Details lists every value tried.<br><br>"
+    "It re-runs the security assessment, the N-1 screens and the two optimisations; other studies are not "
+    "re-checked. It can be switched off under <b>Answer checks</b> in the sidebar."
+)
+
+
+def _ev_help(tip_html: str) -> str:
+    """A (?) that shows `tip_html` on hover or keyboard focus."""
+    return (f'<span class="ev-help" tabindex="0" role="note" aria-label="Help">?'
+            f'<span class="ev-tip">{tip_html}</span></span>')
+
+
+# Lookups: a turn that ran only these ran no study the reading check could cover.
+_NOT_STUDIES = {"get_current_timestamp", "locate_network_element", "get_current_conditions",
+                "get_element_timeseries", "get_data_quality", "advance_timestamp"}
+
+_READING_STATUS = {
+    _robustness.HOLDS: ("✓", "Holds"),
+    _robustness.SHIFTS: ("↗", "Shifts"),
+    _robustness.CHANGES: ("⚠", "Changes"),
+    _robustness.FAILED: ("–", "Not checked"),
+}
+
+
+def _evidence_of(msg: dict):
+    """(evidence ledger, reading-check report) of an answer, from its turn
+    record; the ledger is kept on the message once built."""
+    record = msg.get("record")
+    if msg.get("role") != "assistant" or not isinstance(record, dict):
+        return None, None
+    if "evidence" not in msg:
+        try:
+            msg["evidence"] = _evidence.build(record)
+        except Exception:  # noqa: BLE001 — no card is better than a broken answer
+            logging.getLogger(__name__).warning("Could not grade the answer's evidence.", exc_info=True)
+            msg["evidence"] = None
+    return msg.get("evidence"), _robustness.from_record(record.get("reading_check"))
+
+
+def _ev_chip(level: str, n: int | None = None) -> str:
+    count = f'<span class="ev-n">{n}</span>' if n is not None else ""
+    return (f'<span class="ev-chip ev-chip-{level}" title="{html.escape(_evidence.MEANINGS[level], quote=True)}">'
+            f'<span class="ev-dot"></span>{count}{_evidence.LABELS[level]}</span>')
+
+
+def _render_deep_badge(msg: dict) -> None:
+    """Above an answer asked with Deep Research: whether it was one."""
+    deep = (msg.get("record") or {}).get("deep_research") if isinstance(msg.get("record"), dict) else None
+    if msg.get("role") != "assistant" or not deep:
         return
+    if deep.get("investigated"):
+        st.markdown("<span class='dr-badge'>🔬 Deep Research</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("<span class='dr-badge dr-badge-off'>Deep Research not needed — answered as an analysis"
+                    "</span>", unsafe_allow_html=True)
 
-    icon = "⚠️" if trace.has_concerns else "🔍"
-    with st.expander(f"{icon} How this answer was produced — {trace.headline()}"):
 
-        # Concerns first: anything worth acting on should not be below a table
-        # the operator has to scroll past.
-        if trace.concerns:
-            st.markdown("**Worth checking**")
-            for item in trace.concerns:
-                st.markdown(f"- {item}")
-            st.divider()
+def _render_answer_text(msg: dict, key: str) -> None:
+    """The answer; with its figures marked by evidence level when the
+    operator turned marking on for it. CONDUCTOR's own reading-check note is
+    not shown here: the card under the answer says the same, without
+    outweighing the answer (it stays in the stored text, which the model and
+    the reports read)."""
+    prose = (msg.get("text") or "").partition(_robustness.NOTE_PREFIX)[0].rstrip()
+    ledger, _ = _evidence_of(msg)
+    if ledger is not None and ledger.figures and st.session_state.get(f"evmark_{key}"):
+        st.markdown(_evidence.mark_figures(prose, ledger), unsafe_allow_html=True)
+    else:
+        st.markdown(prose)
 
-        if trace.steps:
-            st.markdown("**What ran**")
-            timing = trace.timing_line()
-            if timing:
-                st.caption(f"Time: {timing}")
-            for step in trace.steps:
-                label = _tools_reg.label(step.name)
-                mark = "" if step.ok else " ❌"
-                if step.reused_from is not None:
-                    mark += f" ↺ *same call as step {step.reused_from}, not run again*"
-                elif step.duration_s is not None:
-                    mark += f" · {_trace.seconds(step.duration_s)}"
-                st.markdown(f"`{step.order}.` **{label}**{mark}")
-                if step.args:
-                    # Each argument in its own code span. A bare "·" separator
-                    # sat flush against the preceding value — `…pct=100· data…`
-                    # reads as a decimal point, which is the one typo an
-                    # operator scanning limits must not have to second-guess.
-                    # The monospace box also gives every value a visible
-                    # boundary, so a trailing digit cannot merge into the next
-                    # key.
-                    st.markdown(
-                        "&nbsp; ".join(f"`{k}={v}`" for k, v in step.args.items()),
-                        unsafe_allow_html=True,
-                        help="Arguments this tool actually ran with.",
-                    )
-                if step.inherited:
-                    # The only place the repair guard becomes visible to a
-                    # human: a value the operator set earlier, carried forward
-                    # so this study matched the one before it. Same code-span
-                    # treatment as the arguments above — this line states a
-                    # limit, and a limit an operator has to squint at is worse
-                    # than no line.
-                    carried = "&nbsp; ".join(
-                        f"`{field}={detail.get('value')}`"
-                        f" _(from {detail.get('from')})_"
-                        if isinstance(detail, dict) else f"`{field}={detail}`"
-                        for field, detail in sorted(
-                            step.inherited.items(), key=lambda kv: str(kv[0]))
-                    )
-                    st.markdown(f"↳ carried forward: {carried}",
-                                unsafe_allow_html=True)
-                if step.error:
-                    st.caption(f"↳ {step.error}")
-            st.divider()
 
+def _ev_code(text: str) -> str:
+    """Plain text for the card, its `code` spans kept as code."""
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", html.escape(str(text)))
+
+
+def _ev_claims_html(ledger) -> str:
+    """The Claims tab: the figures grouped by evidence level and study, then
+    the sentences graded by what they assert."""
+    legend = ('<div class="ev-legend">Strongest first: <b>proved</b> (a certificate) · <b>power flow</b> (physics, '
+              'for the data given) · <b>optimised</b> (a local optimum) · <b>estimated</b> (sampled scenarios) · '
+              '<b>input</b> (data or a setting). Hover over a figure for the phrase it is in.</div>')
+    rows = []
+    for group in _evidence.groups(ledger):
+        figs = "".join(
+            f"<span class='ev-fig{' ev-flag' if group.level == _evidence.UNSUPPORTED else ''}' "
+            f"title='{html.escape(c.context, quote=True)}'>{html.escape(c.text)}</span>"
+            for c in group.figures)
+        what = ", ".join(group.fields[:3]) + (" …" if len(group.fields) > 3 else "")
+        notes = sorted({c.note for c in group.figures if c.note})
+        rows.append(f"<tr><td>{_ev_chip(group.level)}</td><td><div class='ev-figs'>{figs}</div></td>"
+                    f"<td class='ev-src'><span class='ev-what'>{html.escape(group.study)}</span>"
+                    + (f"<br>{html.escape(what)}" if what else "")
+                    + (f"<br><i>{html.escape('; '.join(notes))}</i>" if notes else "") + "</td></tr>")
+    for claim in ledger.assertions:
+        level = _evidence.UNSUPPORTED if claim.overstated else claim.level
+        note = f"<br><i>{html.escape(claim.note)}</i>" if claim.note else ""
+        rows.append(f"<tr><td>{_ev_chip(level)}</td><td><span class='ev-what'>“{html.escape(claim.text[:220])}”"
+                    f"</span></td><td class='ev-src'>{html.escape(claim.source if claim.source != '—' else '')}"
+                    f"{note}</td></tr>")
+    return legend + f"<table class='ev-table'>{''.join(rows)}</table>"
+
+
+def _ev_readings_html(reading) -> str:
+    """The Readings tab: each other reading of the question and what it gave."""
+    legend = ('<div class="ev-legend">The answer\'s studies, re-run under what the question left open; the '
+              'conclusion compared from the studies\' own fields — ✓ holds, ↗ a figure moves by more than 10 %, '
+              '⚠ the conclusion changes.</div>')
+    rows = []
+    for o in reading.outcomes:
+        icon, word = _READING_STATUS.get(o.status, ("–", o.status))
+        label = o.reading.label[:1].upper() + o.reading.label[1:]
+        rows.append(
+            f"<tr><td><span class='ev-chip ev-{o.status}'>{icon} {word}</span></td>"
+            f"<td><span class='ev-what'>{html.escape(label)}</span><br><span class='ev-src'>instead of "
+            f"{html.escape(o.reading.assumed)} · {html.escape(_robustness.NOUNS.get(o.tool, _tools_reg.label(o.tool)))}"
+            f"</span></td><td class='ev-src'>{html.escape(o.before)}<span class='ev-arrow'>→</span>"
+            f"<span class='ev-what'>{html.escape(o.after)}</span></td></tr>")
+    skipped = (f"<div class='ev-legend'>Not re-run: {html.escape('; '.join(reading.skipped))}</div>"
+               if reading.skipped else "")
+    return legend + f"<table class='ev-table'>{''.join(rows)}</table>" + skipped
+
+
+def _ev_steps_html(trace) -> str:
+    """The How it ran tab: where the time went, then each study with its
+    arguments as it actually ran, what was carried forward and any error."""
+    parts = []
+    timing = trace.timing_line()
+    if timing:
+        parts.append(f"<div class='ev-legend'>Time: {html.escape(timing)}</div>")
+    for step in trace.steps:
+        if step.reused_from is not None:
+            state = f"<span class='ev-dur'>↺ same call as step {step.reused_from}, not run again</span>"
+        else:
+            mark = "<span class='ev-ok'>✓</span>" if step.ok else "<span class='ev-bad'>✕</span>"
+            took = f"<span class='ev-dur'>{_trace.seconds(step.duration_s)}</span>" if step.duration_s is not None else ""
+            state = mark + took
+        args = "".join(f"<code class='ev-arg'>{html.escape(f'{k}={v}'[:90])}</code>" for k, v in step.args.items())
+        carried = ""
+        if step.inherited:
+            items = "".join(
+                f"<code class='ev-arg'>{html.escape(str(field))}={html.escape(str(d.get('value') if isinstance(d, dict) else d))}"
+                f"</code><span class='ev-src'>from {html.escape(str(d.get('from')))}</span> "
+                if isinstance(d, dict) else f"<code class='ev-arg'>{html.escape(f'{field}={d}')}</code>"
+                for field, d in sorted(step.inherited.items(), key=lambda kv: str(kv[0])))
+            carried = f"<div class='ev-carried'>↳ carried forward: {items}</div>"
+        error = f"<div class='ev-err'>↳ {html.escape(step.error)}</div>" if step.error else ""
+        parts.append(
+            f"<div class='ev-step'><span class='ev-stepno'>{step.order}</span><div class='ev-stepbody'>"
+            f"<div class='ev-steptitle'><b>{html.escape(_tools_reg.label(step.name))}</b>{state}</div>"
+            + (f"<div class='ev-args'>{args}</div>" if args else "") + carried + error + "</div></div>")
+    return "".join(parts) or "<div class='ev-legend'>No study ran for this answer.</div>"
+
+
+def _ev_reading_line(reading) -> str:
+    """The reading check in one line: the change itself when a reading changes
+    the conclusion ("Changes with loads at power factor 1.00 (0.95 assumed):
+    not secure: 1 violation"), else the headline."""
+    if not reading.changes:
+        return html.escape(reading.headline())
+    first = reading.changes[0]
+    more = len(reading.changes) - 1
+    return (f"<b>Conclusion changes</b> with {html.escape(first.reading.label)} instead of "
+            f"{html.escape(first.reading.assumed)}"
+            f" — {html.escape(first.after)}"
+            + (f" <span class='ev-src'>· +{more} more in Readings</span>" if more else ""))
+
+
+def _ev_details_label(trace, ledger) -> str:
+    """The Details label: what ran, figures traced, time — the old audit
+    panel's headline, less its concerns (counted in the header)."""
+    parts = []
+    if trace is not None:
+        ran = [s for s in trace.steps if s.reused_from is None]
+        if ran:
+            ok = sum(1 for s in ran if s.ok)
+            parts.append(f"{ok} stud{'ies' if ok != 1 else 'y'}" if ok == len(ran)
+                         else f"{ok}/{len(ran)} studies succeeded")
         if trace.figures:
-            st.markdown("**Where the numbers came from**")
-            st.dataframe(
-                [
-                    {
-                        "Figure": f"{f.value:g}" + (f" {f.unit}" if f.unit else ""),
-                        "Status": f.detail,
-                        "Source": f.source or "—",
-                    }
-                    for f in trace.figures
-                ],
-                hide_index=True, width="stretch",
-                key=f"trace_figs_{key}",
-            )
-            st.divider()
+            parts.append(f"{trace.n_traced}/{len(trace.figures)} figures traced")
+        total = (trace.timing or {}).get("total_s")
+        if isinstance(total, (int, float)):
+            parts.append(_trace.seconds(total))
+    return "Details" + (f" · {' · '.join(parts)}" if parts else "")
 
-        st.markdown("**What this does not tell you**")
-        for limit in trace.limits:
-            st.caption(f"· {limit}")
+
+_INVESTIGATION_HELP = (
+    "<b>Investigation.</b> The possible causes CONDUCTOR considered for this question, and how each one "
+    "was tested:<ul>"
+    "<li><b>Supported</b> — the studies named under it show it explains the problem.</li>"
+    "<li><b>Ruled out</b> — the studies named under it show it does not.</li>"
+    "<li><b>Not tested</b> — no tool can test it yet. It is not a finding, and the answer must not present "
+    "it as one; the tool it would need is noted for the developers.</li></ul>"
+    "The agent chooses what to test, but not what counts as tested: a record citing a study that did not "
+    "run in this question is refused."
+)
+_VERDICTS = {"supported": "Supported", "refuted": "Ruled out", "untested": "Not tested"}
+
+
+def _investigation_of(msg: dict) -> dict | None:
+    """The investigation record of an answer (its last accepted one), if any."""
+    record = msg.get("record")
+    if msg.get("role") != "assistant" or not isinstance(record, dict):
+        return None
+    found = None
+    for entry in record.get("tool_results") or []:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if entry.get("name") == "record_investigation" and isinstance(result, dict) \
+                and result.get("status") == "recorded":
+            found = result
+    return found
+
+
+def _render_investigation(msg: dict, key: str) -> None:
+    """The investigation's record, as one card under the answer: each
+    hypothesis with its verdict, what showed it and which studies, or — when
+    no tool could test it — the tool it would need."""
+    trail = _investigation_of(msg)
+    if not trail or not trail.get("hypotheses"):
+        return
+    esc = html.escape
+    counts = trail.get("counts") or {}
+    tally = " · ".join(f"{counts[v]} {_VERDICTS[v].lower()}" for v in _VERDICTS if counts.get(v))
+    rows = []
+    for h in trail["hypotheses"]:
+        verdict = h.get("verdict", "untested")
+        detail = f'<div class="inv-find">{esc(h["finding"])}</div>' if h.get("finding") else ""
+        if verdict == "untested":
+            _need = {"analysis": "Would need a tool (an analysis CONDUCTOR does not do yet)",
+                     "data": "Would need data CONDUCTOR does not have"}.get(h.get("missing_kind"), "Would need")
+            detail += (f'<div class="inv-need"><b>{_need}:</b> {esc(h.get("missing_tool", ""))}</div>')
+        elif h.get("evidence"):
+            tools = " · ".join(esc(_tools_reg.label(t)) for t in h["evidence"])
+            detail += f'<div class="inv-ev">Tested with {tools}</div>'
+        rows.append(f'<div class="inv-row inv-{verdict}"><span class="inv-pill">{_VERDICTS.get(verdict, verdict)}'
+                    f'</span><div class="inv-body"><div class="inv-hyp">{esc(h.get("hypothesis", ""))}</div>'
+                    f'{detail}</div></div>')
+    symptom = f'<span class="inv-symptom">{esc(trail.get("symptom", ""))}</span>' if trail.get("symptom") else ""
+    st.markdown(f'<div class="inv-card"><div class="inv-head"><span class="ev-title">Investigation'
+                f'{_ev_help(_INVESTIGATION_HELP)}</span>{symptom}<span class="inv-tally">{esc(tally)}</span></div>'
+                + "".join(rows) + "</div>", unsafe_allow_html=True)
+
+
+def _render_report_download(msg: dict, key: str) -> None:
+    """A download of the investigation's detailed report, under an answer that
+    investigated something (agent/investigation_report.py)."""
+    record = msg.get("record")
+    if msg.get("role") != "assistant" or not _investigation_report.has_investigation(record):
+        return
+    try:
+        report = _investigation_report.build(record, msg.get("text"))
+    except Exception:  # noqa: BLE001 — no button is better than a broken answer
+        logging.getLogger(__name__).warning("Could not build the investigation report.", exc_info=True)
+        return
+    stamp = str(record.get("timestamp_utc") or "")[:16].replace(":", "").replace("-", "").replace("T", "-")
+    st.download_button("Download the investigation report", data=report.encode("utf-8"),
+                       file_name=f"conductor-investigation-{stamp or 'report'}.md", mime="text/markdown",
+                       icon=":material/download:", key=f"invreport_{key}",
+                       help="Everything the investigation found, step by step: the comparison, each factor's exact "
+                            "share, the hypotheses tested, what backs it, the studies run, the method and its limits.")
+
+
+def _render_evidence(msg: dict, key: str) -> None:
+    """What backs this answer — one card under the answer, from its turn
+    record: the claims per evidence level, anything worth checking and the
+    reading check, always in view; then the details — each claim with what
+    backs it, each other reading, how the answer ran (studies, arguments,
+    time) and what the checks cannot see.
+
+    Describes, never certifies: a level says what kind of evidence stands
+    behind a claim, not that it is true; the Limits tab says what the checks
+    miss. A concern is always counted in the header, which is never collapsed."""
+    ledger, reading = _evidence_of(msg)
+    trace = msg.get("trace")
+    judged = reading.judged if reading is not None else ()
+    has_trace = trace is not None and bool(trace.steps or trace.figures or trace.concerns)
+    if not ((ledger is not None and ledger.claims) or judged or has_trace):
+        return
+    concerns = tuple(trace.concerns) if has_trace else ()
+    with st.container(key=f"evcard_{key}"):
+        chips = ""
+        if ledger is not None:
+            counts = ledger.counts()
+            chips = "".join(_ev_chip(level, n) for level, n in counts.items() if level != _evidence.UNSUPPORTED)
+            if counts.get(_evidence.UNSUPPORTED):
+                chips += _ev_chip(_evidence.UNSUPPORTED, counts[_evidence.UNSUPPORTED])
+        if not chips:
+            chips = "<span class='ev-none'>no figures or claims to grade</span>"
+        if concerns:
+            chips += (f"<span class='ev-chip ev-concern' title='Listed at the top of Details'>⚠ "
+                      f"<span class='ev-n'>{len(concerns)}</span> to check</span>")
+        # The chips have the row to themselves, so they wrap (rarely) in place;
+        # the switch sits at the right end of the row below.
+        st.markdown(f'<div class="ev-chips"><span class="ev-title">What backs this answer'
+                    f'{_ev_help(_EVIDENCE_HELP)}</span>{chips}</div>', unsafe_allow_html=True)
+        marks = ledger is not None and bool(ledger.figures)
+        studied = has_trace and any(s.name not in _NOT_STUDIES for s in trace.steps)
+        if judged or marks or studied:
+            with st.container(key=f"evrow_{key}"):
+                left, right = st.columns([0.76, 0.24], vertical_alignment="center", gap="small")
+                if judged:
+                    state = (_robustness.CHANGES if reading.changes else
+                             _robustness.SHIFTS if reading.shifts else _robustness.HOLDS)
+                    icon, _word = _READING_STATUS[state]
+                    left.markdown(f'<div class="ev-reading"><span class="ev-title">Reading check'
+                                  f'{_ev_help(_READING_HELP)}</span>'
+                                  f'<span class="ev-chip ev-{state}">{icon}</span>'
+                                  f'<span>{_ev_reading_line(reading)}</span></div>', unsafe_allow_html=True)
+                elif studied:
+                    left.markdown(f'<div class="ev-reading"><span class="ev-title">Reading check'
+                                  f'{_ev_help(_READING_HELP)}</span>'
+                                  f'<span class="ev-none">not run for this answer</span></div>',
+                                  unsafe_allow_html=True)
+                if marks:
+                    right.toggle("Mark figures", key=f"evmark_{key}",
+                                 help="Colour each figure in the answer by what backs it; hover over one for "
+                                      "its source.")
+        with st.expander(_ev_details_label(trace if has_trace else None, ledger), icon=":material/fact_check:"):
+            if concerns:
+                items = "".join(f"<li>{_ev_code(c)}</li>" for c in concerns)
+                st.markdown(f"<div class='ev-concerns'><div class='ev-sub'>Worth checking</div><ul>{items}</ul></div>",
+                            unsafe_allow_html=True)
+            tabs = []
+            if ledger is not None and ledger.claims:
+                tabs.append(("Claims", lambda: _ev_claims_html(ledger)))
+            if reading is not None and reading.outcomes:
+                tabs.append(("Readings", lambda: _ev_readings_html(reading)))
+            if has_trace:
+                tabs.append(("How it ran", lambda: _ev_steps_html(trace)))
+            limits = (list(trace.limits) if has_trace else []) + (
+                [_evidence.BLIND_SPOT] if ledger is not None and ledger.claims else []) + (
+                [_robustness.BLIND_SPOT] if reading is not None and reading.outcomes else [])
+            if limits:
+                tabs.append(("Limits", lambda: "<ul class='ev-limits'>"
+                             + "".join(f"<li>{html.escape(item)}</li>" for item in limits) + "</ul>"))
+            for (_name, body), tab in zip(tabs, st.tabs([name for name, _ in tabs])):
+                with tab:
+                    st.markdown(body(), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -5902,21 +6448,19 @@ with _chat_tab:
             )
     for _msg_idx, msg in enumerate(st.session_state.messages):
         with _col_chat, st.chat_message(msg["role"], avatar=_AVATARS.get(msg["role"])):
-            st.markdown(msg["text"])
+            _render_deep_badge(msg)
+            _render_answer_text(msg, f"m{_msg_idx}")
+            # Same rule as the audit panel below: the card must never take the
+            # conversation view down with it.
+            try:
+                _render_investigation(msg, f"m{_msg_idx}")
+                _render_evidence(msg, f"m{_msg_idx}")
+                _render_report_download(msg, f"m{_msg_idx}")
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "Could not render the evidence card for message %s.", _msg_idx, exc_info=True)
             if msg.get("charts"):
                 render_charts(msg["charts"])
-            if msg.get("trace") is not None:
-                # History re-renders on every rerun, so an exception here would
-                # not break one panel — it would permanently break the whole
-                # conversation view. The audit is worth less than the record of
-                # what was said.
-                try:
-                    _render_trace(msg["trace"], key=f"hist_{_msg_idx}")
-                except Exception:  # noqa: BLE001
-                    logging.getLogger(__name__).warning(
-                        "Could not render the audit panel for message %s.",
-                        _msg_idx, exc_info=True)
-                    st.caption("⚠️ The audit panel could not be rendered for this answer.")
             if msg["role"] == "assistant":
                 # Same rule as the audit panel: a failure here must not take
                 # the conversation view down with it.
@@ -5974,13 +6518,132 @@ def _safe_attention(record: dict | None) -> list[str]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Deep Research — while the operator waits
+#
+# An investigation in depth runs a dozen studies. Listing each one buries the
+# question under tool names; this card shows where the investigation is and
+# what it has found so far, from the studies' own results. The full list stays
+# in the collapsed box under it. If the model decides the question is not an
+# investigation, the card says so and the usual list opens instead.
+# ---------------------------------------------------------------------------
+
+_DEEP_PHASES = (("question", "Reading the question"), ("cause", "Finding the cause"),
+                ("references", "Checking the cause against other moments"),
+                ("prevention", "Could it have been avoided?"), ("recurring", "Does it recur?"),
+                ("record", "Recording what was tested"), ("answer", "Writing and checking the answer"))
+# Calls that do not tell an investigation from an analysis.
+_NEUTRAL_TOOLS = {"get_current_timestamp", "locate_network_element", "get_current_conditions",
+                  "get_element_timeseries", "record_investigation"}
+
+
+class _DeepProgress:
+    """The Deep Research card: one row per phase, its state and what it found."""
+
+    def __init__(self, slot, status_box):
+        self.slot, self.status_box = slot, status_box
+        self.state = {key: "todo" for key, _ in _DEEP_PHASES}
+        self.detail: dict[str, str] = {}
+        self.state["question"] = "run"
+        self.known = ""
+        self.studies = 0
+        self.analysis = False
+        self.started = time.time()
+        self.render()
+
+    def _set(self, key: str, state: str, detail: str | None = None) -> None:
+        self.state[key] = state
+        if detail:
+            self.detail[key] = detail
+
+    def on_event(self, event: str, data: dict) -> None:
+        name = data.get("name")
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        if event == "tool_start" and not self.analysis and name not in _NEUTRAL_TOOLS \
+                and name not in ("investigate", "test_prevention") and self.studies == 0:
+            # The model judged the question not an investigation.
+            self.analysis = True
+            self.status_box.update(label="Answering as an analysis…", state="running", expanded=True)
+        if self.analysis:
+            self.render()
+            return
+        if event == "tool_start" and name == "investigate":
+            self._set("question", "done")
+            self._set("recurring" if (data.get("args") or {}).get("recurring") else "cause", "run")
+        elif event == "tool_done" and name == "investigate" and not result.get("error"):
+            self.studies += 1
+            if result.get("mode") == "recurring":
+                top = (result.get("causes") or [{}])[0]
+                self._set("recurring", "done", (f"{top.get('cause')} is the main cause in {top.get('episodes')} "
+                                                f"of the episodes" if result.get("recurs") else
+                                                "no single cause recurs") if top else None)
+            else:
+                main = result.get("main_cause")
+                share = next((f["share_pct"] for f in result.get("factors") or [] if f["factor"] == main), None)
+                self._set("cause", "done", f"{self.studies} stud{'y' if self.studies == 1 else 'ies'} so far")
+                if main and share is not None:
+                    self.known = f"{main}: {share:.0f} % of the change" + (
+                        f", against {(result.get('reference') or {}).get('label')}" if result.get("reference") else "")
+                rr = result.get("reference_robustness")
+                if rr:
+                    self._set("references", "done", "the main cause holds" if rr.get("holds")
+                              else "the main cause depends on the reference")
+        elif event == "tool_start" and name == "test_prevention":
+            self._set("question", "done")
+            self._set("prevention", "run")
+        elif event == "tool_done" and name == "test_prevention" and not result.get("error"):
+            warn = result.get("warning") or {}
+            enough = next((a["smallest"]["action"] for a in result.get("actions") or [] if a.get("smallest")), None)
+            self._set("prevention", "done",
+                      (f"{warn.get('lead_minutes')} min of warning · " if warn.get("seen") else "no warning · ")
+                      + (f"enough: {enough}" if enough else "nothing tested was enough"))
+        elif event == "tool_done" and name == "record_investigation" and result.get("status") == "recorded":
+            counts = result.get("counts") or {}
+            self._set("record", "done", " · ".join(f"{n} {w}" for w, n in (
+                ("supported", counts.get("supported")), ("ruled out", counts.get("refuted")),
+                ("not tested", counts.get("untested"))) if n))
+        elif event in ("reflection", "reading_check"):
+            self._set("answer", "run")
+        self.render()
+
+    def finish(self) -> None:
+        for key, state in self.state.items():
+            self.state[key] = "done" if state == "run" else ("skip" if state == "todo" else state)
+        self.render()
+
+    def render(self) -> None:
+        # When it started, not a running count: the card redraws on each step,
+        # and a count frozen between steps read as a stuck investigation.
+        clock = "started " + time.strftime("%H:%M", time.localtime(self.started))
+        if self.analysis:
+            self.slot.markdown(
+                "<div class='dr-card'><div class='dr-head'><span class='dr-title'>Deep Research</span>"
+                f"<span class='dr-clock'>{clock}</span></div><div class='dr-note'>Not needed for this question: "
+                "it is not a <i>why</i> about a problem in the grid, so CONDUCTOR is answering it as an "
+                "analysis.</div></div>", unsafe_allow_html=True)
+            return
+        icons = {"todo": "<span class='dr-dot'></span>", "run": "<span class='conductor-spin dr-spin'></span>",
+                 "done": "<span class='dr-ok'>✓</span>", "skip": "<span class='dr-skip'>–</span>"}
+        rows = "".join(
+            f"<div class='dr-row dr-{self.state[key]}'>{icons[self.state[key]]}<span class='dr-label'>{label}</span>"
+            + (f"<span class='dr-detail'>{html.escape(self.detail[key])}</span>" if key in self.detail else "")
+            + "</div>" for key, label in _DEEP_PHASES)
+        known = (f"<div class='dr-known'><b>Found so far:</b> {html.escape(self.known)}</div>" if self.known else "")
+        self.slot.markdown(
+            f"<div class='dr-card'><div class='dr-head'><span class='dr-title'>Deep Research</span>"
+            f"<span class='dr-clock'>{clock}</span></div>{rows}{known}</div>", unsafe_allow_html=True)
+
+
 def _queue_turn() -> None:
     """Send's callback: record the question. The fragment's rerun then draws a
     waiting line instead of the box before the turn starts — a box that stays
     on screen during a turn looks ready to take the next question, and is not."""
-    typed = (st.session_state.get(f"chat_box_{st.session_state.get('_box_n', 0)}") or "").strip()
+    n = st.session_state.get('_box_n', 0)
+    typed = (st.session_state.get(f"chat_box_{n}") or "").strip()
     if typed:
         st.session_state._pending_turn = typed
+        # One question only: the switch is a new widget with every box.
+        st.session_state._pending_deep = st.session_state.get(f"deep_{n}") == "deep"
         st.session_state._turn_redraw = True
         st.session_state.pop("_attempts_turn", None)
 
@@ -6044,8 +6707,9 @@ def _chat_input_fragment():
         # and only this one runs studies.
         # One row sized by its content: the label only as wide as itself.
         with st.container(horizontal=True, vertical_alignment="center", gap="small"):
-            st.markdown("<span class='conductor-who'>⚡ CONDUCTOR</span>", unsafe_allow_html=True,
-                        width="content")
+            # The brand mark and wordmark: whose box this is (the advisor has its own).
+            st.markdown(f"<span class='conductor-who'><img src='{_MARK_URI}' alt=''/>CONDUCTOR</span>",
+                        unsafe_allow_html=True, width="content")
             typed = st.text_input(
                 "Ask CONDUCTOR",
                 key=f"chat_box_{st.session_state._box_n}",
@@ -6054,6 +6718,13 @@ def _chat_input_fragment():
                 label_visibility="collapsed",
                 width="stretch",
             )
+            # One icon, filled when on: the box keeps its width. Off again after each question.
+            st.pills("Deep Research", options=["deep"], format_func=lambda _: ":material/biotech:",
+                     key=f"deep_{st.session_state._box_n}", label_visibility="collapsed",
+                     help=("**Deep Research** — for *why* questions about a problem in the grid: CONDUCTOR "
+                           "investigates in depth (its own hypotheses, other moments, could it have been "
+                           "avoided, does it recur). One to three minutes. For analyses leave it off: the model "
+                           "decides anyway. It switches itself off after each question."))
             st.form_submit_button("Run", width=96, type="primary", on_click=_queue_turn,
                                   help="CONDUCTOR runs the studies and answers with solver results.")
     del typed
@@ -6098,7 +6769,11 @@ def _process_turn(effective_input: str, work) -> None:
             st.markdown(effective_input)
 
         with st.chat_message("assistant", avatar=_AVATARS["assistant"]):
-            status_box = st.status("Thinking…", expanded=True)
+            deep = bool(st.session_state.get("_pending_deep"))
+            deep_slot = st.empty() if deep else None
+            # Deep Research shows its own card; the studies' list stays under it, closed.
+            status_box = st.status("The studies it runs" if deep else "Thinking…", expanded=not deep)
+            deep_progress = _DeepProgress(deep_slot, status_box) if deep else None
             # Lines go into a plain container inside the box: leaving a `with
             # status_box:` block marks the box finished (✓), so writing there
             # showed every run as done after its first step.
@@ -6106,6 +6781,11 @@ def _process_turn(effective_input: str, work) -> None:
             progress_lines: dict = {}            # tool -> its one line of progress, rewritten in place
 
             def _on_event(event: str, data: dict) -> None:
+                if deep_progress is not None:
+                    try:
+                        deep_progress.on_event(event, data)
+                    except Exception:  # noqa: BLE001 — the card must never stop the question
+                        logging.getLogger(__name__).warning("Deep Research card failed.", exc_info=True)
                 with status_body:
                     if event == "tool_progress":
                         # A long study as it runs: one line, updated, and the status header.
@@ -6147,6 +6827,12 @@ def _process_turn(effective_input: str, work) -> None:
                             f"🛑 **{label}** not run — invalid parameters: "
                             + "; ".join(data.get("problems", []))
                         )
+                    elif event == "parameter_warning":
+                        label = _tools_reg.label(data["name"])
+                        st.write(
+                            f"⚠️ **{label}** ran with unusual parameters: "
+                            + "; ".join(data.get("problems", []))
+                        )
                     elif event == "integrity_warning":
                         label = _tools_reg.label(data["name"])
                         st.write(
@@ -6170,6 +6856,15 @@ def _process_turn(effective_input: str, work) -> None:
                             st.write(f"🔎 Answer checks: {'; '.join(parts)} — returning to the agent")
                         else:
                             st.write(f"🔎 Answer checks: {'; '.join(parts)} (recorded only)")
+                    elif event == "deep_reminder":
+                        st.write("🔬 Deep Research: going deeper before answering — "
+                                 + "; ".join(m.split(" (`")[0] for m in data.get("missing", [])))
+                    elif event == "reading_check":
+                        st.write(f"🔁 Reading check: re-running the **{_tools_reg.label(data['name'])}** with "
+                                 f"{data.get('reading', 'another reading')}…")
+                    elif event == "reading_check_done":
+                        mark = "⚠️" if data.get("changes") else "✅"
+                        st.write(f"{mark} Reading check: {data.get('headline', '')}")
                     elif event == "model_loading":
                         st.write(
                             f"⏳ Loading **{data.get('model', 'the model')}** into memory "
@@ -6205,7 +6900,11 @@ def _process_turn(effective_input: str, work) -> None:
                     on_event=_on_event,
                     reflection=_reflection_mode(),
                     earlier_context=_earlier_context_block(),
+                    reading_check=bool(st.session_state.get("reading_check", READING_CHECK)),
+                    deep=deep,
                 )
+                if deep_progress is not None:
+                    deep_progress.finish()
                 # Persist history
                 st.session_state.history = updated_history
 
@@ -6245,20 +6944,22 @@ def _process_turn(effective_input: str, work) -> None:
                 turn_trace = None
                 turn_record = None
                 try:
-                    record = _loop_module.session_log[-1] if _loop_module.session_log else None
-                    # Verify the record belongs to *this* question. A turn that
-                    # aborts before logging leaves the previous turn's record at
-                    # the end of the list, and attributing one answer's evidence to
-                    # a different question is the worst thing this panel could do —
-                    # it would assert provenance for numbers never produced. No
-                    # panel is strictly better than a wrong one.
-                    if record is not None and record.get("user") == llm_input:
+                    # Verify the record belongs to *this* question, by the
+                    # `turn_key` the loop wrote for it. A turn that aborts
+                    # before logging leaves the previous turn's record at the
+                    # end of the list, and attributing one answer's evidence to
+                    # a different question is the worst thing this panel could
+                    # do — it would assert provenance for numbers never
+                    # produced. No panel is strictly better than a wrong one.
+                    record = _loop_module.latest_record_for(
+                        llm_input, st.session_state.ui_conversation_id)
+                    if record is not None:
                         turn_record = record
                         turn_trace = _trace.build(record)
-                    elif record is not None:
+                    elif _loop_module.session_log:
                         logging.getLogger(__name__).warning(
                             "Skipping the audit panel: the newest log record is for "
-                            "a different prompt.")
+                            "a different question.")
                 except Exception:  # noqa: BLE001
                     logging.getLogger(__name__).warning(
                         "Could not build the answer trace.", exc_info=True)
@@ -6270,6 +6971,7 @@ def _process_turn(effective_input: str, work) -> None:
                 # operator saw nothing happen and sent it again.
                 st.session_state.messages.append({"role": "user", "text": effective_input, "charts": None})
                 st.session_state.pop("_pending_turn", None)
+                st.session_state.pop("_pending_deep", None)
                 st.session_state.pop("_attempts_turn", None)
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -6292,6 +6994,7 @@ def _process_turn(effective_input: str, work) -> None:
                 _warn_if_grid_identity_unverified()
             except RuntimeError as exc:
                 st.session_state.pop("_pending_turn", None)
+                st.session_state.pop("_pending_deep", None)
                 st.session_state.pop("_attempts_turn", None)
                 status_box.update(label="Error", state="error", expanded=True)
                 with status_box:
@@ -6299,14 +7002,15 @@ def _process_turn(effective_input: str, work) -> None:
                 st.stop()
 
             # Render reply inside the same chat bubble
-            st.markdown(assistant_text)
-            render_charts(charts_this_turn)
+            _render_deep_badge(st.session_state.messages[-1])
+            _render_answer_text(st.session_state.messages[-1], f"live{len(st.session_state.messages)}")
             try:
-                _render_trace(turn_trace, key=f"live_{len(st.session_state.messages)}")
+                _render_investigation(st.session_state.messages[-1], f"live{len(st.session_state.messages)}")
+                _render_evidence(st.session_state.messages[-1], f"live{len(st.session_state.messages)}")
+                _render_report_download(st.session_state.messages[-1], f"live{len(st.session_state.messages)}")
             except Exception:  # noqa: BLE001
-                logging.getLogger(__name__).warning(
-                    "Could not render the audit panel.", exc_info=True)
-                st.caption("⚠️ The audit panel could not be rendered for this answer.")
+                logging.getLogger(__name__).warning("Could not render the evidence card.", exc_info=True)
+            render_charts(charts_this_turn)
 
     # Fold the finished turn into the main conversation history with a full app
     # rerun. It's fast now — the answer is already computed, so nothing blocks it.

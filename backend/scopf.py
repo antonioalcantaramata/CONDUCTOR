@@ -46,6 +46,7 @@ VOLTAGE_WEIGHT = 20.0       # 0.01 p.u. of voltage weighed like ~10 % of loading
 # A corrective action as short as it can be: an absolute-value cost (few units
 # move, the rest exactly not) and a small quadratic one (a unique answer).
 MOVE_L1, MOVE_WEIGHT = 1e-2, 1e-3            # per MW, per MW²
+Q_MOVE_L1, Q_MOVE_WEIGHT = 1e-3, 1e-4        # per Mvar, per Mvar²: a unit held to a power factor, told a new Q
 SETPOINT_L1, SETPOINT_WEIGHT = 2.0, 10.0     # per p.u., per p.u.²: 0.01 p.u. weighs like 2 MW
 RESIDUAL_TOL = 1e-4         # slack below this is solver tolerance, not a violation
 SECURE_TOL = 1e-6           # stage 2 keeps stage 1's security to within this (absolute) ...
@@ -61,12 +62,17 @@ def _deactivate_objectives(m) -> None:
         obj.deactivate()
 
 
-def release(m, keep_fixed: set) -> None:
+def release(m, keep_fixed: set, free_held_q: bool = False) -> None:
     """Unfix what the engine's first stage fixed (every unit at its schedule,
     when that schedule was already feasible): the SCOPF chooses them. Units
-    in `keep_fixed` (the operator's held units) stay as they are."""
+    in `keep_fixed` (the operator's held units) stay as they are — except,
+    with `free_held_q` (a post-outage state), their reactive output: the first
+    stage froze it at the post-outage power flow, but after an outage it
+    follows the grid (a held set-point) or is linked to the base state."""
     for g in m.G:
         if g in keep_fixed:
+            if free_held_q and m.Qg_new[g].fixed:
+                m.Qg_new[g].unfix()
             continue
         if m.Pg_new[g].fixed and value(m.Pg_min[g]) < value(m.Pg_max[g]):
             m.Pg_new[g].unfix()
@@ -162,6 +168,13 @@ def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, la
             setattr(top, f"vdown{k}", Var(buses, within=NonNegativeReals, initialize=0.0))
             setattr(top, f"vmove{k}", Constraint(buses, rule=lambda t, b, m=m, k=k: (
                 m.V[b] - t.base.V[b] == getattr(t, f"vup{k}")[b] - getattr(t, f"vdown{k}")[b])))
+            # A unit held to a power factor may be told a new reactive output after
+            # the outage: an action too, costed like the others (not free).
+            pf_units = [g for g in units if g not in vc]
+            setattr(top, f"qup{k}", Var(pf_units, within=NonNegativeReals, initialize=0.0))
+            setattr(top, f"qdown{k}", Var(pf_units, within=NonNegativeReals, initialize=0.0))
+            setattr(top, f"qmove{k}", Constraint(pf_units, rule=lambda t, g, m=m, k=k: (
+                m.Qg_new[g] - t.base.Qg_new[g] == getattr(t, f"qup{k}")[g] - getattr(t, f"qdown{k}")[g])))
     blocks = [getattr(top, f"c{k}") for k in range(len(names))]
     shed = 0.0
     if mode == CORRECTIVE and load_reduction:
@@ -178,9 +191,11 @@ def build(base, states: dict, mode: str, reach: dict, lambda_p: float = 0.01, la
     moves = 0.0
     if mode == CORRECTIVE:
         for k in range(len(names)):
-            up, down, vup, vdown = (getattr(top, f"{n}{k}") for n in ("up", "down", "vup", "vdown"))
+            up, down, vup, vdown, qup, qdown = (getattr(top, f"{n}{k}") for n in
+                                                ("up", "down", "vup", "vdown", "qup", "qdown"))
             moves += sum(MOVE_L1 * (up[g] + down[g]) + MOVE_WEIGHT * (up[g] - down[g]) ** 2 for g in up)
             moves += sum(SETPOINT_L1 * (vup[b] + vdown[b]) + SETPOINT_WEIGHT * (vup[b] - vdown[b]) ** 2 for b in vup)
+            moves += sum(Q_MOVE_L1 * (qup[g] + qdown[g]) + Q_MOVE_WEIGHT * (qup[g] - qdown[g]) ** 2 for g in qup)
     # Two stages (`secure_first`): as secure as possible, then — keeping that —
     # the smallest change and the smallest corrective actions.
     top.violation = Expression(expr=sum(_slacks(m) for m in blocks) + shed)

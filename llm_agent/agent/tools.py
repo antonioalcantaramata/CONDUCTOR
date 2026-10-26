@@ -11,10 +11,14 @@ Every function:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import difflib
+import json
 import re
 import httpx
 from .config import BASE_URL, HTTP_TIMEOUT
+from .investigation_record import REQUESTS_FILE as TOOL_REQUESTS_FILE
 
 # ---------------------------------------------------------------------------
 # Shared state — cleared by loop.py at the start of every agent turn.
@@ -106,7 +110,8 @@ def _post_following(endpoint: str, body: dict, what: str) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     job = uuid.uuid4().hex
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(_post, endpoint, {**body, "progress_id": job})
+        # In this thread's context: `unrecorded` must hold in the worker too.
+        future = pool.submit(contextvars.copy_context().run, _post, endpoint, {**body, "progress_id": job})
         said = None
         while True:
             try:
@@ -132,9 +137,16 @@ def _post_following(endpoint: str, body: dict, what: str) -> dict:
                 _say_progress(text)
 
 
+# Endpoints that keep what they compute (an option set, "the last dispatch"):
+# told not to while a check re-runs a study (`unrecorded`).
+_KEEPS_RESULTS = ("/api/flexibility/optimize", "/api/contingency/optimize")
+
+
 def _post(endpoint: str, body: dict) -> dict:
     """Execute a POST request and return parsed JSON or an error dict."""
     body = {k: v for k, v in body.items() if not (k in _LIMIT_KEYS and v is None)}
+    if not _RECORDING.get() and endpoint in _KEEPS_RESULTS:
+        body["remember"] = False
     url = f"{BASE_URL}{endpoint}"
     try:
         with httpx.Client(timeout=_timeout_for(endpoint)) as client:
@@ -183,9 +195,27 @@ def _get(endpoint: str) -> dict:
 _MAX_NEIGHBOURS = 12
 
 
+# False while a check re-runs studies (`unrecorded`).
+_RECORDING: contextvars.ContextVar = contextvars.ContextVar("recording", default=True)
+
+
+@contextlib.contextmanager
+def unrecorded():
+    """Tool calls inside leave no trace: their results are not added to
+    `_last_tool_results` (the answer's charts), and the backend keeps nothing
+    they compute (no option set, no "last dispatch"). For a check that re-runs
+    a study under another reading (robustness.py)."""
+    token = _RECORDING.set(False)
+    try:
+        yield
+    finally:
+        _RECORDING.reset(token)
+
+
 def _record(name: str, result: dict) -> dict:
-    """Append result to _last_tool_results and return it."""
-    _last_tool_results.append((name, result))
+    """Append result to _last_tool_results and return it (not inside `unrecorded`)."""
+    if _RECORDING.get():
+        _last_tool_results.append((name, result))
     return result
 
 
@@ -603,9 +633,12 @@ def flexibility_over_time(study: str = "", option: str | None = None, start: str
     least_disturbance or cheapest. study="security": the cost of N-1 security
     (`n1` preventive / corrective / both) at each moment of a window.
     """
-    endpoint = _OVER_TIME_ENDPOINTS.get(str(study or "").strip().lower())
+    # Normalised once: "Hold" reached the hold endpoint without its option.
+    requested = study
+    study = str(study or "").strip().lower()
+    endpoint = _OVER_TIME_ENDPOINTS.get(study)
     if endpoint is None:
-        return {"error": f"study must be one of {sorted(_OVER_TIME_ENDPOINTS)}; got {study!r}."}
+        return {"error": f"study must be one of {sorted(_OVER_TIME_ENDPOINTS)}; got {requested!r}."}
     unsupported = _unsupported_kwargs_result(
         "flexibility_over_time", kwargs,
         supported_extra={"data_source", "network", "load_power_factor", "load_scaling_factor", "hold_units",
@@ -750,7 +783,7 @@ def get_element_timeseries(
 
 def locate_network_element(element: str, network: str | None = None, **kwargs) -> dict:
     """
-    GET /api/network/topology, resolved locally to one element.
+    GET /api/network/resolve (which element), then /api/network/topology (what it is joined to).
 
     Answers "what is X, and what is it joined to" — and returns the index each
     neighbouring branch has, which is what the contingency and optimisation
@@ -766,39 +799,28 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
     small network and hundreds of thousands on a large one. Only the matched
     element and its immediate neighbours are returned.
     """
-    # On a proposal the topology includes the buses and lines its edits added.
-    path = "/api/network/topology" + (f"?network={network}" if network and network != "base" else "")
-    topology = _get(path)
-    if "error" in topology:
-        return topology
-
     wanted = str(element or "").strip()
     if not wanted:
         return {"error": "locate_network_element needs the name of a bus, line or transformer."}
+    # Which element: the backend's one lookup, the same every study uses — its
+    # label with or without the tag, the tag, its ends, a kind word, an index
+    # (observed live: "line Bus_8 -> Bus_9" found nothing here and worked elsewhere).
+    on = network if network and network != "base" else None
+    from urllib.parse import urlencode
+    found = _get("/api/network/resolve?" + urlencode({"name": wanted, **({"network": on} if on else {})}))
+    if "error" in found or not {"element_type", "index"} <= set(found):
+        return {"error": found.get("detail") or found.get("error") or f"The name lookup gave no element: {found}"}
 
+    # On a proposal the topology includes the buses and lines its edits added.
+    topology = _get("/api/network/topology" + (f"?network={on}" if on else ""))
+    if "error" in topology:
+        return topology
     buses = {int(b["index"]): b for b in topology.get("buses") or []}
     branches = topology.get("branches") or []
-    # "Bus 8" and "Bus_8" are one bus: names are compared with spaces and
-    # underscores folded together (the agent asked for "Bus 8" first, got
-    # nothing, and had to retry).
-    def fold(text) -> str:
-        return re.sub(r"[\s_]+", " ", str(text)).strip().casefold()
+    index = int(found["index"])
 
-    folded = fold(wanted)
-
-    matches = [b for b in buses.values() if fold(b.get("name", "")) == folded]
-    if len(matches) > 1:
-        # Bus names repeat on real networks; guessing which one is meant is
-        # exactly the error this tool exists to prevent.
-        return {
-            "error": f"{wanted!r} matches {len(matches)} buses; say which by index.",
-            "candidates": [{"index": b["index"], "name": b["name"], "vn_kv": b["vn_kv"]}
-                           for b in matches],
-        }
-
-    if matches:
-        bus = matches[0]
-        index = int(bus["index"])
+    if found["element_type"] == "bus":
+        bus = buses.get(index, {"name": found["name"], "index": index})
         neighbours = []
         for branch in branches:
             ends = (int(branch["from_bus"]), int(branch["to_bus"]))
@@ -820,6 +842,9 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
             "kind": "bus",
             "bus_index": index,
             "vn_kv": bus.get("vn_kv"),
+            # Observed live: a 1 kV placeholder read as the bus's real voltage, and a
+            # 20 kV substation at it refused as a mismatch.
+            **({"vn_kv_note": topology["voltage_note"]} if topology.get("voltage_note") else {}),
             "in_service": bus.get("in_service", True),
             "connected_to": neighbours[:_MAX_NEIGHBOURS],
             "n_connections": len(neighbours),
@@ -827,31 +852,19 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
             **({"network": topology["network"]} if "network" in topology else {}),
         })
 
-    branch_matches = [b for b in branches
-                      if folded in fold(b.get("name", ""))]
-    if len(branch_matches) == 1:
-        branch = branch_matches[0]
-        return _record("locate_network_element", {
-            "element": branch["name"],
-            "kind": branch["kind"],
-            "element_type": branch["kind"],
-            "element_index": int(branch["index"]),
-            "between": [buses.get(int(branch["from_bus"]), {}).get("name"),
-                        buses.get(int(branch["to_bus"]), {}).get("name")],
-            "in_service": branch.get("in_service", True),
-            **({"network": topology["network"]} if "network" in topology else {}),
-        })
-    if len(branch_matches) > 1:
-        return {
-            "error": f"{wanted!r} matches {len(branch_matches)} branches; name one exactly.",
-            "candidates": [{"element_index": b["index"], "name": b["name"],
-                            "element_type": b["kind"]} for b in branch_matches[:10]],
-        }
-
-    return {
-        "error": f"No bus, line or transformer is named {wanted!r}.",
-        "known_buses": sorted({str(b.get("name")) for b in buses.values()})[:20],
-    }
+    branch = next((b for b in branches if b["kind"] == found["element_type"] and int(b["index"]) == index), None)
+    if branch is None:
+        return {"error": f"{found['name']} is not in the topology of this network."}
+    return _record("locate_network_element", {
+        "element": branch["name"],
+        "kind": branch["kind"],
+        "element_type": branch["kind"],
+        "element_index": int(branch["index"]),
+        "between": [buses.get(int(branch["from_bus"]), {}).get("name"),
+                    buses.get(int(branch["to_bus"]), {}).get("name")],
+        "in_service": branch.get("in_service", True),
+        **({"network": topology["network"]} if "network" in topology else {}),
+    })
 
 
 def get_current_conditions(**kwargs) -> dict:
@@ -1115,8 +1128,8 @@ def scan_rsa_over_time(
 
     timestamps: list[str] = []
     violation_counts: list[int] = []
-    min_voltage: list[float] = []
-    max_voltage: list[float] = []
+    min_voltage: list[float | None] = []
+    max_voltage: list[float | None] = []
     max_line_loading: list[float] = []
     max_trafo_loading: list[float] = []
     thresholds_used = None
@@ -1152,10 +1165,11 @@ def scan_rsa_over_time(
         violation_counts.append(rsa.get("total_violations", 0))
         thresholds_used = thresholds_used or rsa.get("thresholds_used")
 
+        # No voltage back is unknown, not 1.0 p.u.
         voltages = [v.get("vm_pu") for v in rsa.get("all_voltages", [])]
         voltages = [v for v in voltages if isinstance(v, (int, float))]
-        min_voltage.append(min(voltages) if voltages else 1.0)
-        max_voltage.append(max(voltages) if voltages else 1.0)
+        min_voltage.append(min(voltages) if voltages else None)
+        max_voltage.append(max(voltages) if voltages else None)
 
         max_line_loading.append(_peak(rsa.get("all_line_loading", []), 0.0))
         max_trafo_loading.append(_peak(rsa.get("all_trafo_loading", []), 0.0))
@@ -1266,7 +1280,8 @@ def run_probabilistic_rsa(
     """
     POST /api/rsa/probabilistic
 
-    Run a Monte Carlo probabilistic security assessment at the current timestamp.
+    Run a Monte Carlo probabilistic security assessment at one moment: the
+    current timestamp, or `timestamp` (forwarded in kwargs) when given.
         Draws n_samples Latin Hypercube samples for generation and load uncertainty,
         runs a power flow for each, and returns:
     - per-bus/line/trafo violation probability
@@ -1299,7 +1314,7 @@ def run_probabilistic_rsa(
 
 def optimize_robust_flexibility(
     robust_method: str = "heuristic",
-    risk_target: float = 0.05,
+    risk_target: float | None = None,
     sgen_sigma: float = 0.0,
     load_sigma: float = 0.05,
     confidence: float | None = None,
@@ -1346,9 +1361,13 @@ def optimize_robust_flexibility(
     - p_any_violation_after_validation
     - robust_loop_iterations / robust_loop_stop_reason
     - confidence, sgen_sigma, n_samples, validation_samples used
+
+    `risk_target`, `confidence`, `alpha` and `target_p_any` are sent only when
+    given: the backend reads a sent `risk_target` as chosen and refuses a
+    `confidence` or `alpha` that disagrees with it, and with none of them it
+    applies its own default (0.05).
     """
     body: dict = {
-        "risk_target": risk_target,
         "sgen_sigma": sgen_sigma,
         "load_sigma": load_sigma,
         "robust_method": robust_method,
@@ -1358,7 +1377,6 @@ def optimize_robust_flexibility(
         "vm_lower_pu": vm_lower_pu,
         "slack_max_mw": slack_max_mw,
         "load_scaling_factor": load_scaling_factor,
-        "target_p_any": target_p_any,
         "max_iter": max_iter,
         "min_improvement": min_improvement,
         "beta": beta,
@@ -1368,6 +1386,8 @@ def optimize_robust_flexibility(
         "max_line_loading_pct": max_line_loading_pct,
         "max_trafo_loading_pct": max_trafo_loading_pct,
     }
+    if risk_target is not None:
+        body["risk_target"] = risk_target
     if confidence is not None:
         body["confidence"] = confidence
     if alpha is not None:
@@ -1488,7 +1508,9 @@ def compute_hosting_capacity(
     }
     if timestamp is not None:
         body["timestamp"] = timestamp
-    if p_max_search_mw is not None:
+    # 0 (or less) is no search bound at all: some models fill an optional
+    # number with 0, which the backend refuses — the backend's own choice it is.
+    if p_max_search_mw is not None and p_max_search_mw > 0:
         body["p_max_search_mw"] = p_max_search_mw
     body.update(kwargs)
     result = _post("/api/flexibility/hosting_capacity", body)
@@ -1515,10 +1537,10 @@ def compute_historical_risk(
     """
     POST /api/rsa/historical_risk
 
-    Empirical historical violation / near-miss statistics over a real SCADA
-    window. First implementation slice returns exceedance frequency/count,
-    worst episodes, and a duration curve over the signed limit-margin metric.
-    Conditional binning parameters are accepted but currently deferred.
+    Empirical historical violation / near-miss statistics over a window:
+    exceedance frequency/count, worst episodes, a duration curve (the signed
+    limit margin of one element, or the violation count system-wide) and,
+    with `condition`, statistics per bin.
     """
     resolved_window_start = _expand_day_prefix(window_start)
     resolved_window_end = _expand_day_prefix(window_end)
@@ -1644,6 +1666,201 @@ def compute_violation_attribution(
             body[key] = value
 
     return _record("compute_violation_attribution", _post("/api/rsa/attribution", body))
+
+
+def investigate(
+    element: str | None = None,
+    element_type: str | None = None,
+    reference_timestamp: str | None = None,
+    reference_data_source: str | None = None,
+    reference_network: str | None = None,
+    hypotheses: list | None = None,
+    classical: list | None = None,
+    recurring: bool | None = None,
+    check_references: bool | None = None,
+    reference_mode: str | None = None,
+    outage: str | None = None,
+    reference_outage: str | None = None,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
+    reference_start_timestamp: str | None = None,
+    reference_end_timestamp: str | None = None,
+    timestamp: str | None = None,
+    load_scaling_factor: float = 1.0,
+    vm_lower_pu: float | None = None,
+    vm_upper_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
+    **kwargs,
+) -> dict:
+    """Why one element's voltage or loading is what it is: its change since a
+    reference state, divided among the changes that caused it."""
+    unsupported = _unsupported_kwargs_result(
+        "investigate", kwargs, {"data_source", "network", "load_power_factor"})
+    if unsupported is not None:
+        return unsupported
+    body = {"load_scaling_factor": load_scaling_factor, **kwargs}
+    for key, value in (
+        ("element", element), ("element_type", element_type),
+        ("timestamp", _expand_day_prefix(timestamp)),
+        ("reference_timestamp", _expand_day_prefix(reference_timestamp)),
+        ("reference_data_source", reference_data_source), ("reference_network", reference_network),
+        ("reference_mode", reference_mode), ("outage", outage), ("reference_outage", reference_outage),
+        ("start_timestamp", start_timestamp), ("end_timestamp", end_timestamp),
+        ("reference_start_timestamp", reference_start_timestamp),
+        ("reference_end_timestamp", reference_end_timestamp),
+        ("vm_lower_pu", vm_lower_pu), ("vm_upper_pu", vm_upper_pu),
+        ("max_line_loading_pct", max_line_loading_pct), ("max_trafo_loading_pct", max_trafo_loading_pct),
+    ):
+        # "" is how a model that fills every field leaves one out.
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            body[key] = value
+    if hypotheses:
+        body["hypotheses"] = hypotheses
+    if classical:
+        body["classical"] = classical
+    if recurring:
+        body["recurring"] = True
+    if check_references is not None:
+        body["check_references"] = bool(check_references)
+    return _record("investigate", _post("/api/investigate", body))
+
+
+def test_prevention(
+    element: str | None = None,
+    element_type: str | None = None,
+    actions: list | None = None,
+    combine: bool = False,
+    warning_margin: float | None = None,
+    outage: str | None = None,
+    timestamp: str | None = None,
+    load_scaling_factor: float = 1.0,
+    vm_lower_pu: float | None = None,
+    vm_upper_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
+    **kwargs,
+) -> dict:
+    """Could an episode outside the limits have been avoided, and how early was it seen."""
+    unsupported = _unsupported_kwargs_result(
+        "test_prevention", kwargs, {"data_source", "network", "load_power_factor"})
+    if unsupported is not None:
+        return unsupported
+    body = {"load_scaling_factor": load_scaling_factor, "combine": bool(combine), **kwargs}
+    for key, value in (
+        ("element", element), ("element_type", element_type), ("outage", outage),
+        ("timestamp", _expand_day_prefix(timestamp)), ("warning_margin", warning_margin),
+        ("vm_lower_pu", vm_lower_pu), ("vm_upper_pu", vm_upper_pu),
+        ("max_line_loading_pct", max_line_loading_pct), ("max_trafo_loading_pct", max_trafo_loading_pct),
+    ):
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            body[key] = value
+    # A model that fills every field sends zeros for the changes it leaves out.
+    cleaned = []
+    for a in actions or []:
+        if isinstance(a, dict) and str(a.get("unit") or "").strip():
+            cleaned.append({k: v for k, v in a.items() if k == "unit" or v not in (None, "", 0, 0.0)})
+    if cleaned:
+        body["actions"] = cleaned
+    return _record("test_prevention", _post("/api/investigate/prevention", body))
+
+
+def look_ahead(
+    start_timestamp: str | None = None,
+    hours: float = 24.0,
+    elements: list | None = None,
+    uncertainty_pct: float = 5.0,
+    max_episodes: int | None = None,
+    data_source: str = "forecasts",
+    load_scaling_factor: float = 1.0,
+    vm_lower_pu: float | None = None,
+    vm_upper_pu: float | None = None,
+    max_line_loading_pct: float | None = None,
+    max_trafo_loading_pct: float | None = None,
+    **kwargs,
+) -> dict:
+    """What the forecast says is coming, its cause, when to decide, and what would prevent it."""
+    unsupported = _unsupported_kwargs_result("look_ahead", kwargs, {"network", "load_power_factor"})
+    if unsupported is not None:
+        return unsupported
+    body = {"data_source": (data_source or "").strip() or "forecasts", "hours": hours or 24.0,
+            "uncertainty_pct": 5.0 if uncertainty_pct in (None, "") else uncertainty_pct,
+            "load_scaling_factor": load_scaling_factor, **kwargs}
+    for key, value in (
+        ("start_timestamp", _expand_day_prefix(start_timestamp)), ("max_episodes", max_episodes or None),
+        ("vm_lower_pu", vm_lower_pu), ("vm_upper_pu", vm_upper_pu),
+        ("max_line_loading_pct", max_line_loading_pct), ("max_trafo_loading_pct", max_trafo_loading_pct),
+    ):
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            body[key] = value
+    named = [str(e).strip() for e in elements or [] if str(e).strip()]
+    if named:
+        body["elements"] = named
+    return _record("look_ahead", _post("/api/investigate/look_ahead", body))
+
+
+
+
+def _tools_called() -> set[str]:
+    """Tools that returned a result (not an error) so far in this question."""
+    return {name for name, result in _last_tool_results
+            if isinstance(result, dict) and not result.get("error") and name != "record_investigation"}
+
+
+def _save_tool_requests(symptom: str, rows: list[dict]) -> None:
+    """Append the tools an investigation needed and did not have, for the
+    developers (`python -m evaluation.tool_requests`). Best effort: a full disk
+    must not cost the operator the answer."""
+    import datetime
+    from .usage import cache_dir
+
+    wanted = [r for r in rows if r["verdict"] == "untested" and r.get("missing_tool")]
+    if not wanted or not _RECORDING.get():
+        return
+    try:
+        path = cache_dir() / TOOL_REQUESTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as fh:
+            for r in wanted:
+                fh.write(json.dumps({"time": stamp, "symptom": symptom, "hypothesis": r["hypothesis"],
+                                     "missing_tool": r["missing_tool"],
+                                     "missing_kind": r.get("missing_kind")}) + "\n")
+    except OSError:
+        pass
+
+
+def record_investigation(symptom: str = "", hypotheses: list | None = None, **kwargs) -> dict:
+    """The agent's record of an investigation: each hypothesis it considered,
+    its verdict, and the tools whose results in this question decide it.
+
+    The verdicts are the agent's, but they cannot float free of the studies
+    (`investigation_record.validate`): a supported or refuted hypothesis must
+    cite tools that returned a result in this question and agree with the
+    investigation's own verdict for that factor; an untested one must describe
+    a tool CONDUCTOR lacks. Anything else is refused with the reasons, for the
+    agent to correct. The tools named as missing are kept for the developers.
+    """
+    unsupported = _unsupported_kwargs_result("record_investigation", kwargs, set())
+    if unsupported is not None:
+        return unsupported
+    from . import investigation_record as ir
+
+    rows, problems = ir.validate(hypotheses, _tools_called(), ir.study_factors(_last_tool_results))
+    if problems:
+        return _record("record_investigation", {
+            "error": "The investigation record was not accepted: " + " ".join(problems), "problems": problems})
+    _save_tool_requests(symptom, rows)
+    counts = {v: sum(r["verdict"] == v for r in rows) for v in ir.VERDICTS}
+    return _record("record_investigation", {
+        "status": "recorded", "symptom": symptom, "hypotheses": rows, "counts": counts,
+        "tool_suggestions": [r["missing_tool"] for r in rows
+                             if r["verdict"] == "untested" and r.get("missing_kind") == ir.ANALYSIS],
+        "data_suggestions": [r["missing_tool"] for r in rows
+                             if r["verdict"] == "untested" and r.get("missing_kind") == ir.DATA],
+        "note": ("In the answer: the supported hypotheses as findings, the refuted ones as ruled out, and the "
+                 "untested ones as not tested — with the tool that would be needed — never as findings."),
+    })
 
 
 # ---------------------------------------------------------------------------

@@ -512,6 +512,10 @@ def last_resort(model, prices: Prices, pext0: dict, qext0: dict, restart: Callab
     _replace_objective(m, _disturbance(m))
     if solve(m):
         found.append((capture(m, "last_resort_least"), None))
+    else:
+        missing.append({"id": "last_resort_least", "label": STRATEGIES["last_resort_least"][0],
+                        "reason": "the least reduction was found, but the smallest change to the schedule at "
+                                  "that reduction did not solve"})
     m2 = model.clone()
     if restart:
         restart(m2)
@@ -525,6 +529,9 @@ def last_resort(model, prices: Prices, pext0: dict, qext0: dict, restart: Callab
         elif found:
             missing.append({"id": "last_resort_cheapest", "label": STRATEGIES["last_resort_cheapest"][0],
                             "reason": "the same dispatch as Least load reduction", "same_as": "last_resort_least"})
+    else:
+        missing.append({"id": "last_resort_cheapest", "label": STRATEGIES["last_resort_cheapest"][0],
+                        "reason": "no feasible dispatch with the load reductions at their prices"})
     return [(o, action_cost(o, prices, pext0, qext0)) for o, _ in found], missing
 
 
@@ -533,10 +540,15 @@ def last_resort(model, prices: Prices, pext0: dict, qext0: dict, restart: Callab
 # ---------------------------------------------------------------------------
 
 def _same(a: Option, b: Option) -> bool:
+    """One dispatch: every unit within DUPLICATE_MW, the same load reductions
+    and the same units instructed. Active power alone made an option that
+    calls fewer units (no voltage or reactive instruction) a duplicate of one
+    that calls more."""
     units = set(a.p) | set(b.p)
     loads = [(a.dr or {}, b.dr or {}), (a.relief or {}, b.relief or {})]
     return (all(abs(a.p.get(g, 0.0) - b.p.get(g, 0.0)) < DUPLICATE_MW for g in units)
-            and all(abs(x.get(k, 0.0) - y.get(k, 0.0)) < DUPLICATE_MW for x, y in loads for k in set(x) | set(y)))
+            and all(abs(x.get(k, 0.0) - y.get(k, 0.0)) < DUPLICATE_MW for x, y in loads for k in set(x) | set(y))
+            and set(a.instructions) == set(b.instructions))
 
 
 def _key(option: Option, cost: dict) -> tuple:
@@ -563,11 +575,11 @@ def _best_at_something(option: Option, cost: dict, pool: list) -> bool:
 
 def select(options: list[tuple[Option, dict]]) -> tuple[list[tuple[Option, dict]], list[dict]]:
     """Drop near-duplicates and options no better than another on any count
-    (units called, MW moved, cost, import, highest loading); least_disturbance
-    always stays. Beyond MAX_OPTIONS, the option closest to another one shown
-    goes — never an anchor, and one that is best of all on some count (the
-    fewest units called, MW moved, cost, import or highest loading) last. Returns (kept, dropped with the reason)
-    — nothing is dropped without one."""
+    (units called, MW moved, cost, import, highest loading, load reduced:
+    `_key`); least_disturbance always stays. Beyond MAX_OPTIONS, the option
+    closest to another one shown goes — never an anchor, and one that is best
+    of all on some count last. Returns (kept, dropped with the reason) —
+    nothing is dropped without one."""
     kept, dropped = [], []
     for option, cost in options:
         twin = next((k for k, _ in kept if _same(k, option)), None)
@@ -623,7 +635,12 @@ def _bounded(model, prices: Prices, pext0: dict, qext0: dict, budget: float):
 
 
 def _free_units(m) -> list:
-    return [g for g in m.G if not m.Pg_new[g].fixed]
+    """Units whose active power can move: neither fixed nor held by equal
+    bounds (a condenser's [0, 0], a non-dispatchable unit's [P0, P0]) —
+    those used to get two range solves each and a trivial range row."""
+    def held(var):
+        return var.lb is not None and var.ub is not None and float(var.ub) - float(var.lb) < MOVE_MW
+    return [g for g in m.G if not m.Pg_new[g].fixed and not held(m.Pg_new[g])]
 
 
 def generate_near_optimal(model, prices: Prices, pext0: dict, qext0: dict, pct: float = NEAR_OPTIMAL_PCT,
@@ -636,8 +653,12 @@ def generate_near_optimal(model, prices: Prices, pext0: dict, qext0: dict, pct: 
     first = capture(model, "least_disturbance")
     best = cheapest(model, first, prices, pext0, qext0)
     if best is None:
-        return [], [{"id": "near_optimal", "label": "Near-optimal alternatives",
-                     "reason": "the cheapest option has no feasible dispatch to start from"}], None, None, []
+        # No cheapest, no budget: the dispatch that was found, alone, rather
+        # than nothing (the result used to crash formatting a None budget).
+        return [(first, action_cost(first, prices, pext0, qext0))], [
+            {"id": "near_optimal", "label": "Near-optimal alternatives",
+             "reason": "the cheapest option has no feasible dispatch, so there is no cost to measure the "
+                       "margin from"}], None, None, []
     best_cost = action_cost(best, prices, pext0, qext0)
     budget = near_optimal_budget(best_cost["total"], pct)
     pool: list[tuple[Option, str]] = []          # (dispatch, how it was found)
@@ -714,13 +735,17 @@ def generate_near_optimal(model, prices: Prices, pext0: dict, qext0: dict, pct: 
         option = option._replace(id=f"near_optimal_{k}", label=f"Near-optimal {k}", how=why)
         found.append((option, action_cost(option, prices, pext0, qext0)))
     missing = []
-    if len(found) == 1:
+    if len(found) - 1 < count:
+        # Why fewer than asked: every candidate too close to one shown, or the
+        # methods found no more candidates at all.
+        too_close = bool(candidates)
+        ran_out = (f"the {'method' if len(methods) == 1 else 'methods'} run ({', '.join(methods)}) found no "
+                   "further dispatch within the margin" + ("" if len(methods) == len(NEAR_OPTIMAL_METHODS)
+                                                          else "; the others might"))
+        why = (f"no further dispatch within the margin differs by {DIVERSE_MW:g} MW or more from those shown"
+               if too_close else ran_out)
         missing.append({"id": "near_optimal", "label": "Near-optimal alternatives",
-                        "reason": "no other dispatch within the margin changes the units differently"})
-    elif len(found) - 1 < count:
-        missing.append({"id": "near_optimal", "label": "Near-optimal alternatives",
-                        "reason": f"{len(found) - 1} found: no further dispatch within the margin differs by "
-                                  f"{DIVERSE_MW:g} MW or more from those shown"})
+                        "reason": (why if len(found) == 1 else f"{len(found) - 1} found: {why}")})
     return found, missing, best_cost["total"], round(budget, 2), ranges
 
 
@@ -746,8 +771,18 @@ def generate(model, prices: Prices, pext0: dict, qext0: dict
         if option is None:
             reason = ("no feasible dispatch" if sid != "least_import" or sum(first.pext.values()) > MOVE_MW
                       else "the grid is not importing")
-            if sid == "fewest_units" and len(first.instructions) <= 1:
+            if sid == "fewest_units" and not first.instructions:
+                reason = "the least-disturbance option instructs no unit"
+            elif sid == "fewest_units" and len(first.instructions) <= 1:
                 reason = "the least-disturbance option already calls one unit"
+            elif sid == "fewest_units":
+                reason = (f"no dispatch with fewer units: none instructing only the {MAX_FEWEST_K} it leans on "
+                          f"most, or fewer, clears the violations" if len(first.instructions) > MAX_FEWEST_K
+                          else "no dispatch with fewer units clears the violations")
+            elif sid == "without_main_unit" and not first.moved:
+                reason = "the least-disturbance option moves no unit's active power, so there is no main unit"
+            elif sid == "demand_response" and not any((model.Pdr[load].ub or 0.0) > MOVE_MW for load in model.LFlex):
+                reason = "no load has demand-response capacity (cost table)"
             # Named: "Without the main unit" was read as the unit the operator
             # had ruled out (seen live), when it was another one.
             main = max(first.moved, key=lambda g: abs(first.moved[g])) if first.moved else None

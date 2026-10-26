@@ -9,6 +9,10 @@ edit_uri: edit/main/docs/
 docs_dir: docs
 exclude_docs: |
   requirements.txt
+# A link to a heading that does not exist fails the strict build, like a missing page.
+validation:
+  links:
+    anchors: warn
 
 theme:
   name: material
@@ -47,6 +51,21 @@ nav:
       - The advisor: guide/advisor.md
       - Sessions and scenarios: guide/sessions-and-scenarios.md
       - Troubleshooting: guide/troubleshooting.md
+  - How it works:
+      - methods/index.md
+      - Network, data and the operating point: methods/network-and-data.md
+      - Power flow and security assessment: methods/power-flow-and-security.md
+      - Contingency analysis (N-1): methods/contingency-analysis.md
+      - Investigating a cause: methods/investigation.md
+      - The optimal power flow: methods/optimal-power-flow.md
+      - Corrective options: methods/corrective-options.md
+      - Near-optimal alternatives: methods/near-optimal-alternatives.md
+      - N-1 security: methods/n1-security.md
+      - Studies over time: methods/over-time.md
+      - Key performance indicators: methods/key-performance-indicators.md
+      - Risk, uncertainty and capacity: methods/risk-and-capacity.md
+      - The agent and its checks: methods/the-agent.md
+      - Assumptions and limits: methods/assumptions-and-limits.md
   - Research:
       - Using CONDUCTOR in research: research/using-conductor-in-research.md
   - Reference:
@@ -61,4 +80,18 @@ markdown_extensions:
   - toc:
       permalink: true
   - pymdownx.highlight
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        # Diagrams in the "How it works" pages (Material renders them).
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  # Formulas: $ … $ inline, $$ … $$ displayed (as GitHub and editors render them), typeset by MathJax.
+  - pymdownx.arithmatex:
+      generic: true
+  - footnotes
+  - def_list
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js

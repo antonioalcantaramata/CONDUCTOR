@@ -2,7 +2,8 @@
 config.py — Central configuration for the AIDT LLM agent.
 
 All values are overridable via environment variables.
-GEMINI_API_KEY is required and raises EnvironmentError at import time if missing.
+A missing GEMINI_API_KEY (or any provider's key) does not raise at import: the
+app's setup flow asks for it.
 """
 
 import logging
@@ -183,8 +184,9 @@ OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gemma4:12b-mlx")
 
 # Ollama defaults num_ctx to ~4096 REGARDLESS of what the model supports, and
 # silently truncates the *front* of an over-long prompt — which drops the system
-# prompt first, with no error. This agent's system prompt plus 29 tool schemas
-# measures ~28k tokens before any conversation, so a generous window is required.
+# prompt first, with no error. This agent's system prompt plus its tool schemas
+# (29 of them when measured) came to ~28k tokens before any conversation, so a
+# generous window is required.
 #
 # 65536: at 32768 the fixed prefix (~28k) plus the 4096 reply reserve left under
 # a thousand tokens of conversation — one options result is ~6k — so a session
@@ -232,6 +234,9 @@ HTTP_TIMEOUT: float = float(os.environ.get("DT_HTTP_TIMEOUT", "120.0"))
 # the model once more to answer from what it has (loop.py), so the operator gets
 # an answer rather than only a warning.
 MAX_AGENT_TURNS: int = int(os.environ.get("DT_MAX_AGENT_TURNS", "16"))
+# More steps for a question asked with Deep Research: hypotheses, references,
+# prevention and recurrence are several studies before the answer.
+DEEP_EXTRA_TURNS: int = int(os.environ.get("DT_DEEP_EXTRA_TURNS", "12"))
 
 # Timeout for the per-turn grid-constants fetch. Previously 3s — far tighter
 # than everything else here — which meant a briefly busy backend silently
@@ -258,6 +263,9 @@ MODEL_OVERLOADED_RETRY_DELAY_S: int = int(
 # and lets it decide. See `reflection.py` for why informing and correcting are
 # deliberately different things.
 REFLECTION_MODE: str = os.environ.get("CONDUCTOR_REFLECTION", "off").strip().lower()
+# The reading check (robustness.py): after an answer, its decisive studies are
+# re-run under the readings the question left open. On unless set to "off".
+READING_CHECK: bool = os.environ.get("CONDUCTOR_READING_CHECK", "on").strip().lower() not in ("off", "0", "false")
 
 # ---------------------------------------------------------------------------
 # Session logging
@@ -291,6 +299,7 @@ DEFAULT_GRID_CONSTANTS: dict = {
     "n_trafos": 3,
     "n_substations": 14,
     "substation_names": [f"Bus_{i}" for i in range(1, 15)],
+    "unit_names": ["Gen_bus1", "Gen_bus2", "Gen_bus5", "Gen_bus7"],
     "vm_lower": 0.94,
     "vm_upper": 1.06,
     "max_loading_pct": 100.0,

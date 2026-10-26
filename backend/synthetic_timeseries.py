@@ -21,8 +21,9 @@ generation_profile : "wind" | "solar" | "flat"
 
 Stress events
 -------------
-If stress_events=True, one 2-hour high-load / low-generation window is injected
-per day, ensuring the OPF agent finds at least one constraint violation window.
+If stress_events=True, a mild 2-hour high-load / low-generation window (load
+×1.15, generation ×0.97) is injected on about one day in three. It makes a
+stressed hour likely; it does not guarantee a violation.
 """
 
 from __future__ import annotations
@@ -160,8 +161,9 @@ def generate(
     seed : int
         RNG seed for reproducibility.
     stress_events : bool
-        If True, inject one 2-hour high-load / low-generation stress window per
-        day so that constraint violations are guaranteed in the series.
+        If True, inject a mild 2-hour high-load / low-generation window on
+        about one day in three (load ×1.15, generation ×0.97). Violations are
+        likely in it, not guaranteed.
     start_dt : datetime
         First timestamp of the series. Defaults to 2000-01-01. Used to place a
         forecast series on a time range immediately after the measurement series.

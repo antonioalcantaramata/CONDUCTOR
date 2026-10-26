@@ -671,7 +671,7 @@ class TestNewSite:
         ({"std_type": "NA2XS2Y 1x240 RM/25 12/20 kV"}, "exactly one of"),
         ({"line_like": None, "std_type": "nope"}, "not a known line type"),
         ({"vn_kv": 999}, "one voltage"),
-        ({"length_km": 0}, "above 0"),
+        ({"length_km": 0}, "length_km is required"),       # 0 is no length: a blank in a filled-in form
         ({"length_km": 500}, "at most"),
     ])
     def test_invalid_sites_are_refused(self, net, change, fragment):
@@ -858,7 +858,7 @@ class TestNewTransformer:
         ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "parallel": 5}, "at most 4"),
         ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "parallel": 1.5}, "whole number"),
         ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "line_like": "Feeder"},
-         "length_km is required"),
+         "a line to the substation needs length_km"),
         ({"connect_to": "MV2", "trafo_std_type": "0.63 MVA 20/0.4 kV", "length_km": 3}, "exactly one of"),
         ({"connect_to": "MV2", "vn_kv": 0.4, "sn_mva": 1, "vk_percent": 6, "vkr_percent": 1,
           "vn_lv_kv": 0.6}, "vn_lv_kv must be at most"),
@@ -1275,3 +1275,60 @@ def test_the_opf_comparison(client):
         out["proposal"]["grid_import_after_mw"] - out["base"]["grid_import_after_mw"], abs=1e-3)
     assert isinstance(out["units"], list)
     assert mb.app_data["last_dispatch_result"] == ["kept"]      # the comparison left it alone
+
+
+class TestAFilledInForm:
+    """A model that fills every field of the edit form sends 0 or "" for those
+    it means to leave out (observed live: vn_kv 0, min_vm_pu 0 and length_km 0
+    refused edits that needed none of them)."""
+
+    def test_blank_and_impossible_zero_fields_are_not_given(self, net):
+        form = {"p_mw": 0, "vn_kv": 0, "min_vm_pu": 0, "max_vm_pu": 0, "trafo_std_type": "", "line_std_type": "",
+                "dispatchable": False}
+        prop, edits = sb.materialise(net, [{**SITE, **form}])
+        assert prop.bus.at[int(prop.bus.index[-1]), "vn_kv"] == net.bus.vn_kv[9]
+        sub = {**SUBSTATION[0], "length_km": 0, "line_like": "Bus_9", "min_vm_pu": 0,
+               "tap_step_percent": 0, "tap_min": 0, "tap_max": 0, "tap_side": "hv", "tap_pos": 0}
+        prop, edits = sb.materialise(net, [sub])
+        assert "length_km" not in edits[0]                        # no line: the transformer at Bus 9 itself
+        assert not any(k in edits[0] for k in ("tap_step_percent", "tap_min", "tap_max", "tap_side"))  # none
+        # A tap changer asked for in full is kept.
+        tapped = {**SUBSTATION[0], "tap_side": "hv", "tap_step_percent": 1.5, "tap_min": -8, "tap_max": 8}
+        assert sb.materialise(net, [tapped])[1][0]["tap_step_percent"] == 1.5
+
+    def test_a_zero_that_is_a_value_is_kept(self, net):
+        with pytest.raises(sb.EditError, match="above"):
+            sb.materialise(net, [{"op": "add_shunt", "name": "C", "bus": "Bus_9", "kind": "capacitor", "q_mvar": 0}])
+
+
+def test_placeholder_voltages_are_said_to_be_placeholders(net):
+    pu = copy.deepcopy(net)
+    pu.bus["vn_kv"] = 1.0                                    # a converted per-unit case (PGLib)
+    assert sb.placeholder_voltages(pu) and not sb.placeholder_voltages(net)
+    prop, edits = sb.materialise(pu, [SUBSTATION[0]])
+    assert sb.PLACEHOLDER_KV_NOTE in sb.notes(prop, edits)
+    # The real network's rating (20 kV the low side) is not used against a 1 kV placeholder.
+    prop, edits = sb.materialise(pu, [{**SUBSTATION[0], "vn_lv_kv": 20}])
+    assert "vn_lv_kv" not in edits[0]
+
+
+def test_a_name_with_a_slip_of_another_script_is_still_found(net):
+    # Observed live: 'Bus_4На' (two Cyrillic letters stuck to the name).
+    assert sb.resolve_bus(net, "Bus_4На") == 4
+    for name in ("Bus_4", "Bus_42", "На", "Østerbro"):
+        assert sb._foreign_tail(name) is None
+    with pytest.raises(sb.EditError):
+        sb.resolve_bus(net, "Bus_99На")
+
+
+def test_a_new_dispatchable_unit_runs_at_its_rating_and_says_so(net):
+    # Observed live: "add a 30 MW generator — is the grid secure?" was studied with it at 0 MW.
+    import main_backend as mb
+    unit = {"op": "add_generator", "name": "G new", "bus": "Bus_4", "p_max_mw": 30, "kind": "dispatchable",
+            "control": "power_factor"}
+    for raw in (unit, {**unit, "p_mw": 0}):                       # left out, or left blank in a filled-in form
+        prop, edits = sb.materialise(net, [raw])
+        assert edits[0]["p_mw"] == 30
+        assumed = mb._assumed_defaults(prop, [raw], edits)
+        assert assumed and assumed[0]["defaults"]["p_mw"] == 30
+    assert sb.materialise(net, [{**unit, "p_mw": 12}])[1][0]["p_mw"] == 12

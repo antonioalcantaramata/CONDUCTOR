@@ -23,7 +23,8 @@ def contingency_assessment_single(
     Parameters
     ----------
     net : pandapowerNet
-        The original pandapower network object.
+        The network with the element already switched out by the caller (it
+        is solved in place).
     element : str
         Type of element to be taken out of service: "line" or "trafo".
     element_index : int
@@ -43,8 +44,12 @@ def contingency_assessment_single(
     -------
     df_results : pd.DataFrame
         DataFrame listing all violations (voltage or loading).
-    net_copy : pandapowerNet
-        The modified network with the specified element switched out.
+    net : pandapowerNet
+        The same network, solved (its `converged` flag says whether the power
+        flow converged).
+
+    Element indices in the rows are the pandapower index labels, which need
+    not run 0..n-1.
     """
 
     print("\n================ Contingency Assessment (Single Outage) =============================")
@@ -75,38 +80,38 @@ def contingency_assessment_single(
     results = []
 
     # Voltage violations
-    for bus_idx, vm in enumerate(net.res_bus.vm_pu):
+    for bus_idx, vm in net.res_bus.vm_pu.items():
         if vm > vm_upper or vm < vm_lower:
             results.append({
                 "timestamp": timestamp,
                 "outage_type": element,
                 "outage_element_index": element_index,  # store the element taken out
                 "violation_type": "bus_vm_pu",
-                "violation_element_index": bus_idx,
+                "violation_element_index": int(bus_idx),
                 "value": round(vm, 3)
             })
 
     # Line overloads
-    for line_idx, loading in enumerate(net.res_line.loading_percent):
+    for line_idx, loading in net.res_line.loading_percent.items():
         if loading > max_line_loading:
             results.append({
                 "timestamp": timestamp,
                 "outage_type": element,
                 "outage_element_index": element_index,
                 "violation_type": "line_loading",
-                "violation_element_index": line_idx,
+                "violation_element_index": int(line_idx),
                 "value": round(loading, 2)
             })
 
     # Transformer overloads
-    for trafo_idx, loading in enumerate(net.res_trafo.loading_percent):
+    for trafo_idx, loading in net.res_trafo.loading_percent.items():
         if loading > max_trafo_loading:
             results.append({
                 "timestamp": timestamp,
                 "outage_type": element,
                 "outage_element_index": element_index,
                 "violation_type": "trafo_loading",
-                "violation_element_index": trafo_idx,
+                "violation_element_index": int(trafo_idx),
                 "value": round(loading, 2)
             })
 

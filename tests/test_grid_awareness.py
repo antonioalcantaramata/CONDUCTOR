@@ -114,3 +114,20 @@ class TestSystemPromptCarriesTheNames:
             **config.DEFAULT_GRID_CONSTANTS, "slack_name": "Cable Connection",
         })
         assert "Cable Connection" in prompt
+
+    def test_missing_limits_fall_back_to_the_fallback_grid_s(self):
+        """0.9–1.1 p.u. used to be stated, while the fallback grid has 0.94–1.06."""
+        from llm_agent.agent.system_prompt import build_system_prompt
+
+        constants = {k: v for k, v in config.DEFAULT_GRID_CONSTANTS.items() if k not in ("vm_lower", "vm_upper")}
+        prompt = build_system_prompt(constants)
+        low, high = config.DEFAULT_GRID_CONSTANTS["vm_lower"], config.DEFAULT_GRID_CONSTANTS["vm_upper"]
+        assert f"**{low}–{high} p.u.**" in prompt and "0.9–1.1 p.u." not in prompt
+
+    def test_the_probabilistic_assessment_takes_a_timestamp(self):
+        """The backend resolves `timestamp` for it like any point study."""
+        from llm_agent.agent.system_prompt import build_system_prompt
+
+        prompt = build_system_prompt(config.DEFAULT_GRID_CONSTANTS)
+        assert "current timestamp only" not in prompt
+        assert "the current timestamp, or `timestamp` when given" in prompt

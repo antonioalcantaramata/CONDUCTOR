@@ -81,7 +81,10 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
         branch-current limits. If that solves, line loading is the binding
         limit — losing the main import line pushes the import onto what is
         left, which no voltage can fix — and the branches that would be
-        overloaded are named (`branch_label(i, j)` gives their names).
+        overloaded are named (`branch_label(i, j)` gives their names);
+      - neither: a last re-solve lifts the external-grid exchange limits. If
+        that solves, the moment needs more import (or export) than the
+        connection allows, and the exchange it needs is reported.
 
     Reported, never applied: the caller's result stays infeasible. The model
     is restored afterwards. Returns None when the model has no single fixed
@@ -134,6 +137,7 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
 
     overloads = []
     thermal_solvable = combined_solvable = False
+    exchange = []
     if not solvable:
         try:
             overloads, thermal_solvable = _thermal_check(model, branch_label)
@@ -143,6 +147,13 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
                 overloads, combined_solvable = _thermal_check(model, branch_label, slack=var)
         except Exception:  # noqa: BLE001
             overloads, thermal_solvable, combined_solvable = [], False, False
+    if not (solvable or thermal_solvable or combined_solvable):
+        # Neither lever is the connection's own limit: the import (or export)
+        # the moment needs may be more than it allows.
+        try:
+            exchange = _exchange_check(model)
+        except Exception:  # noqa: BLE001
+            exchange = []
 
     band_text = f"{band[0]:.2f}–{band[1]:.2f} p.u" if None not in band else "its bounds"
     if solvable:
@@ -174,6 +185,13 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
             f"give a dispatch, with {listed} overloaded."
             + _best_sentence(overloads[0])
         )
+    elif exchange:
+        explanation = (
+            "local flexibility cannot clear the violations within the external-grid exchange "
+            "limits: a dispatch exists only if "
+            + "; ".join(_exchange_sentence(x) for x in exchange)
+            + ". Raising that limit is the transmission operator's decision, not local flexibility."
+        )
     else:
         explanation = (
             f"local flexibility cannot clear the violations: neither raising the grid-connection "
@@ -189,8 +207,10 @@ def diagnose_infeasible(model, branch_label=None) -> dict | None:
         "binding_limit": ("voltage_support" if solvable
                           else "branch_loading" if thermal_solvable and overloads
                           else "voltage_support_and_branch_loading" if combined_solvable and overloads
+                          else "exchange_limit" if exchange
                           else "beyond_voltage_and_branch_levers"),
         "branch_overloads": overloads,
+        **({"exchange_needed": exchange} if exchange else {}),
         "explanation": explanation,
     }
 
@@ -315,9 +335,123 @@ def _thermal_check(model, branch_label=None, slack=None) -> tuple[list[dict], bo
             slack.fix(fixed_at)
 
 
+def _exchange_check(model) -> list[dict]:
+    """Re-solve with the external-grid exchange limits lifted.
+
+    Returns, for each connection whose exchange at that solution is outside
+    the limits the model had, what it needs (MW, Mvar) and those limits; an
+    empty list when the re-solve fails too, or lands within the limits. A
+    pinned exchange stays pinned. Bounds are restored afterwards.
+    """
+    from pyomo.environ import SolverFactory
+
+    if not hasattr(model, "Pext"):
+        return []
+    saved = {}                                          # (connection, "P" | "Q") -> bounds
+    for e in model.Ext:
+        for kind, var in (("P", model.Pext[e]), ("Q", model.Qext[e])):
+            if not var.fixed:
+                saved[e, kind] = (var.lb, var.ub)
+                var.setlb(-1e4)
+                var.setub(1e4)
+    if not saved:
+        return []
+    _restart(model)
+    try:
+        res = SolverFactory("ipopt").solve(model, tee=False, load_solutions=False)
+        if res.solver.termination_condition != TerminationCondition.optimal:
+            return []
+        model.solutions.load_from(res)
+        needed = []
+        for e in model.Ext:
+            p, q = float(value(model.Pext[e])), float(value(model.Qext[e]))
+            p_lim = saved.get((e, "P"), (None, None))
+            q_lim = saved.get((e, "Q"), (None, None))
+            outside = [lim for v, (lo, hi), lim in ((p, p_lim, "active"), (q, q_lim, "reactive"))
+                       if (lo is not None and v < lo - 1e-3) or (hi is not None and v > hi + 1e-3)]
+            if outside:
+                needed.append({"name": str(e), "p_mw": round(p, 2), "q_mvar": round(q, 2),
+                               "p_limits_mw": [round(float(x), 2) if x is not None else None for x in p_lim],
+                               "q_limits_mvar": [round(float(x), 2) if x is not None else None for x in q_lim],
+                               "outside": outside})
+        return needed
+    finally:
+        for (e, kind), (lo, hi) in saved.items():
+            var = model.Pext[e] if kind == "P" else model.Qext[e]
+            var.setlb(lo)
+            var.setub(hi)
+
+
+def _exchange_sentence(x: dict) -> str:
+    """One `_exchange_check` entry in words: "Grid_1 imports 82.4 MW (allowed −70 to 70 MW)"."""
+    def span(lims, unit):
+        lo, hi = ("−∞" if lims[0] is None else f"{lims[0]:.0f}"), ("∞" if lims[1] is None else f"{lims[1]:.0f}")
+        return f"allowed {lo} to {hi} {unit}"
+
+    parts = []
+    if "active" in x["outside"]:
+        parts.append(f"{'imports' if x['p_mw'] >= 0 else 'exports'} {abs(x['p_mw']):.1f} MW "
+                     f"({span(x['p_limits_mw'], 'MW')})")
+    if "reactive" in x["outside"]:
+        parts.append(f"supplies {x['q_mvar']:.1f} Mvar ({span(x['q_limits_mvar'], 'Mvar')})")
+    return f"{x['name']} " + " and ".join(parts)
+
+
 def _in_service(row) -> bool:
     v = row.get("in_service", True)
     return True if v is None or v != v else bool(v)
+
+
+class PinnedOutsideBounds(ValueError):
+    """A set-point the request pins outside the range the model gives that
+    unit or connection: the request contradicts itself (a unit held at a
+    schedule above the maximum it was also given, for example)."""
+
+
+def _checked_pins(model, fixed: dict | None) -> dict | None:
+    """The pinned set-points, each within its variable's bounds.
+
+    Within 1 kW of a bound (the schedule rounded to 4 decimals) the value is
+    put on the bound; farther out, `PinnedOutsideBounds` names every one.
+    """
+    if not fixed:
+        return fixed
+    checked, outside = {}, []
+    for name, mw in fixed.items():
+        var = model.Pg_new[name] if name in model.G else model.Pext[name] if name in model.Ext else None
+        if var is None:
+            checked[name] = mw
+            continue
+        lo, hi, v = var.lb, var.ub, float(mw)
+        if (lo is not None and v < lo - 1e-3) or (hi is not None and v > hi + 1e-3):
+            outside.append(f"{name} at {v:.2f} MW (its range: "
+                           f"{'−∞' if lo is None else f'{lo:.2f}'} to {'∞' if hi is None else f'{hi:.2f}'} MW)")
+        checked[name] = min(max(v, lo if lo is not None else v), hi if hi is not None else v)
+    if outside:
+        raise PinnedOutsideBounds(
+            "These set-points are outside the range the optimisation gives them: " + "; ".join(outside)
+            + ". Release the unit, or give it a range that includes the set-point.")
+    return checked
+
+
+def _exchange_bounds(net, names: list) -> tuple[dict, dict]:
+    """Active-power bounds of each external grid, as a symmetric capacity.
+
+    The case's limits (a MATPOWER slack generator's Pmin/Pmax) describe the
+    generator that stood for the grid, not the connection: a Pmin of 50 MW
+    (the 30-bus case) is not a minimum import, and the power flows never
+    enforce it. The larger of their magnitudes is taken as the capacity in
+    both directions (±200 MW when absent, NaN or zero); the exchange cap the
+    studies apply then bounds it. Reactive limits from MATPOWER likewise
+    describe that generator, not the connection: Qext keeps ±200 Mvar.
+    """
+    lo_map, hi_map = {}, {}
+    for name, (_, row) in zip(names, net.ext_grid.iterrows()):
+        values = [abs(float(row[c])) for c in ("min_p_mw", "max_p_mw")
+                  if c in net.ext_grid.columns and pd.notna(row.get(c)) and math.isfinite(float(row[c]))]
+        cap = max(values) if values and max(values) > 0 else 200.0
+        lo_map[name], hi_map[name] = -cap, cap
+    return lo_map, hi_map
 
 
 def _branch_current_data(net) -> dict:
@@ -571,44 +705,6 @@ def reactive_power_balance_rule(m, bus_idx):
     return expr
 
 
-# Current from i->j
-def branch_current_from_rule(m, i, j):
-    I_real = m.Yff_real_used[i,j]*m.V[i]*cos(m.theta[i]) - m.Yff_imag_used[i,j]*m.V[i]*sin(m.theta[i]) \
-             + m.Yft_real_used[i,j]*m.V[j]*cos(m.theta[j]) - m.Yft_imag_used[i,j]*m.V[j]*sin(m.theta[j])
-    I_imag = m.Yff_real_used[i,j]*m.V[i]*sin(m.theta[i]) + m.Yff_imag_used[i,j]*m.V[i]*cos(m.theta[i]) \
-             + m.Yft_real_used[i,j]*m.V[j]*sin(m.theta[j]) + m.Yft_imag_used[i,j]*m.V[j]*cos(m.theta[j])
-    
-    current_pu_sq = I_real**2 + I_imag**2
-    max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j])**2
-    return current_pu_sq <= 0.9 * max_current_pu_sq
-    #return current_pu_sq <= max_current_pu_sq
-
-
-# Current from j->i
-def branch_current_to_rule(m, i, j):
-    I_real = m.Yff_real_used[j,i]*m.V[j]*cos(m.theta[j]) - m.Yff_imag_used[j,i]*m.V[j]*sin(m.theta[j]) \
-             + m.Yft_real_used[j,i]*m.V[i]*cos(m.theta[i]) - m.Yft_imag_used[j,i]*m.V[i]*sin(m.theta[i])
-    I_imag = m.Yff_real_used[j,i]*m.V[j]*sin(m.theta[j]) + m.Yff_imag_used[j,i]*m.V[j]*cos(m.theta[j]) \
-             + m.Yft_real_used[j,i]*m.V[i]*sin(m.theta[i]) + m.Yft_imag_used[j,i]*m.V[i]*cos(m.theta[i])
-
-    current_pu_sq = I_real**2 + I_imag**2
-    max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i])**2
-    return current_pu_sq <= 0.9 * max_current_pu_sq
-    #return current_pu_sq <= max_current_pu_sq
-
-
-# --- Objective function ---
-def objective_rule(m):
-    # 1️⃣ Generation deviation penalties
-    p_dev_sq = sum((m.Pg_new[g] - m.Pg_base[g])**2 for g in m.G)
-    q_dev_sq = sum((m.Qg_new[g] - m.Qg_base[g])**2 for g in m.G)
-    
-    
-    # 3️⃣ Weights
-    lambda_p = 0.01
-    lambda_q = 0.001
-    
-    return lambda_p * p_dev_sq + lambda_q * q_dev_sq 
 
 
 
@@ -675,6 +771,9 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # theta[b] = voltage angle at bus b
     model.V = Var(model.B, bounds=(V_min, V_max))
     model.theta = Var(model.B, bounds=(-math.pi, math.pi))
+    # The band as asked, for the result: a bus's own bounds may differ (the
+    # slack's are widened to hold its measured voltage; per-bus overrides).
+    model._opf_band = (float(V_min), float(V_max))
 
     # Per-bus bound overrides (back-off / robust OPF support).
     # Keys are bus names from API payloads; handle blank names via fallback labels.
@@ -719,6 +818,15 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     slack_bus = int(net.ext_grid['bus'].iloc[0])
     model.theta[slack_bus].fix(va_rad_map[slack_bus])
     _fix_slack_voltage(model.V[slack_bus], vm_pu_map[slack_bus])
+    # The solver starts from the power flow of the moment (inside the bounds),
+    # not from zero: the voltages were left uninitialised, so every solve began
+    # near flat, which the docstrings said it did not.
+    for b_idx in model.B:
+        vm, va = vm_pu_map.get(b_idx), va_rad_map.get(b_idx)
+        if not model.V[b_idx].fixed and vm is not None and math.isfinite(vm):
+            model.V[b_idx].value = min(max(vm, model.V[b_idx].lb), model.V[b_idx].ub)
+        if not model.theta[b_idx].fixed and va is not None and math.isfinite(va):
+            model.theta[b_idx].value = va
 
         
     # -------------------------
@@ -956,26 +1064,15 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     net_base.ext_grid = net_base.ext_grid.copy()
     net_base.ext_grid['name'] = ext_grid_name_list
 
-    # Dictionaries: name -> active/reactive power from loadflow results
-    ext_grid_data_p = dict(zip(ext_grid_name_list, net_base.res_ext_grid['p_mw']))
-    ext_grid_data_q = dict(zip(ext_grid_name_list, net_base.res_ext_grid['q_mvar']))
+    # Dictionaries: name -> active/reactive power from the moment's power flow
+    _ext_res = net.res_ext_grid if _has_results(net.res_ext_grid) else net_base.res_ext_grid
+    ext_grid_data_p = dict(zip(ext_grid_name_list, _ext_res['p_mw']))
+    ext_grid_data_q = dict(zip(ext_grid_name_list, _ext_res['q_mvar']))
 
     # Mapping: external grid name -> bus index
     ext_grid_bus_map = dict(zip(ext_grid_name_list, net_base.ext_grid['bus']))
 
-    # Build Pext bounds from net.ext_grid limits (read from .m file Pmin/Pmax).
-    # Fall back to ±200 MW when columns are absent, NaN, or degenerate (lo >= hi).
-    # Q limits from MATPOWER describe the *generator* at that bus, not the reactive
-    # capacity of the external network connection — always use ±200 Mvar for Qext.
-    _pext_lo_map: dict = {}
-    _pext_hi_map: dict = {}
-    for name, (_, row) in zip(ext_grid_name_list, net.ext_grid.iterrows()):
-        lo = float(row['min_p_mw']) if ('min_p_mw' in net.ext_grid.columns and pd.notna(row.get('min_p_mw'))) else -200.0
-        hi = float(row['max_p_mw']) if ('max_p_mw' in net.ext_grid.columns and pd.notna(row.get('max_p_mw'))) else  200.0
-        if hi <= lo or (lo == 0.0 and hi == 0.0):
-            lo, hi = -200.0, 200.0
-        _pext_lo_map[name] = lo
-        _pext_hi_map[name] = hi
+    _pext_lo_map, _pext_hi_map = _exchange_bounds(net, ext_grid_name_list)
 
     def Pext_bounds_rule(m, e):
         return (_pext_lo_map.get(e, -200.0), _pext_hi_map.get(e, 200.0))
@@ -991,6 +1088,10 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     
     model.Pext = Var(model.Ext, bounds=Pext_bounds_rule, initialize=ext_grid_data_p)
     model.Qext = Var(model.Ext, bounds=Qext_bounds_rule, initialize=ext_grid_data_q)
+    # The connection's own capacity: an exchange cap applied later may tighten
+    # it, never loosen it (main_backend._cap_exchange).
+    model._ext_capacity = {e: ((_pext_lo_map.get(e, -200.0), _pext_hi_map.get(e, 200.0)), (-200.0, 200.0))
+                           for e in ext_grid_name_list}
     # Fixed active and reactive injections (MW / Mvar)
     #model.Pext = Param(model.Ext, initialize=ext_grid_data_p)
     #model.Qext = Param(model.Ext, initialize=ext_grid_data_q)
@@ -1074,18 +1175,14 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
         max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j])**2
         return current_pu_sq <= _limit(i, j) ** 2 * max_current_pu_sq
 
-    def branch_current_to_rule(m, i, j):
-        I_real = m.Yff_real_used[j,i]*m.V[j]*cos(m.theta[j]) - m.Yff_imag_used[j,i]*m.V[j]*sin(m.theta[j]) \
-                 + m.Yft_real_used[j,i]*m.V[i]*cos(m.theta[i]) - m.Yft_imag_used[j,i]*m.V[i]*sin(m.theta[i])
-        I_imag = m.Yff_real_used[j,i]*m.V[j]*sin(m.theta[j]) + m.Yff_imag_used[j,i]*m.V[j]*cos(m.theta[j]) \
-                 + m.Yft_real_used[j,i]*m.V[i]*sin(m.theta[i]) + m.Yft_imag_used[j,i]*m.V[i]*cos(m.theta[i])
-        current_pu_sq = I_real**2 + I_imag**2
-        max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i])**2
-        return current_pu_sq <= _limit(i, j) ** 2 * max_current_pu_sq
-
+    # Each end of a branch once: `Branches` holds both orientations of every
+    # branch, so the "from" end of (j, i) is the "to" end of (i, j). A "to"
+    # family used to state every limit a second time — redundant for the
+    # solver, and every excess paid twice once softened after an outage
+    # (scopf). It stays, empty, for the code that reads both families.
     model.branch_current_from_limit = Constraint(model.Branches, rule=branch_current_from_rule)
 
-    model.branch_current_to_limit = Constraint(model.Branches, rule=branch_current_to_rule)
+    model.branch_current_to_limit = Constraint(model.Branches, rule=lambda m, i, j: Constraint.Skip)
 
     # --- Objective function (captures lambda_p / lambda_q from outer scope) ---
     def objective_rule(m):
@@ -1099,7 +1196,10 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
 
     opt = SolverFactory('ipopt')
 
-    
+    # A set-point outside its unit's range used to make IPOPT raise in Fold 2
+    # ("trivially infeasible variable"), answered as a bare HTTP 500.
+    fixed_setpoints = _checked_pins(model, fixed_setpoints)
+
     # =====================================================
     # FOLD 1 — FIX GENERATION
     # =====================================================
@@ -1117,7 +1217,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                 if _name in model.Ext:
                     model.Pext[_name].fix(float(_mw))
 
-        res1 = opt.solve(model, tee=True)
+        res1 = opt.solve(model, tee=False)
         tc1 = res1.solver.termination_condition
 
         if tc1 == TerminationCondition.optimal:
@@ -1148,7 +1248,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
                 model.Pext[_name].fix(float(_mw))
 
     try:
-        res2 = opt.solve(model, tee=True)
+        res2 = opt.solve(model, tee=False)
         tc2 = res2.solver.termination_condition
         
         if tc2 == TerminationCondition.optimal:
@@ -1164,6 +1264,24 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
 
 
 
+def _has_results(res) -> bool:
+    return res is not None and not res.empty and bool(pd.notna(res["p_mw"]).all())
+
+
+def _ext_grid_before(net, net_base, default=None) -> tuple:
+    """The external grid's exchange before redispatch (MW, Mvar): the power
+    flow of `net`, the moment as studied (loads scaled), else of `net_base`.
+
+    `net_base` is the moment before load scaling: with a scaling other than
+    1 its exchange is not the state the dispatch moved from.
+    """
+    for candidate in (net, net_base):
+        res = getattr(candidate, "res_ext_grid", None)
+        if _has_results(res):
+            return float(res["p_mw"].values[0]), float(res["q_mvar"].values[0])
+    return default, default
+
+
 def prepare_regulation_df_rsa(model, net, net_base, ts):
     """
     Prepare a DataFrame with generator and external grid regulation results.
@@ -1173,8 +1291,12 @@ def prepare_regulation_df_rsa(model, net, net_base, ts):
     model : Pyomo model
         Optimized model containing Pg_new, Pg_base, Qg_new, Qg_base, Pext, Qext
     net : pandapower network
-        Network with base values for external grids
-    timestamp : str or pd.Timestamp
+        The moment as studied (loads scaled), with its power flow: the
+        external grid's exchange before redispatch
+    net_base : pandapower network
+        The same moment before load scaling; its power flow is used only
+        when `net` has none
+    ts : str or pd.Timestamp
         Current timestamp for the results
 
     Returns
@@ -1209,8 +1331,9 @@ def prepare_regulation_df_rsa(model, net, net_base, ts):
     _ext_name = next(iter(model.Ext))  # use Pyomo's own key to avoid None/NaN mismatch
     Pext_new_val = value(model.Pext[_ext_name])
     Qext_new_val = value(model.Qext[_ext_name])
-    Pext_base_val = net_base.res_ext_grid['p_mw'].values[0]
-    Qext_base_val = net_base.res_ext_grid['q_mvar'].values[0]
+    Pext_base_val, Qext_base_val = _ext_grid_before(net, net_base)
+    if Pext_base_val is None:              # no converged power flow: no "before", no change claimed
+        Pext_base_val, Qext_base_val = Pext_new_val, Qext_new_val
 
     records.append({
         "timestamp": str(ts),
@@ -1369,9 +1492,7 @@ def extract_post_opf_voltages(model, net) -> dict:
             continue
         bus_voltages.append({"bus": int(b), "bus_name": _bus_name(int(b)), "vm_pu": round(float(v), 6)})
 
-    first_b = next(iter(model.B))
-    vm_lower = model.V[first_b].lb
-    vm_upper = model.V[first_b].ub
+    vm_lower, vm_upper = getattr(model, "_opf_band", (None, None))
 
     return {
         "bus_voltages_post_opf": bus_voltages,
@@ -1502,12 +1623,14 @@ def scenario_optimization_model_base(
     fixed_setpoints: dict = None,
     allowed_violation_fraction: float = 0.0,
     warm_start: dict | None = None,
+    max_slack_mw: float | None = None,
 ):
     """Scenario-based AC-OPF with shared dispatch and scenario-indexed PF states.
 
     Formulation notes:
     - Shared first-stage decisions: Pg_new[g], Qg_new[g].
     - Scenario variables: V[b,k], theta[b,k], Pinj[g,k], Pext[e,k], Qext[e,k].
+    - Units without a resource series inject Pg_new[g] in every scenario.
     - Renewable min(P_new, xi) is represented with Pinj[g,k] <= Pg_new[g]
       and Pinj[g,k] <= xi[g,k]. A tiny objective reward on Pinj encourages
       the optimizer to hit the active bound, reproducing min() behavior.
@@ -1668,18 +1791,15 @@ def scenario_optimization_model_base(
     net_base.ext_grid['name'] = ext_grid_name_list
 
     ext_grid_bus_map = dict(zip(ext_grid_name_list, net_base.ext_grid['bus']))
-    _pext_lo_map = {}
-    _pext_hi_map = {}
-    for name, (_, row) in zip(ext_grid_name_list, net.ext_grid.iterrows()):
-        lo = float(row['min_p_mw']) if ('min_p_mw' in net.ext_grid.columns and pd.notna(row.get('min_p_mw'))) else -200.0
-        hi = float(row['max_p_mw']) if ('max_p_mw' in net.ext_grid.columns and pd.notna(row.get('max_p_mw'))) else 200.0
-        if hi <= lo or (lo == 0.0 and hi == 0.0):
-            lo, hi = -200.0, 200.0
-        _pext_lo_map[name] = lo
-        _pext_hi_map[name] = hi
+    _pext_lo_map, _pext_hi_map = _exchange_bounds(net, ext_grid_name_list)
 
     model.Ext = Set(initialize=ext_grid_name_list)
     model.ext_bus = Param(model.Ext, initialize=ext_grid_bus_map)
+    if max_slack_mw is not None:
+        # The study's exchange cap, within the connection's own capacity.
+        cap = abs(float(max_slack_mw))
+        _pext_lo_map = {e: max(_pext_lo_map.get(e, -200.0), -cap) for e in ext_grid_name_list}
+        _pext_hi_map = {e: min(_pext_hi_map.get(e, 200.0), cap) for e in ext_grid_name_list}
     model.Pext = Var(model.Ext, model.K, bounds=lambda m, e, k: (_pext_lo_map.get(e, -200.0), _pext_hi_map.get(e, 200.0)))
     model.Qext = Var(model.Ext, model.K, bounds=lambda m, e, k: (-200.0, 200.0))
 
@@ -1741,6 +1861,12 @@ def scenario_optimization_model_base(
     # Renewable min(P_new, xi) envelope.
     model.pinj_le_dispatch = Constraint(model.G, model.K, rule=lambda m, g, k: m.Pinj[g, k] <= m.Pg_new[g])
     model.pinj_le_resource = Constraint(model.G, model.K, rule=lambda m, g, k: m.Pinj[g, k] <= m.xi[g, k])
+    # A unit without an uncertain resource (no series in `xi_by_gen`: every
+    # voltage-controlled unit) injects its dispatch in every scenario. Its
+    # recourse used to be free — Pinj ≤ min(Pg, Pmax) let it cut output in any
+    # scenario at no cost — so the shared dispatch was only an upper bound.
+    model.G_firm = Set(initialize=[g for g in gen_name_list if g not in xi_by_gen])
+    model.pinj_firm = Constraint(model.G_firm, model.K, rule=lambda m, g, k: m.Pinj[g, k] == m.Pg_new[g])
 
     # Slack reference per scenario.
     slack_bus = int(net.ext_grid['bus'].iloc[0])
@@ -1809,25 +1935,9 @@ def scenario_optimization_model_base(
         max_current_pu_sq = (m.I_from_max[i, j] / m.Ibase_from_kA[i, j]) ** 2
         return current_pu_sq <= _csm ** 2 * max_current_pu_sq
 
-    def branch_current_to_rule(m, i, j, k):
-        I_real = (
-            m.Yff_real_used[j, i] * m.V[j, k] * cos(m.theta[j, k])
-            - m.Yff_imag_used[j, i] * m.V[j, k] * sin(m.theta[j, k])
-            + m.Yft_real_used[j, i] * m.V[i, k] * cos(m.theta[i, k])
-            - m.Yft_imag_used[j, i] * m.V[i, k] * sin(m.theta[i, k])
-        )
-        I_imag = (
-            m.Yff_real_used[j, i] * m.V[j, k] * sin(m.theta[j, k])
-            + m.Yff_imag_used[j, i] * m.V[j, k] * cos(m.theta[j, k])
-            + m.Yft_real_used[j, i] * m.V[i, k] * sin(m.theta[i, k])
-            + m.Yft_imag_used[j, i] * m.V[i, k] * cos(m.theta[i, k])
-        )
-        current_pu_sq = I_real ** 2 + I_imag ** 2
-        max_current_pu_sq = (m.I_from_max[j, i] / m.Ibase_from_kA[j, i]) ** 2
-        return current_pu_sq <= _csm ** 2 * max_current_pu_sq
-
     model.branch_current_from_limit = Constraint(model.Branches, model.K, rule=branch_current_from_rule)
-    model.branch_current_to_limit = Constraint(model.Branches, model.K, rule=branch_current_to_rule)
+    # Each end once (both orientations are in Branches); kept empty for code that reads both families.
+    model.branch_current_to_limit = Constraint(model.Branches, model.K, rule=lambda m, i, j, k: Constraint.Skip)
 
     # Optional fixed setpoints.
     if fixed_setpoints:
@@ -1859,8 +1969,7 @@ def scenario_optimization_model_base(
                 model.V[b, k].value = v0
                 model.theta[b, k].value = t0
         for e in model.Ext:
-            base_p = float(net_base.res_ext_grid['p_mw'].values[0]) if not net_base.res_ext_grid.empty else 0.0
-            base_q = float(net_base.res_ext_grid['q_mvar'].values[0]) if not net_base.res_ext_grid.empty else 0.0
+            base_p, base_q = _ext_grid_before(net, net_base, default=0.0)
             for k in model.K:
                 model.Pext[e, k].value = base_p
                 model.Qext[e, k].value = base_q
@@ -1886,7 +1995,7 @@ def scenario_optimization_model_base(
     opt.options['max_iter'] = 1500
 
     try:
-        results = opt.solve(model, tee=True)
+        results = opt.solve(model, tee=False)
     except Exception:
         results = None
 

@@ -233,6 +233,41 @@ class TestInformMode:
         assert text == "Actually 1.081 p.u."
         assert len(provider.calls) == 3, "not re-checked, not re-asked"
 
+    def test_the_findings_leave_the_history_with_the_turn(self, loop_stub):
+        """Left in the history, the findings were resent with every later call
+        of the conversation as if the operator had written them. The history
+        keeps the answer delivered; the record keeps the draft and the
+        message."""
+        loop_stub([
+            ModelResponse(tool_calls=[ToolCall(id="1", name="run_rsa", args={})]),
+            ModelResponse(text="S2 10kV is at 1.072 p.u."),
+            ModelResponse(text="Correction: S2 10kV is at 1.049 p.u."),
+        ])
+        _, history = loop_module.run_agent_turn("status?", [], reflection="inform")
+
+        assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant"]
+        assert history[-1]["content"] == "Correction: S2 10kV is at 1.049 p.u."
+        assert not any("grounding check" in str(m).lower() for m in history)
+        record = loop_stub.written[0]["reflection"]
+        assert "grounding check" in record["message"].lower()
+        assert record["draft"] == "S2 10kV is at 1.072 p.u."
+
+    def test_a_tool_called_after_the_findings_stays_in_the_history(self, loop_stub):
+        loop_stub([
+            ModelResponse(tool_calls=[ToolCall(id="1", name="run_rsa", args={})]),
+            ModelResponse(text="S2 10kV is at 1.072 p.u."),
+            ModelResponse(tool_calls=[ToolCall(id="2", name="run_rsa", args={})]),
+            ModelResponse(text="Confirmed: 1.049 p.u."),
+        ])
+        _, history = loop_module.run_agent_turn("status?", [], reflection="inform")
+        assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
+
+    def test_nothing_is_taken_out_when_nothing_was_shown(self, loop_stub):
+        loop_stub(_with_tool_then("S2 10kV is at 1.049 p.u."))
+        _, history = loop_module.run_agent_turn("status?", [], reflection="inform")
+        assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant"]
+        assert loop_stub.written[0]["reflection"]["message"] is None
+
     def test_the_agent_may_call_a_tool_instead(self, loop_stub):
         """The best outcome available: an ungrounded figure often means a tool
         was never called. Nothing in the design forces a prose edit."""
@@ -246,6 +281,32 @@ class TestInformMode:
 
         assert text == "Confirmed: 1.049 p.u."
         assert len(provider.calls) == 4
+
+
+class TestStudyVerdictsAreReviewed:
+    """An answer calling an insecure study fine quotes no figure; the audit
+    panel and the grader catch it, and answer review now does too."""
+
+    RECORD = {"user": "Is the grid secure?", "grid": {},
+              "tool_calls": [{"name": "run_rsa", "args": {}}],
+              "tool_results": [{"name": "run_rsa", "result": {"secure": False, "total_violations": 3}}]}
+
+    def test_check_all_reports_it(self):
+        from llm_agent.agent.reflection import check_all
+        _, _, conflicts, _ = check_all("All clear: the grid is secure.", self.RECORD)
+        assert [(c.field, c.study) for c in conflicts] == [("secure", True)]
+
+    def test_the_message_says_so_without_a_figure(self):
+        from llm_agent.agent.reflection import check_all, format_message
+        findings, _, conflicts, gaps = check_all("All clear: the grid is secure.", self.RECORD)
+        message = format_message(findings, conflicts, gaps)
+        assert "reads as reassuring" in message and "insecure" in message
+        assert "- 0 —" not in message
+
+    def test_a_correct_answer_is_not(self):
+        from llm_agent.agent.reflection import check_all
+        _, _, conflicts, _ = check_all("The grid is not secure: 3 violations.", self.RECORD)
+        assert conflicts == ()
 
 
 class TestRecordShape:

@@ -21,13 +21,17 @@ import time
 from typing import Callable
 
 from . import tools as _tools_module
+from .reporting_notes import with_note as with_reporting_note
 from .config import (
+    DEEP_EXTRA_TURNS,
     MAX_AGENT_TURNS,
+    READING_CHECK,
     REFLECTION_MODE,
     SESSION_LOG_DIR,
     SESSION_LOG_PATH,
     last_grid_constants_status,
 )
+from . import robustness as _robustness
 from . import usage as _usage
 from .errors import classify_error
 from .reflection import (
@@ -39,17 +43,22 @@ from .reflection import (
     normalise_mode,
 )
 from .validators import (
+    WARN,
+    without_form_blanks,
+    Issue,
     TurnConsistency,
     TurnOperatingPoint,
     annotate,
     compares_datasets,
     compares_networks,
+    compares_power_factors,
     proposal_note,
     requested_limits,
     requested_timestamps,
     validate_call,
     validate_result,
 )
+from .provenance import is_clarifying_question
 from .providers import (
     assistant_message,
     describe_provider,
@@ -57,7 +66,7 @@ from .providers import (
     tool_message,
     user_message as make_user_message,
 )
-from .system_prompt import get_system_prompt
+from .system_prompt import DEEP_RESEARCH_NOTE, get_system_prompt
 from .tool_registry import LONG_SERIES, changes_state, label
 from .tool_schemas import TOOL_DISPATCH, TOOLS
 
@@ -217,6 +226,25 @@ def _turn_key(user_message: str, conversation_id: str, attempt: int) -> str:
     return digest[:16]
 
 
+def latest_record_for(user_message: str, conversation_id: str) -> dict | None:
+    """The newest turn record, if it is the one for this question — else None.
+
+    Matched by `turn_key`: the prompt, the conversation and the attempt the
+    loop just ran. The prompt alone cannot tell a fresh record from a stale
+    one when the same question is asked twice and the second turn aborted
+    before logging. A record without a key (written before keys existed) is
+    matched by its prompt.
+    """
+    record = session_log[-1] if session_log else None
+    if not isinstance(record, dict):
+        return None
+    key = record.get("turn_key")
+    if key:
+        attempt = _attempt_counter.get(conversation_id, 0)
+        return record if key == _turn_key(user_message, conversation_id, attempt) else None
+    return record if record.get("user") == user_message else None
+
+
 def run_agent_turn(
     user_message: str,
     history: list,
@@ -224,6 +252,8 @@ def run_agent_turn(
     on_event: Callable[[str, dict], None] | None = None,
     reflection: str | None = None,
     earlier_context: str | None = None,
+    reading_check: bool | None = None,
+    deep: bool = False,
 ) -> tuple[str, list]:
     """
     Execute one user turn in the digital twin agentic loop.
@@ -237,9 +267,16 @@ def run_agent_turn(
                           its own provenance findings before the answer is
                           delivered. Defaults to the configured mode; see
                           `reflection.py`.
+        reading_check:    Whether the turn's decisive studies are re-run under
+                          the readings its question left open (robustness.py).
+                          Defaults to the configured setting.
         earlier_context:  An earlier session the operator continues from
                           (`session_context.prompt_block`), added after the
                           system prompt as background.
+        deep:             The operator switched on Deep Research for this
+                          question: the model is asked to investigate in
+                          depth if — it decides — the question is a why, and
+                          has more steps to do it in.
 
     Returns:
         (final_text, updated_history)
@@ -300,9 +337,17 @@ def run_agent_turn(
     # set, across the turn's calls — so a later tool cannot silently fall back
     # to the simulation clock or to a default ceiling. Seeded from the prompt
     # because the first call of a turn has nothing earlier to inherit from,
-    # and that is exactly where a week-long scan ran at the default 1.06 while
-    # every study after it ran at the 1.045 the operator asked for.
-    turn_operating_point = TurnOperatingPoint(requested=requested_limits(user_message))
+    # and that is exactly where a week-long scan ran at the network's own
+    # ceiling while every study after it ran at the 1.045 the operator asked
+    # for. A field the question compares (proposal and base, forecast and
+    # measurements, two power factors) is not carried: its omitted side is
+    # the default one.
+    turn_operating_point = TurnOperatingPoint(
+        requested=requested_limits(user_message),
+        networks_compared=compares_networks(user_message),
+        datasets_compared=compares_datasets(user_message),
+        power_factors_compared=compares_power_factors(user_message),
+    )
 
     # 3. Resolve the backend. The system prompt is read per turn so edits to it
     #    take effect without restarting the app.
@@ -310,6 +355,10 @@ def run_agent_turn(
     system_prompt = get_system_prompt()
     if earlier_context:
         system_prompt = f"{system_prompt}\n\n{earlier_context}"
+    if deep:
+        system_prompt = f"{system_prompt}\n\n{DEEP_RESEARCH_NOTE}"
+    # An investigation in depth runs several studies before it answers.
+    max_turns = MAX_AGENT_TURNS + (DEEP_EXTRA_TURNS if deep else 0)
 
     # 4. Agentic loop.
     final_text = ""
@@ -319,11 +368,19 @@ def run_agent_turn(
     reflection_mode = normalise_mode(reflection if reflection is not None else REFLECTION_MODE)
     reflected = False
     reflection_record: Reflection | None = None
+    # Where the draft the findings were about sits in `history`, when they
+    # were shown: the draft and the findings are taken out of the history
+    # returned to the caller (see the end of the turn).
+    reflection_at: int | None = None
+    # Deep Research: the one reminder of what an investigation in depth still
+    # lacks, and where its draft sits (taken out of the returned history too).
+    deep_reminded = False
+    deep_draft_at: int | None = None
 
     try:
-        while turns_used < MAX_AGENT_TURNS and stuck_on is None:
+        while turns_used < max_turns and stuck_on is None:
             turns_used += 1
-            logger.debug("Agent turn %d / %d", turns_used, MAX_AGENT_TURNS)
+            logger.debug("Agent turn %d / %d", turns_used, max_turns)
 
             # 4a. Call the model (the provider handles retry on transient errors).
             if on_event:
@@ -361,6 +418,20 @@ def run_agent_turn(
                 final_text = response.text
                 turn_status = "completed"
 
+                # 4c-0. Deep Research: an investigation about to answer
+                # without its depth is reminded once of what it has not done.
+                # It may do it, or say why it does not apply.
+                missing = _deep_missing(turn_tool_calls, turn_tool_results) if deep and not deep_reminded else []
+                if missing:
+                    deep_reminded = True
+                    deep_draft_at = len(history) - 1
+                    if on_event:
+                        on_event("deep_reminder", {"missing": missing})
+                    history.append(make_user_message(
+                        "Deep Research, before you answer: you have not yet " + "; ".join(missing) + ". Do them "
+                        "now, or say in the answer why they do not apply here."))
+                    continue
+
                 # 4c-i. Optionally grade the draft and hand the findings back.
                 # Only once per turn: a second pass could oscillate, and the
                 # cost of an unbounded loop is not worth the marginal catch.
@@ -376,6 +447,7 @@ def run_agent_turn(
                     findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
                     timing["checks_s"] += time.perf_counter() - checked
                     show = reflection_mode == INFORM and bool(findings or conflicts or gaps)
+                    message = format_message(findings, conflicts, gaps) if show else ""
                     reflection_record = Reflection(
                         mode=reflection_mode,
                         draft=final_text,
@@ -384,6 +456,7 @@ def run_agent_turn(
                         shown=show,
                         conflicts=conflicts,
                         gaps=gaps,
+                        message=message,
                     )
                     if on_event:
                         on_event("reflection", {
@@ -403,8 +476,8 @@ def run_agent_turn(
                             "Reflection surfaced %d grounding finding(s), %d "
                             "characterisation conflict(s) and %d gap(s) to the agent.",
                             len(findings), len(conflicts), len(gaps))
-                        history.append(make_user_message(
-                            format_message(findings, conflicts, gaps)))
+                        reflection_at = len(history) - 1
+                        history.append(make_user_message(message))
                         continue
 
                 break
@@ -414,7 +487,7 @@ def run_agent_turn(
             for call in response.tool_calls:
                 tool_name = call.name
                 kwargs, inherited = turn_operating_point.resolve(
-                    call.name, call.args, _TOOL_ARGS.get(call.name)
+                    call.name, without_form_blanks(call.args or {}), _TOOL_ARGS.get(call.name)
                 )
                 if inherited:
                     logger.info("Inherited %s for %s from earlier in the turn.",
@@ -489,20 +562,29 @@ def run_agent_turn(
                             # Values that produced no result are not the turn's.
                             turn_operating_point.rollback()
                         # Check the result against itself before the model sees
-                        # it; findings are attached, never substituted.
+                        # it; findings are attached, never substituted. The
+                        # call's own parameter warnings come first: an unusual
+                        # value the study ran with qualifies everything after.
                         checked = time.perf_counter()
-                        integrity = validate_result(tool_name, result)
-                        integrity += turn_consistency.observe(tool_name, result)
+                        parameters = [Issue(WARN, "parameter_warning", i.field, i.message)
+                                      for i in verdict.warnings]
+                        findings = validate_result(tool_name, result)
+                        findings += turn_consistency.observe(tool_name, result)
                         timing["checks_s"] += time.perf_counter() - checked
-                        if integrity:
-                            result = annotate(result, integrity)
+                        if parameters or findings:
+                            result = annotate(result, parameters + findings)
                             logger.warning("Integrity warnings from %s: %s", tool_name,
-                                           [i.render() for i in integrity])
-                            if on_event:
-                                on_event("integrity_warning", {
-                                    "name": tool_name,
-                                    "problems": [i.message for i in integrity],
-                                })
+                                           [i.render() for i in parameters + findings])
+                        if on_event and parameters:
+                            on_event("parameter_warning", {
+                                "name": tool_name,
+                                "problems": [i.message for i in parameters],
+                            })
+                        if on_event and findings:
+                            on_event("integrity_warning", {
+                                "name": tool_name,
+                                "problems": [i.message for i in findings],
+                            })
                         if on_event:
                             on_event("tool_done", {"name": tool_name, "result": result,
                                                    "duration_s": round(ran_s, 3)})
@@ -516,19 +598,18 @@ def run_agent_turn(
 
                 logger.debug("Tool %s result keys: %s", tool_name, list(result.keys()) if isinstance(result, dict) else type(result))
 
-                if verdict.warnings:
-                    logger.info("Parameter warnings for %s: %s", tool_name,
-                                [i.render() for i in verdict.warnings])
-
                 call_record = {"name": tool_name, "args": kwargs}
                 if inherited:
                     call_record["inherited"] = inherited
                 if ran_s is not None:
                     call_record["duration_s"] = round(ran_s, 3)
+                compact = _compact_for_model(tool_name, result)
+                # How to report the study goes to the model only: guidance, not a figure to log.
+                model_result = with_reporting_note(tool_name, compact)
                 turn_tool_calls.append(call_record)
-                turn_tool_results.append({"name": tool_name, "result": result})
+                turn_tool_results.append({"name": tool_name,
+                                          "result": _with_model_summary(tool_name, result, compact)})
                 _remember_call(turn_seen_calls, key, len(turn_tool_calls), tool_name, kwargs, result)
-                model_result = _prepare_tool_result_for_model(tool_name, result)
 
                 history.append(tool_message(tool_name, model_result, call_id=call.id))
 
@@ -548,9 +629,9 @@ def run_agent_turn(
                         f"already failed ({label(stuck_on)})")
             else:
                 logger.warning("MAX_AGENT_TURNS (%d) reached; asking for an answer from what is known.",
-                               MAX_AGENT_TURNS)
-                why = f"You have used all {MAX_AGENT_TURNS} steps allowed for this question."
-                note = (f"⚠️ CONDUCTOR used all {MAX_AGENT_TURNS} steps allowed for one question "
+                               max_turns)
+                why = f"You have used all {max_turns} steps allowed for this question."
+                note = (f"⚠️ CONDUCTOR used all {max_turns} steps allowed for one question "
                         f"(`DT_MAX_AGENT_TURNS`) before finishing")
             summary_text = ""
             try:
@@ -615,6 +696,28 @@ def run_agent_turn(
     if note:
         final_text = f"{final_text.rstrip()}\n\n{note}"
 
+    # The reading check: the turn's decisive studies re-run under the readings
+    # its question left open. Their verdicts, never the model's prose, are
+    # compared; when one changes the conclusion, CONDUCTOR's note about it is
+    # kept with the answer (the app shows it in the answer's card). Never fatal.
+    reading_report = None
+    if (READING_CHECK if reading_check is None else reading_check) and turn_status == "completed" \
+            and turn_tool_results and not is_clarifying_question(final_text, turn_tool_calls):
+        checked = time.perf_counter()
+        try:
+            reading_report = _robustness.check(
+                {"user": user_message, "tool_calls": turn_tool_calls, "tool_results": turn_tool_results},
+                grid=_grid_facts(), dispatch=TOOL_DISPATCH, on_event=on_event)
+        except Exception:  # noqa: BLE001
+            logger.warning("The reading check failed.", exc_info=True)
+        timing["reading_s"] = time.perf_counter() - checked
+        reading_note = _robustness.note(reading_report)
+        if reading_note:
+            final_text = f"{final_text.rstrip()}\n\n{reading_note}"
+        if on_event and reading_report is not None:
+            on_event("reading_check_done", {"headline": reading_report.headline(),
+                                            "changes": len(reading_report.changes)})
+
     # Close the reflection record now the answer is settled. Both the draft and
     # the delivered answer are kept: the difference between them is the only
     # way to tell a revision from a rationalisation after the fact.
@@ -623,6 +726,16 @@ def run_agent_turn(
             revised=reflection_record.shown,
             final=final_text,
         )
+
+    # The findings were for this answer only. Left in the history they were
+    # resent with every later call of the conversation, as if the operator had
+    # written them; the draft they were about goes with them, so the history
+    # holds the answer the operator received. Both stay in the turn record
+    # (`reflection`: draft, findings, message).
+    # Drafts the agent revised after a check or a reminder, with the message
+    # that prompted the revision: the conversation keeps the final answer only.
+    for at in sorted((i for i in (reflection_at, deep_draft_at) if i is not None), reverse=True):
+        del history[at:at + 2]
 
     # How many calls this question took and what the provider reported, for
     # the launch screen's estimates (agent/usage.py). Never fatal.
@@ -648,7 +761,8 @@ def run_agent_turn(
         # Where those seconds went. The rest of the total (preparing messages,
         # writing the log) is small; the panel shows it as "other" when not.
         "timing": {"total_s": duration_s, "model_s": round(timing["model_s"], 3),
-                   "studies_s": round(timing["studies_s"], 3), "checks_s": round(timing["checks_s"], 3),
+                   "studies_s": round(timing["studies_s"], 3),
+                   "checks_s": round(timing["checks_s"] + timing.get("reading_s", 0.0), 3),
                    "model_calls": model_calls, "waited_for_rate_limit": timing["waited_for_rate_limit"]},
         "status": turn_status,
         # The earlier session this turn was given as background, if any.
@@ -678,6 +792,12 @@ def run_agent_turn(
         # read them are unaffected.
         **({"reflection": reflection_record.as_record()}
            if reflection_record is not None else {}),
+        # What re-running the studies under the question's other readings found.
+        **({"reading_check": reading_report.as_record()} if reading_report is not None else {}),
+        # Deep Research asked for, and whether the model judged the question
+        # one (it investigated) or answered it as an analysis.
+        **({"deep_research": {"requested": True, "investigated": any(
+            c.get("name") in ("investigate", "test_prevention") for c in turn_tool_calls)}} if deep else {}),
     })
 
     return final_text, history
@@ -688,6 +808,42 @@ def run_agent_turn(
 # ---------------------------------------------------------------------------
 
 
+def _deep_missing(calls: list[dict], results: list[dict]) -> list[str]:
+    """What an investigation in depth has not done yet; [] when the turn did
+    not investigate (the model judged the question not a why) or did it all."""
+    done = [(c.get("name"), c.get("args") or {}, e.get("result") if isinstance(e, dict) else None)
+            for c, e in zip(calls, results)]
+    ok = [(n, a, r) for n, a, r in done if isinstance(r, dict) and not r.get("error")]
+    point = [r for n, a, r in ok if n == "investigate" and not a.get("recurring") and r.get("mode") != "recurring"
+             and r.get("status") == "explained"]
+    if not point:
+        return []
+    missing = []
+    violated = any((r.get("symptom") or {}).get("violated") for r in point)
+    if violated and not any(n == "test_prevention" for n, _a, _r in ok):
+        missing.append("checked whether it could have been avoided and how much warning there was "
+                       "(`test_prevention`)")
+    if not any(n == "investigate" and (a.get("recurring") is True or r.get("mode") == "recurring")
+               for n, a, r in ok):
+        missing.append("looked for whether it recurs (`investigate` with `recurring`)")
+    if any(r.get("coverage_note") for r in point) and not any(
+            r.get("hypotheses_coverage_pct", 0) >= 75 for r in point):
+        missing.append("refined your hypotheses until they explain most of the change")
+    records = [r for n, _a, r in ok if n == "record_investigation" and r.get("status") == "recorded"]
+    if not records:
+        missing.append("recorded every hypothesis tested (`record_investigation`)")
+    untested = [h for r in records for h in r.get("hypotheses") or [] if h.get("verdict") == "untested"]
+    if not any(h.get("missing_kind") == "analysis" for h in untested):
+        # Where the tools stop: the analysis that would decide the cause, and
+        # what lies behind it — what CONDUCTOR should build or integrate next.
+        missing.append("asked which analysis of the grid would confirm the cause or how serious it is and "
+                       "CONDUCTOR cannot do (a stability margin, ramps over time, dynamics, its cost), and what "
+                       "lies behind the cause outside the grid (why demand rose…); recorded each as untested, "
+                       "with what would test it"
+                       + (" (record again, with every hypothesis)" if records else ""))
+    return missing
+
+
 def _without_long_series(tool_name: str, result: dict) -> dict:
     """The answer-bearing part of a scan, without its per-tick series.
 
@@ -695,10 +851,12 @@ def _without_long_series(tool_name: str, result: dict) -> dict:
     needs to answer — and it is replayed with every later call of the
     conversation. On a year of data it would not fit the context at all. The
     charts and the guard layer still read the full result; only what the model
-    is sent is reduced. Whatever stays is copied verbatim, so provenance can
-    still trace every figure the answer quotes.
+    is sent is reduced. Whatever stays is copied verbatim; the few figures
+    computed here (`n_points`, `violations_per_tick_truncated`) are kept in
+    the logged result too (`_with_model_summary`), so provenance can trace
+    every figure the answer quotes.
     """
-    out = {k: v for k, v in result.items() if k != "series"}
+    out = {k: v for k, v in result.items() if k not in ("series", MODEL_SUMMARY_KEY)}
     series = result.get("series")
     if tool_name == "get_element_timeseries" and isinstance(series, dict):
         stamps = result.get("timestamps") or []
@@ -832,12 +990,59 @@ def _messages_for_model(history: list[dict], turn_start: int) -> list[dict]:
     return compact_history(history, turn_start) if _compaction_on() else history
 
 
+# Where the logged result keeps what the loop computed for the model.
+MODEL_SUMMARY_KEY = "summary_for_model"
+
+
+def _computed_for_model(tool_name: str, view) -> dict:
+    """The figures in what the model is sent that the loop computed rather
+    than copied from the result: the whole summary of a security scan, a
+    series' length and its extremes, the full length of a capped list."""
+    if not isinstance(view, dict) or "error" in view:
+        return {}
+    if tool_name == "scan_rsa_over_time":
+        return dict(view)
+    out = {k: view[k] for k in ("n_points", "series_summary") if k in view}
+    capped = [{"label": s.get("label"), "violations_per_tick_truncated": s["violations_per_tick_truncated"]}
+              for s in view.get("scenarios") or []
+              if isinstance(s, dict) and "violations_per_tick_truncated" in s]
+    if capped:
+        out["scenarios"] = capped
+    return out
+
+
+def _with_model_summary(tool_name: str, result, view):
+    """The result as logged: unchanged, plus — when the model was sent a
+    reduced view — the figures the loop computed for it, under
+    `summary_for_model`.
+
+    The answer checks read the logged result. A count the model was given
+    but the result does not hold ("12 of 96 steps violated") was otherwise
+    reported as a figure from nowhere."""
+    if view is result or not isinstance(result, dict):
+        return result
+    computed = _computed_for_model(tool_name, view)
+    return {**result, MODEL_SUMMARY_KEY: computed} if computed else result
+
+
+def _numbers(values) -> list[float]:
+    return [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+
 def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001
+    """What the model is sent: a compact summary when needed, and how to
+    report the study (`reporting_notes`) — never in the logged result."""
+    return with_reporting_note(tool_name, _compact_for_model(tool_name, result))
+
+
+def _compact_for_model(tool_name: str, result):  # noqa: ANN001
     """Keep full tool payloads for charting, but return compact summaries to the model when needed."""
     if tool_name in _SERIES_TOOLS and isinstance(result, dict) and "error" not in result:
         import copy
         return _without_long_series(tool_name, copy.deepcopy(result))
-    if tool_name != "scan_rsa_over_time" or not isinstance(result, dict):
+    # A failed or refused scan goes to the model as it is: a summary of the
+    # empty scan read as "no violations" and hid the error.
+    if tool_name != "scan_rsa_over_time" or not isinstance(result, dict) or "error" in result:
         return result
 
     timestamps = result.get("timestamps") or []
@@ -864,8 +1069,9 @@ def _prepare_tool_result_for_model(tool_name: str, result):  # noqa: ANN001
         "violating_step_count": len(violating_steps),
         "max_violation_count": max(violation_counts) if violation_counts else 0,
         "first_violation_timestamps": first_violations,
-        "min_observed_voltage": min(min_voltage) if min_voltage else None,
-        "max_observed_voltage": max(max_voltage) if max_voltage else None,
+        # A step whose assessment returned no voltage has None (tools.scan_rsa_over_time).
+        "min_observed_voltage": min(_numbers(min_voltage), default=None),
+        "max_observed_voltage": max(_numbers(max_voltage), default=None),
         "peak_line_loading_pct": max(max_line_loading) if max_line_loading else None,
         "peak_trafo_loading_pct": max(max_trafo_loading) if max_trafo_loading else None,
     }

@@ -19,8 +19,9 @@ Severity policy
 requests no parameterisation could satisfy. These are returned to the model as
 structured errors so it can correct itself, which it does reliably.
 
-`warn` covers the unusual-but-legal. These execute and the result is annotated,
-so capability is preserved while the parameterisation stays auditable.
+`warn` covers the unusual-but-legal. These execute and the loop annotates the
+result (`_integrity_warnings`, code `parameter_warning`), so capability is
+preserved while the parameterisation stays auditable.
 Over-rejecting would destroy the flexibility that makes the agent useful, so
 anything merely surprising warns rather than blocks.
 
@@ -103,6 +104,9 @@ _UNIT_CLOSED = {
 _UNIT_OPEN = {"risk_target", "risk_threshold", "alpha", "beta", "confidence", "target_p_any"}
 # (0, 1]: power factors.
 _POWER_FACTOR = {"opf_min_power_factor", "power_factor"}
+# The loads' power factor for one study: the backend accepts 0.5–1 (lagging).
+_LOAD_POWER_FACTOR = {"load_power_factor"}
+_LOAD_PF_RANGE = (0.5, 1.0)
 # Strictly positive integers — counts and resolutions.
 _POSITIVE_INT = {
     "n_samples", "n_scenarios", "n_steps", "n_bins", "resolution", "step_size",
@@ -129,7 +133,7 @@ _ORDERED_PAIRS = (
 # authority on what it accepts, and a wrongly-rejected valid value would break
 # a working capability. The warning still surfaces a likely typo.
 _ENUMS = {
-    "data_source": {"measurements", "forecasts"},
+    "data_source": {"measurements", "forecasts", "nominal"},
     "element_type": {"bus", "line", "trafo"},
     "metric": {"violations", "slack_import", "max_voltage", "min_voltage", "max_loading"},
     "q_mode": {"unity", "fixed_pf", "reactive_proxy", "all"},
@@ -169,6 +173,11 @@ def _check_ranges(kwargs: dict) -> Iterable[Issue]:
         if field in _POWER_FACTOR and value is not None and not 0.0 < value <= 1.0:
             yield Issue(REJECT, "out_of_range", field,
                         f"{field}={raw} must be greater than 0 and at most 1.")
+        if field in _LOAD_POWER_FACTOR and value is not None:
+            low, high = _LOAD_PF_RANGE
+            if not low <= value <= high:
+                yield Issue(REJECT, "out_of_range", field,
+                            f"{field}={raw} must be between {low} and {high} (lagging).")
         if field in _POSITIVE_INT and value is not None and value < 1:
             yield Issue(REJECT, "out_of_range", field,
                         f"{field}={raw} must be at least 1.")
@@ -189,10 +198,19 @@ def _check_ranges(kwargs: dict) -> Iterable[Issue]:
                                 f"{field}={raw} p.u. is far outside normal "
                                 f"operating limits ({tlow}–{thigh}).")
 
-        if field in _ENUMS and isinstance(raw, str) and raw not in _ENUMS[field]:
+        # A blank is a field left out by a model that fills every one, not a value.
+        if field in _ENUMS and isinstance(raw, str) and raw.strip() and raw not in _ENUMS[field]:
             yield Issue(WARN, "unknown_value", field,
                         f"{field}={raw!r} is not a recognised value "
                         f"({', '.join(sorted(_ENUMS[field]))}).")
+
+
+def without_form_blanks(kwargs: dict) -> dict:
+    """The arguments without the counts a model that fills every field sends
+    as 0 for those it leaves out: 0 is never a count (observed live:
+    `step_size=0` refused a comparison that asked for no window at all)."""
+    return {k: v for k, v in kwargs.items()
+            if not (k in _POSITIVE_INT and not isinstance(v, bool) and isinstance(v, (int, float)) and v == 0)}
 
 
 def _check_pairs(kwargs: dict) -> Iterable[Issue]:
@@ -480,6 +498,22 @@ def compares_datasets(text: str) -> bool:
     return bool(_FORECAST_WORD_RE.search(text or "") and _ACTUALS_WORD_RE.search(text or ""))
 
 
+_PF_WORD_RE = re.compile(r"power[ -]?factor|\bpf\b|\bcos\s?(?:φ|phi)", re.IGNORECASE)
+_WHAT_IF_RE = re.compile(r"\bwhat if\b", re.IGNORECASE)
+
+
+def compares_power_factors(text: str) -> bool:
+    """Whether the question sets one load power factor against another.
+
+    "What if the loads were at pf 0.90?" is answered by the same study with
+    and without that power factor (system prompt), so the value given to one
+    run must not be carried into the other.
+    """
+    text = text or ""
+    return bool(_PF_WORD_RE.search(text)
+                and (_BASE_WORD_RE.search(text) or _WHAT_IF_RE.search(text)))
+
+
 def requested_timestamps(text: str) -> frozenset:
     """Operating points the user named, normalised to the minute.
 
@@ -544,8 +578,8 @@ def requested_limits(text: str) -> dict:
     Inheritance carries a limit forward from an earlier *call*, which leaves
     the first call of a turn uncovered. Observed live: asked a question that
     set a 1.045 ceiling, the agent ran a week-long scan first — with nothing
-    established yet, so at the tool default of 1.06 — and then three studies at
-    1.045. The consistency guard correctly reported that these were not one
+    established yet, so at the default ceiling of 1.06 — and then three
+    studies at 1.045. The consistency guard correctly reported that these were not one
     assessment, which is a warning about a gap rather than a fix for it.
 
     The ceiling is in the prompt. Reading it there means the first call is
@@ -701,11 +735,15 @@ class TurnConsistency:
 # Arguments that identify *which* operating point a call runs against.
 _OPERATING_POINT_ARGS = ("timestamp", "data_source", "network")
 
+# The study assumption a question can set for itself: "with loads at pf 0.90,
+# is it secure, and under N-1?" asks both studies at 0.90.
+_ASSUMPTION_ARGS = ("load_power_factor",)
+
 # Limits the user set for this turn. A request like "would it still be secure
 # with a maximum voltage of 1.045, and if contingencies happen?" decomposes
 # into two studies, and the ceiling belongs to both: an N-1 screen run at the
-# default 1.05 after an N-0 run at 1.045 answers a question nobody asked, and
-# reports a security margin the operator did not ask about.
+# network's own ceiling after an N-0 run at 1.045 answers a question nobody
+# asked, and reports a security margin the operator did not ask about.
 #
 # The submitted paper's Act 1 turns on the agent propagating this correctly.
 # It did — and nothing in the system required it to, which is the same gap the
@@ -717,7 +755,7 @@ _CONSTRAINT_ARGS = (
     "max_trafo_loading_pct",
 )
 
-_INHERITED_ARGS = _OPERATING_POINT_ARGS + _CONSTRAINT_ARGS
+_INHERITED_ARGS = _OPERATING_POINT_ARGS + _ASSUMPTION_ARGS + _CONSTRAINT_ARGS
 
 # The same quantity under a different name.
 #
@@ -741,13 +779,29 @@ class TurnOperatingPoint:
     """Carries the operating point and the turn's limits across its tool calls.
 
     Named for the operating point because that is what it originally carried;
-    it now also carries user-set thresholds, on the same rule — the first
-    explicit value in a turn defines it, and later calls that leave the field
-    empty inherit rather than falling back to a default.
+    it now also carries user-set thresholds and the load power factor, on the
+    same rule — the first explicit value in a turn defines it, and later calls
+    that leave the field empty inherit rather than falling back to a default.
+
+    Except where the question itself compares two values of a field: a
+    proposal against the base (`networks_compared`), the forecast against the
+    measurements (`datasets_compared`), or two load power factors
+    (`power_factors_compared`). There the side the model leaves empty is the
+    default one, and inheriting would run both sides of the comparison on the
+    same network, dataset or power factor. The network and dataset cues are
+    the ones that exempt those comparisons from `TurnConsistency`.
     """
 
-    def __init__(self, requested: dict | None = None) -> None:
+    def __init__(self, requested: dict | None = None, *, networks_compared: bool = False,
+                 datasets_compared: bool = False, power_factors_compared: bool = False) -> None:
         self._established: dict[str, tuple[Any, str]] = {}
+        # Fields the question compares: established as usual, never inherited.
+        self._not_inherited = {
+            field for field, compared in (("network", networks_compared),
+                                          ("data_source", datasets_compared),
+                                          ("load_power_factor", power_factors_compared))
+            if compared
+        }
         # Fields the most recent `resolve` established, so a call that is then
         # refused or fails can take them back (see `rollback`).
         self._last_established: list[str] = []
@@ -794,7 +848,7 @@ class TurnOperatingPoint:
 
             if accepts is None or field not in accepts:
                 continue
-            if field not in self._established:
+            if field not in self._established or field in self._not_inherited:
                 continue
 
             value, source = self._established[field]

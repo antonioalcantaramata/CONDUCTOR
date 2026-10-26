@@ -16,6 +16,7 @@ came back stamped with.
 from __future__ import annotations
 
 from llm_agent.agent.provenance import is_clarifying_question
+from llm_agent.agent.tool_registry import MOVES_CLOCK, REGISTRY
 from llm_agent.agent.tool_registry import POINT_IN_TIME as _POINT_IN_TIME_TOOLS
 from llm_agent.agent.validators import (
     PROPOSAL_NOTE_PREFIX,
@@ -36,12 +37,14 @@ from ..session_log import (
     Finding,
 )
 
-# Tools that move the simulation cursor, which every later turn then reads.
-# `scan_rsa_over_time` is a composite of advance + assess, so it moves it too.
-# Taken from the dispatch table rather than restated here would be better, but
-# the property is not recorded there; the set is small and its members say so
-# in their own docstrings.
-_CURSOR_TOOLS = {"advance_timestamp", "scan_rsa_over_time"}
+# Tools that move the simulation cursor, which every later turn then reads
+# (`scan_rsa_over_time` is a composite of advance + assess, so it moves it
+# too): their `effect` in the tool registry.
+_CURSOR_TOOLS = frozenset(name for name, tool in REGISTRY.items() if tool.effect == MOVES_CLOCK)
+
+# Endings where the loop stopped the question and the model then answered from
+# the results so far: an answer exists, so these are warnings, not failures.
+_SUMMARISED = {"max_turns_summarised", "repeated_failure_summarised"}
 
 # Codes the replay below produces itself. A turn recorded while the live guard
 # was active carries the same findings inside the result payload, and counting
@@ -141,14 +144,24 @@ def grade_composition(record: dict) -> list[Finding]:
             ))
 
     status = record.get("status")
+    # The loop's own stops (the step limit, a repeated failure) carry no error
+    # classification ("none"); the status names what happened.
+    classified = record.get("error_classification")
+    code = str(classified) if classified not in (None, "", "none") else None
     if status == "completed_with_warning":
         findings.append(Finding(
-            turn, EXECUTION, WARN, str(record.get("error_classification") or "completed_with_warning"),
+            turn, EXECUTION, WARN, code or "completed_with_warning",
             str(record.get("runner_error") or status),
+        ))
+    elif status in _SUMMARISED:
+        findings.append(Finding(
+            turn, EXECUTION, WARN, code or str(status),
+            str(record.get("runner_error") or f"{status}: the loop stopped the question and the "
+                                                "answer was built from the results so far"),
         ))
     elif status not in (None, "completed"):
         findings.append(Finding(
-            turn, EXECUTION, FAIL, str(record.get("error_classification") or "turn_failed"),
+            turn, EXECUTION, FAIL, code or str(status or "turn_failed"),
             str(record.get("runner_error") or status),
         ))
 
