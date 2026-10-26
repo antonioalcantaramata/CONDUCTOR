@@ -205,6 +205,7 @@ def test_the_injected_causes_are_found_and_nothing_else_is_blamed(client):
 
 
 def test_the_chart_is_a_waterfall_of_the_change(client):
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
     from llm_agent.agent.renderers import render_investigation
 
     out = _ok(client.post("/api/investigate", json={"timestamp": PEAK, "element": "Bus_0 -> Bus_1 [L0]"}))
@@ -403,6 +404,7 @@ def test_over_a_window(client):
                                                          "data_source": "forecasts",
                                                          "reference_data_source": "measurements"}))
     assert forecast["reference"]["why"] == "the measurements over the same window"
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
     from llm_agent.agent.renderers import render_investigation
     fig = render_investigation(out)[0]
     assert "outside limits" in fig.layout.yaxis.title.text
@@ -595,6 +597,7 @@ def test_a_switching_cause_has_no_sensitivity_but_a_branch_out_has_its_lodf(clie
 
 
 def test_classical_figures_are_drawn_beside_the_exact_ones(client):
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
     from llm_agent.agent.renderers import render_investigation
     out = _ok(client.post("/api/investigate", json={"timestamp": PEAK, "element": "Bus_0 -> Bus_1 [L0]",
                                                     "classical": ["linear", "tracing"]}))
@@ -639,6 +642,7 @@ def test_recurring_causes_over_the_week(client):
     assert out["episodes_found"] >= 5 and out["recurs"] is True
     assert out["causes"][0]["cause"] == "demand" and out["causes"][0]["main_in_pct"] == 100.0
     assert all(e["reference"] < e["start"] for e in out["events"] if e.get("reference"))
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
     from llm_agent.agent.renderers import render_investigation
     assert render_investigation(out)[0].layout.barmode == "relative"
 
@@ -653,6 +657,7 @@ def test_prevention_finds_the_smallest_sufficient_action_and_the_warning(client)
     assert gen7["as_given"]["works"] and gen7["smallest"]["share_of_action"] <= 1.0
     assert out["actions"][-1]["action"].startswith("together:")
     assert len(out["series"]["with"]) == len(out["series"]["moments"]) and out["series"]["sufficient"]
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
     from llm_agent.agent.renderers import render_prevention
     assert len(render_prevention(out)[0].data) == 2
 
@@ -809,15 +814,16 @@ def test_the_look_ahead_finds_the_episodes_when_to_decide_and_what_prevents_them
 
 def test_the_look_ahead_chart_and_report(ahead):
     from llm_agent.agent import investigation_report as rep
-    from llm_agent.agent.renderers import render_look_ahead
-    fig = render_look_ahead(ahead)[0]
-    assert len(fig.layout.yaxis.categoryarray) == len(ahead["episodes"])
     record = {"user": "What should I watch for?", "assistant": "…",
               "tool_calls": [{"name": "look_ahead", "args": {}}],
               "tool_results": [{"name": "look_ahead", "result": ahead}]}
     assert rep.has_investigation(record)
     md = rep.build(record)
     assert "Looking ahead" in md and "Holds if the forecast errs" in md and "A look-ahead is as good" in md
+    pytest.importorskip("plotly")  # the chart is UI-only; CI does not install plotly
+    from llm_agent.agent.renderers import render_look_ahead
+    fig = render_look_ahead(ahead)[0]
+    assert len(fig.layout.yaxis.categoryarray) == len(ahead["episodes"])
 
 
 def test_a_quiet_horizon_and_one_element(client):
