@@ -1,5 +1,6 @@
 """Error injection (evaluation/injection.py), and the gaps in the answer checks it found — without model credit."""
 
+import csv
 import json
 import random
 
@@ -153,6 +154,26 @@ def test_the_command_writes_its_tables(tmp_path, cigre_facts):
     data = json.loads((tmp_path / "injection.json").read_text())
     assert data["records"] == 1 and data["summary"] and "baseline" in data
     assert ij.run(ij.load_records([tmp_path]), seed=1) == ij.run(ij.load_records([tmp_path]), seed=1)
+
+
+def test_findings_on_the_answers_as_written_go_to_a_sheet_that_keeps_its_labels(tmp_path, cigre_facts):
+    rec = _cigre_turn(cigre_facts, "The solar units are PV 3 and CHP diesel 1.")
+    run = tmp_path / "runs" / "full" / "x"
+    run.mkdir(parents=True)
+    (run / "t-01.jsonl").write_text(json.dumps({"kind": "ablation"}) + "\n" + json.dumps(rec) + "\n")
+    out = tmp_path / "out"
+    assert ij.main([str(tmp_path), "--out", str(out)]) == 0
+    sheet = out / "findings-to-label.csv"
+    rows = list(csv.DictReader(open(sheet, encoding="utf-8")))
+    assert rows and rows[0]["code"] == "entity_contradicted" and rows[0]["source"].endswith("t-01.jsonl")
+    assert rows[0]["label"] == ""
+    rows[0]["label"] = "error"
+    with open(sheet, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    assert ij.main([str(tmp_path), "--out", str(out)]) == 0
+    assert "error" in sheet.read_text()
 
 
 def test_a_derived_value_called_measured_is_caught_and_a_measured_one_is_not(cigre_facts):

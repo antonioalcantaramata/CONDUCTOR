@@ -83,6 +83,7 @@ def load_records(folders) -> list[dict]:
                 key = (rec.get("user"), answer)
                 if key not in seen:
                     seen.add(key)
+                    rec["_source"] = str(path)
                     out.append(rec)
     return out
 
@@ -483,13 +484,17 @@ def baseline(records: list[dict]) -> dict:
     from .report import grade_record
     counts: dict[str, int] = defaultdict(int)
     examples: dict[str, list[str]] = defaultdict(list)
+    findings: list[dict] = []
     for rec in records:
         for f in grade_record(_with(rec, rec["assistant"])).findings:
             if f.code in _CODES:
                 counts[f.code] += 1
                 if len(examples[f.code]) < 5:
                     examples[f.code].append(f.detail[:220])
-    return {"answers": len(records), "counts": dict(counts), "examples": dict(examples)}
+                findings.append({"source": rec.get("_source", ""), "turn": rec.get("turn", ""), "code": f.code,
+                                 "finding": f.detail, "question": rec.get("user", ""), "answer": rec["assistant"],
+                                 "label": "", "note": ""})
+    return {"answers": len(records), "counts": dict(counts), "examples": dict(examples), "findings": findings}
 
 
 def summarise(rows: list[dict]) -> list[dict]:
@@ -544,6 +549,15 @@ def write(out: pathlib.Path, rows: list[dict], summary: list[dict], n_records: i
         w = csv.DictWriter(fh, fieldnames=list(rows[0]) if rows else ["kind"])
         w.writeheader()
         w.writerows(rows)
+    # The findings on the answers as written, one per row, with an empty `label` column to fill by hand
+    # (error / false alarm / ambiguous): the precision of the checks. Left alone when it exists, so labels survive.
+    found = (base or {}).get("findings") or []
+    sheet = out / "findings-to-label.csv"
+    if found and not sheet.exists():
+        with open(sheet, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(found[0]))
+            w.writeheader()
+            w.writerows(found)
     return md
 
 
