@@ -333,6 +333,11 @@ Prompt parts are found by the words they begin with, not by their number, and
   failed runs in a row, an arm's process stops. If its backend has died, the
   backend is restarted and the arm retried once; otherwise the run stops,
   with the manifest saying why. An exhausted quota stops it at once.
+- **Progress.** In a terminal, one line is redrawn as the run goes: a bar,
+  the share done, the turns, the time so far and the time left (estimated
+  from the turns run in this session), what is running, and how many runs
+  failed. Written to a log, it prints one line per run. `status <folder>`
+  shows the same line from another terminal while the run goes on.
 - **Running a part, again or later:**
 
   ```bash

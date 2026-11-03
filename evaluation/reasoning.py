@@ -194,8 +194,11 @@ ITEMS: tuple[Item, ...] = (
                 "any": ["transformer", "Trafo 0-1", "Trafo 0-12", "T0", "T1"]})),
          "switches", "cigre"),
     # Line 14-8 is a line in service whose switch S1 is normally open: it carries no power in normal operation
-    # (observed without the layer: "Line 14-8 is in service, so it is not a normally open tie").
-    Item(Task("switches_line148", ("Does Line 14-8 carry power in normal operation?",),
+    # (observed without the layer: "Line 14-8 is in service, so it is not a normally open tie"). Asked as "does it
+    # carry power?" the pilot showed the question answerable from the flow alone (0.00 MW, charging current from
+    # the energised end), so it asks for the switch and its normal state.
+    Item(Task("switches_line148", ("Which switch decides whether Line 14-8 carries power, and what is its normal "
+                                   "state?",),
               ({"kind": "mentions_all", "label": "named its switch S1", "all": ["S1"]},
                {"kind": "mentions", "label": "said it is normally open",
                 "any": ["normally open", "normally-open", "is open", "kept open", "open switch", "no power",
@@ -242,8 +245,10 @@ ITEMS: tuple[Item, ...] = (
          "data", "cigre"),
     Item(Task("data_ieee30_solved", ("Is Gen_bus12's reactive power measured?",),
               ({"kind": "mentions", "label": "said the power flow solves it",
+                # "modeled rather than taken from a measurement" (pilot, correct) was not recognised.
                 "any": ["power flow", "solved", "computed", "calculated", "voltage control", "not measured",
-                        "isn't measured", "is not measured", "result of"]},)),
+                        "isn't measured", "is not measured", "result of", "modeled", "modelled",
+                        "not taken from a measurement", "rather than measured", "rather than taken from"]},)),
          "data", "ieee30"),
 
     # --- Consistency ----------------------------------------------------------

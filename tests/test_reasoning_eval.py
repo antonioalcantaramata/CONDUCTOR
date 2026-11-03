@@ -66,8 +66,8 @@ def test_a_unit_lowered_by_a_proposal_is_studied_too():
      "S1, S2 and S3 close loops within the feeder."),
     ("switches_breakers", "Switch 6 and Switch 7 are breakers on the transformers Trafo 0-1 and Trafo 0-12.",
      "No switch is a breaker."),
-    ("switches_line148", "No: its switch S1 is normally open, so Line 14-8 carries no power.",
-     "Yes, Line 14-8 is in service and carries power."),
+    ("switches_line148", "S1, on Line 14-8 at Bus 8, decides it; it is normally open, so the line carries no power.",
+     "Line 14-8 is in service; its loading is 0.04 %."),
     ("data_cigre_wind", "WKA 7's output is measured directly: it is the only unit at Bus 7. PV 9's output is a share "
                         "of Bus 9's measured production.",
      "Both WKA 7 and PV 9 are measured individually."),
@@ -77,6 +77,8 @@ def test_a_unit_lowered_by_a_proposal_is_studied_too():
      "Yes, Load R1 is metered."),
     ("data_ieee30_solved", "No: Gen_bus12's reactive power is solved by the power flow (it holds its voltage).",
      "Yes, Gen_bus12's reactive power comes from the measurements."),
+    ("data_ieee30_solved", "No. Gen_bus12's reactive power is modeled rather than taken from a measurement.",
+     "Yes, it is in the data."),
 ])
 def test_the_new_tasks_pass_a_right_answer_and_fail_a_wrong_one(task, right, wrong):
     item = rs.TASKS[task]

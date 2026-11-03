@@ -319,6 +319,8 @@ def run_study(study: dict, repeats: int, out: pathlib.Path, *, order: str = "int
     started = started or datetime.datetime.now().isoformat(timespec="seconds")
     write_manifest(out, plan_study, plan_repeats, order, "running", started)
 
+    from . import progress as _progress
+    _progress.start(out, total, total - left)
     modes = sorted({a.backend_mode() for a in study["arms"]})
     ports = {mode: port + k for k, mode in enumerate(modes)}
     backends = {}
@@ -327,20 +329,17 @@ def run_study(study: dict, repeats: int, out: pathlib.Path, *, order: str = "int
     try:
         for mode in modes:
             backends[mode] = _start_backend(out, ports[mode], mode)
-        done = 0
         for arm, reps in _schedule(study["arms"], repeats, order):
             mode = arm.backend_mode()
             url = f"http://127.0.0.1:{ports[mode]}"
             env = {**os.environ, **arm.env(), "DT_BACKEND_URL": url,
                    "CONDUCTOR_SESSION_LOG_DIR": str(out / "logs"), "CONDUCTOR_CACHE_DIR": str(out / "cache"),
                    "CONDUCTOR_CONTEXT_DIR": str(out / "context")}
-            n = turns_per_repeat(arm, study["items"]) * len(reps)
             for attempt in (1, 2):
                 rc = subprocess.run([sys.executable, "-m", "evaluation.ablation", "_child", "--out", str(out),
                                      "--arm", json.dumps({"name": arm.name, "settings": arm.settings}),
                                      "--items", ",".join(i.key for i in study["items"]),
-                                     "--repeats", ",".join(map(str, reps)),
-                                     "--progress", f"{done}/{total}/{t0}"], cwd=_ROOT, env=env,
+                                     "--repeats", ",".join(map(str, reps))], cwd=_ROOT, env=env,
                                     check=False).returncode
                 if rc == 0:
                     break
@@ -357,7 +356,6 @@ def run_study(study: dict, repeats: int, out: pathlib.Path, *, order: str = "int
                 break
             if stopped:
                 break
-            done += n
     finally:
         for proc in backends.values():
             proc.terminate()
@@ -365,6 +363,9 @@ def run_study(study: dict, repeats: int, out: pathlib.Path, *, order: str = "int
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
+    state = _progress.load(out)
+    if state:
+        _progress.show(state, "stopped" if stopped else "done", final=True)
     if stopped:
         write_manifest(out, plan_study, plan_repeats, order, "stopped", started, {"seconds": round(time.time() - t0)})
         log_change(out, f"stopped: {stopped}")
@@ -380,9 +381,10 @@ def run_study(study: dict, repeats: int, out: pathlib.Path, *, order: str = "int
     return 0
 
 
-def _child(out: pathlib.Path, arm_json: str, item_keys: list[str], reps: list[int], progress: str) -> int:
+def _child(out: pathlib.Path, arm_json: str, item_keys: list[str], reps: list[int]) -> int:
     """One arm, some repeats, in this process (its settings are in the environment)."""
     from . import ablation_stats as st
+    from . import progress as _progress
     from .semantics import check_backend_mode
     from .suites import SCENARIOS, by_key
     from .whatif import _post_backend, run_task
@@ -392,8 +394,6 @@ def _child(out: pathlib.Path, arm_json: str, item_keys: list[str], reps: list[in
     items = by_key()
     kwargs = arm.run_kwargs()
     follow = kwargs.pop("follow_suggestion")
-    offset, total, t0 = progress.split("/")
-    done, total, t0 = int(offset), int(total), float(t0)
     failed_in_a_row = 0
     for k in reps:
         for key in item_keys:
@@ -401,11 +401,12 @@ def _child(out: pathlib.Path, arm_json: str, item_keys: list[str], reps: list[in
             path = out / "runs" / arm.name / item.suite / f"{item.task.id}-{k:02d}.jsonl"
             turns = len(item.task.turns) + int(follow)
             if st.completed(path, arm.hash):
-                done += turns
-                continue
-            elapsed = time.time() - t0
-            eta = f", ~{elapsed / done * (total - done) / 60:.0f} min left" if 0 < done < total and t0 else ""
-            print(f"[{done}/{total} turns{eta}] {arm.name} · {key} · repeat {k}", flush=True)
+                continue                                    # counted as done when the session started
+            now = f"{arm.name} · {key} #{k}"
+            state = _progress.load(out)
+            if state:
+                _progress.show(state, now)
+            began = time.time()
             started = datetime.datetime.now().isoformat(timespec="seconds")
             try:
                 _post_backend("/api/scenario", {"name": SCENARIOS[item.network]})
@@ -428,10 +429,10 @@ def _child(out: pathlib.Path, arm_json: str, item_keys: list[str], reps: list[in
                                      "finished": datetime.datetime.now().isoformat(timespec="seconds")}) + "\n")
                 for rec in records:
                     fh.write(json.dumps(rec, default=str) + "\n")
-            done += turns
+            why = st.failure(records)
+            _progress.record(out, turns, time.time() - began, failed=bool(why), current=now)
             # Fail fast: an exhausted quota will not come back; three failed runs in a row mean the backend or the
             # model's API is down — continuing would only write failures. The parent decides what to do.
-            why = st.failure(records)
             if why in st.FATAL_STATUSES:
                 print(f"Stopping: {why} ({arm.name} · {key} · repeat {k}).", flush=True)
                 return EXIT_FATAL
@@ -530,6 +531,10 @@ def status(folder: pathlib.Path, detail: bool = False) -> str:
             c["done"] += 1
     for name, c in counts.items():
         lines.append(f"| {name} | {c['done']} | {c['failed']} | {c['stale']} | {c['missing']} | {c['planned']} |")
+    from . import progress as _progress
+    state = _progress.load(folder)
+    if state and m.get("status") == "running":
+        lines += ["", "Now: " + _progress.line(state)]
     if detail and todo:
         lines += ["", "Runs a resume will run again:", *todo]
     if m.get("changes"):
@@ -692,7 +697,6 @@ def main(argv: list[str] | None = None) -> int:
     p_child.add_argument("--arm", required=True)
     p_child.add_argument("--items", required=True)
     p_child.add_argument("--repeats", required=True)
-    p_child.add_argument("--progress", default="0/0/0")
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -710,7 +714,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "_child":
         return _child(pathlib.Path(args.out), args.arm, args.items.split(","),
-                      [int(k) for k in args.repeats.split(",")], args.progress)
+                      [int(k) for k in args.repeats.split(",")])
 
     try:
         if args.command == "run" and args.resume:

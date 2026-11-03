@@ -268,7 +268,7 @@ def test_the_child_writes_one_record_per_run_and_resumes(tmp_path, monkeypatch):
     arm = arms.parse("inf: review=inform")
     spec = json.dumps({"name": arm.name, "settings": arm.settings})
     keys = ["whatif/dc_flat", "whatif/wind_week"]
-    ablation._child(tmp_path, spec, keys, [1], "0/2/0")
+    ablation._child(tmp_path, spec, keys, [1])
     runs = sorted((tmp_path / "runs" / "inf" / "whatif").glob("*.jsonl"))
     assert [p.name for p in runs] == ["dc_flat-01.jsonl", "wind_week-01.jsonl"]
     meta, records = st.read_run(runs[1])
@@ -277,7 +277,7 @@ def test_the_child_writes_one_record_per_run_and_resumes(tmp_path, monkeypatch):
     assert [c[3] for c in calls if c[0] == "run"][0] == {"reflection": "inform", "reading_check": None, "deep": None}
     # Resuming: the good run is kept, the runner error is run again.
     calls.clear()
-    ablation._child(tmp_path, spec, keys, [1], "0/2/0")
+    ablation._child(tmp_path, spec, keys, [1])
     assert [c[1] for c in calls if c[0] == "run"] == ["dc_flat"]
     # Other settings under the same name do not count as done.
     other = arms.parse("inf: review=warn")
@@ -290,7 +290,7 @@ def test_a_reasoning_item_is_prepared_and_undone(tmp_path, monkeypatch):
     monkeypatch.setattr(reasoning, "_post_backend", lambda path, body: calls.append((path, body)) or {})
     item = next(i for i in suites.items(["reasoning"]) if i.task.id == "names_cigre")
     arm = arms.parse("full:")
-    ablation._child(tmp_path, json.dumps({"name": "full", "settings": {}}), [item.key], [1], "0/1/0")
+    ablation._child(tmp_path, json.dumps({"name": "full", "settings": {}}), [item.key], [1])
     paths = [c[0] for c in calls if isinstance(c[0], str) and c[0].startswith("/api/")]
     assert paths[0] == "/api/scenario" and "/api/names" in paths and paths[-1] == "/api/network/declare"
     assert arm.hash
@@ -339,7 +339,7 @@ def test_analyse_grades_a_run_folder_end_to_end(tmp_path, monkeypatch):
     _fake_backend(monkeypatch, answer="WKA 7, PV 3 and PV 11 are renewable.")
     for name, settings in (("on", {}), ("off", {"ontology": "off"})):
         ablation._child(tmp_path, json.dumps({"name": name, "settings": settings}),
-                        ["semantics-cigre/cigre_renewables", "semantics-cigre/cigre_storage"], [1, 2], "0/0/0")
+                        ["semantics-cigre/cigre_renewables", "semantics-cigre/cigre_storage"], [1, 2])
     (tmp_path / "manifest.json").write_text(json.dumps({"study": "custom", "baseline": "on",
                                                         "arms": [{"name": "on"}, {"name": "off"}]}))
     md = ablation.analyse([tmp_path])
@@ -356,7 +356,7 @@ def test_resuming_counts_only_what_is_left(tmp_path, monkeypatch):
     assert ablation.remaining_turns(study, 1, tmp_path) == 2
     arm = study["arms"][0]
     ablation._child(tmp_path, json.dumps({"name": arm.name, "settings": arm.settings}),
-                    [i.key for i in study["items"]], [1], "0/2/0")
+                    [i.key for i in study["items"]], [1])
     assert ablation.remaining_turns(study, 1, tmp_path) == 1          # the runner error is left to run
     monkeypatch.setattr(ablation, "_start_backend", lambda *a, **k: pytest.fail("started a backend"))
     assert ablation.run_study(study, 1, tmp_path, max_turns=0, yes=True) == 2
@@ -427,13 +427,13 @@ def test_a_child_stops_after_three_failures_in_a_row_and_at_once_on_quota(tmp_pa
     calls = _fake_backend(monkeypatch, fail_on=("dc_flat", "wind_week", "new_site_n1", "trafo_upgrade"))
     spec = json.dumps({"name": "a", "settings": {}})
     keys = ["whatif/dc_flat", "whatif/wind_week", "whatif/new_site_n1", "whatif/trafo_upgrade"]
-    assert ablation._child(tmp_path, spec, keys, [1], "0/4/0") == ablation.EXIT_FAILING
+    assert ablation._child(tmp_path, spec, keys, [1]) == ablation.EXIT_FAILING
     assert len([c for c in calls if c[0] == "run"]) == 3
 
     def quota(task, repeat, follow=False, **kw):
         return [{"turn": 1, "status": "quota_exhausted", "assistant": "quota"}]
     monkeypatch.setattr(whatif, "run_task", quota)
-    assert ablation._child(tmp_path / "q", spec, keys, [1], "0/4/0") == ablation.EXIT_FATAL
+    assert ablation._child(tmp_path / "q", spec, keys, [1]) == ablation.EXIT_FATAL
     assert len(list((tmp_path / "q").rglob("*.jsonl"))) == 1
 
 
@@ -443,7 +443,7 @@ def _planned_run(tmp_path, monkeypatch):
     study = ablation.resolve(None, ["a:", "b: review=inform"], "whatif", "dc_flat,wind_week")
     for arm in study["arms"]:
         ablation._child(tmp_path, json.dumps({"name": arm.name, "settings": arm.settings}),
-                        [i.key for i in study["items"]], [1, 2], "0/8/0")
+                        [i.key for i in study["items"]], [1, 2])
     ablation.write_manifest(tmp_path, study, 2, "interleaved", "finished", "2026-11-03T10:00:00")
     return study
 
@@ -521,3 +521,13 @@ def test_a_dead_backend_is_restarted_once_then_the_run_stops_cleanly(tmp_path, m
     m = json.loads((tmp_path / "manifest.json").read_text())
     assert m["status"] == "stopped" and any("restarted" in c["what"] for c in m["changes"])
     assert any(c["what"].startswith("stopped") for c in m["changes"])
+
+
+def test_the_child_keeps_the_progress_file(tmp_path, monkeypatch):
+    from evaluation import progress as pg
+    _fake_backend(monkeypatch, fail_on=("wind_week",))
+    pg.start(tmp_path, total=2, done=0)
+    ablation._child(tmp_path, json.dumps({"name": "a", "settings": {}}), ["whatif/dc_flat", "whatif/wind_week"], [1])
+    state = pg.load(tmp_path)
+    assert state["done"] == 2 and state["ran"] == 2 and state["failed"] == 1
+    assert state["current"] == "a · whatif/wind_week #1"
