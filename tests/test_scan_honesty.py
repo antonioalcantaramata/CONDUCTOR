@@ -16,10 +16,10 @@ def _tick():
 
 
 def test_collapsing_outages_are_insecure_not_clean(backend_client):
-    # 3.6×: every outage collapses on the calibrated default network (at 3.2×,
-    # 6 of 20 do — before the October 2026 calibration all 20 did).
+    # 4.5×: every one of the IEEE 30 demo's 41 outages collapses (at 3.6×,
+    # 6 of 41 do; at 4.0×, 12).
     r = backend_client.post("/api/contingency/simulate_all", json={
-        "timestamp": _tick(), "load_scaling_factor": 3.6}).json()
+        "timestamp": _tick(), "load_scaling_factor": 4.5}).json()
     assert r["system_n1_secure"] is False
     assert r["n_non_converged_outages"] == r["total_outages_tested"]
     assert "Bus_0 -> Bus_1 [L0]" in r["non_converged_outages"]
@@ -38,11 +38,29 @@ def test_a_converging_sweep_reports_none_missing(backend_client):
     assert r["n_non_converged_outages"] == 0
 
 
-def test_the_sweep_applies_renewable_scaling(backend_client):
-    def total(scale):
+def test_the_sweep_applies_renewable_scaling_to_the_wind_and_solar_units(backend_client):
+    def sweep(scale):
         return backend_client.post("/api/contingency/simulate_all", json={
-            "timestamp": _tick(), "sgen_scaling_factor": scale}).json()["total_violations"]
-    assert total(0.0) != total(1.0)
+            "timestamp": _tick(), "sgen_scaling_factor": scale}).json()
+    # The IEEE 30 demo loads every unit on voltage control (the `gen` table);
+    # one at a fixed power factor is a static generator, as a converted
+    # conventional unit is — the case renewable scaling used to get wrong.
+    unit = "Gen_bus12"
+    try:
+        assert backend_client.post("/api/generators", json={"changes": [
+            {"unit": unit, "control": "power_factor"}]}).status_code == 200
+        # No unit is stated to be wind or solar: the scaling changes nothing, and says so
+        # (it used to scale every static generator — conventional units included).
+        nothing = sweep(0.0)
+        assert nothing["total_violations"] == sweep(1.0)["total_violations"]
+        assert "No unit of this network is stated to be wind or solar" in nothing["renewables_scaled"]["note"]
+        backend_client.post("/api/network/declare", json={"units": [{"unit": unit, "source": "wind"}]})
+        declared = sweep(0.0)
+        assert declared["renewables_scaled"]["units"] == [unit]
+        assert declared["total_violations"] != sweep(1.0)["total_violations"]
+    finally:
+        backend_client.post("/api/network/declare", json={"reset": True})
+        backend_client.post("/api/generators", json={"reset": True})
 
 
 def test_scans_report_their_non_converged_ticks(backend_client):

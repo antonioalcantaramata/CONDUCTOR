@@ -7,10 +7,14 @@ networks and data are, and how proposals change a network without touching it.
 ## From a file to a network
 
 **Formats.** MATPOWER (`.m`, converted by pandapower; PGLib cases included),
-pandapower JSON or Excel, and UCTE. A MATPOWER generator at a load bus is turned
-back into a voltage-controlled unit at 1.0 p.u.
+pandapower JSON or Excel, UCTE, and CGMES (`.zip`, CIM 2.4.15 or 3.0, read by
+pandapower's CIM converter: `network_loader.read_cgmes`). A MATPOWER generator
+at a load bus is turned back into a voltage-controlled unit at 1.0 p.u. A CGMES
+model keeps its identifiers (mRID), its substations and the control each
+synchronous machine states; a model whose reference is a generator gets it as
+the external grid, as the MATPOWER converter does, and the upload says so.
 
-**Units.** On loading, each generator not at the external grid becomes a
+**Units.** On loading (except from CGMES, see above), each generator not at the external grid becomes a
 controllable **static generator** at unity power factor, keeping what it needs to
 return to voltage control (its set-point and reactive limits). A unit below 1 MW
 is a **synchronous condenser** and stays voltage-controlled. A bundled profile may
@@ -34,18 +38,25 @@ from pandapower's internal model (see
 
 ## The bundled networks
 
-| | IEEE 30 (default) | IEEE 14 |
+| | IEEE 30 (default) | CIGRE MV |
 | --- | --- | --- |
-| Source | PGLib-OPF `pglib_opf_case30_as` (Alsac–Stott) | PGLib-OPF `pglib_opf_case14_ieee` |
-| Buses / lines / transformers / loads | 30 / 41 / 0 / 21 | 14 / 17 / 3 / 11 |
-| Units | five, all voltage-controlled (Gen_bus1 and Gen_bus12 at 1.025 p.u., the others at 1.0) | Gen_bus1 at unity power factor; three synchronous condensers |
-| External grid | Bus_0 at 1.0 p.u. | Bus_0 at 1.02 p.u. |
-| Case load | 283.4 MW, 126.2 Mvar | 259.0 MW, 73.5 Mvar |
-| Limits | 0.95–1.05 p.u., 100 % | 0.94–1.06 p.u., 100 % |
-| Synthetic week | residential load, flat generation | two-peak load, wind |
+| Source | PGLib-OPF `pglib_opf_case30_as` (Alsac–Stott) | pandapower `create_cigre_network_mv(with_der="all")` |
+| Buses / lines / transformers / loads | 30 / 41 / 0 / 21 | 15 / 15 / 2 / 18 |
+| Units | five, all voltage-controlled (Gen_bus1 and Gen_bus12 at 1.025 p.u., the others at 1.0) | 13 static generators at a fixed power factor — eight PV, one wind turbine, a CHP unit, three fuel cells — and two batteries, each typed by the network |
+| Topology | meshed, one voltage level (135 kV) | 110/20 kV substation, two radial 20 kV feeders, three normally open ties |
+| External grid | Bus_0 at 1.0 p.u. | Bus 0 (110 kV) at 1.03 p.u. |
+| Case load | 283.4 MW, 126.2 Mvar | 44.7 MW, 11.0 Mvar (the benchmark's peak) |
+| Load power factor | 0.95 (CONDUCTOR's default) | 0.97 (the profile's, the benchmark's own) |
+| Limits | 0.95–1.05 p.u., 100 % | 0.95–1.05 p.u., 100 % |
+| Synthetic week | residential load, flat generation | residential load at 0.9 of the peak; each unit shaped by its stated source (PV the sun, wind the wind, the others flat) |
 
-Ratings are the cases' own (PGLib `rateA`). Element names use 0-based bus
-indices: `Gen_bus1` sits at MATPOWER bus 2.
+Ratings are the cases' own (PGLib `rateA`; CIGRE's line currents). IEEE 30's
+element names use 0-based bus indices: `Gen_bus1` sits at MATPOWER bus 2.
+
+The data are per bus, so a bus's production is split across its units by
+capacity. On CIGRE MV three buses hold PV beside a fuel cell or the CHP unit
+(Bus 5, 9 and 10): their PV units carry a share of that bus's night output, though
+each bus's total is right.
 
 ### Naming an element
 

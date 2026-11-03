@@ -13,10 +13,11 @@ from llm_agent.agent.validators import PROPOSAL_NOTE_PREFIX
 
 NET = {"id": "bus9_datacenter", "edits": ["New bus ...", "Add load ..."]}
 
-# The first live session (Oct 11), reduced to what the checks read.
+# The first live session (Oct 11, then on IEEE 14), reduced to what the checks
+# read and moved to the CIGRE MV task it now answers.
 LIVE = {
     "turn": 1, "status": "completed",
-    "user": "What if we build a new substation 5 km from Bus 9 ... and put a 15 MW data centre there? "
+    "user": "What if we build a new substation 5 km from Bus 9 ... and put a 1 MW data centre there? "
             "Compare with today.",
     "tool_calls": [{"name": "locate_network_element", "args": {"element": "Bus 8"}},
                    {"name": "edit_proposal", "args": {"proposal": "bus9_datacenter"}},
@@ -26,8 +27,8 @@ LIVE = {
         {"name": "locate_network_element", "result": {"error": "No bus named 'Bus 8'."}},
         {"name": "edit_proposal", "result": {"status": "created", "edits": [
             {"op": "add_bus_with_connection", "name": "New Substation near Bus 9", "connect_to": 9,
-             "vn_kv": 1.0, "length_km": 5.0, "line_like": 12},
-            {"op": "add_load", "name": "Data centre", "bus": 14, "p_mw": 15.0, "pf": 0.95, "profile": "flat"}]}},
+             "vn_kv": 20.0, "length_km": 5.0, "line_like": 6},
+            {"op": "add_load", "name": "Data centre", "bus": 15, "p_mw": 1.0, "pf": 0.95, "profile": "flat"}]}},
         {"name": "compare_networks", "result": {"study": "rsa", "timestamp": "2000-01-01 00:00:00",
                                                 "network": {**NET, "compared_with": "base"},
                                                 "new_violations": [{"type": "bus_vm_pu", "element": "x"}]}}],
@@ -42,10 +43,10 @@ def _task(task_id):
 def test_the_live_session_graded_against_the_new_site_task():
     got = whatif.evaluate(_task("new_site_n1"), [LIVE])
     assert got == {
-        "edit: new bus 5 km from Bus_9 like L12": True,
-        "edit: 15 MW load at the new bus": True,
+        "edit: new bus 5 km from Bus 9 like L6": True,
+        "edit: 1 MW load at the new bus": True,
         "N-1 on the proposal": False,                  # it was not asked in that session
-        "reported the line-length note": False,        # the note did not exist yet
+        "said a single-line site loses supply": False, # nor was N-1, so nothing was said
         "named the proposal": False,                   # the guard had to add it
         "no refused edit": True,
     }
@@ -127,7 +128,7 @@ def test_the_runner_end_to_end_with_a_scripted_model(backend_client, monkeypatch
     def scripted():
         return iter([
             [ToolCall("edit_proposal", {"proposal": "dc", "edits": [
-                {"op": "add_load", "bus": "Bus 9", "p_mw": 50, "name": "Data centre"}]})],
+                {"op": "add_load", "bus": "Bus 9", "p_mw": 2, "name": "Data centre"}]})],
             [ToolCall("compare_networks", {"proposal": "dc", "study": "scan",
                                            "start_timestamp": "2000-01-01", "end_timestamp": "2000-01-01",
                                            "step_size": 8})],
@@ -154,10 +155,10 @@ def test_the_runner_end_to_end_with_a_scripted_model(backend_client, monkeypatch
     assert lines[0] == {"kind": "whatif", "task": "dc_flat", "repeat": 1, "follow_suggestion": False}
     summary = whatif.grade(out)["dc_flat"]
     assert summary["runs"] == 1
-    assert summary["checks"] == {"edit: 50 MW load at Bus_9": 1, "looked beyond one moment": 1,
+    assert summary["checks"] == {"edit: 2 MW load at Bus 9": 1, "looked beyond one moment": 1,
                                  "named the proposal": 1, "no refused edit": 1}
     assert written == [] and loop._append_to_log is not None
-    assert "| dc_flat | 1 | edit: 50 MW load at Bus_9 | 1/1 |" in whatif.render(whatif.grade(out))
+    assert "| dc_flat | 1 | edit: 2 MW load at Bus 9 | 1/1 |" in whatif.render(whatif.grade(out))
     mb._discard_proposals()
 
 
@@ -167,7 +168,7 @@ def test_a_question_to_the_operator_is_asking_not_a_refusal():
     asked = {"tool_calls": [{"name": "edit_proposal", "args": {}}], "tool_results": [{"result": question}],
              "assistant": "How should the new 30 MW unit behave: (1) voltage control or (2) a fixed power factor?"}
     built = {"tool_calls": [{"name": "edit_proposal", "args": {}}],
-             "tool_results": [{"result": {"edits": [{"op": "add_generator", "bus": 4, "p_max_mw": 30,
+             "tool_results": [{"result": {"edits": [{"op": "add_generator", "bus": 4, "p_max_mw": 2,
                                                      "control": "voltage", "vm_pu": 1.0}]}}],
              "assistant": "On proposal g the unit holds 1.0 p.u."}
     assert whatif.check({"kind": "valid_edits"}, [asked, built])
@@ -175,7 +176,7 @@ def test_a_question_to_the_operator_is_asking_not_a_refusal():
     assert not whatif.check({"kind": "asked"}, [built])
     got = whatif.evaluate(_task("classical_generator"), [asked, built])
     assert got["asked how the unit is modelled before building it"]
-    assert got["edit: 30 MW unit on voltage control at Bus_4"]
+    assert got["edit: 2 MW unit on voltage control at Bus 4"]
 
 
 def test_a_reused_refusal_is_counted_once():

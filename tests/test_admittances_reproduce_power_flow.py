@@ -14,6 +14,7 @@ from collections import defaultdict
 import pandapower as pp
 import pytest
 
+import flex_engine as fe
 import network_loader as nl
 
 
@@ -29,7 +30,14 @@ def _distribution_net():
     return net
 
 
-@pytest.mark.parametrize("profile", ["pglib_case30", "pglib_case14", "ieee14", "distribution"])
+@pytest.mark.parametrize("profile", [
+    "pglib_case30",
+    # CIGRE MV's normally open ties leave lines open at one end: pandapower keeps
+    # such a line's charging at its closed end, the database leaves it out
+    # (~0.008 Mvar; exact once those lines are taken out of service).
+    # (~0.008 Mvar): the optimisation adds it as a shunt (`flex_engine.half_open_lines`).
+    "cigre_mv",
+    "distribution"])
 def test_each_bus_injection_is_given_back(profile):
     net = _distribution_net() if profile == "distribution" else nl.load_network(nl.load_profile(profile))
     db = nl.build_ybus_full(net)
@@ -41,6 +49,9 @@ def test_each_bus_injection_is_given_back(profile):
         yff = complex(g_ff, db["Yff_i"][(i, j), tap])
         yft = complex(db["Yft_r"][(i, j), tap], db["Yft_i"][(i, j), tap])
         flows[i] += v[i] * (yff * v[i] + yft * v[j]).conjugate() * net.sn_mva
+    # A line open at one end reaches its live bus as a shunt, as the optimisation models it.
+    for b, p_mw, q_mvar in fe.half_open_lines(net).values():
+        flows[b] += complex(p_mw, q_mvar) * abs(v[b]) ** 2
     for b, s in flows.items():
         # pandapower's bus result is what the bus consumes (shunts included): the branches carry the rest away.
         consumed = complex(net.res_bus.at[b, "p_mw"], net.res_bus.at[b, "q_mvar"])

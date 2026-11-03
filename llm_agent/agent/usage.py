@@ -93,7 +93,10 @@ def prompt_tokens_from(raw: Any) -> int | None:
     """Prompt tokens a provider reported for one call, whatever its shape:
     OpenAI-style `usage.prompt_tokens` / `input_tokens`, Gemini
     `usage_metadata.prompt_token_count`, Anthropic `usage.input_tokens`, Ollama
-    `prompt_eval_count`. None when it reported nothing."""
+    `prompt_eval_count`. None when it reported nothing.
+
+    The whole prompt, cached or not: Anthropic reports the tokens read from and
+    written to its prompt cache apart from `input_tokens`, so they are added."""
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -109,9 +112,63 @@ def prompt_tokens_from(raw: Any) -> int | None:
         return meta.prompt_token_count
     usage = getattr(raw, "usage", None)
     if usage is not None and isinstance(getattr(usage, "input_tokens", None), int):
-        return usage.input_tokens
+        return usage.input_tokens + sum(getattr(usage, k, None) or 0 for k in
+                                        ("cache_read_input_tokens", "cache_creation_input_tokens"))
     return None
 
+
+def cached_tokens_from(raw: Any) -> int | None:
+    """Of a call's prompt tokens, those read from the provider's prompt cache —
+    billed at a fraction of the input price, and most of CONDUCTOR's input (the
+    system prompt and the tools go out unchanged with every call). OpenAI-style
+    `usage.input_tokens_details.cached_tokens` / `prompt_tokens_details.cached_tokens`,
+    Gemini `usage_metadata.cached_content_token_count`, Anthropic
+    `usage.cache_read_input_tokens`. None when the provider reported nothing
+    about its cache (Ollama has none)."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        usage = raw.get("usage") or {}
+        for key in ("input_tokens_details", "prompt_tokens_details"):
+            details = usage.get(key)
+            if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+                return details["cached_tokens"]
+        return None
+    meta = getattr(raw, "usage_metadata", None)
+    if meta is not None and isinstance(getattr(meta, "prompt_token_count", None), int):
+        cached = getattr(meta, "cached_content_token_count", None)
+        return cached if isinstance(cached, int) else 0
+    usage = getattr(raw, "usage", None)
+    if usage is not None and isinstance(getattr(usage, "cache_read_input_tokens", None), int):
+        return usage.cache_read_input_tokens
+    return None
+
+
+
+def output_tokens_from(raw: Any) -> int | None:
+    """Output tokens (reasoning included where the provider counts it there) one
+    call reported: OpenAI `usage.completion_tokens` / `output_tokens`, Gemini
+    `usage_metadata.candidates_token_count` (+ `thoughts_token_count`), Anthropic
+    `usage.output_tokens`, Ollama `eval_count`. None when it reported nothing.
+    Recorded per turn so an evaluation can state what a run cost."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        usage = raw.get("usage") or {}
+        for key in ("completion_tokens", "output_tokens"):
+            if isinstance(usage.get(key), int):
+                return usage[key]
+        if isinstance(raw.get("eval_count"), int):
+            return raw["eval_count"]
+        return None
+    meta = getattr(raw, "usage_metadata", None)
+    if meta is not None and isinstance(getattr(meta, "candidates_token_count", None), int):
+        return meta.candidates_token_count + (getattr(meta, "thoughts_token_count", None) or 0)
+    usage = getattr(raw, "usage", None)
+    for key in ("output_tokens", "completion_tokens"):
+        if usage is not None and isinstance(getattr(usage, key, None), int):
+            return getattr(usage, key)
+    return None
 
 # ── calls per question ───────────────────────────────────────────────────────
 

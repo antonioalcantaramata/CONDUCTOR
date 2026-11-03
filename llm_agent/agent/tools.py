@@ -17,7 +17,7 @@ import difflib
 import json
 import re
 import httpx
-from .config import BASE_URL, HTTP_TIMEOUT
+from .config import BASE_URL, HTTP_TIMEOUT, ontology_enabled
 from .investigation_record import REQUESTS_FILE as TOOL_REQUESTS_FILE
 
 # ---------------------------------------------------------------------------
@@ -807,9 +807,20 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
     # (observed live: "line Bus_8 -> Bus_9" found nothing here and worked elsewhere).
     on = network if network and network != "base" else None
     from urllib.parse import urlencode
-    found = _get("/api/network/resolve?" + urlencode({"name": wanted, **({"network": on} if on else {})}))
+    found = _get("/api/network/resolve?" + urlencode({"name": wanted, "kinds": "bus,line,trafo,gen,sgen,storage,load",
+                                                        "facts": "true" if ontology_enabled() else "false",
+                                                        **({"network": on} if on else {})}))
     if "error" in found or not {"element_type", "index"} <= set(found):
         return {"error": found.get("detail") or found.get("error") or f"The name lookup gave no element: {found}"}
+    # What it is, with the basis of each fact (stated, named, inferred, unknown).
+    facts = found.get("facts") or {}
+    if found["element_type"] in ("gen", "sgen", "storage"):
+        return _record("locate_network_element", {
+            "element": found["name"], "kind": "unit", "element_type": found["element_type"],
+            "element_index": int(found["index"]), **facts})
+    if found["element_type"] == "load":
+        return _record("locate_network_element", {
+            "element": found["name"], "kind": "load", "element_index": int(found["index"]), **facts})
 
     # On a proposal the topology includes the buses and lines its edits added.
     topology = _get("/api/network/topology" + (f"?network={on}" if on else ""))
@@ -845,6 +856,7 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
             # Observed live: a 1 kV placeholder read as the bus's real voltage, and a
             # 20 kV substation at it refused as a mismatch.
             **({"vn_kv_note": topology["voltage_note"]} if topology.get("voltage_note") else {}),
+            **{k: facts[k] for k in ("kv", "substation", "cim_class", "external_grid") if k in facts},
             "in_service": bus.get("in_service", True),
             "connected_to": neighbours[:_MAX_NEIGHBOURS],
             "n_connections": len(neighbours),
@@ -863,8 +875,62 @@ def locate_network_element(element: str, network: str | None = None, **kwargs) -
         "between": [buses.get(int(branch["from_bus"]), {}).get("name"),
                     buses.get(int(branch["to_bus"]), {}).get("name")],
         "in_service": branch.get("in_service", True),
+        **{k: facts[k] for k in ("cim_class", "kv", "rating_mva") if k in facts},
         **({"network": topology["network"]} if "network" in topology else {}),
     })
+
+
+def describe_network(about: str = "summary", element: str | None = None, network: str | None = None,
+                     **kwargs) -> dict:
+    """
+    GET /api/network/semantics?about=…
+
+    What the network's elements are, each fact with its basis — stated (by the
+    network, a proposal or the operator), named (read from a name), inferred
+    (by a rule it names) or unknown: never guessed. `about`: summary, units
+    (by energy source), loads (by category), voltage_levels, substations,
+    external_grid, switches (class, normal and present state, role), feeders
+    (with what they supply and their ties), data (where each value of the
+    operating point comes from) — or around, with `element`: that element and everything it
+    is connected to (its substation, the units and loads there, the branches
+    leaving it, its supply route and feeder, what would be cut off without it).
+    """
+    unsupported = _unsupported_kwargs_result("describe_network", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    from urllib.parse import urlencode
+    about = (str(about or "").strip() or "summary").casefold().replace(" ", "_")
+    if about == "around" and not str(element or "").strip():
+        return {"error": "describe_network(about='around') needs element: a bus, line, transformer, unit, load or "
+                         "substation, by name."}
+    on = network if network and network != "base" else None
+    params = {"about": about, **({"element": str(element).strip()} if about == "around" else {}),
+              **({"network": on} if on else {})}
+    return _record("describe_network", _get("/api/network/semantics?" + urlencode(params)))
+
+
+def declare_network_facts(units: list | None = None, loads: list | None = None, reset: bool = False,
+                          **kwargs) -> dict:
+    """
+    POST /api/network/declare
+
+    The operator's statement of what the network does not describe: what
+    drives a unit — [{unit, source}], source one of wind, solar, hydro,
+    bioenergy, thermal, nuclear, storage, conventional, other — and what kind
+    of demand a load is — [{load, category}] ('unknown' withdraws either).
+    Kept for this network; a renewable scaling then applies to the units
+    declared wind or solar. Only what the operator says: never a guess.
+    """
+    unsupported = _unsupported_kwargs_result("declare_network_facts", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    given = [u for u in units or [] if isinstance(u, dict) and str(u.get("unit") or "").strip()]
+    given_loads = [d for d in loads or [] if isinstance(d, dict) and str(d.get("load") or "").strip()]
+    if not given and not given_loads and not reset:
+        return {"error": "declare_network_facts needs units: [{unit, source}], loads: [{load, category}], "
+                         "or reset=true."}
+    return _record("declare_network_facts", _post("/api/network/declare",
+                                                  {"units": given, "loads": given_loads, "reset": bool(reset)}))
 
 
 def get_current_conditions(**kwargs) -> dict:

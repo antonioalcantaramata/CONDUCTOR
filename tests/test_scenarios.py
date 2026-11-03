@@ -24,7 +24,7 @@ def _patch_storage(monkeypatch, tmp_path):
     systems, data = tmp_path / "systems", tmp_path / "data_files"
     systems.mkdir(exist_ok=True)
     data.mkdir(exist_ok=True)
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(systems))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(data))
     monkeypatch.setattr(mb, "_LAST_UPLOAD_SENTINEL", str(systems / "last_uploaded.json"))
@@ -61,8 +61,8 @@ def _option(payload, name):
 class TestChoosing:
     def test_a_fresh_start_offers_the_demos_and_no_resume(self, client):
         payload = client.get("/api/scenario").json()
-        assert payload["current"] == "ieee14"
-        assert [o["name"] for o in payload["options"]] == ["resume", "ieee30", "ieee30_reactive", "ieee14"]
+        assert payload["current"] == "ieee30"
+        assert [o["name"] for o in payload["options"]] == ["resume", "ieee30", "ieee30_reactive", "cigre_mv"]
         assert _option(payload, "resume")["available"] is False
         assert "Nothing uploaded yet" in _option(payload, "resume")["description"]
 
@@ -118,12 +118,13 @@ class TestResume:
     def test_each_network_keeps_its_own_proposals_and_assumptions(self, client):
         _upload_case9(client)
         client.post("/api/assumptions", json={"load_power_factor": 0.9})
-        client.post("/api/scenario", json={"name": "ieee14"})
-        assert client.get("/api/assumptions").json()["load_power_factor"]["value"] == 0.95
+        assert client.post("/api/scenario", json={"name": "cigre_mv"}).status_code == 200
+        pf = client.get("/api/assumptions").json()["load_power_factor"]
+        assert (pf["value"], pf["source"]) == (0.97, "the network's profile")     # CIGRE MV's loads' own
         client.post("/api/assumptions", json={"load_power_factor": 0.85})
         client.post("/api/scenario", json={"name": "resume"})
         assert client.get("/api/assumptions").json()["load_power_factor"]["value"] == 0.9
-        client.post("/api/scenario", json={"name": "ieee14"})
+        client.post("/api/scenario", json={"name": "cigre_mv"})
         assert client.get("/api/assumptions").json()["load_power_factor"]["value"] == 0.85
 
     def test_reset_forgets_the_choice(self, client, tmp_path):
@@ -185,7 +186,7 @@ class TestTemplateAndDataKey:
         client.post("/api/scenario", json={"name": "ieee30_reactive"})
         reactive = client.get("/api/assumptions").json()["data_key"]
         assert reactive != key
-        client.post("/api/scenario", json={"name": "ieee14"})
+        client.post("/api/scenario", json={"name": "ieee30"})
         assert client.get("/api/assumptions").json()["data_key"] == key      # same data, same key
 
 
@@ -215,9 +216,10 @@ def test_a_network_with_numbered_buses_gives_text_names(client):
 
 def test_buses_and_substations_are_reported_apart(client):
     grid = client.get("/api/grid_constants").json()
-    assert grid["n_buses"] == 14 and grid["n_substations"] == 11 and grid["n_lines"] == 17 and grid["n_trafos"] == 3
+    # The IEEE 30 demo: 30 buses, 23 with a load or a unit (the substations), 41 lines.
+    assert grid["n_buses"] == 30 and grid["n_substations"] == 23 and grid["n_lines"] == 41 and grid["n_trafos"] == 0
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "llm_agent"))
     from agent.system_prompt import build_system_prompt
     prompt = build_system_prompt(grid)
-    assert "14 buses, 17 power lines" in prompt and "11 of the 14 buses are substations" in prompt
+    assert "30 buses, 41 power lines" in prompt and "23 of the 30 buses are substations" in prompt

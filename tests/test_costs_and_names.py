@@ -97,7 +97,7 @@ def client(tmp_path, monkeypatch):
     systems, data = tmp_path / "systems", tmp_path / "data_files"
     systems.mkdir()
     data.mkdir()
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(systems))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(data))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -145,7 +145,7 @@ class TestRenames:
     def test_a_renamed_unit_keeps_its_model_costs_and_studies(self, client):
         _ok(client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "dispatchable": False}]}))
         _ok(client.post("/api/costs", json={"changes": [{"unit": "Gen_bus1", "up_eur_per_mwh": 77}]}))
-        _ok(client.post("/api/names", json={"changes": [{"element_type": "sgen", "element": "Gen_bus1",
+        _ok(client.post("/api/names", json={"changes": [{"element_type": "gen", "element": "Gen_bus1",
                                                          "name": "Plant A"}]}))
         gens = _ok(client.get("/api/generators"))
         assert "Plant A" in [u["unit"] for u in gens["units"]] and gens["changed"] == {"Plant A": {"dispatchable": False}}
@@ -158,7 +158,7 @@ class TestRenames:
 
     @pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
     def test_the_opf_runs_on_renamed_units(self, client):
-        _ok(client.post("/api/names", json={"changes": [{"element_type": "sgen", "element": "Gen_bus1",
+        _ok(client.post("/api/names", json={"changes": [{"element_type": "gen", "element": "Gen_bus1",
                                                          "name": "Plant A"}]}))
         r = client.post("/api/flexibility/optimize", json={"timestamp": TS})
         assert r.status_code == 200, r.text
@@ -193,7 +193,7 @@ class TestRenames:
         _ok(client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "dispatchable": False}]}))
         _ok(client.post("/api/names", json={"changes": [
             {"element_type": "bus", "element": "Bus_3", "name": "North"},
-            {"element_type": "sgen", "element": "Gen_bus1", "name": "Plant A"}]}))
+            {"element_type": "gen", "element": "Gen_bus1", "name": "Plant A"}]}))
         edit = _ok(client.post("/api/proposals/edit", json={"proposal": "p1", "edits": [
             {"op": "scale", "element_type": "load", "bus": "North", "factor": 1.5}]}))
         assert "North" in edit["summary"]["edits"][0] and "Bus_3" not in edit["summary"]["edits"][0]
@@ -229,7 +229,7 @@ def test_the_launcher_says_what_is_kept_and_start_fresh_clears_it(client):
     _ok(client.post("/api/scenario", json={"name": "ieee30_reactive"}))
     kept = {o["name"]: o.get("kept") for o in _ok(client.get("/api/scenario"))["options"]}
     assert kept["ieee30"] == kept["ieee30_reactive"] == {"renames": 1, "costs": 1, "proposals": 1}  # one network
-    assert kept["ieee14"] is None                                                         # another network
+    assert kept["cigre_mv"] is None                                                       # another network
     assert kept["resume"] is None
     # Switching back restores them; Start fresh clears them, live and saved.
     _ok(client.post("/api/scenario", json={"name": "ieee30"}))

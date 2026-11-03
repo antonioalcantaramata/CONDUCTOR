@@ -143,6 +143,7 @@ def generate(
     stress_events: bool = True,
     start_dt: datetime = _ORIGIN,
     peak_load_factor: float | None = 1.0,
+    unit_shapes: dict | None = None,
 ) -> tuple[list[str], dict[str, pd.DataFrame]]:
     """Generate a synthetic measurement timeseries from a static pandapower network.
 
@@ -174,6 +175,11 @@ def generate(
         windows go above it. The profile shapes alone peak higher (residential
         at ~1.22×), which pushed a test case past its reactive capability every
         afternoon. ``None`` keeps the raw shape.
+    unit_shapes : dict or None
+        {(table, index): "wind" | "solar" | "flat"} — the shape a unit follows
+        when the network says what drives it (a PV unit follows the sun, not
+        the wind). Units not in it follow ``generation_profile``; ``None``
+        (the default) gives every unit that shape, as before.
 
     Returns
     -------
@@ -194,13 +200,18 @@ def generate(
     dow   = np.array([dt.weekday() for dt in dts])
 
     # --- Base values per bus (use max_p_mw as capacity reference for gen) ---
+    # Capacity per bus and per shape: {shape: {bus: MW}}.
+    unit_shapes = unit_shapes or {}
+    cap_by_shape: dict[str, dict[int, float]] = {}
     bus_max_gen: dict[int, float] = {}
-    for _, row in net.gen.iterrows():
-        bus_id = int(row["bus"])
-        bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + _get_max_ref(row)
-    for _, row in net.sgen.iterrows():
-        bus_id = int(row["bus"])
-        bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + _get_max_ref(row)
+    for table in ("gen", "sgen"):
+        for idx, row in net[table].iterrows():
+            bus_id = int(row["bus"])
+            shape = unit_shapes.get((table, int(idx)), generation_profile)
+            ref = _get_max_ref(row)
+            cap_by_shape.setdefault(shape, {})
+            cap_by_shape[shape][bus_id] = cap_by_shape[shape].get(bus_id, 0.0) + ref
+            bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + ref
 
     bus_base_load: dict[int, float] = {}
     for _, row in net.load.iterrows():
@@ -217,6 +228,11 @@ def generate(
     # --- Generate profile timeseries ---
     load_alpha = _load_scale(hours, dow, load_profile, rng)
     gen_alpha  = _gen_scale(generation_profile, n_steps, hours, rng)
+    # Other shapes only when a unit needs one (drawn after the default's, so a
+    # network whose units all follow the default gets the same week as before).
+    alphas = {generation_profile: gen_alpha}
+    for shape in sorted(set(cap_by_shape) - {generation_profile}):
+        alphas[shape] = _gen_scale(shape, n_steps, hours, rng)
     if peak_load_factor is not None:
         load_alpha = load_alpha * (float(peak_load_factor) / _shape_peak(load_profile))
 
@@ -237,9 +253,8 @@ def generate(
                 load_alpha[peak:peak + width] = np.clip(
                     load_alpha[peak:peak + width] * 1.15, 0.0, 1.6
                 )
-                gen_alpha[peak:peak + width] = np.clip(
-                    gen_alpha[peak:peak + width] * 0.97, 0.0, 1.0
-                )
+                for alpha in alphas.values():
+                    alpha[peak:peak + width] = np.clip(alpha[peak:peak + width] * 0.97, 0.0, 1.0)
 
     # --- Assemble measurement DataFrames ---
     measurements: dict[str, pd.DataFrame] = {}
@@ -247,7 +262,8 @@ def generate(
         rows = [
             {
                 "substation_name": _bus_name(net, bus_id),
-                "production":  float(bus_max_gen.get(bus_id, 0.0) * gen_alpha[t]),
+                "production":  float(sum(cap.get(bus_id, 0.0) * alphas[shape][t]
+                                         for shape, cap in cap_by_shape.items())),
                 "consumption": float(bus_base_load.get(bus_id, 0.0) * load_alpha[t]),
             }
             for bus_id in all_buses
@@ -280,6 +296,7 @@ def forecast(
     peak_load_factor: float | None = 1.0,
     load_error: float = 0.04,
     generation_error: float = 0.20,
+    unit_shapes: dict | None = None,
 ) -> tuple[list[str], dict[str, pd.DataFrame]]:
     """A synthetic forecast that overlaps the end of the measurements.
 
@@ -316,7 +333,7 @@ def forecast(
         ahead_ts, ahead = generate(
             net, n_days=n_days, resolution_min=resolution_min, load_profile=load_profile,
             generation_profile=generation_profile, seed=seed, start_dt=start,
-            peak_load_factor=peak_load_factor,
+            peak_load_factor=peak_load_factor, unit_shapes=unit_shapes,
         )
         out.update(ahead)
     return list(overlap) + ahead_ts, out

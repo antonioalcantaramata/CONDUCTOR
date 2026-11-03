@@ -47,7 +47,9 @@ MAX_SUGGESTIONS = 4
 # Clock control is left out of what the agent is told it can suggest: a
 # suggestion names its timestamp explicitly, so the operator's view of the
 # simulation clock is never moved by following one.
-_EXCLUDED_CAPABILITIES = frozenset({"get_current_timestamp", "advance_timestamp"})
+# Not studies to suggest: the clock, and recording what the operator states
+# about the network (only they can say it).
+_EXCLUDED_CAPABILITIES = frozenset({"get_current_timestamp", "advance_timestamp", "declare_network_facts"})
 
 # How much of the conversation the agent sees. Older turns matter less than
 # the cost of sending them on every request.
@@ -512,7 +514,7 @@ def answer_concerns(record: dict | None) -> list[str]:
             out.append(f"answer check: {shown(v.claim.value, v.claim.unit)} appears in no tool result "
                        "(the agent may have computed or estimated it)")
     for c in conflicts:
-        if c.path in ("evidence", "investigation"):
+        if c.path in ("evidence", "investigation", "entities"):
             out.append(f"answer check: \"{c.context[:120]}\" {c.detail}")
         elif c.study:
             out.append(f"answer check: the answer reads as reassuring, but {c.detail} ({c.path})")

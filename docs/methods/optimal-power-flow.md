@@ -47,7 +47,8 @@ $$
 where $Y^{ff}_{bj} = G^{ff}_{bj} + jB^{ff}_{bj}$ and $Y^{ft}_{bj}$ are the
 branch's π-model admittances seen from bus $b$, and $\sigma_l = 1 - (P^{dr}_l + P^{\text{shed}}_l)/P^L_l$ is the share of load $l$ served (1 unless load is
 reduced; a reduced load keeps its power factor). Loads are constant power;
-shunts are constant impedance.
+shunts are constant impedance. A storage unit is a constant demand at its
+set-point, as the power flow has it (positive = charging); it is not dispatched.
 
 **Branch currents**, at both ends of every branch, with the current
 $I_{ij} = Y^{ff}_{ij} \tilde V_i + Y^{ft}_{ij} \tilde V_j$ in per unit, where
@@ -130,8 +131,15 @@ $b + b^{\text{asym}}$); otherwise they equal $y_s$, $y_c$. This is the π-model
 pandapower builds its own bus admittance matrix from. Parallel branches between
 the same buses are added into one equivalent branch.
 
-Evaluated at a converged power flow, these admittances reproduce pandapower's
-bus injections on the three bundled networks to within $10^{-6}$ MVA.
+A line with a switch open at one end — a normally open tie, as CIGRE MV has
+three — is no branch of the optimisation: no current flows between its buses.
+Its charging still reaches the bus at its closed end, as pandapower has it: the
+π-model with the far end open, seen as a shunt,
+$Y = y_c/2 + 1/(1/y_s + 2/y_c)$ (`flex_engine.half_open_lines`).
+
+Evaluated at a converged power flow, these admittances (with those shunts)
+reproduce pandapower's bus injections on the bundled networks to within
+$10^{-6}$ MVA.
 
 An uploaded network can instead bring its admittances as CSV files; the upload
 is refused (HTTP 400) unless they cover every entry the optimisation reads —
@@ -250,8 +258,8 @@ re-checked this way; ask for options to have the check.
   limits (±200 Mvar instead) and any minimum import; ramping (except in
   [a plan](over-time.md#one-plan-for-a-window)).
 - **Elements outside the model:** three-winding transformers, impedance elements,
-  wards, DC lines and storage; buses joined by bus–bus switches. The bundled
-  networks have none.
+  wards and DC lines; buses joined by bus–bus switches. The bundled networks
+  have none. Storage is held at its set-point, never dispatched.
 - **Only the first external grid** is the reference; any other is a free injection.
 - **Parallel branches** are one equivalent branch with the ratings added: exact
   for identical circuits.

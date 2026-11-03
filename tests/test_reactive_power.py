@@ -100,7 +100,7 @@ def test_the_setting_survives_a_restart_for_the_same_network_only(tmp_path, monk
     pytest.importorskip("fastapi.testclient")
     import main_backend as mb
     from fastapi.testclient import TestClient
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(tmp_path / "systems"))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(tmp_path / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -185,10 +185,11 @@ def test_results_name_the_units_modelled_differently(backend_client):
     caches are keyed to the assumptions, so the map redraws."""
     key0 = backend_client.get("/api/assumptions").json()["key"]
     assert "generator_model" not in backend_client.post("/api/grid/rsa", json={}).json()
-    backend_client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]})
+    # The demo loads Gen_bus1 on voltage control: a fixed power factor is the change.
+    backend_client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "power_factor"}]})
     try:
         out = backend_client.post("/api/grid/rsa", json={}).json()
-        assert out["generator_model"]["changed_units"] == {"Gen_bus1": {"control": "voltage"}}
+        assert out["generator_model"]["changed_units"] == {"Gen_bus1": {"control": "power_factor"}}
         assert backend_client.get("/api/assumptions").json()["key"] != key0
     finally:
         backend_client.post("/api/generators", json={"reset": True})

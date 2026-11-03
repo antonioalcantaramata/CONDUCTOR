@@ -22,9 +22,11 @@ Every start shows a launch screen in two columns.
 - **Demo: IEEE 30 · with reactive measurements** — the same network and week,
   with measured reactive demand and generation. A few values are left out on
   purpose, so the data-quality report has gaps to show.
-- **Demo: IEEE 14 · smaller** — PGLib's IEEE 14-bus network and its week: one
-  unit can move its active power and three condensers hold voltages. The
-  what-if evaluation is written for it.
+- **Demo: CIGRE MV · distribution with DER** — the CIGRE medium-voltage
+  benchmark: a 110/20 kV substation and two radial feeders with PV, wind, CHP,
+  fuel cells and batteries, each typed by the network (so *System → What it is*
+  shows every unit's source as stated). The feeder ends sag below 0.95 p.u. at
+  the evening peaks. The what-if evaluation is written for it.
 
 When a session was saved for the network loaded, the launch screen also asks
 whether to **continue from it** — see

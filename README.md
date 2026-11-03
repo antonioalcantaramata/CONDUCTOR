@@ -82,8 +82,8 @@ do once it is running: [getting started](docs/guide/getting-started.md),
 - **`llm_agent/`** — Streamlit chat app and the LLM agent that orchestrates the
   backend tools.
 - **`systems/`**, **`data_files/`** — networks and time-series data (the bundled
-  demos — PGLib's IEEE 30-bus case, the default, and IEEE 14 — and an example
-  CSV are included; everything else is generated or user-supplied at runtime).
+  demos — PGLib's IEEE 30-bus case, the default, and the CIGRE MV distribution
+  benchmark, built by pandapower — and an example CSV are included; everything else is generated or user-supplied at runtime).
 
 ## Requirements
 

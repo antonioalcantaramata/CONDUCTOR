@@ -52,6 +52,7 @@ from .validators import (
     compares_datasets,
     compares_networks,
     compares_power_factors,
+    mentions_power_factor,
     proposal_note,
     requested_limits,
     requested_timestamps,
@@ -68,7 +69,7 @@ from .providers import (
 )
 from .system_prompt import DEEP_RESEARCH_NOTE, get_system_prompt
 from .tool_registry import LONG_SERIES, changes_state, label
-from .tool_schemas import TOOL_DISPATCH, TOOLS
+from .tool_schemas import TOOL_DISPATCH, TOOLS, hidden_tool_names, tools_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,46 @@ def _grid_facts() -> dict:
     """Constants the prompt stated this turn, or empty if none were known."""
     status = last_grid_constants_status()
     return dict(status.values) if status is not None else {}
+
+
+def _network_facts(results: list[dict], answer: str) -> dict:
+    """What the elements of the networks this turn studied are — the base and
+    every proposal its results came from — as far as the answer needs to be
+    checked (entities.py): the elements it names, the units by source, the
+    voltage levels, the external grid. Kept in the record, so the check can be
+    run again on old logs. {} when the backend cannot say."""
+    import re as _re
+    from urllib.parse import urlencode
+    from .entities import names_not_in_network
+    from .tools import _get
+    from .validators import proposals_used
+    out = {}
+    tags = set(_re.findall(r"\b[LT]\d+\b", answer or ""))
+    for name in ["base", *proposals_used(results)]:
+        facts = _get("/api/network/semantics?" + urlencode({"about": "facts",
+                                                             **({"network": name} if name != "base" else {})}))
+        if not isinstance(facts, dict) or "error" in facts or "units" not in facts:
+            continue
+
+        def named(label: str) -> bool:
+            return label in (answer or "") or any(f"[{t}]" in label for t in tags)
+        units = facts["units"]
+        out[name] = {
+            "per_unit_case": facts["per_unit_case"], "voltage_levels_kv": facts["voltage_levels_kv"],
+            "external_grids": facts["external_grids"],
+            "units_by_source": {src: sorted(u for u, f in units.items() if f["source"] == src and f["basis"] != "unknown")
+                                for src in {f["source"] for f in units.values()} if src != "unknown"},
+            "units_unknown": sum(f["basis"] == "unknown" for f in units.values()),
+            "buses": {k: v for k, v in facts["buses"].items() if named(k)},
+            "branches": {k: v for k, v in facts["branches"].items() if named(k)},
+            "units": {k: v for k, v in units.items() if named(k)},
+            "loads": {k: v for k, v in (facts.get("loads") or {}).items() if named(k)},
+            # Names shaped like the network's own that it does not have ("Load R9").
+            "names_not_in_network": names_not_in_network(answer, [
+                *facts["buses"], *(facts.get("loads") or {}), *units,
+                *facts["branches"], *(k.split(" | ")[0] for k in facts["branches"])]),
+        }
+    return out
 
 
 def _append_to_log(record: dict) -> None:
@@ -309,6 +350,8 @@ def run_agent_turn(
     turn_start = len(history) - 1
     model_calls = 0
     prompt_tokens: list[int] = []
+    output_tokens: list[int] = []
+    cached_tokens: list[int] = []
 
     # Per-turn log accumulators.
     turn_tool_calls: list[dict] = []
@@ -347,6 +390,7 @@ def run_agent_turn(
         networks_compared=compares_networks(user_message),
         datasets_compared=compares_datasets(user_message),
         power_factors_compared=compares_power_factors(user_message),
+        power_factor_asked=mentions_power_factor(user_message),
     )
 
     # 3. Resolve the backend. The system prompt is read per turn so edits to it
@@ -366,6 +410,8 @@ def run_agent_turn(
     # Reflection state. `reflected` guards the one-pass rule: the draft is
     # graded once, and whatever comes back is the answer.
     reflection_mode = normalise_mode(reflection if reflection is not None else REFLECTION_MODE)
+    # Tools withheld from the model (an ablation): a call to one by name is refused like an unknown tool.
+    hidden = hidden_tool_names()
     reflected = False
     reflection_record: Reflection | None = None
     # Where the draft the findings were about sits in `history`, when they
@@ -396,7 +442,7 @@ def run_agent_turn(
             started = time.perf_counter()
             response = provider.chat(
                 messages=_messages_for_model(history, turn_start),
-                tools=TOOLS,
+                tools=tools_for_model(),
                 system=system_prompt,
                 on_event=_watch,
             )
@@ -406,6 +452,12 @@ def run_agent_turn(
             reported = _usage.prompt_tokens_from(response.raw)
             if reported:
                 prompt_tokens.append(reported)
+            produced = _usage.output_tokens_from(response.raw)
+            if produced:
+                output_tokens.append(produced)
+            cached = _usage.cached_tokens_from(response.raw)
+            if cached is not None:
+                cached_tokens.append(cached)
             if not waited:      # a latency measured across retries means nothing
                 _usage.record_latency(getattr(provider, "name", "unknown"), getattr(provider, "model", ""),
                                       time.perf_counter() - started)
@@ -442,6 +494,7 @@ def run_agent_turn(
                         "grid": _grid_facts(),
                         "tool_calls": turn_tool_calls,
                         "tool_results": turn_tool_results,
+                        "network_facts": _network_facts(turn_tool_results, final_text),
                     }
                     checked = time.perf_counter()
                     findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
@@ -519,7 +572,7 @@ def run_agent_turn(
                     history.append(tool_message(tool_name, result, call_id=call.id))
                     continue
 
-                tool_fn = TOOL_DISPATCH.get(tool_name)
+                tool_fn = None if tool_name in hidden else TOOL_DISPATCH.get(tool_name)
                 checked = time.perf_counter()
                 verdict = validate_call(tool_name, kwargs)
                 timing["checks_s"] += time.perf_counter() - checked
@@ -640,7 +693,7 @@ def run_agent_turn(
                     messages=_messages_for_model(history, turn_start) + [make_user_message(
                         f"{why} Do not call any more tools. Answer now from the tool results above: what "
                         "was found, and plainly what could not be done and why.")],
-                    tools=TOOLS, system=system_prompt, on_event=on_event)
+                    tools=tools_for_model(), system=system_prompt, on_event=on_event)
                 model_calls += 1
                 timing["model_s"] += time.perf_counter() - started
                 summary_text = (response.text or "").strip()
@@ -781,12 +834,17 @@ def run_agent_turn(
         # counts from here, and a grounding check that only looked at tool
         # results called them fabricated.
         "grid": _grid_facts(),
+        # What the elements the answer names are (semantics), for the entity checks.
+        "network_facts": _network_facts(turn_tool_results, final_text),
         "tool_calls": turn_tool_calls,
         "tool_call_count": len(turn_tool_calls),
         "tool_results": turn_tool_results,
         "tool_error_count": tool_error_count,
         "model_calls": model_calls,
         "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        # Of the prompt tokens, those the provider served from its prompt cache (billed far lower).
+        "cached_tokens": cached_tokens,
         "assistant": final_text,
         # Absent when reflection is off, so existing logs and the graders that
         # read them are unaffected.

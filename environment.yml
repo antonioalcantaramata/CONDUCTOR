@@ -27,6 +27,7 @@ dependencies:
     - python-dotenv>=1.0
     - pyyaml>=6.0
     - openpyxl>=3.1.0      # required by pandapower.from_excel() for .xlsx network upload
+    - lxml>=5.0            # required by pandapower's CIM converter, for CGMES network upload
     # LLM agent / chat UI
     - streamlit>=1.63.0
     - plotly>=5.20.0

@@ -54,6 +54,7 @@ nav:
   - How it works:
       - methods/index.md
       - Network, data and the operating point: methods/network-and-data.md
+      - What the network is: methods/what-the-network-is.md
       - Power flow and security assessment: methods/power-flow-and-security.md
       - Contingency analysis (N-1): methods/contingency-analysis.md
       - Investigating a cause: methods/investigation.md

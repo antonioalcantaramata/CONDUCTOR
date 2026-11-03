@@ -29,8 +29,8 @@ logging.basicConfig(level=logging.INFO)
 def _neutral_tap(net, trafo_idx) -> int:
     """A transformer's neutral tap as an integer key; 0 when unset.
 
-    `pn.case14()` (the `ieee14` profile) leaves `tap_neutral` NaN on two
-    transformers, and `int(nan)` failed every OPF on that profile. 0 is the
+    `pn.case14()` (pandapower's own IEEE 14) leaves `tap_neutral` NaN on two
+    transformers, and `int(nan)` failed every OPF on it. 0 is the
     rule `network_loader._build_ybus_entry` already applies when it builds the
     admittance database these keys index.
     """
@@ -488,9 +488,14 @@ def _branch_current_data(net) -> dict:
         add(i, j, sbase / (root3 * v_hv), sn / (root3 * v_hv))
         add(j, i, sbase / (root3 * v_lv), sn / (root3 * v_lv))
 
-    for _, line in net.line.iterrows():
+    # A line with a switch open at either end carries no current between its
+    # buses: the admittance database leaves it out (its open end is no bus of
+    # the network), and so must the branches — an open tie raised a KeyError in
+    # every optimisation on CIGRE MV. Its charging is a shunt (`half_open_lines`).
+    switched_open = _lines_switched_open(net)
+    for idx, line in net.line.iterrows():
         i, j = int(line["from_bus"]), int(line["to_bus"])
-        if not (_in_service(line) and bus_on.get(i, True) and bus_on.get(j, True)):
+        if not (_in_service(line) and bus_on.get(i, True) and bus_on.get(j, True)) or int(idx) in switched_open:
             continue
         imax = float(line["max_i_ka"]) * factor(line, "df") * factor(line, "parallel")
         add(i, j, sbase / (root3 * float(net.bus.at[i, "vn_kv"])), imax)
@@ -536,8 +541,59 @@ def _unit_in_service(net, row) -> bool:
     return bus not in net.bus.index or _in_service(net.bus.loc[bus])
 
 
+def _lines_switched_open(net) -> set[int]:
+    """Lines with a line switch open at either end."""
+    sw = getattr(net, "switch", None)
+    if sw is None or not len(sw):
+        return set()
+    return {int(e) for e in sw.loc[(sw.et == "l") & ~sw.closed.astype(bool), "element"]}
+
+
+def half_open_lines(net) -> dict:
+    """{key: (bus, P MW, Q Mvar at 1 p.u.)} for every line open at one end.
+
+    A normally open tie (CIGRE MV has three) is a line whose switch is open at
+    one end: pandapower keeps it energised from the other, so its charging
+    reaches that bus — the line's π-model with the far end open, seen as a
+    shunt, Y = y/2 + 1/(z + 2/y). The admittance database leaves such a line out
+    (its far end is no bus of the network), so the optimisation adds it here, as
+    a shunt (~0.008 Mvar on CIGRE MV's ties).
+    """
+    import cmath
+    out = {}
+    sw = getattr(net, "switch", None)
+    if sw is None or not len(sw) or not len(net.line):
+        return out
+    line_sw = sw[sw.et == "l"]
+    f = float(getattr(net, "f_hz", 50.0) or 50.0)
+    bus_on = {int(b): _in_service(r) for b, r in net.bus.iterrows()}
+    for idx, row in net.line.iterrows():
+        if not _in_service(row):
+            continue
+        mine = line_sw[line_sw.element == idx]
+        open_at = {int(b) for b in mine.loc[~mine.closed.astype(bool), "bus"]}
+        ends = (int(row["from_bus"]), int(row["to_bus"]))
+        if len(open_at) != 1 or not set(ends) - open_at:
+            continue
+        live = next(b for b in ends if b not in open_at)
+        if not bus_on.get(live, True):
+            continue
+        length, parallel = float(row["length_km"]), float(row.get("parallel", 1) or 1)
+        z = complex(float(row["r_ohm_per_km"]), float(row["x_ohm_per_km"])) * length / parallel
+        g = float(row.get("g_us_per_km", 0.0) or 0.0) * 1e-6
+        b = 2 * cmath.pi * f * float(row.get("c_nf_per_km", 0.0) or 0.0) * 1e-9
+        y = complex(g, b) * length * parallel
+        if abs(y) == 0:
+            continue
+        y_eq = y / 2 + 1 / (z + 2 / y)                                 # siemens
+        vn = float(net.bus.at[live, "vn_kv"])
+        out[f"half_open_line_{int(idx)}"] = (live, vn ** 2 * y_eq.real, -vn ** 2 * y_eq.imag)
+    return out
+
+
 def _shunt_data(net) -> tuple[list, dict, dict, dict]:
-    """(keys, bus, P MW, Q Mvar at 1 p.u.) for every in-service shunt.
+    """(keys, bus, P MW, Q Mvar at 1 p.u.) for every in-service shunt, and
+    for every line open at one end (`half_open_lines`).
 
     Keyed by index: keyed by `name` — empty on most networks — several shunts
     collapsed into one entry. `step` multiplies the nominal values, as in
@@ -556,7 +612,30 @@ def _shunt_data(net) -> tuple[list, dict, dict, dict]:
         bus[k] = b
         p[k] = (0.0 if row.get("p_mw") != row.get("p_mw") else float(row.get("p_mw") or 0.0)) * step
         q[k] = (0.0 if row.get("q_mvar") != row.get("q_mvar") else float(row.get("q_mvar") or 0.0)) * step
+    for k, (b, pk, qk) in half_open_lines(net).items():
+        keys.append(k)
+        bus[k], p[k], q[k] = b, pk, qk
     return keys, bus, p, q
+
+
+def _fixed_demand(net) -> dict[int, tuple[float, float]]:
+    """{bus: (P MW, Q Mvar)} of the storage units, as the power flow has them
+    (positive = charging; `scaling` applies). Not dispatched: held at their
+    set-point. Left out before, the optimisation balanced a network without
+    them — on CIGRE MV 0.8 MW of charging, enough to call an evening peak
+    "restored" that the power flow still finds below 0.95 p.u."""
+    out: dict[int, tuple[float, float]] = {}
+    if "storage" not in net or not len(net.storage):
+        return out
+    bus_on = {int(b): _in_service(r) for b, r in net.bus.iterrows()}
+    for _, row in net.storage.iterrows():
+        b = int(row["bus"])
+        if not (_in_service(row) and bus_on.get(b, True)):
+            continue
+        k = 1.0 if row.get("scaling") is None or row.get("scaling") != row.get("scaling") else float(row["scaling"])
+        p, q = out.get(b, (0.0, 0.0))
+        out[b] = (p + float(row.get("p_mw") or 0.0) * k, q + float(row.get("q_mvar") or 0.0) * k)
+    return out
 
 
 def _load_data(net) -> tuple[list, dict, dict, dict]:
@@ -654,7 +733,8 @@ def active_power_balance_rule(m, bus_idx):
     P_inj = sum(m.Pg_new[g] for g in m.G if m.gen_bus[g] == bus_idx) \
           + sum(m.Pext[e] for e in m.Ext if m.ext_bus[e] == bus_idx) \
           - sum(m.Pl[l] * _served(m, l) for l in m.L if m.load_bus[l] == bus_idx) \
-          - sum(m.Ps_nom[s] * m.V[bus_idx] ** 2 for s in m.S if m.shunt_bus[s] == bus_idx)
+          - sum(m.Ps_nom[s] * m.V[bus_idx] ** 2 for s in m.S if m.shunt_bus[s] == bus_idx) \
+          - getattr(m, "fixed_demand", {}).get(bus_idx, (0.0, 0.0))[0]
 
     # --- Branch outflows ---
     P_flow = sum(
@@ -685,7 +765,7 @@ def reactive_power_balance_rule(m, bus_idx):
     # Qs_nom is Mvar at V=1.0; actual Q = Qs_nom * V^2
     Q_shunts_at_bus = sum(m.Qs_nom[s] * (m.V[bus_idx]**2) for s in m.S if m.shunt_bus[s] == bus_idx)
     # In your original code you subtracted model.Qs; keep same sign convention:
-    Q_inj = Q_inj - Q_shunts_at_bus
+    Q_inj = Q_inj - Q_shunts_at_bus - getattr(m, "fixed_demand", {}).get(bus_idx, (0.0, 0.0))[1]
 
 
     # --- Branch outflows ---
@@ -1041,6 +1121,7 @@ def optimization_model_base(net, net_base, Yff_r, Yff_i, Yft_r, Yft_i, TAPS, tra
     # Nominal shunt P and Q at 1 p.u. (the solved values scale with V², as in
     # pandapower); one entry per shunt index (see _shunt_data).
     shunt_name_list, shunt_bus_map, shunt_P_nom, shunt_Q_nom = _shunt_data(net)
+    model.fixed_demand = _fixed_demand(net)    # storage, held at its set-point
     
     model.S = Set(initialize=shunt_name_list)
     model.shunt_bus = Param(model.S, initialize=shunt_bus_map)
@@ -1774,6 +1855,7 @@ def scenario_optimization_model_base(
 
     # Shunts.
     shunt_name_list, shunt_bus_map, shunt_P_nom, shunt_Q_nom = _shunt_data(net)
+    model.fixed_demand = _fixed_demand(net)    # storage, held at its set-point
     model.S = Set(initialize=shunt_name_list)
     model.shunt_bus = Param(model.S, initialize=shunt_bus_map)
     model.Qs_nom = Param(model.S, initialize=shunt_Q_nom)

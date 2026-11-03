@@ -18,7 +18,7 @@ import resolve as rv
 @pytest.fixture(scope="module")
 def ieee14():
     net = pn.case14()
-    net.bus["name"] = None                         # as the PGLib profile loads it: Bus_<i>
+    net.bus["name"] = None                         # as a MATPOWER case loads: Bus_<i>
     return net
 
 

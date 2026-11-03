@@ -23,6 +23,7 @@ _build_ybus_entry(net)         -> dict
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -41,7 +42,7 @@ def load_profile(profile_name: str, backend_dir: Optional[str] = None) -> dict:
     Parameters
     ----------
     profile_name : str
-        Name of the profile (without .yaml extension), e.g. "pglib_case14", "ieee14".
+        Name of the profile (without .yaml extension), e.g. "pglib_case30", "cigre_mv".
     backend_dir : str, optional
         Absolute path to the backend/ directory.  Defaults to the directory
         containing this file.
@@ -65,6 +66,9 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
     - ``"excel"``     → pp.from_excel(excel_path)
     - ``"matpower"``  → pandapower MATPOWER converter
     - ``"ieee"``      → pp.networks.case{case}()  (e.g. case14, case30, case118)
+    - ``"pandapower"`` → pp.networks.<case>(**case_args) — any of pandapower's
+                         bundled networks, e.g. ``create_cigre_network_mv``
+                         with ``case_args: {with_der: all}``
     - ``"json"``      → pp.from_json(json_path)
     - ``"pickle"``    → pp.from_pickle(pickle_path)
     """
@@ -78,12 +82,12 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
     if source == "matpower":
         return read_matpower(str(base.parent / profile["matpower_path"]))
 
-    if source == "ieee":
+    if source in ("ieee", "pandapower"):
         case = profile.get("case", "case14")
         loader = getattr(pp.networks, case, None)
         if loader is None:
             raise ValueError(f"Unknown pp.networks case: {case}")
-        return loader()
+        return loader(**(profile.get("case_args") or {}))
 
     if source == "json":
         path = base.parent / profile["json_path"]
@@ -129,6 +133,80 @@ def _move_cost(net, et: str, idx, new_et: str, new_idx) -> None:
     rows = (net.poly_cost["et"] == et) & (net.poly_cost["element"] == idx)
     net.poly_cost.loc[rows, "et"] = new_et
     net.poly_cost.loc[rows, "element"] = new_idx
+
+
+class CgmesError(ValueError):
+    """A CGMES upload that cannot be used; the message says why and what to add."""
+
+
+def read_cgmes(path: str) -> pp.pandapowerNet:
+    """A CGMES model (CIM 2.4.15 or 3.0) from a zip of its profiles — EQ, SSH,
+    TP, SV, and the boundary set when the model has one — or a zip of such
+    zips (a model and its boundary, as ENTSO-E publishes them). Converted by
+    pandapower's CIM converter, which keeps each element's mRID (`origin_id`)
+    and class (`origin_class`), and each bus's Substation (`Substation_id`).
+
+    Refused, with what to add, when the profiles leave lines without a node at
+    one end — a model whose boundary set is missing — or carry no equipment."""
+    import logging
+    import tempfile
+    import warnings
+    import zipfile
+
+    from pandapower.converter.cim.cim2pp.from_cim import from_cim
+
+    with tempfile.TemporaryDirectory() as scratch:
+        files, xml_heads = [], []
+        with zipfile.ZipFile(path) as outer:
+            inner = [n for n in outer.namelist() if n.lower().endswith(".zip")]
+            if inner:
+                for n in inner:
+                    target = os.path.join(scratch, os.path.basename(n))
+                    with open(target, "wb") as fh:
+                        fh.write(outer.read(n))
+                    files.append(target)
+                    with zipfile.ZipFile(target) as z:
+                        xml_heads += [z.read(m)[:4000] for m in z.namelist() if m.lower().endswith(".xml")]
+            else:
+                files.append(path)
+                xml_heads += [outer.read(m)[:4000] for m in outer.namelist() if m.lower().endswith(".xml")]
+        if not xml_heads or not any(b"TC57/CIM" in h or b"iec.ch" in h for h in xml_heads):
+            raise CgmesError("This zip holds no CIM/CGMES profiles (XML files in the IEC CIM namespace).")
+        version = "3.0" if any(b"CIM100" in h for h in xml_heads) else "2.4.15"
+        logging.disable(logging.CRITICAL)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                net = from_cim(file_list=files, cgmes_version=version)
+        finally:
+            logging.disable(logging.NOTSET)
+    if not len(net.bus):
+        raise CgmesError("The CGMES profiles describe no topology: include the TP (or EQ with connectivity) profile.")
+    dangling = []
+    for tbl, a, b in (("line", "from_bus", "to_bus"), ("trafo", "hv_bus", "lv_bus")):
+        bad = net[tbl][net[tbl][a].isna() | net[tbl][b].isna()]
+        dangling += [str(n) for n in bad.get("name", bad.index)]
+    if dangling:
+        raise CgmesError(f"{len(dangling)} branch(es) end in nodes the model does not contain ("
+                         + ", ".join(dangling[:5]) + ("…" if len(dangling) > 5 else "")
+                         + "): the boundary set (EQ_BD, TP_BD) is probably missing. Add it to the zip.")
+    # CONDUCTOR studies the network from a supply point. A model whose reference is a generator (CGMES
+    # `referencePriority`, pandapower's `slack`) gets it as the external grid, as pandapower's MATPOWER
+    # converter makes the reference bus's unit one; it keeps the unit's mRID.
+    net["_import_notes"] = []
+    if not len(net.ext_grid) and len(net.gen):
+        slack = net.gen[net.gen["slack"].fillna(False).astype(bool)] if "slack" in net.gen.columns else net.gen.iloc[0:0]
+        ref = slack.index[0] if len(slack) else net.gen["max_p_mw"].fillna(0).idxmax()
+        row = net.gen.loc[ref]
+        idx = pp.create_ext_grid(net, bus=int(row["bus"]), vm_pu=float(row.get("vm_pu", 1.0) or 1.0),
+                                 name=f"{row.get('name') or 'Reference unit'} (reference)")
+        if "origin_id" in net.gen.columns:
+            net.ext_grid.at[idx, "origin_id"] = row.get("origin_id")
+        net.gen = net.gen.drop(index=ref)
+        net["_import_notes"].append(f"The model has no external grid: its reference unit {row.get('name')!r} "
+                                    "is the supply point (the external grid) in CONDUCTOR.")
+    net.name = net.name or os.path.splitext(os.path.basename(path))[0]
+    return net
 
 
 def read_matpower(path: str) -> pp.pandapowerNet:

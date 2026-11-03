@@ -127,9 +127,12 @@ def test_the_dispatch_starts_from_the_scaled_moment(backend_client):
 def test_contradictions_and_caps_are_explained(backend_client):
     ts = mb.app_data["timestamps"][40]
     pinned = backend_client.post("/api/flexibility/optimize",
-                                 json={"timestamp": ts, "fixed_setpoints": {"Gen_bus2": 500}})
-    assert pinned.status_code == 422 and "Gen_bus2 at 500.00 MW" in pinned.json()["detail"]
-    capped = backend_client.post("/api/flexibility/optimize", json={"timestamp": ts, "slack_max_mw": 10}).json()
+                                 json={"timestamp": ts, "fixed_setpoints": {"Gen_bus1": 500}})
+    assert pinned.status_code == 422 and "Gen_bus1 at 500.00 MW" in pinned.json()["detail"]
+    assert "0.00 to 80.00 MW" in pinned.json()["detail"]                     # its range
+    # The IEEE 30 demo's units cover a 10 MW cap at this hour as measured; at 1.3× load they cannot.
+    capped = backend_client.post("/api/flexibility/optimize",
+                                 json={"timestamp": ts, "slack_max_mw": 10, "load_scaling_factor": 1.3}).json()
     assert capped["status"] == "cap_infeasible"
     assert capped["infeasibility_diagnosis"]["binding_limit"] == "exchange_limit"
     assert "would import" in capped["message"]

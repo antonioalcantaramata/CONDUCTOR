@@ -67,6 +67,7 @@ from agent import update_check as _update_check
 from agent import timeline as _tl
 from agent import generator_table as _gen_table
 from agent import system_tables as _sys_table
+from agent import semantics_view as _sem_view
 from agent import data_view as _dv
 from agent import settings_change as _settings_change
 from agent import session_context as _sc
@@ -527,6 +528,20 @@ st.markdown(
         background: var(--cd-brand-soft); border-radius: 0.6rem; padding: 0.05rem 0.45rem;
     }
     [class*="st-key-gentable_"] [data-testid="stButton"] button { min-height: 1.6rem; padding: 0 0.4rem; }
+    /* The network description: four facts, each with how it is known. */
+    .st-key-sem_headline [data-testid="stColumn"] {
+        border: 1px solid var(--cd-border); border-radius: 0.6rem; padding: 0.55rem 0.75rem;
+    }
+    .sem-label { font-size: 0.75rem; font-weight: 600; color: var(--cd-muted); text-transform: uppercase;
+                 letter-spacing: 0.03em; }
+    .sem-value { font-size: 1.05rem; font-weight: 600; margin: 0.15rem 0; }
+    .sem-how { font-size: 0.78rem; color: var(--cd-muted); line-height: 1.3; }
+    .st-key-sem_around_cards [data-testid="stColumn"] {
+        border: 1px solid var(--cd-border); border-radius: 0.6rem; padding: 0.6rem 0.8rem;
+    }
+    .st-key-sem_around_cards p { font-size: 0.88rem; margin-bottom: 0.35rem; }
+    .sem-swatch { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 0.2rem;
+                  margin-right: 0.45rem; vertical-align: -0.1rem; }
     /* The System tab's assumption chips: small pills, filled when changed. */
     .st-key-sys_chips button {
         border-radius: 999px; min-height: 1.9rem; padding: 0.1rem 0.85rem;
@@ -1252,7 +1267,7 @@ def _render_main_hero(compact: bool = False) -> None:
                 <div class="cb-panel-head"><div class="cb-panel-title">Upload Network</div>
                     <button type="button" class="cb-close" aria-label="Close">✕</button></div>
                 <div class="cb-modal-grid"><div class="cb-modal-main">
-                <input type="file" id="cb-net-file" accept=".m,.json,.xlsx,.uct" />
+                <input type="file" id="cb-net-file" accept=".m,.json,.xlsx,.uct,.zip" />
                 <label class="cb-check">
                     <input type="checkbox" id="cb-net-convert" checked />
                     Start generators at a fixed power factor (pf 1.0); unticked, they keep voltage control. Change each unit afterwards in the System tab.
@@ -1272,7 +1287,8 @@ def _render_main_hero(compact: bool = False) -> None:
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.m</span><span class="cb-fmt-desc">MATPOWER case file — IEEE cases, pglib-opf, or any compatible model</span></div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.json</span><span class="cb-fmt-desc">pandapower JSON — export with <code>pp.to_json(net, "file.json")</code></span></div>
                     <div class="cb-fmt-row"><span class="cb-fmt-tag">.xlsx</span><span class="cb-fmt-desc">pandapower Excel — export with <code>pp.to_excel(net, "file.xlsx")</code></span></div>
-                    <div class="cb-fmt-row"><span class="cb-fmt-tag">.uct</span><span class="cb-fmt-desc">UCTE/CGMES exchange — ENTSO-E standard for European TSO networks</span></div>
+                    <div class="cb-fmt-row"><span class="cb-fmt-tag">.uct</span><span class="cb-fmt-desc">UCTE-DEF exchange — ENTSO-E's older format for European TSO networks</span></div>
+                    <div class="cb-fmt-row"><span class="cb-fmt-tag">.zip</span><span class="cb-fmt-desc">CGMES (CIM 2.4.15 or 3.0) — the profiles in a zip, with the boundary set if the model has one; each element keeps its CIM identifier</span></div>
                 </div>
                 <div class="cb-adv-card">
                     <div class="cb-fmt-title">Advanced OPF admittance (expert)</div>
@@ -1589,7 +1605,7 @@ full,,branch_to_trafo,3,33,0,,</pre>
                 const tapPolicy = parentDoc.getElementById('cb-net-tap-policy').value;
                 const status = parentDoc.getElementById('cb-net-status');
                 const btn = parentDoc.getElementById('cb-net-submit');
-                if (!file) { status.textContent = 'Select a file first (.m, .json, .xlsx, .uct).'; status.className = 'cb-status err'; return; }
+                if (!file) { status.textContent = 'Select a file first (.m, .json, .xlsx, .uct, .zip).'; status.className = 'cb-status err'; return; }
                 status.textContent = 'Uploading…'; status.className = 'cb-status'; btn.disabled = true;
                 const fd = new FormData();
                 fd.append('file', file, file.name);
@@ -3016,11 +3032,11 @@ SCENARIO_QUERIES: dict[str, list[tuple[str, str]]] = {
         ("Is the network secure at its nominal operating point, and how do the synthetic data compare "
          "with it?", ":material/push_pin:"),
     ],
-    "ieee14": [
-        ("How sensitive are the voltages to the load power factor? Compare 0.90, 0.95 and 1.0 at the "
-         "current timestamp.", ":material/tune:"),
-        ("Is the network secure at its nominal operating point, and how do the synthetic data compare "
-         "with it?", ":material/push_pin:"),
+    "cigre_mv": [
+        ("Where do the voltages sag at the evening peak, and which feeder is it?", ":material/trending_down:"),
+        ("If Line 2-3 were out, which loads and units would lose supply, and which tie could restore them?",
+         ":material/account_tree:"),
+        ("Which units are solar, and how much of the evening peak can they cover?", ":material/solar_power:"),
     ],
     "ieee30_reactive": [
         ("What does the data-quality report say about the reactive measurements, and how are the gaps "
@@ -3154,7 +3170,7 @@ def _read_json_file(path: pathlib.Path) -> dict | None:
 # Files in systems/ that are not uploads: the bundled demo cases and the
 # backend's saved state.
 PROTECTED_SYSTEM_FILES = frozenset({
-    ".gitkeep", "pglib_opf_case14_ieee.m", "pglib_opf_case30_ieee.m", "pglib_opf_case30_as.m",
+    ".gitkeep", "pglib_opf_case30_ieee.m", "pglib_opf_case30_as.m",
     "pandapower_network_flex.xlsx",
     "assumptions.json", "scenario.json", "proposals.json", "option_sets.json",
 })
@@ -3213,7 +3229,7 @@ def _collect_uploaded_cleanup_groups() -> dict[str, list[pathlib.Path]]:
     for p in sorted(_DATA_FILES_DIR.glob("uploaded_*.csv")):
         _add("Other uploaded-looking CSV files", p)
     for p in sorted(_SYSTEMS_DIR.glob("uploaded_*")):
-        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
+        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct", ".zip"}:
             _add("Other uploaded-looking network files", p)
 
     # Show non-default network files as optional removable artifacts — never a
@@ -3222,7 +3238,7 @@ def _collect_uploaded_cleanup_groups() -> dict[str, list[pathlib.Path]]:
     for p in sorted(_SYSTEMS_DIR.iterdir()) if _SYSTEMS_DIR.is_dir() else []:
         if not p.is_file() or p.name in PROTECTED_SYSTEM_FILES:
             continue
-        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct"}:
+        if p.suffix.lower() in {".m", ".json", ".xlsx", ".uct", ".zip"}:
             _add("Other network files in systems (non-default)", p)
 
     return groups
@@ -4436,10 +4452,13 @@ def _render_system_view() -> None:
     _render_system_header(payload, assumptions)
     st.session_state.setdefault("system_pane", "map")
     pane = st.segmented_control(
-        "System view", ["map", "assumptions", "names"], key="system_pane", label_visibility="collapsed",
-        format_func={"map": "🗺️ Network map", "assumptions": "⚙️ Model assumptions",
+        "System view", ["map", "semantics", "assumptions", "names"], key="system_pane", label_visibility="collapsed",
+        format_func={"map": "🗺️ Network map", "semantics": "🧭 What it is", "assumptions": "⚙️ Model assumptions",
                      "names": "🏷️ Names"}.get,
         selection_mode="single") or "map"
+    if pane == "semantics":
+        _render_semantics()
+        return
     if pane == "assumptions":
         _render_model_assumptions(assumptions)
         return
@@ -4763,6 +4782,193 @@ def _edit_cost_dialog(unit: dict) -> None:
             st.rerun()
         st.rerun(scope="fragment")
     if c_cancel.button("Cancel", width="stretch", key="cost_cancel"):
+        st.rerun()
+
+
+def _render_semantics() -> None:
+    """What each element is — a unit's energy source, a load's category, a
+    bus's voltage level and substation, a branch's ends and rating, where the
+    external grid comes in — and how we know: stated by the network, read from
+    a name, inferred by a rule, or unknown. The operator sets what the network
+    does not say; the agent reads and sets the same."""
+    data = _api_request("get", "/api/network/semantics", error_key="_sem_error")
+    error = st.session_state.pop("_sem_error", None)
+    if error:
+        st.warning(error)
+    if data is None:
+        st.caption("Could not read the network description from the backend.")
+        return
+    st.caption("What each element is and how CONDUCTOR knows it: **stated** by the network, read from its "
+               "**name**, **inferred** by a rule, or **unknown** — never guessed. The agent answers from these "
+               "facts and every answer is checked against them. Set what the network does not say; renewable "
+               "scaling applies to the units set to wind or solar. Kept for this network across restarts; "
+               "CONDUCTOR records what you tell it in the chat here too.")
+    with st.container(key="sem_headline"):
+        for col, (label, value, how) in zip(st.columns(5), _sem_view.headline(data)):
+            col.markdown(f"<div class='sem-label'>{html.escape(label)}</div>"
+                         f"<div class='sem-value'>{html.escape(value)}</div>"
+                         f"<div class='sem-how'>{html.escape(how)}</div>", unsafe_allow_html=True)
+
+    kinds = [k for k in ("units", "loads") if data.get(k)]
+    if kinds:
+        st.session_state.setdefault("sem_picture", kinds[0])
+        if st.session_state.sem_picture not in kinds:
+            st.session_state.sem_picture = kinds[0]
+        shown = st.segmented_control("Picture", kinds, key="sem_picture", label_visibility="collapsed",
+                                     format_func={"units": "Units by energy source",
+                                                  "loads": "Loads by category"}.get) or kinds[0]
+        c_fig, c_key = st.columns([3, 1], vertical_alignment="center")
+        c_fig.plotly_chart(_sem_view.figure(data, shown), width="stretch", theme=None,
+                           config={"displayModeBar": False})
+        c_key.markdown(f"**{_sem_view.KINDS[shown]['legend']}**<br>" + "<br>".join(
+            f"<span class='sem-swatch' style='background:{c}'></span>{html.escape(v)}"
+            for v, c in _sem_view.legend(data, shown)), unsafe_allow_html=True)
+        c_key.caption("Voltage level › substation › element. A lighter shade: read from the name or inferred, "
+                      "not stated. Grey: the network does not say. Click a ring to zoom in.")
+
+    units, loads = _sem_view.unit_rows(data), _sem_view.load_rows(data)
+    lines, trafos, buses = _sem_view.line_table(data), _sem_view.trafo_table(data), _sem_view.bus_table(data)
+    switches, feeders, shunts = _sem_view.switch_table(data), _sem_view.feeder_table(data), _sem_view.shunt_table(data)
+    values = _sem_view.data_table(data)
+    tabs = [(f"Units · {len(units)}", "units"), (f"Loads · {len(loads)}", "loads"),
+            (f"Lines · {len(lines)}", "lines"), (f"Transformers · {len(trafos)}", "trafos"),
+            (f"Buses · {len(buses)}", "buses"), (f"Switches · {len(switches)}", "switches"),
+            (f"Feeders · {len(feeders)}", "feeders"), (f"Shunts · {len(shunts)}", "shunts"),
+            (f"Data · {len(values)}", "data")]
+    tabs = [t for t in tabs if not t[0].endswith(" 0")]
+    for (_title, kind), tab in zip(tabs, st.tabs([t[0] for t in tabs])):
+        with tab:
+            if kind in ("units", "loads"):
+                rows = units if kind == "units" else loads
+                n_unknown = sum(r["value"] == "unknown" for r in rows)
+                what = "source" if kind == "units" else "category"
+                _render_plain_table(
+                    f"semantics_{kind}", "",
+                    (f"{n_unknown} with no stated {what} (the network does not say) — set one where you know "
+                     "it. " if n_unknown else "") + "Your setting overrides what the network or a name says.",
+                    _sem_view.UNIT_COLUMNS if kind == "units" else _sem_view.LOAD_COLUMNS, rows,
+                    lambda name, kind=kind: st.session_state.update(_sem_editing=(kind, name)),
+                    mark="declared", flag="declared",
+                    widths=[1.1, 1.0, 0.8, 0.8, 1.9] if kind == "units" else [1.1, 1.0, 0.9, 0.8, 1.6, 0.7])
+            else:
+                table = {"lines": lines, "trafos": trafos, "buses": buses, "switches": switches,
+                         "feeders": feeders, "shunts": shunts, "data": values}[kind]
+                st.caption({"lines": "Each line's ends, voltage and rating, as the network states them (a "
+                                     "rating in MVA needs a voltage: unknown in a per-unit case).",
+                            "trafos": "Each transformer's high- and low-voltage ends and rated power.",
+                            "buses": "Each bus's nominal voltage, substation and feeder, with how each is known.",
+                            "switches": "Each switch's class as the network types it, its normal state (as "
+                                        "loaded) and its state now, and its role: a tie joins two feeders — "
+                                        "closing it restores supply across them (not checked against flows).",
+                            "feeders": "Each feeder, named after its first line, with what it supplies and the "
+                                       "switches that tie it to others — inferred from the topology as switched "
+                                       "now, only where the voltage level is radial.",
+                            "shunts": "Each shunt compensator (LinearShuntCompensator): a capacitor injects "
+                                      "reactive power, a reactor absorbs it; the size is at 1 p.u. voltage.",
+                            "data": _sem_view.data_caption(data)}[kind])
+                st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch",
+                             height=min(420, 38 + 35 * len(table)))
+    # The export on demand: a large network's RDF is megabytes, not worth fetching on every render.
+    key = (st.session_state.get("_network_fingerprint"), st.session_state.get("_assumptions_key"))
+    ready = st.session_state.get("_sem_export")
+    if not ready or ready.get("key") != key:
+        if st.button("Export as CIM…", key="sem_export", icon=":material/download:",
+                     help="What CONDUCTOR knows about this network, as CIM (CIM100), with the basis of each fact "
+                          "in a namespace of its own — readable by CIM tools and SPARQL."):
+            files = {}
+            try:
+                with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+                    for fmt in ("xml", "jsonld"):
+                        r = client.get(f"{BASE_URL}/api/network/cim", params={"format": fmt})
+                        r.raise_for_status()
+                        files[fmt] = r.content
+                st.session_state._sem_export = {"key": key, **files}
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"The export could not be prepared: {exc}")
+    else:
+        c_rdf, c_jl, _ = st.columns([1, 1, 2])
+        c_rdf.download_button("CIM RDF/XML", ready["xml"], file_name="conductor-network.xml",
+                              mime="application/rdf+xml", key="sem_export_xml", icon=":material/download:")
+        c_jl.download_button("JSON-LD", ready["jsonld"], file_name="conductor-network.jsonld",
+                             mime="application/ld+json", key="sem_export_jsonld", icon=":material/download:")
+    if st.button("Forget everything I set", key="sem_reset",
+                 disabled=not any(r["declared"] for r in units + loads)):
+        _api_request("post", "/api/network/declare", {"reset": True}, error_key="_sem_error")
+        st.rerun()
+    ext = data.get("external_grids") or []
+    if ext:
+        st.markdown("**External grid**")
+        for e in ext:
+            st.caption(f"Connected at **{e['bus']}** ({e['substation']}); its power comes in over "
+                       + ", ".join(f"`{b}`" for b in e["branches"]) + ".")
+    _render_around(data)
+    editing = st.session_state.pop("_sem_editing", None)
+    if editing:
+        kind, name = editing
+        row = next((r for r in (units if kind == "units" else loads) if r["unit"] == name), None)
+        if row is not None:
+            _set_fact_dialog(kind, row)
+
+
+def _render_around(data: dict) -> None:
+    """One element and everything it is connected to — where it sits, how it is
+    supplied, what would lose supply without it: what the agent reads with
+    describe_network(about="around")."""
+    from urllib.parse import urlencode
+    st.markdown("**Look around an element**")
+    choices = _sem_view.around_choices(data)
+    picked = st.selectbox("Element", [c[0] for c in choices], index=None, key="sem_around",
+                          placeholder="A substation, bus, line, transformer, unit or load",
+                          label_visibility="collapsed")
+    if not picked:
+        st.caption("What it is connected to, how it is supplied, and what would lose supply without it.")
+        return
+    name = dict(choices)[picked]
+    result = _api_request("get", "/api/network/semantics?" + urlencode({"about": "around", "element": name}),
+                          error_key="_sem_error")
+    if result is None:
+        st.warning(st.session_state.pop("_sem_error", "Could not look around it."))
+        return
+    cards = _sem_view.around_cards(result)
+    with st.container(key="sem_around_cards"):
+        for col, (title, lines) in zip(st.columns(len(cards)), cards):
+            col.markdown(f"<div class='sem-label'>{html.escape(title)}</div>", unsafe_allow_html=True)
+            col.markdown("\n\n".join(lines))
+
+
+@st.dialog("Set what it is", width="small")
+def _set_fact_dialog(kind: str, row: dict) -> None:
+    """A unit's source or a load's category, as the operator knows it; Forget
+    goes back to what the network (or the element's name) says."""
+    is_unit = kind == "units"
+    what = "Energy source" if is_unit else "Demand category"
+    st.markdown(f"**{html.escape(row['unit'])}** · {html.escape(row['cells'][1])}")
+    now = ("not stated by the network" if row["value"] == "unknown" else
+           f"{row['cells'][2]} — {row['cells'][3].lower()}" + (f" ({row['cells'][4]})" if row["cells"][4] else ""))
+    st.caption(f"Now: {now}.")
+    options = list(_sem_view.SETTABLE if is_unit else _sem_view.SETTABLE_CATEGORIES)
+    choice = st.selectbox(what, options, index=options.index(row["value"]) if row["value"] in options else None,
+                          format_func=_sem_view.label, placeholder="Choose one", key=f"dlg_fact_{kind}_{row['unit']}")
+    error = st.session_state.pop("_sem_error", None)
+    if error:
+        st.warning(error)
+
+    def send(value: str) -> None:
+        body = ({"units": [{"unit": row["unit"], "source": value}]} if is_unit else
+                {"loads": [{"load": row["unit"], "category": value}]})
+        if _api_request("post", "/api/network/declare", body, error_key="_sem_error") is not None:
+            st.rerun()
+        st.rerun(scope="fragment")
+
+    c_apply, c_forget, c_cancel = st.columns(3)
+    if c_apply.button("Apply", type="primary", disabled=choice is None or (choice == row["value"] and row["declared"]),
+                      width="stretch", key="sem_apply"):
+        send(choice)
+    if c_forget.button("Forget", disabled=not row["declared"], width="stretch", key="sem_forget",
+                       help="Back to what the network (or the element's name) says."):
+        send("unknown")
+    if c_cancel.button("Cancel", width="stretch", key="sem_cancel"):
         st.rerun()
 
 
@@ -6358,6 +6564,8 @@ def _render_data_view() -> None:
                                  help="Leave empty for the system total. A renamed bus shows its name now, "
                                       "with the name its data are filed under.")
     offered = _dv.quantities(base)
+    # Session state carries the value (and its fallback): the widgets take no default of their own, or Streamlit
+    # warns that both set it.
     if st.session_state.get("dv_quantity") not in offered:
         st.session_state.dv_quantity = "consumption"
     if len(offered) > len(_dv.QUANTITIES):
@@ -6365,7 +6573,7 @@ def _render_data_view() -> None:
         quantity = c_qty.selectbox("Quantity", list(offered), format_func=offered.get, key="dv_quantity")
     else:
         quantity = c_qty.segmented_control("Quantity", list(offered), format_func=offered.get,
-                                           default="consumption", required=True, key="dv_quantity")
+                                           required=True, key="dv_quantity")
     items = list(picked) or [_dv.TOTAL]
 
     subs = tuple(sorted(picked))

@@ -158,7 +158,9 @@ class TestInstructions:
 # ---------------------------------------------------------------------------
 
 needs_ipopt = pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
-TS = "2000-01-03 18:00:00"
+# On the IEEE 30 demo: secure as measured, and at 1.8× load the line from the
+# external grid and Bus_29 are violated (at 18:00 it is already violated at 1.0×).
+TS = "2000-01-03 04:00:00"
 
 
 @pytest.fixture
@@ -169,7 +171,7 @@ def client(tmp_path, monkeypatch):
     systems, data = tmp_path / "systems", tmp_path / "data_files"
     systems.mkdir()
     data.mkdir()
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(systems))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(data))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",

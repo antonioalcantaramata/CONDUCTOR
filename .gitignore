@@ -30,7 +30,6 @@ llm_agent/session_contexts/
 # ── Runtime state & user uploads (keep only the bundled default network) ───
 systems/*
 !systems/.gitkeep
-!systems/pglib_opf_case14_ieee.m
 !systems/pglib_opf_case30_as.m
 
 data_files/*
@@ -60,6 +59,10 @@ backend/datastream_map.local.json
 
 # What-if evaluation runs (python -m evaluation.whatif run)
 evaluation_runs/
+
+# A paper's material — task catalogue, run records, analysis, case-study report (papers/<paper>/). Kept out of git
+# until the paper is public; remove this line (or force-add the folder) to publish it.
+papers/
 
 # Local LLM state: usage counts, discovery caches, tool-calling test results.
 llm_agent/.cache/

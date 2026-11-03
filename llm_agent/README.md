@@ -54,7 +54,7 @@ llm_agent/
 The launch screen has two columns: on the left **what to load** — *Resume* (your last uploaded
 network and data; offered once something has been uploaded), *Demo: IEEE 30 ·
 active only* (the default), *Demo: IEEE 30 · with reactive measurements*, or *Demo:
-IEEE 14 · smaller* — and on the right
+CIGRE MV · distribution with DER* — and on the right
 how to run the assistant, with Start. A choice there loads at once. Later, the sidebar's
 *Scenario* expander switches with **Load**, which starts a new conversation (the
 old one described another grid). Demos never replace your uploads; each network

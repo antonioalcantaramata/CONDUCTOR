@@ -28,7 +28,7 @@ bus voltages outside $[\underline V, \overline V]$, lines and transformers
 above their loading limit, each widened by the screen's solver tolerance
 ($10^{-4}$ p.u., 0.01 %; see [the N-1 screen](#the-n-1-screen)). The limits are
 the network's own unless the question gives others — on the bundled networks
-100 % of each rating, and 0.95–1.05 p.u. (IEEE 30) or 0.94–1.06 p.u. (IEEE 14).
+100 % of each rating, and 0.95–1.05 p.u. (IEEE 30 and CIGRE MV).
 
 **Islanding.** An outage may leave buses without a path to a source. The
 single-outage study finds them with pandapower's connectivity search

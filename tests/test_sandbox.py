@@ -249,7 +249,7 @@ class TestProposalEndpoints:
             DC, {**DC, "bus": "Bus 99", "name": "x"}]})
         assert r.status_code == 400 and "Edit 2" in r.json()["detail"]
         r = client.post("/api/proposals/edit", json={"proposal": "bad", "edits": [
-            {**DC, "bus": 7, "profile": "follow_bus"}]})
+            {**DC, "bus": 5, "profile": "follow_bus"}]})                      # Bus_5: no load
         assert r.status_code == 422 and "no measured demand" in r.json()["detail"]
         assert client.get("/api/proposals").json()["proposals"] == []
 
@@ -498,7 +498,7 @@ class TestSwitchedOff:
 
     def test_results_mark_what_is_switched_off(self, client):
         _create(client, "off", [
-            {"op": "set_in_service", "element_type": "sgen", "element": "Gen_bus1", "in_service": False},
+            {"op": "set_in_service", "element_type": "gen", "element": "Gen_bus1", "in_service": False},
             {"op": "set_in_service", "element_type": "line", "element": 3, "in_service": False},
             {"op": "set_in_service", "element_type": "load", "element": 1, "in_service": False}])
         rsa = client.post("/api/grid/rsa", json={"network": "off"}).json()
@@ -517,8 +517,11 @@ class TestSwitchedOff:
         rsa = client.post("/api/grid/rsa", json={"timestamp": "2000-01-03 12:00"}).json()
         names = [g["name"] for g in rsa["gen_dispatch"]]
         assert "Gen_bus1" in names and "0" not in names
-        gen1 = next(g for g in rsa["gen_dispatch"] if g["name"] == "Gen_bus1")
-        assert rsa["flexibility_metrics"]["total_available_capacity_mw"] == pytest.approx(59.0 - gen1["Pg_mw"], abs=1e-2)
+        # The headroom of the demo's five units: 80 + 40 + 50 + 35 + 30 MW less what they produce.
+        units = [g for g in rsa["gen_dispatch"] if g["name"].startswith("Gen_bus")]
+        assert sorted(g["name"] for g in units) == ["Gen_bus1", "Gen_bus10", "Gen_bus12", "Gen_bus4", "Gen_bus7"]
+        assert rsa["flexibility_metrics"]["total_available_capacity_mw"] == pytest.approx(
+            235.0 - sum(g["Pg_mw"] for g in units), abs=1e-2)
 
 
 class TestDiffMap:
@@ -978,11 +981,12 @@ class TestGraderAndPrompt:
 
 class TestFromTheLiveTest:
     """Found in the first live session: a new substation 5 km from Bus 9 with
-    a 15 MW data centre."""
+    a data centre (15 MW on IEEE 14; 30 MW on the IEEE 30 demo, where 15 MW
+    leaves the new bus at 0.977 p.u.)."""
 
     LIVE = [{"op": "add_bus_with_connection", "name": "New Substation near Bus 9", "connect_to": "Bus_9",
-             "length_km": 5, "line_like": "Bus_8 -> Bus_9 [L12]"},
-            {"op": "add_load", "name": "Data centre", "bus": "New Substation near Bus 9", "p_mw": 15,
+             "length_km": 5, "line_like": "Bus_8 -> Bus_9 [L13]"},
+            {"op": "add_load", "name": "Data centre", "bus": "New Substation near Bus 9", "p_mw": 30,
              "pf": 0.95, "profile": "flat"}]
 
     def test_the_comparison_names_the_violated_new_bus_and_reports_its_voltage(self, client):
@@ -991,7 +995,7 @@ class TestFromTheLiveTest:
                                                          "timestamp": "2000-01-01 00:00"}).json()
         assert out["new_violations"] == [{"type": "bus_vm_pu", "element": "New Substation near Bus 9"}]
         (site,) = out["added_buses"]
-        assert site["bus"] == "New Substation near Bus 9" and site["vm_pu"] < 0.94
+        assert site["bus"] == "New Substation near Bus 9" and site["vm_pu"] < 0.95       # the demo's band
 
     def test_placeholder_lengths_are_noted(self, client):
         out = _create(client, "live", self.LIVE)
@@ -1017,7 +1021,7 @@ class TestFromTheLiveTest:
         from llm_agent.agent import tools
         monkeypatch.setattr(tools, "_get", lambda path: client.get(path).json())
         assert tools.locate_network_element("Bus 8")["element"] == "Bus_8"
-        assert tools.locate_network_element("bus_8 -> bus 9")["element_index"] == 12
+        assert tools.locate_network_element("bus_8 -> bus 9")["element_index"] == 13
 
 
 def test_a_retried_lookup_is_not_a_concern():
@@ -1041,7 +1045,7 @@ def restartable(tmp_path, monkeypatch):
     pytest.importorskip("fastapi.testclient")
     import main_backend as mb
     from fastapi.testclient import TestClient
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     for name, sub in (("SYSTEMS_DIR", "systems"), ("DATA_FILES_DIR", "data_files")):
         monkeypatch.setattr(mb, name, str(tmp_path / sub))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL"):
@@ -1134,7 +1138,8 @@ class TestPersistence:
 
 
 class TestCompareOverTime:
-    FACTORY = [{**DC, "name": "Factory", "p_mw": 45, "profile": "shift", "start_hour": 8, "end_hour": 18}]
+    # 90 MW at Bus 9 on the IEEE 30 demo: lines overloaded only while it runs.
+    FACTORY = [{**DC, "name": "Factory", "p_mw": 90, "profile": "shift", "start_hour": 8, "end_hour": 18}]
 
     def test_violations_follow_the_proposals_profile(self, client):
         _create(client, "factory", self.FACTORY)

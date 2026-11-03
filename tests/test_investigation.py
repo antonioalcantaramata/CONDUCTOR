@@ -806,7 +806,7 @@ def test_the_look_ahead_finds_the_episodes_when_to_decide_and_what_prevents_them
     held = [h for e in episodes if e["action"] for h in e["action"]["holds_under"]]
     # Where the forecast errs against the action: more demand. The demo's units are all
     # conventional, so no error in renewable output is checked, and the result says so.
-    assert {h["case"] for h in held} == {"demand_higher"} and "no renewable units" in ahead["forecast_errors_checked"]
+    assert {h["case"] for h in held} == {"demand_higher"} and "stated to be wind or solar" in ahead["forecast_errors_checked"]
     assert all(h["holds"] in (True, False) for h in held)
     assert all(h.get("why_not") for h in held if h["holds"] is False)
     assert "the forecast expects" in ahead["message"]

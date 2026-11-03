@@ -36,7 +36,7 @@ def case14_net():
 
 @pytest.fixture(scope="module")
 def backend_client(tmp_path_factory):
-    """The real backend, in-process, on the bundled IEEE 14-bus profile.
+    """The real backend, in-process, on the bundled IEEE 30-bus demo profile.
 
     About 1.5 s to start and no IPOPT needed for assessment endpoints. Saved
     uploads on this machine are ignored, and the module-level `app_data` is
@@ -48,7 +48,7 @@ def backend_client(tmp_path_factory):
 
     scratch = tmp_path_factory.mktemp("uploads")
     patch = pytest.MonkeyPatch()
-    patch.setenv("GRID_PROFILE", "pglib_case14")
+    patch.setenv("GRID_PROFILE", "pglib_case30")
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
                  "_PROPOSALS_FILE", "_ASSUMPTIONS_FILE", "_SCENARIO_FILE"):
         patch.setattr(mb, name, str(scratch / f"{name}.json"))

@@ -12,8 +12,12 @@ Starting scenarios: what CONDUCTOR loads — the operator's own work, or a demo.
 - ``ieee30_reactive`` — the same network and week, with measured reactive
   demand and generation (`demo_reactive_csv`), a few values left out on
   purpose so the data-quality report shows how gaps are handled.
-- ``ieee14`` — the smaller PGLib IEEE 14-bus case and its week; one unit can
-  move its active power. The what-if evaluation is written for it.
+- ``cigre_mv`` — pandapower's CIGRE medium-voltage benchmark (110/20 kV, two
+  radial feeders with normally open ties) with all its distributed resources —
+  PV, wind, CHP, fuel cells, batteries — each typed by the network, so its
+  units' sources are stated, not guessed; a synthetic week in which the
+  feeder ends sag below 0.95 p.u. at the evening peaks. The what-if
+  evaluation is written for it.
 
 The demo data are generated deterministically (fixed seeds), so a demo is the
 same starting point every time — evaluation runs can name one.
@@ -28,7 +32,7 @@ import math
 import numpy as np
 
 DEMO_PROFILE = "pglib_case30"
-SMALL_DEMO_PROFILE = "pglib_case14"
+DISTRIBUTION_DEMO_PROFILE = "cigre_mv"
 DEFAULT_DEMO = "ieee30"
 SCENARIOS = {
     "resume": {
@@ -49,21 +53,23 @@ SCENARIOS = {
                        "left out on purpose, so the data-quality report shows how gaps are handled.",
         "profile": DEMO_PROFILE, "reactive": True,
     },
-    "ieee14": {
-        "label": "Demo: IEEE 14 · smaller",
-        "description": "PGLib IEEE 14-bus with a synthetic week of active power: one unit can move its active "
-                       "power, three condensers hold voltages. The what-if evaluation is written for it.",
-        "profile": SMALL_DEMO_PROFILE, "reactive": False,
+    "cigre_mv": {
+        "label": "Demo: CIGRE MV · distribution with DER",
+        "description": "The CIGRE medium-voltage benchmark: a 110/20 kV substation and two radial feeders with "
+                       "PV, wind, CHP, fuel cells and batteries, each typed by the network. A synthetic week in "
+                       "which the feeder ends sag below 0.95 p.u. at the evening peaks.",
+        "profile": DISTRIBUTION_DEMO_PROFILE, "reactive": False,
     },
 }
 DEMOS = tuple(k for k, v in SCENARIOS.items() if "profile" in v)
 
 
-def demo_for_profile(profile: str) -> str:
-    """The demo a profile loads as (its active-power one); the default demo
-    for a profile no demo uses."""
-    return next((k for k, v in SCENARIOS.items() if v.get("profile") == profile and not v.get("reactive")),
-                DEFAULT_DEMO)
+def demo_for_profile(profile: str) -> str | None:
+    """The demo a profile loads as (its active-power one); None for a profile
+    no demo uses (`GRID_PROFILE=<your own>`). Calling it the default demo filed
+    its saved changes under that demo, and the next start loaded the demo
+    instead of the profile."""
+    return next((k for k, v in SCENARIOS.items() if v.get("profile") == profile and not v.get("reactive")), None)
 
 
 def demo_reactive_csv(measurements: dict, seed: int = 7) -> bytes:

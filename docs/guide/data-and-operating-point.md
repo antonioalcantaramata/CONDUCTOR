@@ -34,7 +34,8 @@ and moment it used.
 | `.m` | MATPOWER case file: IEEE cases, pglib-opf, or any compatible model |
 | `.json` | pandapower JSON, exported with `pp.to_json(net, "file.json")` |
 | `.xlsx` | pandapower Excel, exported with `pp.to_excel(net, "file.xlsx")` |
-| `.uct` | UCTE exchange format (ENTSO-E) |
+| `.uct` | UCTE-DEF exchange format (ENTSO-E's older format) |
+| `.zip` | CGMES (CIM 2.4.15 or 3.0): the profiles (EQ, SSH, TP, SV) in a zip, or a zip of zips with the boundary set. Each element keeps its CIM identifier and the model's substations; synchronous machines keep the control the model states. A model whose lines end outside it is refused with what to add (usually the boundary set). |
 
 Two choices in the upload dialog:
 

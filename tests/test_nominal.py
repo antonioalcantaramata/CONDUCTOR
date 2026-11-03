@@ -75,10 +75,13 @@ class TestSnapshot:
 
 def _pristine():
     """The app's network exactly as `_lifespan_generic` builds it, before any tick."""
-    profile = nl.load_profile("pglib_case14", backend_dir=str(BACKEND))
+    import generators as gm
+    profile = nl.load_profile("pglib_case30", backend_dir=str(BACKEND))
     net = nl.load_network(profile, backend_dir=str(BACKEND))
     if len(net.gen):
         net, _, _ = nl.gen_to_sgen(net)
+    if profile.get("unit_model"):                     # the demo's units on voltage control
+        net = gm.apply(net, gm.normalise(net, [{"unit": u, **v} for u, v in profile["unit_model"].items()]))
     nl.apply_voltage_setpoints(net, profile)
     return net
 
@@ -158,7 +161,7 @@ def test_an_uploaded_network_keeps_its_nominal_point(tmp_path, monkeypatch):
     pytest.importorskip("fastapi.testclient")
     import main_backend as mb
     from fastapi.testclient import TestClient
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(tmp_path / "systems"))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(tmp_path / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",

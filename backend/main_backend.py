@@ -99,6 +99,7 @@ import naming
 import nominal as nom
 import resolve as rv
 import sandbox as sb
+import semantics as sem
 
 from dotenv import load_dotenv
 
@@ -767,6 +768,8 @@ def _remember_loaded(net) -> None:
     app_data["generator_model"] = {}
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
+    app_data["unit_sources"] = {}
+    app_data["load_categories"] = {}
     app_data["option_sets"] = {}        # options of another network mean nothing on this one
     _restore_option_sets()              # ... but this network's, saved earlier, still do
 
@@ -806,11 +809,22 @@ def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
     return dropped
 
 
+def _default_load_pf() -> tuple[float, str]:
+    """The load power factor when the operator has set none: the network
+    profile's (`load_power_factor`, the loads' own — CIGRE MV's are ~0.97),
+    else CONDUCTOR's default."""
+    stated = (app_data.get("grid_profile") or {}).get("load_power_factor")
+    if isinstance(stated, (int, float)) and LOAD_PF_MIN <= float(stated) <= 1.0:
+        return float(stated), "the network's profile"
+    return lg.DEFAULT_LOAD_POWER_FACTOR, "default"
+
+
 def _load_pf_setting() -> tuple[float, str]:
-    """(the session's load power factor, "default" or "session setting")."""
+    """(the session's load power factor, its source: the default, the
+    network's profile, or the session setting)."""
     value = app_data.get("load_power_factor")
     if value is None:
-        return lg.DEFAULT_LOAD_POWER_FACTOR, "default"
+        return _default_load_pf()
     return float(value), "session setting"
 
 
@@ -821,15 +835,18 @@ def _save_assumptions() -> None:
     model = app_data.get("generator_model") or {}
     unit_costs = app_data.get("unit_costs") or {}
     names = app_data.get("element_names") or {}
+    sources = app_data.get("unit_sources") or {}
+    load_categories = app_data.get("load_categories") or {}
     # Keyed to the network as loaded: the generator model changes the base's own
     # fingerprint, the network it applies to does not change.
     store = _read_store(_ASSUMPTIONS_FILE)
     fp = app_data.get("loaded_fingerprint")
-    if value is None and not model and not unit_costs and not names:
+    if value is None and not model and not unit_costs and not names and not sources and not load_categories:
         store.pop(fp, None)
     else:
         store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model,
-                     "unit_costs": unit_costs, "element_names": names}
+                     "unit_costs": unit_costs, "element_names": names, "unit_sources": sources,
+                     "load_categories": load_categories}
     _write_store(_ASSUMPTIONS_FILE, store)
     _note_where_changes_are_kept()
 
@@ -873,6 +890,23 @@ def _restore_assumptions() -> None:
             print(f"[assumptions] Names restored for {len(changes)} element(s).")
         except (naming.RenameError, gm.ModelError) as exc:
             print(f"[assumptions] Saved names no longer apply ({exc}) — not restored.")
+    saved_sources = saved.get("unit_sources") or {}
+    if saved_sources:
+        try:
+            # Re-checked against the network as loaded: a unit it no longer has is dropped.
+            app_data["unit_sources"] = sem.normalise_declarations(
+                app_data["net_loaded"], [{"unit": k, "source": v} for k, v in saved_sources.items()], {})
+            print(f"[assumptions] Unit sources restored for {len(saved_sources)} unit(s).")
+        except sem.DeclarationError as exc:
+            print(f"[assumptions] Saved unit sources no longer apply ({exc}) — not restored.")
+    saved_loads = saved.get("load_categories") or {}
+    if saved_loads:
+        try:
+            app_data["load_categories"] = sem.normalise_load_declarations(
+                app_data["net_loaded"], [{"load": k, "category": v} for k, v in saved_loads.items()], {})
+            print(f"[assumptions] Load categories restored for {len(saved_loads)} load(s).")
+        except sem.DeclarationError as exc:
+            print(f"[assumptions] Saved load categories no longer apply ({exc}) — not restored.")
     saved_costs = saved.get("unit_costs") or {}
     if saved_costs:
         try:
@@ -2519,6 +2553,8 @@ def _prepare_runtime_reload() -> None:
     app_data["generator_model"] = {}
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
+    app_data["unit_sources"] = {}
+    app_data["load_categories"] = {}
     app_data["option_sets"] = {}
     app_data["_parse_notes"] = {}
     app_data["_quality_cache"] = {}
@@ -2556,6 +2592,8 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
         elif ext == ".uct":
             from pandapower.converter.ucte.from_ucte import from_ucte
             net = from_ucte(network_path)
+        elif ext == ".zip":
+            net = nl.read_cgmes(network_path)
         else:
             print(f"[lifespan] Unknown extension {ext!r} in sentinel — falling back.")
             return False
@@ -2586,7 +2624,8 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
         print(f"[lifespan] Power flow failed (non-fatal): {exc}")
 
     print("[lifespan] Generating synthetic timeseries for uploaded network...")
-    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42)
+    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42,
+                                           unit_shapes=_unit_shapes(net, {}))
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
 
     # The case's own operating point, before the first tick is written over it.
@@ -2656,6 +2695,10 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
                 "[lifespan] gen->sgen conversion: "
                 f"created={created_names}, kept_condensers={kept_condensers}"
             )
+    # A profile whose network brings static generators only (a distribution
+    # benchmark) keeps them at every tick, as an upload does — otherwise each
+    # tick rebuilt its units from the loads, injecting minus the bus's production.
+    nl.keep_own_units(net)
 
     # A profile can load its units under another control than power factor
     # 1.0 — synchronous machines holding a voltage, as the case describes
@@ -2685,10 +2728,11 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
     gen_prof    = profile.get("synthetic_generation_profile", "wind")
     print(f"[lifespan] Generating synthetic timeseries ({n_days}d, {resolution}min)...")
     peak = profile.get("synthetic_peak_load_factor", 1.0)
+    shapes = _unit_shapes(net, profile)
     timestamps, measurements = st.generate(
         net, n_days=n_days, resolution_min=resolution,
         load_profile=load_prof, generation_profile=gen_prof, seed=42,
-        peak_load_factor=peak,
+        peak_load_factor=peak, unit_shapes=shapes,
     )
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
     # A synthetic forecast, as a network upload gets — so the default network
@@ -2700,6 +2744,7 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
         overlap_days=float(profile.get("synthetic_forecast_overlap_days", 2)),
         n_days=n_days, resolution_min=resolution,
         load_profile=load_prof, generation_profile=gen_prof, seed=137, peak_load_factor=peak,
+        unit_shapes=shapes,
     )
 
     # The case's own operating point, before the first tick is written over it.
@@ -2708,7 +2753,8 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
     initial_meas = measurements[timestamps[0]]
     subs = get_substation_names(net)
     substations.extend(subs)
-    net, _ = lg.assign_load_values_from_measurements(net, initial_meas, subs)
+    net, _ = lg.assign_load_values_from_measurements(
+        net, initial_meas, subs, power_factor=float(profile.get("load_power_factor") or lg.DEFAULT_LOAD_POWER_FACTOR))
     net, _ = lg.assign_generators_values_from_measurements(net, initial_meas, subs)
 
     # Populate global state.
@@ -2731,6 +2777,11 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
         "description": profile.get("description", ""),
         "voltage_level_kv": float(profile.get("voltage_level_kv", 0.0)),
         "load_scaling_max": 4.0,
+        # What the profile states about the network (semantics.py) and its
+        # loads' own power factor (`_default_load_pf`).
+        "unit_sources": dict(profile.get("unit_sources") or {}),
+        "load_categories": dict(profile.get("load_categories") or {}),
+        **({"load_power_factor": float(profile["load_power_factor"])} if profile.get("load_power_factor") else {}),
     }
     app_data["default_vm_lower"] = float(profile.get("vm_lower", 0.95))
     app_data["default_vm_upper"] = float(profile.get("vm_upper", 1.05))
@@ -3066,16 +3117,21 @@ def _off_event_loop(endpoint):
                 _study.pf_used = False
                 _study.q_share = None
                 _study.tick_resolved = []
+                _study.renewables = None
                 try:
                     result = asyncio.run(endpoint(*args, **kwargs))
                     if _study.tick_resolved and isinstance(result, dict):
                         # A day or an hour asked for as one moment: which moment was used.
                         result.setdefault("timestamp_resolved", _study.tick_resolved)
+                    if _study.renewables and isinstance(result, dict):
+                        # Which units a renewable scaling applied to — or that none is known.
+                        result.setdefault("renewables_scaled", _study.renewables)
                     return _echo_power_factor(_echo_network(result, args, kwargs))
                 finally:
                     _holds_state.active = False
                     _study.load_pf = None
                     _study.tick_resolved = None
+                    _study.renewables = "off"
 
         return await anyio.to_thread.run_sync(locked)
 
@@ -3110,30 +3166,304 @@ async def health():
     }
 
 
+def _semantics(network: str | None = None) -> dict:
+    """What every element of the network studied is (`semantics.build`), with
+    the operator's declarations and the profile's, the switches' state as
+    loaded (their normal state), and where each value of the operating point
+    at the clock's moment comes from."""
+    import types
+    net = _net_for(types.SimpleNamespace(network=network))
+    profile = app_data.get("grid_profile") or {}
+    loaded = app_data.get("net_loaded")
+    normal_open = ({int(i): not bool(c) for i, c in loaded.switch["closed"].items()}
+                   if loaded is not None and len(getattr(loaded, "switch", [])) else None)
+    return sem.build(net, app_data.get("unit_sources") or {}, profile.get("unit_sources") or {},
+                     app_data.get("load_categories") or {}, profile.get("load_categories") or {},
+                     normal_open=normal_open, provenance=_value_provenance(net),
+                     network_id=str(app_data.get("loaded_fingerprint") or "local"))
+
+
+_MRID_RE = re.compile(r"_?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _by_mrid(layer: dict, text) -> tuple[str, object] | None:
+    """(element type, index — or the name, for a substation or feeder) of the
+    element whose mRID is `text`; None when `text` is not an mRID or matches none."""
+    t = str(text or "").strip()
+    if not _MRID_RE.fullmatch(t):
+        return None
+    t = t.lstrip("_").lower()
+    for b in layer["buses"]:
+        if b.get("mrid", "").lower() == t:
+            return "bus", b["index"]
+    for key in ("branches", "units"):
+        for e in layer[key]:
+            if e.get("mrid", "").lower() == t:
+                return e["element_type"], e["index"]
+    for d in layer.get("loads") or []:
+        if d.get("mrid", "").lower() == t:
+            return "load", d["index"]
+    for x in (layer.get("containers") or {}).get("substations") or []:
+        if x.get("mrid", "").lower() == t:
+            return "substation", x["name"]
+    return None
+
+
+def _value_provenance(net) -> dict | None:
+    """Where each value of the operating point at the clock's moment comes
+    from (`semantics.value_provenance`); None when it cannot be said."""
+    moment = _clock_moment()
+    rows = (app_data.get("measurements") or {}).get(moment) if moment else None
+    try:
+        pf, pf_source = _load_pf_setting()
+        return sem.value_provenance(
+            net, prepare_measurement_df(rows) if rows is not None else None, dataset="measurements",
+            moment=moment, synthetic=app_data.get("measurements_source", "synthetic") != "uploaded",
+            load_pf=pf, load_pf_source=pf_source)
+    except Exception as exc:  # noqa: BLE001 — a description must not fail for want of provenance
+        print(f"[semantics] Value provenance unavailable: {exc}")
+        return None
+
+
+def _unit_shapes(net, profile: dict) -> dict:
+    """{(table, index): shape} for the synthetic week: a unit the network (or
+    its profile) states or names as solar follows the sun, wind the wind, a
+    fuel-burning or other dispatchable unit a flat output. A unit it says
+    nothing about follows the profile's shape, as every unit did before."""
+    shapes = {}
+    for table in ("gen", "sgen"):
+        for i in net[table].index:
+            f = sem.unit_source(net, table, i, None, profile.get("unit_sources") or {})
+            if f["basis"] not in (sem.STATED, sem.NAMED):
+                continue
+            shape = {"solar": "solar", "wind": "wind"}.get(f["value"], "flat")
+            shapes[(table, int(i))] = shape
+    return shapes
+
+
+def _clock_moment() -> str | None:
+    """The simulation clock's moment: what a load's demand in the semantic layer is the value at."""
+    ts = app_data.get("timestamps") or []
+    i = app_data.get("current_index", 0)
+    return ts[i] if ts and 0 <= i < len(ts) else None
+
+
+def studies_use_semantic_layer() -> bool:
+    """Whether the studies rest on what the network says its units are. Off
+    only for the ablation's third arm (`CONDUCTOR_ONTOLOGY=none`, read at each
+    study): the studies then behave as before the layer — every static
+    generator is a renewable unit, declarations change nothing."""
+    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() != "none"
+
+
+def _renewable_rows(net) -> tuple[list[tuple[str, int]], dict]:
+    """The units a renewable scaling applies to — (table, index) of those stated
+    (or named) to be wind or solar, static or on voltage control — and a note
+    for the result. Every static generator was scaled before: in a converted
+    MATPOWER case the conventional units are static generators too, and
+    "renewables 30 % lower" lowered them."""
+    if not studies_use_semantic_layer():
+        # The behaviour before the layer (ablation only): every static generator.
+        rows = [("sgen", int(i)) for i in net.sgen.index]
+        return rows, {"units": [gm.unit_name(net, "sgen", i) for i in net.sgen.index],
+                      "basis": "every static generator (the semantic layer is switched off in the studies)"}
+    declared = app_data.get("unit_sources") or {}
+    profile = (app_data.get("grid_profile") or {}).get("unit_sources") or {}
+    rows, names = [], []
+    for table in ("gen", "sgen"):
+        for i in net[table].index:
+            f = sem.unit_source(net, table, i, declared, profile)
+            if f["value"] in sem.VARIABLE and f["basis"] in (sem.STATED, sem.NAMED):
+                rows.append((table, int(i)))
+                names.append(gm.unit_name(net, table, i))
+    note = ({"units": names, "basis": "the units stated or named to be wind or solar"} if rows else
+            {"units": [], "note": "No unit of this network is stated to be wind or solar, so a renewable scaling "
+                                  "changes nothing. Declare which units are (declare_network_facts) to scale them."})
+    return rows, note
+
+
+def _renewable_mask(net) -> tuple[np.ndarray, dict]:
+    """Per static generator (in `net.sgen` order): whether a renewable
+    uncertainty applies to it — stated, named or declared wind or solar — and
+    the note for the result. The probabilistic and robust studies drew every
+    static generator's output as renewable: a conventional unit converted to a
+    static generator was curtailed "as renewable output"."""
+    rows, note = _renewable_rows(net)
+    wanted = {i for table, i in rows if table == "sgen"}
+    return np.array([int(i) in wanted for i in net.sgen.index], dtype=bool), note
+
+
+def _scale_renewables(net, factor: float, rows: list[tuple[str, int]] | None = None) -> None:
+    """Scale the wind and solar units' output by `factor` (`_renewable_rows`),
+    and say in the result which units that was — also when there are none."""
+    if factor == 1.0:
+        return
+    if rows is None:
+        rows, note = _renewable_rows(net)
+        if getattr(_study, "renewables", "off") is None:
+            _study.renewables = {"factor": factor, **note}
+    for table, i in rows:
+        net[table].at[i, "p_mw"] *= factor
+        if table == "sgen":                 # a voltage-controlled unit's Q follows its set-point
+            net.sgen.at[i, "q_mvar"] *= factor
+
+
+@app.get("/api/network/semantics")
+@_off_event_loop
+async def network_semantics(network: str | None = None, about: str | None = None, element: str | None = None):
+    """What every element of the network is — buses (nominal voltage,
+    substation), branches (ends, voltage, rating), units (energy source,
+    control), the external grid and what carries its power — each fact with
+    its basis: stated, named, inferred or unknown (`backend/semantics.py`).
+
+    `about`: one compact view for the agent (summary, units, loads,
+    voltage_levels, substations, external_grid), "around" with `element` (a
+    bus, line, transformer, unit, load or substation and everything it is
+    connected to: `semantics.around`), or "facts" (what an answer is checked
+    against); omitted, everything."""
+    facts = _semantics(network)
+    if about is None:
+        return facts
+    if about == "facts":
+        return sem.compact(facts)
+    if about == "around":
+        if not element or not str(element).strip():
+            raise HTTPException(status_code=400, detail="about=around needs an element: a bus, line, transformer, "
+                                                        "unit, load or substation, by name.")
+        import types
+        net = _net_for(types.SimpleNamespace(network=network))
+        hit = _by_mrid(facts, element)
+        if hit:
+            return {**sem.around(net, facts, hit[0], hit[1]), "operating_point": _clock_moment()}
+        said = str(element).strip().casefold()
+        stations = {b["substation"]["value"] for b in facts["buses"] if b["substation"]["value"]}
+        station = next((n for n in stations if n.casefold() in (said, f"substation {said}")), None)
+        # A bus is named before its own one-bus substation (they share the name).
+        if station and not any(b["name"].casefold() == said for b in facts["buses"]):
+            return sem.around(net, facts, "substation", station)
+        found = _find_element(net, element, ("bus", "line", "trafo", "gen", "sgen", "storage", "load"))
+        return {**sem.around(net, facts, found.etype, found.idx), "operating_point": _clock_moment()}
+    if about not in sem.ABOUT:
+        raise HTTPException(status_code=400, detail=f"about must be one of {list(sem.ABOUT) + ['facts']}.")
+    out = sem.view(facts, about)
+    if about == "summary":
+        out["studies_use_semantic_layer"] = studies_use_semantic_layer()
+    # Demands are the current moment's: say which moment.
+    return {**out, "operating_point": _clock_moment()} if about == "loads" else out
+
+
+@app.get("/api/network/cim")
+@_off_event_loop
+async def network_cim(format: str = "xml", network: str | None = None):
+    """The semantic layer as CIM (CIM100 namespace): RDF/XML (`xml`) or JSON-LD
+    (`jsonld`), with the basis of each fact and where each value comes from
+    in a namespace of CONDUCTOR's own (`cim_export.py`)."""
+    import cim_export as ce
+    from fastapi.responses import Response
+    facts = _semantics(network)
+    network_id = str(app_data.get("loaded_fingerprint") or "local")
+    stem = f"conductor-{(app_data.get('grid_profile') or {}).get('profile_name') or 'network'}"
+    if format == "xml":
+        return Response(ce.to_rdf_xml(facts, network_id), media_type="application/rdf+xml",
+                        headers={"Content-Disposition": f'attachment; filename="{stem}.xml"'})
+    if format == "jsonld":
+        return Response(ce.to_json_ld(facts, network_id), media_type="application/ld+json",
+                        headers={"Content-Disposition": f'attachment; filename="{stem}.jsonld"'})
+    raise HTTPException(status_code=400, detail="format must be 'xml' (RDF/XML) or 'jsonld'.")
+
+
+class DeclarationRequest(BaseModel):
+    """What the network does not state, declared by the operator: units'
+    energy sources [{unit, source}] and loads' categories [{load, category}]
+    ('unknown' withdraws one); `reset` withdraws all."""
+    units: list[dict] = []
+    loads: list[dict] = []
+    reset: bool = False
+
+
+@app.post("/api/network/declare")
+async def declare_units(request: DeclarationRequest):
+    """Declare what drives units the network does not describe (kept for this
+    network, like renames). Returns the units by source afterwards."""
+    with _STATE_LOCK:
+        if app_data.get("net_loaded") is None:
+            raise HTTPException(status_code=503, detail="No network loaded yet.")
+        if not request.reset and not request.units and not request.loads:
+            raise HTTPException(status_code=400, detail="Give units, loads, or reset.")
+        try:
+            declared = app_data.get("unit_sources") or {}
+            loads = app_data.get("load_categories") or {}
+            if request.reset:
+                declared, loads = {}, {}
+            if request.units:
+                declared = sem.normalise_declarations(_net_for(None), request.units, declared)
+            if request.loads:
+                loads = sem.normalise_load_declarations(_net_for(None), request.loads, loads)
+        except sem.DeclarationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        app_data["unit_sources"], app_data["load_categories"] = declared, loads
+        _save_assumptions()
+    facts = _semantics(None)
+    return {"status": "declared", "declared": declared, "declared_loads": loads,
+            "units_by_source": facts["units_by_source"],
+            "loads_by_category": {k: len(v) for k, v in facts["loads_by_category"].items()}}
+
+
+def _find_element(net, name, wanted: tuple[str, ...]) -> "rv.Match":
+    """The element `name` means among `wanted` kinds (bus, line, trafo, gen,
+    sgen, load); raises the HTTP error the lookup's failure calls for."""
+    branchy = tuple(k for k in wanted if k in rv.KINDS)
+    units = tuple(k for k in wanted if k in (*rv.UNIT_TABLES, "storage"))
+    # Buses and branches first, then units, then loads: a name found by an
+    # earlier lookup is that element; only "not found" moves on.
+    lookups = ([lambda: rv.find(net, name, branchy)] if branchy else []) \
+        + ([lambda: rv.find_unit(net, name, units)] if units else []) \
+        + ([lambda: rv.find(net, name, ("load",))] if "load" in wanted else [])
+    first = None
+    for lookup in lookups:
+        try:
+            found = lookup()
+            break
+        except rv.ResolveError as exc:
+            first = first or exc
+            if exc.reason != "not_found":
+                raise _resolution_http(exc) from None
+    else:
+        raise _resolution_http(first or rv.ResolveError("Nothing to look up.", "not_found")) from None
+    return found
+
+
 @app.get("/api/network/resolve")
 @_off_event_loop
-async def resolve_name(name: str, network: str | None = None, kinds: str = "bus,line,trafo"):
-    """The bus, line, transformer or unit a name means (`resolve.find` /
+async def resolve_name(name: str, network: str | None = None, kinds: str = "bus,line,trafo", facts: bool = False):
+    """The bus, line, transformer, unit or load a name means (`resolve.find` /
     `find_unit`) — the one lookup every study uses, for a caller that has only
     a name: {element_type, index, name, how}. Nothing found is 404 with the
     closest names; an ambiguity, or a name that is not an element (the
     external grid), is 400 saying which or what it is."""
     import types
     net = _net_for(types.SimpleNamespace(network=network))
-    wanted = tuple(k.strip() for k in kinds.split(",") if k.strip())
-    branchy = tuple(k for k in wanted if k in rv.KINDS)
-    units = tuple(k for k in wanted if k in rv.UNIT_TABLES)
-    try:
-        found = rv.find(net, name, branchy) if branchy else rv.find_unit(net, name, units)
-    except rv.ResolveError as exc:
-        if exc.reason == "not_found" and branchy and units:
-            try:
-                found = rv.find_unit(net, name, units)
-            except rv.ResolveError:
-                raise _resolution_http(exc) from None
-        else:
-            raise _resolution_http(exc) from None
-    return {"element_type": found.etype, "index": found.idx, "name": found.label, "how": found.how}
+    hit = _by_mrid(_semantics(network), name) if _MRID_RE.fullmatch(str(name or "").strip()) else None
+    if hit and hit[0] != "substation":
+        found = rv.Match(hit[0], int(hit[1]), rv.display(net, hit[0], int(hit[1])), "mrid")
+    else:
+        found = _find_element(net, name, tuple(k.strip() for k in kinds.split(",") if k.strip()))
+    out = {"element_type": found.etype, "index": found.idx, "name": found.label, "how": found.how}
+    if facts:
+        # What it is, with the basis of each fact (`semantics`): its voltage and
+        # substation, its class, a unit's energy source and control.
+        layer = _semantics(network)
+        pool = {"bus": layer["buses"], "line": layer["branches"], "trafo": layer["branches"],
+                "gen": layer["units"], "sgen": layer["units"], "storage": layer["units"],
+                "load": layer["loads"]}.get(found.etype, [])
+        entry = next((e for e in pool if e["index"] == found.idx
+                      and e.get("element_type", found.etype) == found.etype), None)
+        if entry:
+            out["facts"] = {k: v for k, v in entry.items() if k not in ("name", "index", "element_type", "ends_index")}
+        ext = next((e for e in layer["external_grids"] if found.etype == "bus" and e["bus_index"] == found.idx), None)
+        if ext:
+            out["facts"]["external_grid"] = {"connected_here": True, "carried_by": ext["branches"]}
+    return out
 
 
 @app.get("/api/network/topology")
@@ -3583,7 +3913,7 @@ def _assumptions_payload() -> dict:
             "reactive_measured": {"measurements": dq.has_reactive(app_data.get("measurements") or {}),
                                   "forecasts": dq.has_reactive(app_data.get("forecasts") or {})},
             "load_power_factor": {
-        "value": value, "default": lg.DEFAULT_LOAD_POWER_FACTOR, "source": source, "lagging": True,
+        "value": value, "default": _default_load_pf()[0], "source": source, "lagging": True,
         "meaning": "The measurements carry active power only: each measured load's reactive power is "
                    "P·tan(acos pf). Every study uses this unless it is given its own load_power_factor; "
                    "the nominal point keeps the case's own reactive power."}}
@@ -3824,7 +4154,7 @@ def _settings_snapshot() -> dict:
         "names_as_loaded": ({f"{r['element_type']}:{r['index']}": r["loaded_name"]
                              for r in naming.describe(base, app_data.get("element_names") or {})}
                             if base is not None else {}),
-        "default_load_power_factor": lg.DEFAULT_LOAD_POWER_FACTOR,
+        "default_load_power_factor": _default_load_pf()[0],
     }
 
 
@@ -4205,7 +4535,7 @@ async def upload_network(
 ):
     """Replace the in-memory pandapower network with an uploaded one.
 
-    Accepts MATPOWER (.m), pandapower JSON or Excel and UCTE (.uct) files,
+    Accepts MATPOWER (.m), pandapower JSON or Excel, UCTE (.uct) and CGMES (.zip) files,
     runs a base-case power flow to initialise the operating point, and
     generates a synthetic 7-day, 15-minute measurement and forecast series
     from the network's base-case load and generation, so every study works
@@ -4228,11 +4558,11 @@ async def upload_network(
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     ext = os.path.splitext(file.filename or "")[1].lower()
-    _SUPPORTED_EXTS = {".m", ".json", ".xlsx", ".uct"}
+    _SUPPORTED_EXTS = {".m", ".json", ".xlsx", ".uct", ".zip"}
     if ext not in _SUPPORTED_EXTS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format '{ext}'. Accepted: .m  .json  .xlsx  .uct",
+            detail=f"Unsupported format '{ext}'. Accepted: .m  .json  .xlsx  .uct  .zip (CGMES)",
         )
 
     # The converters read from a path, so the upload is parsed from a
@@ -4254,6 +4584,10 @@ async def upload_network(
             elif ext == ".uct":
                 from pandapower.converter.ucte.from_ucte import from_ucte
                 net = from_ucte(probe_path)
+            elif ext == ".zip":
+                net = nl.read_cgmes(probe_path)
+        except nl.CgmesError as exc:
+            raise HTTPException(status_code=400, detail=f"Could not use this CGMES model: {exc}")
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not parse {ext} file: {exc}")
     stored_path = _persist_uploaded_bytes(
@@ -4274,6 +4608,14 @@ async def upload_network(
     # Optionally convert net.gen (PV-bus) → net.sgen for OPF/flexibility tools.
     gen_conversion_note = ""
     nl.keep_own_units(net)
+    # A CGMES model states each machine's control (RegulatingControl): its
+    # synchronous machines keep it, as loaded. Turned into static generators
+    # they lost their voltage control (a 118-bus model no longer converged)
+    # and their stated type.
+    if ext == ".zip" and len(net.gen) and convert_gen_to_sgen:
+        convert_gen_to_sgen = False
+        gen_conversion_note = (f" The model's {len(net.gen)} synchronous machine(s) keep the control it states "
+                               "(no conversion to static generators).")
     if convert_gen_to_sgen and len(net.gen) > 0:
         net, created_names, kept_condensers = nl.gen_to_sgen(net)
         if created_names or kept_condensers:
@@ -4310,7 +4652,8 @@ async def upload_network(
     # Build synthetic multi-timestamp measurement series (7 days, 15-min resolution).
     import synthetic_timeseries as st
     print(f"[upload] Generating synthetic timeseries ({len(net.load)} load buses, {len(net.sgen)} sgens, {len(net.gen)} gens remaining)...")
-    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42)
+    shapes = _unit_shapes(net, {})
+    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42, unit_shapes=shapes)
     print(f"[upload] Timeseries ready: {len(timestamps)} timestamps from {timestamps[0]} to {timestamps[-1]}.")
 
     # A synthetic forecast: the last 2 measured days with a day-ahead-sized
@@ -4318,7 +4661,8 @@ async def upload_network(
     # (an independent realisation). Measurements are the historical actuals
     # that drive the simulation clock; forecasts are read-only, for planning.
     forecast_timestamps, forecasts = st.forecast(
-        net, timestamps, measurements, overlap_days=2, n_days=7, resolution_min=15, seed=137
+        net, timestamps, measurements, overlap_days=2, n_days=7, resolution_min=15, seed=137,
+        unit_shapes=shapes,
     )
     print(f"[upload] Forecast ready: {len(forecast_timestamps)} timestamps from "
           f"{forecast_timestamps[0]} to {forecast_timestamps[-1]}.")
@@ -4437,7 +4781,8 @@ async def upload_network(
         "bus_names": bus_names,
         "active_bus_names": active_bus_names,
         "stored_path": stored_path,
-        "note": f"Network loaded.{gen_conversion_note}{ybus_note}",
+        "note": f"Network loaded.{gen_conversion_note}{ybus_note}"
+                + "".join(" " + n for n in (net.get("_import_notes") or [])),
         "restored": {"proposals": _restore_proposals_after_upload()},
         "n_sgens": len(net.sgen),
         "n_gens_remaining": len(net.gen),
@@ -5011,8 +5356,7 @@ def _prepared_net(timestamp: str, request, applied: tuple | None = None):
     pg_max = _pg_max_for(request, net_copy)
     _scale_loads(net_copy, request.load_scaling_factor)
     if getattr(request, "sgen_scaling_factor", 1.0) != 1.0:
-        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
-        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
+        _scale_renewables(net_copy, request.sgen_scaling_factor)
     if applied:
         stored, option, *rest = applied
         _apply_stored_option(net_copy, stored, option, held=bool(rest and rest[0]))
@@ -5978,9 +6322,11 @@ def _scan_one_scenario(
     vm_lower_pu: float,
     max_line_loading_pct: float,
     max_trafo_loading_pct: float,
+    renewable_rows: list[tuple[str, int]] | None = None,
 ) -> dict:
-    """Run a full timestamp scan for one sgen_scale. Thread-safe — all shared
-    data is read-only; each call does its own deep-copy per tick."""
+    """Run a full timestamp scan for one sgen_scale (applied to the wind and
+    solar units, `renewable_rows`). Thread-safe — all shared data is
+    read-only; each call does its own deep-copy per tick."""
     out_timestamps: list[str] = []
     series: dict[str, list] = {
         "violations": [], "slack_import_mw": [],
@@ -6006,8 +6352,7 @@ def _scan_one_scenario(
             if load_scaling_factor != 1.0:
                 _scale_loads(net_copy, load_scaling_factor)
             if sgen_scale != 1.0:
-                net_copy.sgen["p_mw"] *= sgen_scale
-                net_copy.sgen["q_mvar"] *= sgen_scale
+                _scale_renewables(net_copy, sgen_scale, renewable_rows or [])
             pp.runpp(net_copy, algorithm="nr", numba=False)
         except HTTPException:
             raise  # a request error (unknown network, profile) is not a non-converged tick
@@ -6141,6 +6486,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     # ---- run scenarios in parallel -----------------------------------------
     scenario_results: list[dict | None] = [None] * len(scales)
     max_workers = min(len(scales), 4)
+    renewable_rows, renewables = _renewable_rows(_net_for(request))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -6151,6 +6497,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
                 request.load_scaling_factor,
                 request.vm_upper_pu, request.vm_lower_pu,
                 request.max_line_loading_pct, request.max_trafo_loading_pct,
+                renewable_rows,
             ): i
             for i, scale in enumerate(scales)
         }
@@ -6162,6 +6509,7 @@ async def scan_scenarios_endpoint(request: ScanScenariosRequest):
     return {
         "scenarios": scenario_results,
         "n_scanned": n_scanned,
+        "renewables_scaled": renewables,
         "thresholds": {
             "vm_upper_pu": request.vm_upper_pu,
             "vm_lower_pu": request.vm_lower_pu,
@@ -6196,7 +6544,8 @@ def _run_probabilistic_sample(
         #   xi = clip(P_base * sgen_mult, 0, P_max).
         # For probabilistic RSA, P_ceiling is the current/base setpoint.
         if len(net_copy.sgen.index) > 0:
-            xi = np.clip(sgen_p_base * float(sgen_mult), 0.0, sgen_p_max)
+            # `sgen_mult` is per unit: the draw for wind and solar, 1 for the others.
+            xi = np.clip(sgen_p_base * np.asarray(sgen_mult, dtype=float), 0.0, sgen_p_max)
             p_inj = np.minimum(sgen_p_ceiling, xi)
             net_copy.sgen["p_mw"] = p_inj
 
@@ -6361,8 +6710,9 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
         and not bool(net_base.bus.at[idx, "in_service"])
     }
 
-    # Generation uncertainty inputs (Step 2), with all sgens treated as
-    # uncertain generators for now (Step 1 intentionally skipped).
+    # Generation uncertainty: on the units stated, named or declared wind or
+    # solar (`_renewable_mask`); every other unit keeps its output.
+    renewable_mask, renewables_note = _renewable_mask(net_base)
     if len(net_base.sgen.index) > 0:
 
         sgen_p_base = net_base.sgen["p_mw"].to_numpy(dtype=float, copy=True)
@@ -6399,7 +6749,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
         futures = {
             pool.submit(
                 _run_probabilistic_sample,
-                float(sgen_mults[i]), float(load_mults[i]),
+                np.where(renewable_mask, float(sgen_mults[i]), 1.0), float(load_mults[i]),
                 net_base,
                 sgen_p_base, sgen_p_ceiling, sgen_p_max,
                 request.vm_upper_pu, request.vm_lower_pu,
@@ -6491,6 +6841,7 @@ async def probabilistic_rsa(request: ProbabilisticRSARequest):
         "trafo_violation_probability": _to_prob(trafo_viol_counts),
         "voltage_percentiles": voltage_percentiles,
         "violation_count_histogram": viol_histogram,
+        "renewables_uncertain": renewables_note,
         "samples_summary": {
             "sgen_mean": 1.0,
             "sgen_sigma": request.sgen_sigma,
@@ -7005,8 +7356,7 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
     # Renewable scaling first: an option's dispatch, applied next, is the
     # option's own and is not rescaled.
     if request.sgen_scaling_factor != 1.0:
-        net_copy.sgen['p_mw'] *= request.sgen_scaling_factor
-        net_copy.sgen['q_mvar'] *= request.sgen_scaling_factor
+        _scale_renewables(net_copy, request.sgen_scaling_factor)
     screened_with = None
     if chosen:
         stored, option, held = chosen
@@ -7344,8 +7694,9 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
     base_vm = {bus_idx_to_name.get(int(i), str(i)): float(net_base.res_bus.at[i, "vm_pu"])
                for i in net_base.bus.index}
 
-    # Generation uncertainty inputs (Step 2), with all sgens treated as
-    # uncertain generators for now (Step 1 intentionally skipped).
+    # Generation uncertainty: on the units stated, named or declared wind or
+    # solar (`_renewable_mask`); every other unit keeps its output.
+    renewable_mask, renewables_note = _renewable_mask(net_base)
     if len(net_base.sgen.index) > 0:
         base_sgen_p = net_base.sgen["p_mw"].to_numpy(dtype=float, copy=True)
         if "max_p_mw" in net_base.sgen.columns:
@@ -7543,7 +7894,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             _net = copy.deepcopy(center_net)
             curtailment_mw = 0.0
             if len(_net.sgen.index) > 0:
-                xi = np.clip(base_sgen_p * float(sm), 0.0, sgen_p_max)
+                xi = np.clip(base_sgen_p * np.where(renewable_mask, float(sm), 1.0), 0.0, sgen_p_max)
                 p_inj = np.minimum(p_ceiling, xi)
                 _net.sgen["p_mw"] = p_inj
                 _net.sgen["q_mvar"] = q_set
@@ -7773,6 +8124,8 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         xi_max_seen = float("-inf")
         xi_oob_count = 0
         for idx in range(len(base_sgen_p)):
+            if not renewable_mask[idx]:
+                continue          # not wind or solar: no uncertain resource, dispatchable to its capacity
             gname = sgen_name_by_idx.get(int(net_base.sgen.index[idx]), f"sgen_{int(net_base.sgen.index[idx])}")
             vals = np.clip(base_sgen_p[idx] * sm_train, 0.0, sgen_p_max[idx]).tolist()
             xi_by_gen[gname] = [float(v) for v in vals]
@@ -8068,6 +8421,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
             "n_samples_validation": n_validation,
             "n_converged": int(eval_before["n_converged"]),
             "sgen_sigma": request.sgen_sigma,
+            "renewables_uncertain": renewables_note,
             "confidence": confidence_effective,
             "vm_upper_per_bus_applied": {},
             "vm_lower_per_bus_applied": {},
@@ -8492,6 +8846,7 @@ async def robust_flexibility(request: RobustFlexibilityRequest):
         "n_samples_validation": n_validation,
         "n_converged": n_converged,
         "sgen_sigma": request.sgen_sigma,
+        "renewables_uncertain": renewables_note,
         "confidence": confidence_effective,
         "alpha": alpha_effective,
         "vm_upper_per_bus_applied": vm_upper_per_bus,
@@ -12036,8 +12391,7 @@ async def violation_attribution(request: AttributionRequest):
     net_copy, _ = _assign_tick(net_copy, meas, ts, _dataset_of(request))
     _scale_loads(net_copy, request.load_scaling_factor)
     if request.sgen_scaling_factor != 1.0:
-        net_copy.sgen["p_mw"] *= request.sgen_scaling_factor
-        net_copy.sgen["q_mvar"] *= request.sgen_scaling_factor
+        _scale_renewables(net_copy, request.sgen_scaling_factor)
 
     result = attr.attribute_violations(
         net_copy,
@@ -13318,9 +13672,9 @@ async def look_ahead(request: LookAheadRequest):
             "note": f"Expectations from {basis}, not facts: each figure is a power flow of {basis}.",
             "forecast_errors_checked": (
                 f"each action again with demand {request.uncertainty_pct:g} % above and renewable output "
-                f"{request.uncertainty_pct:g} % below {basis}" if len(probe.sgen) else
-                f"each action again with demand {request.uncertainty_pct:g} % above {basis} (the network has no "
-                "renewable units, so no error in renewable output is checked)"),
+                f"{request.uncertainty_pct:g} % below {basis}" if _renewable_rows(probe)[0] else
+                f"each action again with demand {request.uncertainty_pct:g} % above {basis} (no unit of the "
+                "network is stated to be wind or solar, so no error in renewable output is checked)"),
             **({"start_note": moved} if moved else {})}
     if not episodes:
         return {**base, "status": "clear", "episodes": [],
@@ -13382,7 +13736,7 @@ async def look_ahead(request: LookAheadRequest):
             # it: demand above forecast, and renewable output below it.
             cases = [("demand_higher", f"demand {request.uncertainty_pct:g} % higher",
                       {"load_scaling_factor": request.load_scaling_factor * (1 + request.uncertainty_pct / 100)})]
-            if len(probe.sgen):
+            if _renewable_rows(probe)[0]:
                 cases.append(("renewables_lower", f"renewables {request.uncertainty_pct:g} % lower",
                               {"sgen_scaling_factor": request.sgen_scaling_factor * (1 - request.uncertainty_pct / 100)}))
             entry["action"]["holds_under"] = [

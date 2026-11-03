@@ -79,11 +79,12 @@ def _s(angle="deeper", title="Look closer", prompt="Run X at 2000-01-03 02:15.",
 
 
 class TestCapabilities:
-    def test_generated_from_every_tool_except_the_clock(self):
+    def test_generated_from_every_tool_except_the_clock_and_declarations(self):
         from llm_agent.agent.tool_schemas import TOOL_DISPATCH
 
         names = [name for name, _ in recommender.capability_list()]
-        assert set(names) == set(TOOL_DISPATCH) - {"get_current_timestamp", "advance_timestamp"}
+        assert set(names) == set(TOOL_DISPATCH) - {"get_current_timestamp", "advance_timestamp",
+                                                   "declare_network_facts"}
         assert all(summary for _, summary in recommender.capability_list())
 
     def test_summary_is_one_sentence(self):
@@ -422,7 +423,7 @@ class TestToolLessCalls:
 
         monkeypatch.setattr(httpx, "post", fake_post)
         provider.chat([], TOOLS, "S")
-        assert len(sent["tools"]) == len(recommender.capability_list()) + 2
+        assert len(sent["tools"]) == len(recommender.capability_list()) + len(recommender._EXCLUDED_CAPABILITIES)
 
 
 # ---------------------------------------------------------------------------

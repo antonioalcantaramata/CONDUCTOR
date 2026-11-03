@@ -1480,8 +1480,8 @@ _investigate = genai.types.FunctionDeclaration(
         properties={
             "element": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description=("The bus, line or transformer, named as results name it (e.g. 'Bus_29', "
-                             "'Bus_0 -> Bus_1 [L0]'). 'all' only when the question is about the grid as a "
+                description=("The bus, line or transformer, named as results name it (a bus by its name, a "
+                             "branch by its label '<from> -> <to> [L0]'). 'all' only when the question is about the grid as a "
                              "whole (the number of elements outside limits). Omitted: the only element "
                              "outside its limits; with several, the result lists them — ask which.")),
             "element_type": genai.types.Schema(
@@ -1724,13 +1724,94 @@ _set_load_power_factor = genai.types.FunctionDeclaration(
         "Default 0.95. The change applies to every later study and is kept for this network; "
         "the operator sees it in the System tab. Use it only when the operator asks to change the "
         "assumption itself — to rerun one study under another power factor, pass "
-        "`load_power_factor` to that study instead. reset=true goes back to 0.95."
+        "`load_power_factor` to that study instead. reset=true goes back to the default (0.95, or the "
+        "loads' own when the network's profile states it)."
     ),
     parameters=_S(
         type=_T.OBJECT,
         properties={
             "value": _S(type=_T.NUMBER, description="Power factor, 0.5–1.0 (lagging), e.g. 0.92."),
-            "reset": _S(type=_T.BOOLEAN, description="True: back to the default 0.95."),
+            "reset": _S(type=_T.BOOLEAN, description="True: back to the default."),
+        },
+    ),
+)
+
+_describe_network = genai.types.FunctionDeclaration(
+    name="describe_network",
+    description=(
+        "What the network's elements are. Every fact has a basis: stated (by the network, a proposal or "
+        "the operator), named (read from an element's name), inferred (by a rule it names) or unknown — "
+        "never guessed. about='units': units by energy source (wind, solar, hydro, thermal, storage, "
+        "condenser, unknown…) with their control; 'loads': loads by category (residential, industrial, data "
+        "centre, a downstream network, unknown…); 'switches': each switch's class, normal and present state "
+        "and role (a tie between feeders, a normally open loop point); 'feeders': each feeder with what it "
+        "supplies and its ties; 'data': where each value of the present operating point comes from — "
+        "measured, allocated (a share of its bus's measurement), derived (from an assumption such as the load "
+        "power factor), solved, set or the case's own; 'voltage_levels'; 'substations'; 'external_grid': where "
+        "it connects and which branches carry its power; 'summary'; 'around' with element: that element and "
+        "everything connected to it in one answer — its substation (units, loads, branches leaving and where "
+        "they lead), its supply route from the external grid and feeder, and what would be cut off without "
+        "it with the open ties that could restore supply (topology only). Use it before saying what a unit "
+        "or a load is, which units are renewable, what voltage level, substation or feeder something "
+        "belongs to, or what an element supplies."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "about": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                enum=["summary", "units", "loads", "voltage_levels", "substations", "external_grid", "switches",
+                      "feeders", "data", "around"],
+                description="The aspect to describe (default summary)."),
+            "element": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description="For about='around': a bus, line, transformer, unit, load or substation, by name."),
+        },
+    ),
+)
+
+_declare_network_facts = genai.types.FunctionDeclaration(
+    name="declare_network_facts",
+    description=(
+        "Record what the network does not state about its elements, as the operator states it: what drives a "
+        "unit ('Gen_bus1 and Gen_bus7 are wind farms') or what kind of demand a load is ('Load 5 is a data "
+        "centre'). Kept for this network; a renewable scaling (scenario scans, the look-ahead's check of "
+        "renewables below forecast) then applies to the units declared wind or solar. Only what the operator "
+        "says — never your own guess; 'unknown' withdraws a declaration."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "units": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "unit": genai.types.Schema(type=genai.types.Type.STRING,
+                                                   description="The unit, by name or its bus."),
+                        "source": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            enum=["wind", "solar", "hydro", "bioenergy", "thermal", "nuclear", "storage",
+                                  "conventional", "other", "unknown"]),
+                    },
+                    required=["unit", "source"],
+                )),
+            "loads": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(
+                    type=genai.types.Type.OBJECT,
+                    properties={
+                        "load": genai.types.Schema(type=genai.types.Type.STRING, description="The load, by name."),
+                        "category": genai.types.Schema(
+                            type=genai.types.Type.STRING,
+                            enum=["residential", "commercial", "industrial", "commercial_industrial", "rural",
+                                  "agricultural", "ev_charging", "data_centre", "heat_pump", "network", "other",
+                                  "unknown"]),
+                    },
+                    required=["load", "category"],
+                )),
+            "reset": genai.types.Schema(type=genai.types.Type.BOOLEAN,
+                                        description="Withdraw every declaration (units and loads)."),
         },
     ),
 )
@@ -2114,6 +2195,27 @@ _flexibility_over_time = genai.types.FunctionDeclaration(
     ),
 )
 
+def hidden_tool_names() -> frozenset[str]:
+    """Tools withheld from the model this turn: the semantic layer's when it is
+    switched off (`config.ontology_enabled`), and those an ablation hides
+    (`config.hidden_tools`). Empty in normal use."""
+    from .config import hidden_tools, ontology_enabled
+    from .tool_registry import expand_hidden
+    hidden = set(expand_hidden(hidden_tools()))
+    if not ontology_enabled():
+        hidden |= {"describe_network", "declare_network_facts"}
+    return frozenset(hidden)
+
+
+def tools_for_model() -> list:
+    """The declarations the model is given: all of TOOLS, less the hidden ones."""
+    hidden = hidden_tool_names()
+    if not hidden:
+        return TOOLS
+    return [genai.types.Tool(function_declarations=[fd for t in TOOLS for fd in t.function_declarations
+                                                    if fd.name not in hidden])]
+
+
 TOOLS: list = [
     genai.types.Tool(
         function_declarations=[
@@ -2147,6 +2249,8 @@ TOOLS: list = [
             _get_data_quality,
             _set_load_power_factor,
             _set_generator_model,
+            _describe_network,
+            _declare_network_facts,
             _set_unit_costs,
             _rename_elements,
             _compare_networks,
@@ -2244,6 +2348,8 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "get_data_quality": tools.get_data_quality,
     "set_load_power_factor": tools.set_load_power_factor,
     "set_generator_model": tools.set_generator_model,
+    "describe_network": tools.describe_network,
+    "declare_network_facts": tools.declare_network_facts,
     "set_unit_costs": tools.set_unit_costs,
     "rename_elements": tools.rename_elements,
     "compare_networks": tools.compare_networks,

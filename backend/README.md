@@ -27,7 +27,7 @@ backend/
 ├── sandbox.py               ← Network proposals: edits, validation, profiles
 ├── synthetic_timeseries.py  ← Generate synthetic measurement + forecast series
 ├── pipeline_functions.py    ← Optional external time-series data client
-└── network_profiles/        ← Bundled grid profiles (YAML): pglib_case30 (default), pglib_case14, ieee14
+└── network_profiles/        ← Bundled grid profiles (YAML): pglib_case30 (default), cigre_mv
 ```
 
 The files other than `main_backend.py` are computation **engines**;
@@ -99,7 +99,7 @@ stay fast:
 1. Load the saved **scenario** (`systems/scenario.json`, chosen in the app —
    see *Starting scenarios* below): a demo, or Resume — the last uploaded
    network, else the profile named by `GRID_PROFILE` (defaults to `pglib_case30`).
-2. Load the network (MATPOWER `.m`, pandapower JSON/Excel, or UCTE).
+2. Load the network (MATPOWER `.m`, pandapower JSON/Excel, UCTE, or CGMES `.zip`).
 3. Generate (or restore) the **measurement** and **forecast** time-series.
 4. Apply the first operating point and run a seed power flow.
 5. Build the Ybus / admittance database used by the optimizer (one power flow; an
@@ -112,7 +112,7 @@ stay fast:
 | `resume` | The last uploaded network and data (the "last uploaded" records). Only offered once something has been uploaded. |
 | `ieee30` (default) | PGLib IEEE 30-bus (Alsac–Stott, `pglib_case30`) with its synthetic week, active power only (loads use the load power factor). Five dispatchable units with the case's own quadratic costs, loaded on voltage control (the profile's `unit_model`); the line from the external grid congests at the evening peaks (about 11 of 168 hours with a violation). The nominal operating point is included. |
 | `ieee30_reactive` | The same network and week plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
-| `ieee14` | PGLib IEEE 14-bus (`pglib_case14`) with its synthetic week, active power only. Its week is unchanged (`twin_peak` demand shape), so the what-if evaluation written for it still holds. |
+| `cigre_mv` | pandapower's CIGRE MV benchmark with all its distributed resources (`cigre_mv`, built by `pp.networks.create_cigre_network_mv(with_der="all")` — profile `source: pandapower` with `case_args`): a 110/20 kV substation, two radial feeders with three normally open ties, eight PV units, a wind turbine, CHP, fuel cells and two batteries, each typed by the network. Its synthetic week shapes each unit by the source the network states (`unit_shapes`: PV the sun, wind the wind, the others flat); its loads use the profile's power factor 0.97 (`load_power_factor`, the benchmark's own). The usual daily peak is 0.9 of the benchmark's peak loads: the feeder ends sag below 0.95 p.u. in about 9 of 168 hours, all at the evening peak. The what-if evaluation is written for it. |
 
 A profile can carry `unit_model` — the starting model of named units (e.g.
 `Gen_bus1: {control: voltage, vm_pu: 1.025}`), applied by `generators.apply`
@@ -476,7 +476,7 @@ measurement row it reads, not a name).
 
 | Group | Endpoints |
 |---|---|
-| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee30\|ieee30_reactive\|ieee14`) |
+| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee30\|ieee30_reactive\|cigre_mv`) |
 | **State / clock** | `GET /api/grid_constants`, `GET /api/time/current`, `GET /api/time/timeline`, `POST /api/time/advance` |
 | **Upload** | `POST /api/network/upload`, `POST /api/data/upload` (`kind=measurements\|forecasts`), `GET /api/data/template` (a CSV for the loaded network: substation names, the first hour as example values, the optional reactive columns), `GET /api/data/quality`, `POST /api/network/snapshot` |
 | **Security** | `POST /api/grid/rsa`, `POST /api/rsa/worst_case`, `POST /api/rsa/scan_scenarios`, `POST /api/rsa/probabilistic`, `POST /api/rsa/historical_risk`, `POST /api/grid/element_timeseries` |

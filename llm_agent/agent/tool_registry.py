@@ -89,6 +89,8 @@ _OVER_A_WINDOW = dict(_STUDY, data_source=SERIES, over_time=True)
 REGISTRY: dict[str, Tool] = {
     # Reading the grid and the data
     "locate_network_element": Tool("Element lookup", GROUPS[0], network=True),
+    # What the elements are (units' energy sources, voltage levels, substations), with the basis of each fact.
+    "describe_network": Tool("Network description", GROUPS[0], network=True),
     "get_current_timestamp": Tool("Reading timestamp", GROUPS[0]),
     "advance_timestamp": Tool("Advancing timestamp", GROUPS[0], effect=MOVES_CLOCK),
     "get_current_conditions": Tool("Current conditions", GROUPS[0], **_AT_A_MOMENT),
@@ -139,6 +141,7 @@ REGISTRY: dict[str, Tool] = {
                                 reads_without_changes=True),
     "set_unit_costs": Tool("Unit costs", GROUPS[6], effect=CHANGES_SETTINGS, reads_without_changes=True),
     "rename_elements": Tool("Renaming", GROUPS[6], effect=CHANGES_SETTINGS, reads_without_changes=True),
+    "declare_network_facts": Tool("Network facts", GROUPS[6], effect=CHANGES_SETTINGS),
 }
 
 OVER_TIME = frozenset(n for n, t in REGISTRY.items() if t.over_time)
@@ -172,3 +175,34 @@ def changes_state(name: str, kwargs: dict | None = None) -> bool:
 
 def tools_in(group: str) -> list[str]:
     return [n for n, t in REGISTRY.items() if t.group == group]
+
+
+# Capabilities an ablation can take away from the model (`CONDUCTOR_HIDE_TOOLS=group:<name>`): each one a
+# thing CONDUCTOR adds over a bare model with a power-flow tool.
+ABLATION_GROUPS: dict[str, tuple[str, ...]] = {
+    "investigation": ("investigate", "test_prevention", "look_ahead", "record_investigation",
+                      "compute_violation_attribution"),
+    "proposals": ("edit_proposal", "compare_networks"),
+    "optimisation": tuple(tools_in(GROUPS[3])) + ("optimize_contingency",),
+    "over_time": tuple(tools_in(GROUPS[2])),
+    "kpis": tuple(tools_in(GROUPS[4])),
+    "semantic_layer": ("describe_network", "declare_network_facts"),
+    "lookup": ("locate_network_element",),
+}
+
+
+def expand_hidden(entries) -> frozenset[str]:
+    """Tool names from names and `group:<name>` entries; an unknown entry raises
+    (a typo would otherwise ablate nothing and look like a null result)."""
+    out: set[str] = set()
+    for entry in entries:
+        if entry.startswith("group:"):
+            group = entry.removeprefix("group:")
+            if group not in ABLATION_GROUPS:
+                raise ValueError(f"Unknown tool group {group!r}; known: {sorted(ABLATION_GROUPS)}")
+            out.update(ABLATION_GROUPS[group])
+        elif entry in REGISTRY:
+            out.add(entry)
+        else:
+            raise ValueError(f"Unknown tool {entry!r}")
+    return frozenset(out)

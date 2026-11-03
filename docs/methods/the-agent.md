@@ -135,6 +135,19 @@ a base with a proposal, or found a corrective dispatch and states the
 violations. The words "result" and "answer" are not read as favourable: a
 correct decline uses them too.
 
+### Entities: is each element what the answer says it is?
+
+A figure can be traced and described truly while the element it is about is
+called something it is not: a conventional unit *a wind farm*, a 20 kV bus *the
+132 kV substation*, a line *a transformer*. Each turn's record keeps the facts
+of the elements its answer names (`network_facts`, from the semantic layer — see
+[What the network is](what-the-network-is.md)). The answer is checked against
+them: a unit's source or a load's category the network does not state is
+*unsupported* (a warning), one it states otherwise is *contradicted* (a
+failure). So are a voltage level the network does not have, a branch's kind or
+ends, and what carries the external grid's power. Hypotheticals and denials are
+not claims.
+
 ### Completeness: did it answer what was asked?
 
 Five kinds of question — a percentage, an amount of power, a voltage, a moment,
@@ -297,23 +310,41 @@ use these in studies. In short:
   the step limit, or after a repeated failure, is a warning when it still
   answered from the results so far, and a failure when it did not.
 - **Task suites** run the real agent on fixed tasks and check what it did: ten
-  network-proposal tasks on IEEE 14, eleven corrective-option tasks on IEEE 30
+  network-proposal tasks on CIGRE MV, eleven corrective-option tasks on IEEE 30
   (including that the choice is left to the operator), five clarification
   tasks (asking first only when it changes the answer), nineteen
   investigation tasks (a why about a problem in the grid is investigated and
   recorded; a why about a method, a recommendation or physics is not; a missing
   symptom is said; the agent's own hypotheses are tested; an untestable one is
   said, with the tool it would need; an injected cause is reported; what the
-  forecast says is coming is looked ahead, with when to decide), and six
+  forecast says is coming is looked ahead, with when to decide), six
   narration tasks (a study whose reporting guidance comes with its result is
-  reported as that guidance says). They run with answer review off.
+  reported as that guidance says), ten semantic look-up tasks and twenty-seven
+  reasoning tasks (misleading names, interventions, composition, switches,
+  data, consistency)
+  run with the semantic layer and without it — `python -m evaluation.ablation
+  run ontology`. They run with answer review off. Any part of the agent can be
+  ablated the same way, on any of these suites: the answer checks, the reading
+  check, rules of the prompt, groups of tools, the step budget, the model
+  (`python -m evaluation.ablation list`; see
+  [Using CONDUCTOR in research](../research/using-conductor-in-research.md#ablations)). Every task, with its
+  checks, is written out by `python -m evaluation.catalogue`.
 - **The investigation bench** needs no model: it injects known causes into the
   demo and checks that the [investigation](investigation.md) finds them.
 
 ## What the checks cannot see
 
 - A right number under a wrong label is grounded: provenance checks where a
-  number came from, not whether it answers the question.
+  number came from, not whether it answers the question. A wrong number that
+  some other result of the question happens to hold is grounded too: a study
+  that returns every bus's voltage holds hundreds of values, so a voltage
+  changed by a few per cent often lands on another one. Error injection
+  (`python -m evaluation.injection`) counts these apart, as undetectable by a
+  check that matches figures to results.
+- A figure is called misattributed only when it exists *only* under another
+  element than the one its sentence is about; with clustered voltages (a radial
+  feeder's buses within a few thousandths of each other) the swapped value is
+  often also another element's, and the swap cannot be seen.
 - Small integers are easily grounded by coincidence, because digits inside
   names count as sources: a made-up "9 violations" can be traced to the 9 in
   `Bus_9`. (Dates and clock times are not sources.)
@@ -346,6 +377,7 @@ use these in studies. In short:
 | Tool declarations, the registry of shared arguments, the wrappers | `tool_schemas.py`, `tool_registry.py`, `tools.py` |
 | Operating point, parameter validation, result consistency | `validators.py` |
 | Provenance, characterisation, completeness | `provenance.py`, `characterisation.py`, `completeness.py` |
+| What each element is, its links, the operator's declarations | `backend/semantics.py`; the entity checks: `entities.py` |
 | Answer review, the card's audit data, staleness | `reflection.py`, `trace.py`, `staleness.py` |
 | Evidence levels, the reading check | `evidence.py`, `robustness.py` (re-runs through `tools.unrecorded`) |
 | The advisor, session context, reports | `recommender.py`, `session_context.py`, `report.py`, `tailored_report.py` |

@@ -51,8 +51,8 @@ _KIND_WORDS = {"bus": "bus", "busbar": "bus", "node": "bus", "substation": "bus"
                "line": "line", "cable": "line", "feeder": "line", "circuit": "line",
                "trafo": "trafo", "transformer": "trafo", "tx": "trafo",
                "branch": None}
-_PLURAL = {"bus": "buses", "line": "lines", "trafo": "transformers", "gen": "units", "sgen": "units"}
-_WORD = {"bus": "bus", "line": "line", "trafo": "transformer", "gen": "unit", "sgen": "unit"}
+_PLURAL = {"bus": "buses", "line": "lines", "trafo": "transformers", "gen": "units", "sgen": "units", "storage": "units", "load": "loads"}
+_WORD = {"bus": "bus", "line": "line", "trafo": "transformer", "gen": "unit", "sgen": "unit", "storage": "unit", "load": "load"}
 # Names for the connection to the outside grid, which is not a bus, a line or a transformer.
 _EXTERNAL = {"external grid", "ext grid", "extgrid", "slack", "slack bus", "grid connection",
              "external connection", "upstream grid", "upstream network", "external network",
@@ -132,6 +132,9 @@ def display(net, etype: str, idx: int) -> str:
         return line_display_name(net, idx)
     if etype == "trafo":
         return trafo_display_name(net, idx)
+    if etype == "load":
+        raw = clean_label(net.load.at[idx, "name"]) if "name" in net.load.columns else ""
+        return raw or f"Load {int(idx)}"
     return gm.unit_name(net, etype, idx)
 
 
@@ -151,6 +154,8 @@ def labels(net, etype: str, idx: int) -> list[str]:
         a, b = (("from_bus", "to_bus") if etype == "line" else ("hv_bus", "lv_bus"))
         ends = [bus_display_name(net, int(tbl.at[idx, a])), bus_display_name(net, int(tbl.at[idx, b]))]
         out += [f"{ends[1]} -> {ends[0]}"]
+    elif etype == "load":
+        out += [f"Load {idx}", f"Load_{idx}"]
     else:
         out += [f"Gen_bus{int(tbl.at[idx, 'bus'])}"]
     return list(dict.fromkeys(x for x in out if x))

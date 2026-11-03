@@ -6,13 +6,13 @@ Everything CONDUCTOR can do, it does through these tools: you ask in plain langu
 
 Most studies also take the arguments in [Shared arguments](#shared-arguments).
 
-- [Reading the grid and the data](#reading-the-grid-and-the-data): [`locate_network_element`](#locate_network_element), [`get_current_timestamp`](#get_current_timestamp), [`advance_timestamp`](#advance_timestamp), [`get_current_conditions`](#get_current_conditions), [`get_element_timeseries`](#get_element_timeseries), [`get_data_quality`](#get_data_quality)
+- [Reading the grid and the data](#reading-the-grid-and-the-data): [`locate_network_element`](#locate_network_element), [`describe_network`](#describe_network), [`get_current_timestamp`](#get_current_timestamp), [`advance_timestamp`](#advance_timestamp), [`get_current_conditions`](#get_current_conditions), [`get_element_timeseries`](#get_element_timeseries), [`get_data_quality`](#get_data_quality)
 - [Security at one moment](#security-at-one-moment): [`run_rsa`](#run_rsa), [`simulate_contingency`](#simulate_contingency), [`simulate_all_contingencies`](#simulate_all_contingencies), [`compute_violation_attribution`](#compute_violation_attribution), [`investigate`](#investigate), [`test_prevention`](#test_prevention), [`look_ahead`](#look_ahead), [`record_investigation`](#record_investigation), [`compare_results`](#compare_results)
 - [Over time, scenarios and risk](#over-time-scenarios-and-risk): [`scan_rsa_over_time`](#scan_rsa_over_time), [`find_worst_case_timestamp`](#find_worst_case_timestamp), [`scan_scenarios`](#scan_scenarios), [`run_probabilistic_rsa`](#run_probabilistic_rsa), [`compute_historical_risk`](#compute_historical_risk)
 - [Optimisation and flexibility](#optimisation-and-flexibility): [`optimize_flexibility`](#optimize_flexibility), [`optimize_contingency`](#optimize_contingency), [`optimize_robust_flexibility`](#optimize_robust_flexibility), [`compute_flexibility_envelope`](#compute_flexibility_envelope), [`compute_hosting_capacity`](#compute_hosting_capacity), [`flexibility_over_time`](#flexibility_over_time)
 - [Key performance indicators](#key-performance-indicators): [`evaluate_kpis`](#evaluate_kpis), [`kpis_over_time`](#kpis_over_time)
 - [What-if proposals](#what-if-proposals): [`edit_proposal`](#edit_proposal), [`compare_networks`](#compare_networks)
-- [Settings](#settings): [`set_load_power_factor`](#set_load_power_factor), [`set_generator_model`](#set_generator_model), [`set_unit_costs`](#set_unit_costs), [`rename_elements`](#rename_elements)
+- [Settings](#settings): [`set_load_power_factor`](#set_load_power_factor), [`set_generator_model`](#set_generator_model), [`set_unit_costs`](#set_unit_costs), [`rename_elements`](#rename_elements), [`declare_network_facts`](#declare_network_facts)
 
 ## Reading the grid and the data
 
@@ -23,6 +23,17 @@ Look up one bus, line or transformer by name: what it is, what it connects to, a
 | Argument | Type | Meaning |
 | --- | --- | --- |
 | `element` (required) | text | Name of a bus, line or transformer, e.g. 'Golf' or 'OLS-ØST'. |
+
+Also takes: `network`.
+
+### `describe_network`
+
+What the network's elements are. Every fact has a basis: stated (by the network, a proposal or the operator), named (read from an element's name), inferred (by a rule it names) or unknown — never guessed. about='units': units by energy source (wind, solar, hydro, thermal, storage, condenser, unknown…) with their control; 'loads': loads by category (residential, industrial, data centre, a downstream network, unknown…); 'switches': each switch's class, normal and present state and role (a tie between feeders, a normally open loop point); 'feeders': each feeder with what it supplies and its ties; 'data': where each value of the present operating point comes from — measured, allocated (a share of its bus's measurement), derived (from an assumption such as the load power factor), solved, set or the case's own; 'voltage_levels'; 'substations'; 'external_grid': where it connects and which branches carry its power; 'summary'; 'around' with element: that element and everything connected to it in one answer — its substation (units, loads, branches leaving and where they lead), its supply route from the external grid and feeder, and what would be cut off without it with the open ties that could restore supply (topology only). Use it before saying what a unit or a load is, which units are renewable, what voltage level, substation or feeder something belongs to, or what an element supplies.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `about` | `summary` / `units` / `loads` / `voltage_levels` / `substations` / `external_grid` / `switches` / `feeders` / `data` / `around` | The aspect to describe (default summary). |
+| `element` | text | For about='around': a bus, line, transformer, unit, load or substation, by name. |
 
 Also takes: `network`.
 
@@ -156,7 +167,7 @@ WHY an element is outside its limits (element 'all': the grid insecure), or why 
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
-| `element` | text | The bus, line or transformer, named as results name it (e.g. 'Bus_29', 'Bus_0 -> Bus_1 [L0]'). 'all' only when the question is about the grid as a whole (the number of elements outside limits). Omitted: the only element outside its limits; with several, the result lists them — ask which. |
+| `element` | text | The bus, line or transformer, named as results name it (a bus by its name, a branch by its label '<from> -> <to> [L0]'). 'all' only when the question is about the grid as a whole (the number of elements outside limits). Omitted: the only element outside its limits; with several, the result lists them — ask which. |
 | `element_type` | text | 'bus', 'line' or 'trafo', if the name is ambiguous. |
 | `reference_timestamp` | text | Compare with this moment (prefix, e.g. '2000-01-06 16') when the operator names one. Omitted: the nearest earlier moment within limits. |
 | `reference_data_source` | text | Compare with the other dataset ('forecasts' or 'measurements'), same moment. |
@@ -589,14 +600,14 @@ Also takes: `load_power_factor`.
 
 ### `set_load_power_factor`
 
-Change the session's load power factor: the measurements carry active power only, so every study gives each measured load the reactive power Q = P·tan(acos pf) (lagging). Default 0.95. The change applies to every later study and is kept for this network; the operator sees it in the System tab. Use it only when the operator asks to change the assumption itself — to rerun one study under another power factor, pass `load_power_factor` to that study instead. reset=true goes back to 0.95.
+Change the session's load power factor: the measurements carry active power only, so every study gives each measured load the reactive power Q = P·tan(acos pf) (lagging). Default 0.95. The change applies to every later study and is kept for this network; the operator sees it in the System tab. Use it only when the operator asks to change the assumption itself — to rerun one study under another power factor, pass `load_power_factor` to that study instead. reset=true goes back to the default (0.95, or the loads' own when the network's profile states it).
 
 **Effect:** Changes the session's settings, for every later study.
 
 | Argument | Type | Meaning |
 | --- | --- | --- |
 | `value` | number | Power factor, 0.5–1.0 (lagging), e.g. 0.92. |
-| `reset` | true/false | True: back to the default 0.95. |
+| `reset` | true/false | True: back to the default. |
 
 ### `set_generator_model`
 
@@ -630,6 +641,18 @@ Rename buses, lines, transformers, loads or units of the loaded network, when th
 | --- | --- | --- |
 | `changes` | list of object |  |
 | `reset` | true/false | True: every name back as loaded. |
+
+### `declare_network_facts`
+
+Record what the network does not state about its elements, as the operator states it: what drives a unit ('Gen_bus1 and Gen_bus7 are wind farms') or what kind of demand a load is ('Load 5 is a data centre'). Kept for this network; a renewable scaling (scenario scans, the look-ahead's check of renewables below forecast) then applies to the units declared wind or solar. Only what the operator says — never your own guess; 'unknown' withdraws a declaration.
+
+**Effect:** Changes the session's settings, for every later study.
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `units` | list of object |  |
+| `loads` | list of object |  |
+| `reset` | true/false | Withdraw every declaration (units and loads). |
 
 ## Shared arguments
 

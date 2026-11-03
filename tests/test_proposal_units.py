@@ -147,9 +147,11 @@ class TestThroughTheBackend:
         assert {"vm_pu", "q_min_mvar", "q_max_mvar", "dispatchable", "p_min_mw", "p_mw"} <= set(assumed[2])
 
     def test_studies_see_a_new_synchronous_machine(self, client):
-        client.post("/api/proposals/edit", json={"proposal": "g", "edits": [
-            {"op": "add_generator", "name": "G", "bus": "Bus 4", "p_max_mw": 30, "p_mw": 10,
+        # Bus 9: no unit of the IEEE 30 demo holds it (Bus 4 is Gen_bus4's, at 1.0 p.u.).
+        r = client.post("/api/proposals/edit", json={"proposal": "g", "edits": [
+            {"op": "add_generator", "name": "G", "bus": "Bus 9", "p_max_mw": 30, "p_mw": 10,
              "kind": "dispatchable", "control": "voltage", "vm_pu": 1.02}]})
+        assert r.status_code == 200, r.text
         rsa = client.post("/api/grid/rsa", json={"network": "g"}).json()
         held = {v["unit"]: v for v in rsa["voltage_controlled_buses"]}
         assert held["G"]["setpoint_pu"] == pytest.approx(1.02)
@@ -161,7 +163,7 @@ class TestThroughTheBackend:
     @pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not installed")
     def test_the_opf_uses_a_new_units_limits_and_keeps_a_fixed_one(self, client):
         client.post("/api/proposals/edit", json={"proposal": "g", "edits": [
-            {"op": "add_generator", "name": "G", "bus": "Bus 4", "p_max_mw": 30, "p_mw": 10,
+            {"op": "add_generator", "name": "G", "bus": "Bus 9", "p_max_mw": 30, "p_mw": 10,
              "kind": "dispatchable", "control": "voltage", "q_min_mvar": -2, "q_max_mvar": 2,
              "dispatchable": False}]})
         out = client.post("/api/flexibility/optimize", json={"network": "g", "timestamp": "2000-01-03 14:15"}).json()

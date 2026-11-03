@@ -92,11 +92,14 @@ _SIGNED_CURRENCY_RE = re.compile(r"-\s?[€$£]\s?$")
 # name, not a figure (observed live: the "0" of "an N-0 assessment" traced to
 # "0 violations", and the "1" of "N-1" marked as an input).
 # An element named by a kind word and a number — "Bus 7", "line 12",
-# "transformer 1", "Gen 2": a name, not a figure. A unit after it ("line 95 %")
-# makes it a figure again.
+# "transformer 1", "Gen 2": a name, not a figure. So is a branch named by its
+# ends, and a range of elements — "Line 2-3", "Trafo 0-1" (CIGRE's names),
+# "Bus 4–11" (observed live: the "-3" of "Line 2-3" flagged as a figure no
+# result held). A unit after it ("line 95 %") makes it a figure again.
 ELEMENT_NO_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:bus|line|transformer|trafo|gen|generator|unit|node|feeder|substation|outage)"
-    r"\s?#?\s?\d+(?![\d.,])(?!\s?(?:%|MW|Mvar|MVAr|MVA|kV|p\.?u\.?|€|EUR|h\b|min\b))", re.IGNORECASE)
+    r"\s?#?\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?![\d.,])"
+    r"(?!\s?(?:%|MW|Mvar|MVAr|MVA|kV|p\.?u\.?|€|EUR|h\b|min\b))", re.IGNORECASE)
 
 NK_RE = re.compile(r"(?<![A-Za-z0-9_])[Nn]\s?[-\u2010\u2011\u2013]\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?![\d.])")
 
@@ -277,8 +280,14 @@ class ProvenanceReport(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
-def _strip_noise(text: str) -> str:
-    """Remove the parts of the markdown whose digits are never claims."""
+def _strip_noise(text: str, keep_names: bool = False) -> str:
+    """Remove the parts of the markdown whose digits are never claims.
+
+    Element numbers ("Bus 11", "Line 2-3", "N-1") are blanked with spaces of the same length, so a text cleaned
+    with `keep_names` — the same, with the names left in — has every position in the same place: claims are read
+    from the one, the element each is about from the other. (Blanking the names outright made every name written
+    with a space invisible to the misattribution check — "Bus 11 had the lowest voltage: 0.944" had no subject;
+    found by error injection, evaluation/injection.py.)"""
     # The model writes the typographic minus (U+2212), not a hyphen. Left
     # alone, "−1.35 MW" parses as +1.35 and a correctly reported export reads
     # as fabricated. Only U+2212 is converted: the en-dash it resembles is a
@@ -292,8 +301,9 @@ def _strip_noise(text: str) -> str:
     text = _DATETIME_RE.sub(" ", text)
     text = _DAY_MONTH_RE.sub(" ", text)
     text = _CLOCK_RE.sub(" ", text)
-    text = NK_RE.sub(" ", text)
-    text = ELEMENT_NO_RE.sub(" ", text)
+    if not keep_names:
+        text = NK_RE.sub(lambda m: " " * len(m.group(0)), text)
+        text = ELEMENT_NO_RE.sub(lambda m: " " * len(m.group(0)), text)
     # Emphasis markers sit between a value and its unit ("**3.35 MW**").
     return text.replace("*", "")
 
@@ -951,7 +961,8 @@ def check_answer(answer: str, sources: list[Any],
 
     # A subject is only usable if the payload actually partitions by it.
     scoped = {name for source in sources for name in _scopes_of(source)}
-    cleaned = _strip_noise(answer or "")
+    # Names are found in the text that keeps them; positions match the claims' (see `_strip_noise`).
+    cleaned = _strip_noise(answer or "", keep_names=True)
     occurrences = _occurrences(cleaned, [s for s in subjects if s in scoped])
 
     vocabulary = frozenset(subjects)

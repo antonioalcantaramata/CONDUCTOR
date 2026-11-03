@@ -23,9 +23,15 @@ pytestmark = pytest.mark.skipif(shutil.which("ipopt") is None, reason="IPOPT not
 
 @pytest.fixture(scope="module")
 def default_net():
-    profile = nl.load_profile("pglib_case14")
+    """The IEEE 30 demo as the backend loads it: converted, then its units on
+    voltage control (the profile's unit model). Left at the conversion's power
+    factor 1.0 the units give no reactive power, and the case is infeasible
+    for the OPF at its nominal load (feasible only below ~0.8 of it)."""
+    import generators as gm
+    profile = nl.load_profile("pglib_case30")
     net = nl.load_network(profile)
     net, _, _ = nl.gen_to_sgen(net)
+    net = gm.apply(net, gm.normalise(net, [{"unit": u, **v} for u, v in profile["unit_model"].items()]))
     nl.apply_voltage_setpoints(net, profile)
     net.trafo["tap_pos"] = net.trafo["tap_neutral"]
     return net
@@ -59,14 +65,17 @@ def test_the_answer_does_not_depend_on_the_per_unit_base(default_net):
 def test_a_real_generator_kept_as_gen_can_produce():
     """Without the gen→sgen conversion every `net.gen` row was pinned to 0 MW
     as if it were a condenser (review 2.7). Only units without capacity are."""
-    profile = nl.load_profile("pglib_case14")
-    net = nl.load_network(profile)          # no gen_to_sgen: the 59 MW unit stays a gen
+    profile = nl.load_profile("pglib_case30")
+    net = nl.load_network(profile)          # no gen_to_sgen: every unit stays a gen
+    # IEEE 30 has no condenser: the Bus_10 unit made one (no active power capacity).
+    net.gen.loc[net.gen.bus == 10, ["max_p_mw", "p_mw", "min_p_mw"]] = 0.0
     nl.apply_voltage_setpoints(net, profile)
     net.trafo["tap_pos"] = net.trafo["tap_neutral"]
     model = _solve(net)
     caps = {g: value(model.Pg_max[g]) for g in model.G}
-    assert caps["Gen_bus1"] == pytest.approx(59.0)
-    assert caps["Gen_bus2"] == caps["Gen_bus5"] == caps["Gen_bus7"] == 0.0
+    assert (caps["Gen_bus1"], caps["Gen_bus4"], caps["Gen_bus7"], caps["Gen_bus12"]) == \
+           (pytest.approx(80.0), pytest.approx(50.0), pytest.approx(35.0), pytest.approx(40.0))
+    assert caps["Gen_bus10"] == 0.0
 
 
 def test_a_small_unit_has_a_reactive_limit(default_net):
