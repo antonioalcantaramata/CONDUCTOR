@@ -1,0 +1,183 @@
+source,turn,code,finding,question,answer,label,note
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/compose_tie-01.jsonl,1,entity_contradicted,"“The topological bypass is **Line 3-8**, connecting Bus 3 to Bus 8 around the Line 2-3 section.” — places Line 2-3 | Bus 2 -> Bus 3 [L1] between Bus 3 and Bus 8; its ends are Bus 2 and Bus 3","If Line 2-3 trips, which switch could restore supply to the far end of the feeder, and is it normally open?","The topological bypass is **Line 3-8**, connecting Bus 3 to Bus 8 around the Line 2-3 section. But the model does not identify it as a switch or give a normally-open status; it reports the line **in service**. So I can’t confirm that it is a normally open restoration switch from the available topology data. 📋 Data source: measurements",error,Line 3-8 does not bypass Line 2-3 (the tie is S1 on Line 14-8); the reason the check gives is imprecise
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre-01.jsonl,1,entity_contradicted,"“There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East**.” — lists Solar Farm North among the solar units, but it is thermal (stated)","Which units in this network are solar, and how many are there?","There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East**.",error,Follows a misleading name
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre-04.jsonl,1,entity_contradicted,"“There are **10 solar units**: PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East.” — lists Solar Farm North among the solar units, but it is thermal (stated)","Which units in this network are solar, and how many are there?","There are **10 solar units**: PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East.",error,Follows a misleading name
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre_storage-04.jsonl,1,entity_contradicted,"“The storage unit, **Battery Storage 3**, is connected at **Bus 5**.” — lists Battery Storage 3 among the storage units, but it is thermal (stated)",Where is the storage in this network?,"The storage unit, **Battery Storage 3**, is connected at **Bus 5**.",error,Follows a misleading name
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-01.jsonl,1,entity_unsupported,"“- **Gen_bus12 (wind farm):** 24.39 → 12.19 MW.” — says Gen_bus12 is wind, but the network does not say what drives it (describe_network; the operator can declare it)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half_20000103** (Gen_bus12’s measured output scaled to 50%), the grid **stays within normal-operation limits** at **2000-01-03 12:00**. This is an intact-grid assessment at that timestamp, not an N-1 check.
+
+- **Gen_bus12 (wind farm):** 24.39 → 12.19 MW.
+- **External Grid:** import rises from 79.18 to 91.88 MW (+12.70 MW), supplying most of the lost active power.
+- **Other local units:** Gen_bus1, Gen_bus4, Gen_bus7 and Gen_bus10 keep the same active-power outputs in the power-flow snapshot. Their reactive outputs adjust under voltage control.
+- **Security:** 0 violations; voltage range is 0.974–1.026 p.u., and the highest line loading is 80.8%.
+
+The measured loads’ reactive demand was modeled using the default 0.95 power factor. These results describe this timestamp only; they do not establish security across other times or after contingencies.
+
+📋 Data source: measurements",false alarm,The operator stated Gen_bus12 is a wind farm earlier in the conversation (none arm ignores the declaration)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"0.24 MVAr — “reactive outputs shift: Gen_bus1 +2.07 MVAr, Gen_bus4 +0.24 MVAr, Gen_bus7 +1.83 MVAr, Gen_bus10 -0.05 MVAr, and G”  (nearest source 0.0007 at compare_networks.changes.min_vm_pu)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"1.83 MVAr — “t: Gen_bus1 +2.07 MVAr, Gen_bus4 +0.24 MVAr, Gen_bus7 +1.83 MVAr, Gen_bus10 -0.05 MVAr, and Gen_bus12 +0.76 MVAr.”  (nearest source 1.8482 at get_current_conditions.loads[1].P_mw)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"-0.05 MVAr — “r, Gen_bus4 +0.24 MVAr, Gen_bus7 +1.83 MVAr, Gen_bus10 -0.05 MVAr, and Gen_bus12 +0.76 MVAr. The proposal’s minimu”  (nearest source -0.0015 at compare_networks.largest_voltage_changes[0].change)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"0.76 MVAr — “_bus7 +1.83 MVAr, Gen_bus10 -0.05 MVAr, and Gen_bus12 +0.76 MVAr. The proposal’s minimum voltage is 0.974 p.u., m”  (nearest source 0.81 at get_current_conditions.loads[12].Q_mvar)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-04.jsonl,1,entity_unsupported,"“- **Gen_bus12 (wind):** output falls from **24.39 MW to 12.19 MW**.” — says Gen_bus12 is wind, but the network does not say what drives it (describe_network; the operator can declare it)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half_20000103_1200** (base network with Gen_bus12’s output halved), the grid **remains secure at 2000-01-03 12:00** in the intact-grid assessment: no voltage or thermal violations. Voltage ranged from **0.974 to 1.026 p.u.**, and the highest line loading was **80.8%**. This is an N-0 result for that timestamp, not an N-1 assessment.
+
+- **Gen_bus12 (wind):** output falls from **24.39 MW to 12.19 MW**.
+- **External Grid:** import rises from **79.18 MW to 91.88 MW** (**+12.70 MW**) to cover the shortfall.
+- **Other units:** their active-power outputs stay unchanged in the optimized comparison. Their reactive outputs shift slightly; the largest changes are Gen_bus1 **+2.07 MVAr** and Gen_bus7 **+1.83 MVAr**.
+
+📋 Data source: measurements",false alarm,The operator stated Gen_bus12 is a wind farm earlier in the conversation (none arm ignores the declaration)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-05.jsonl,1,ungrounded_figure,12.19 MW — “en_bus12 (Bus_12): output falls from 24.39 MW to about 12.19 MW. - External Grid: import rises from 79.18 MW to 91.”  (nearest source 12 at set_generator_model.units[1].unit),"If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind50_bus12_20000103** (Gen_bus12’s measured output scaled by 50%), the grid **stays within limits at 2000-01-03 12:00**: no voltage or line-loading violations.
+
+- **Gen_bus12 (Bus_12):** output falls from 24.39 MW to about **12.19 MW**.
+- **External Grid:** import rises from 79.18 MW to **91.88 MW** (+12.70 MW); it balances the lost generation and changed losses. The other local generators are not redispatched in this power-flow assessment.
+- Voltage range: **0.974–1.026 p.u.**; maximum line loading: **80.8%**.
+
+This is an N-0 check at that timestamp, not an N-1 assessment. The twin models Gen_bus12 as a dispatchable, voltage-controlled `gen`; for this what-if, I scaled its measured output profile directly.
+
+📋 Data source: measurements",false alarm,"24.39/2 = 12.195, the halved output (derived, arithmetic in words)"
+papers/cimcontext/runs/A-ontology/runs/none/semantics-cigre/cigre_outage-03.jsonl,1,ungrounded_figure,"0.23 MW — “ed trip of , supply is lost to loads at (0.23 MW), (0.19 MW), (0.33 MW), (0.25 MW)”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)","If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At the simulated trip of **Line 2-3**, supply is lost to loads at **Bus 3 (0.23 MW), Bus 4 (0.19 MW), Bus 5 (0.33 MW), Bus 6 (0.25 MW), Bus 7 (0.03 MW), Bus 8 (0.26 MW), Bus 9 (0.26 MW), Bus 10 (0.25 MW), and Bus 11 (0.15 MW)** — **1.95 MW total** at this snapshot.
+
+I can’t reliably identify a **normally open tie** from the available results: the contingency result identifies the unsupplied buses but not a restoration tie, and the topology lookup shows candidate interconnections such as **Line 14-8** as in service, not normally open. I’d need the switching/normal-open status to name a tie confidently.
+
+📋 Data source: measurements (snapshot at 2000-01-01 00:00)",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/none/semantics-cigre/cigre_outage-05.jsonl,1,ungrounded_figure,0.23 MW — “pping [L1] cuts supply to loads at: - : 0.23 MW - : 0.19 MW - : 0.33 MW - : 0.25 MW”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At the simulation clock, **2000-01-01 00:00**, tripping **Line 2-3 [L1]** cuts supply to loads at:
+
+- Bus 3: **0.23 MW**
+- Bus 4: **0.19 MW**
+- Bus 5: **0.33 MW**
+- Bus 6: **0.25 MW**
+- Bus 7: **0.03 MW**
+- Bus 8: **0.26 MW**
+- Bus 9: **0.26 MW**
+- Bus 10: **0.25 MW**
+- Bus 11: **0.15 MW**
+
+That is **1.95 MW** total across the nine unsupplied buses.
+
+**Line 14-8 [L14]** is the topology’s candidate tie: it joins Bus 8 to Bus 14, which connects onward toward the source through Bus 13, Bus 12 and a transformer. However, the model reports Line 14-8 as **in service** and does not show its switch position, so I can’t confirm that it is normally open or verify a switching restoration.
+
+📋 Data source: measurements",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/none/semantics-ieee30/ieee30_level-03.jsonl,1,ungrounded_figure,132 kV — “The network’s nominal voltage is 132 kV.”  (nearest source 134.1 at get_current_conditions.nominal.forecasts.total_load_mw.min),What is the nominal voltage of this network?,The network’s nominal voltage is **132 kV**.,error,135 kV network called 132 kV
+papers/cimcontext/runs/A-ontology/runs/none/semantics-ieee30/ieee30_level-03.jsonl,1,entity_unsupported,"“The network’s nominal voltage is **132 kV**.” — speaks of 132 kV, but the network has no such level (135 kV)",What is the nominal voltage of this network?,The network’s nominal voltage is **132 kV**.,error,135 kV network called 132 kV
+papers/cimcontext/runs/A-ontology/runs/off/reasoning/drop_ieee30_declared-01.jsonl,1,ungrounded_figure,12.19 MW — “24.39 MW; the half-output case corresponds to roughly 12.19 MW. External-grid import rises from 79.18 MW at baseli”  (nearest source 12 at scan_scenarios.renewables_scaled.units[0]),"If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","Yes—**at 2000-01-03 12:00**, the grid remains within the stated voltage and thermal limits after wind/solar output is halved: the assessment found **0 violations** in both the half-output scenario and the baseline.
+
+The scenario identifies **Gen_bus12** as the unit affected. At that time its measured output was **24.39 MW**; the half-output case corresponds to roughly **12.19 MW**. External-grid import rises from **79.18 MW** at baseline to **91.88 MW** with reduced renewables.
+
+This is a result for that timestamp, not a finding about other hours. The scenario check scales the identified renewable unit(s) uniformly.
+
+📋 Data source: measurements",false alarm,"24.39/2 = 12.195, the halved output (derived, arithmetic in words)"
+papers/cimcontext/runs/A-ontology/runs/off/reasoning/drop_ieee30_declared-02.jsonl,1,ungrounded_figure,12.7 MW — “nal-grid import rises from 79.18 MW to 91.88 MW (about 12.70 MW more). The study applies one uniform scaling to the”  (nearest source 13 at get_current_conditions.loads[8].bus),"If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","At **2000-01-03 12:00**, the grid would stay within the stated security limits in the 50%-renewables scenario: **no voltage or line-loading violations** were detected. The baseline also had no violations at that timestamp.
+
+The scenario identifies **Gen_bus12 at Bus_12** as the wind/solar unit being scaled. With renewables at 50%, external-grid import rises from **79.18 MW** to **91.88 MW** (about **12.70 MW** more). The study applies one uniform scaling to the renewable unit(s) identified by the model; it does not distinguish separate wind and solar units.
+
+This is a result for that single timestamp, not a conclusion about other hours.
+
+📋 Data source: measurements",false alarm,91.88 - 79.18 = 12.70 (derived difference)
+papers/cimcontext/runs/A-ontology/runs/off/reasoning/drop_ieee30_declared-04.jsonl,1,ungrounded_figure,12.19 MW — “was 24.39 MW at baseline and would be halved to about 12.19 MW. External-grid import rises from 79.18 MW to 91.88”  (nearest source 12 at scan_scenarios.renewables_scaled.units[0]),"If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","At **2000-01-03 12:00**, the grid **stays within the tested security limits** when renewable output is cut by 50%: the assessment found **no voltage or thermal violations** in either the reduced-renewables case or the baseline. This is a check of that operating point, not an N-1 assessment.
+
+The unit affected is **Gen_bus12 at Bus_12**. Its active output was **24.39 MW** at baseline and would be halved to about **12.19 MW**. External-grid import rises from **79.18 MW** to **91.88 MW**.
+
+The scenario scales the renewable unit(s) uniformly; the tool identified **Gen_bus12** as the unit treated as wind or solar.
+
+📋 Data source: measurements",false alarm,"24.39/2 = 12.195, the halved output (derived, arithmetic in words)"
+papers/cimcontext/runs/A-ontology/runs/off/reasoning/drop_ieee30_none-04.jsonl,1,entity_unsupported,"“To assess that drop, the renewable units need to be identified in the model.” — speaks of renewable units, but no unit of this network is stated or named to be bioenergy/hydro/solar/wind","If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","At **2000-01-03 12:00**, the grid stayed within the assessed limits in both the baseline and the nominal “50% lower renewables” scenario: **0 violations** in each, with external-grid import at **79.18 MW** in both.
+
+However, the model identifies **no wind or solar units**, so the 50% scaling changed **no units**; this does not establish what would happen if actual renewable units were reduced. The five listed generators—Gen_bus1, Gen_bus12, Gen_bus4, Gen_bus7 and Gen_bus10—are not identified as wind or solar in the model. To assess that drop, the renewable units need to be identified in the model.
+
+📋 Data source: measurements",false alarm,"Generic mention of renewable units, no claim about a unit"
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_feeder-05.jsonl,1,entity_contradicted,"“The external grid connects through **Transformer T0 (Bus 0–Bus 1)**, then **Line L0 (Bus 1–Bus 2)** and **Line L1 (Bus 2–Bus 3)**.” — has Line 2-3 | Bus 2 -> Bus 3 [L1] carrying the external grid's power; the branches that do are Line 1-2 | Bus 1 -> Bus 2 [L0], Line 12-13 | Bus 12 -> Bus 13 [L10], Trafo 0-1 | Bus 0 -> Bus 1 [T0], Trafo 0-12 | Bus 0 -> Bus 12 [T1]","Which feeder supplies Load R11, and through which lines does its power come from the external grid?","Load R11 is at **Bus 11**. The external grid connects through **Transformer T0 (Bus 0–Bus 1)**, then **Line L0 (Bus 1–Bus 2)** and **Line L1 (Bus 2–Bus 3)**.
+
+From Bus 3, the network is meshed, so there isn’t one unique feeder route to Bus 11. Topological routes include:
+
+- **L2 (Bus 3–Bus 4) → L13 (Bus 4–Bus 11)**
+- **L9 (Bus 3–Bus 8) → L6 (Bus 8–Bus 9) → L7 (Bus 9–Bus 10) → L8 (Bus 10–Bus 11)**
+
+These are connected paths, not a measurement of how power is split between them at a particular time.",false alarm,The flagged route sentence is true (Line 2-3 is on the route to Bus 11)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_outage-01.jsonl,1,ungrounded_figure,0.23 MW — “e measured load by bus is: | Bus | Load | | | 0.23 MW | | | 0.19 MW | | | 0.33 MW | | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, the Line 2-3 outage leaves the loads at **Buses 3–11** without a source path: **1.95 MW total**. The measured load by bus is:
+
+| Bus | Load |
+|---|---:|
+| Bus 3 | 0.23 MW |
+| Bus 4 | 0.19 MW |
+| Bus 5 | 0.33 MW |
+| Bus 6 | 0.25 MW |
+| Bus 7 | 0.03 MW |
+| Bus 8 | 0.26 MW |
+| Bus 9 | 0.26 MW |
+| Bus 10 | 0.25 MW |
+| Bus 11 | 0.15 MW |
+
+The plausible tie to check is **Line 14-8 (Bus 14–Bus 8, L14)**, which would connect the affected area toward Bus 14. However, the topology lookup reports that line as *in service*; it does not confirm a normally-open switch or verify that closing it restores supply. The contingency assessment reports no voltage or thermal-limit violations, but the supply loss means the system is **not secure** for this outage.
+
+📋 Data source: measurements.",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_outage-03.jsonl,1,ungrounded_figure,"0.23 — “ed by bus, were: | Bus | Load lost (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)","If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, the Line 2–3 outage was reported to leave **1.95 MW** of load unsupplied. The affected loads, grouped by bus, were:
+
+| Bus | Load lost (MW) |
+|---|---:|
+| Bus 3 | 0.23 |
+| Bus 4 | 0.19 |
+| Bus 5 | 0.33 |
+| Bus 6 | 0.25 |
+| Bus 7 | 0.03 |
+| Bus 8 | 0.26 |
+| Bus 9 | 0.26 |
+| Bus 10 | 0.25 |
+| Bus 11 | 0.15 |
+
+I **could not reliably identify a normally open tie** from the results. The topology lookup showed **Line 14–8** in service, linking the affected area toward Bus 12 and the source, which conflicts with the contingency result that buses 3–11 lose supply. So I can’t recommend Line 14–8 as the normally open restoration tie without resolving that discrepancy. A generic line-name lookup also returned an HTTP 400 error, preventing a complete line inventory.
+
+📋 Data source: measurements
+
+*CONDUCTOR used all 16 steps allowed for one question (`DT_MAX_AGENT_TURNS`) before finishing; this answer is built from the results so far.*",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-ieee30/ieee30_external-04.jsonl,1,ungrounded_figure,"0.52 MW — “nto the network: 7.38 MW. - Bus_0 → Bus_1 [L0] carries 0.52 MW back toward Bus_0, so it is not carrying incoming p”  (nearest source 0.19062 at get_element_timeseries.series.i_ka[0])",Which lines carry the power coming in from the external grid?,"At the simulation time **2000-01-01 00:00**, the external grid connects to **Bus_0** through two lines:
+
+- **Bus_0 → Bus_2 [L1]** carries power into the network: **7.38 MW**.
+- **Bus_0 → Bus_1 [L0]** carries **0.52 MW back toward Bus_0**, so it is not carrying incoming power at that moment.
+
+The external-grid import is **6.86 MW** overall; the difference reflects network losses. These flow directions are for this timestamp and can change over time.
+
+📋 Data source: measurements
+
+**Reading check.** CONDUCTOR re-ran the studies under readings the question left open, and the conclusion changes: with loads at power factor 1.00 instead of 0.95 (the default), the security assessment finds it not secure, 1 violation (first at Bus_23). Say which reading you meant.",false alarm,"P_from_mw = -0.5233, sign stated in words"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/data_cigre_battery-04.jsonl,1,entity_contradicted,"“Battery 1’s active output is **set at its configured set-point**, rather than measured in the measurement data.” — calls Battery 1's active power measured, but it is set: held at its set-point; the data carry no storage",Is Battery 1's output in the measurement data?,"No. Battery 1’s active output is **set at its configured set-point**, rather than measured in the measurement data. Its reactive output is also set. The dataset is synthetic, not field measurements.",false alarm,"The sentence denies the value is measured (""rather than measured"", ""allocated"", ""estimated""); read as claiming it"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/data_cigre_load_split-03.jsonl,1,entity_unsupported,"“**Load R1’s active demand (P) is allocated**: the data give the total at its bus, and the load’s share is estimated rather than measured separately.” — calls Load R1's active power measured, but it is a share of its bus's measurement: Bus 1's consumption in the synthetic data, split across its 2 loads by their demand in the network as loaded",Is Load R1's demand measured on its own?,"No. **Load R1’s active demand (P) is allocated**: the data give the total at its bus, and the load’s share is estimated rather than measured separately. Its reactive demand (Q) is derived from the network’s load power factor of 0.97; it is not measured. The data are synthetic, not field measurements.",false alarm,"The sentence denies the value is measured (""rather than measured"", ""allocated"", ""estimated""); read as claiming it"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/data_cigre_wind-02.jsonl,1,entity_unsupported,"“PV 9’s is estimated**: its bus’s measured total is allocated among units there.” — calls PV 9's active power measured, but it is a share of its bus's measurement: Bus 9's production in the synthetic data, split by capacity across its 3 units — each unit's share is an estimate, the bus total is not","Which output is measured directly, and which is estimated: WKA 7's or PV 9's?","**WKA 7’s active-power output is measured directly. PV 9’s is estimated**: its bus’s measured total is allocated among units there. These are synthetic dataset values, not field measurements.",false alarm,"The sentence denies the value is measured (""rather than measured"", ""allocated"", ""estimated""); read as claiming it"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/data_cigre_wind-03.jsonl,1,entity_unsupported,"“PV 9’s is **allocated**—estimated by splitting its bus’s measured total among elements.” — calls PV 9's active power measured, but it is a share of its bus's measurement: Bus 9's production in the synthetic data, split by capacity across its 3 units — each unit's share is an estimate, the bus total is not","Which output is measured directly, and which is estimated: WKA 7's or PV 9's?","WKA 7’s **active-power output is measured directly**. PV 9’s is **allocated**—estimated by splitting its bus’s measured total among elements. Both units’ reactive output is derived from their fixed power factor, not measured. These are synthetic data.",false alarm,"The sentence denies the value is measured (""rather than measured"", ""allocated"", ""estimated""); read as claiming it"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/data_cigre_wind-04.jsonl,1,entity_unsupported,"“PV 9’s is **allocated**—estimated as a share of its bus’s measured total.” — calls PV 9's active power measured, but it is a share of its bus's measurement: Bus 9's production in the synthetic data, split by capacity across its 3 units — each unit's share is an estimate, the bus total is not","Which output is measured directly, and which is estimated: WKA 7's or PV 9's?","WKA 7’s **active-power output is measured directly** in the dataset. PV 9’s is **allocated**—estimated as a share of its bus’s measured total. These are synthetic data, not field measurements. Q for both is derived from the units’ fixed power factor.",false alarm,"The sentence denies the value is measured (""rather than measured"", ""allocated"", ""estimated""); read as claiming it"
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/persist_ieee30-04.jsonl,1,ungrounded_figure,"12.7 MW — “led to 50%, versus 79.18 MW at baseline—an increase of 12.70 MW. This is a result for that timestamp, not a guarant”  (nearest source 13 at grid.substation_names[10])","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","At **2000-01-03 12:00**, the 50% wind-output scenario scales **Gen_bus12**; it is the only unit identified as wind or solar. The scan applies the scaling uniformly to all identified renewable units.
+
+The grid **stays within the stated security limits at that moment**: the half-output scenario and the baseline each had **0 violations**. External-grid import was **91.88 MW** with wind scaled to 50%, versus **79.18 MW** at baseline—an increase of **12.70 MW**. This is a result for that timestamp, not a guarantee for other hours.
+
+📋 Data source: measurements",false alarm,91.88 - 79.18 = 12.70 (derived difference)
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/switches_line148-04.jsonl,1,ungrounded_figure,"-8 — “S1 controls the tie on -8, at the end. Its normal state is open (and it is”  (nearest source 0 at describe_network.switches[0].name)","Which switch decides whether Line 14-8 carries power, and what is its normal state?","**S1** controls the tie on Line 14-8, at the **Bus 8** end. Its normal state is **open** (and it is currently open). It ties the Line 1-2 and Line 12-13 feeders.",false alarm,"Parse artefact: ""-8"" left from ""Line 14-8"""
+papers/cimcontext/runs/A-ontology/runs/on/reasoning/switches_line148-05.jsonl,1,ungrounded_figure,"-8 — “S1 controls the tie on -8, at the end. It is normally open (and is current”  (nearest source 0 at describe_network.switches[0].name)","Which switch decides whether Line 14-8 carries power, and what is its normal state?","**S1** controls the tie on Line 14-8, at the Bus 8 end. It is **normally open** (and is currently open).",false alarm,"Parse artefact: ""-8"" left from ""Line 14-8"""

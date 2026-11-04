@@ -61,8 +61,12 @@ backend/datastream_map.local.json
 evaluation_runs/
 
 # A paper's material — task catalogue, run records, analysis, case-study report (papers/<paper>/). Kept out of git
-# until the paper is public; remove this line (or force-add the folder) to publish it.
-papers/
+# until the paper is public; un-ignore its folder below to publish it. The runs' server logs and scratch caches stay
+# out: they hold repeated library warnings and local paths, and nothing in a paper is computed from them.
+papers/*
+!papers/cimcontext/
+papers/*/runs/*/backends/
+papers/*/runs/*/cache/
 
 # Local LLM state: usage counts, discovery caches, tool-calling test results.
 llm_agent/.cache/

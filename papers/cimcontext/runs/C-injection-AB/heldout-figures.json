@@ -1,0 +1,290 @@
+{
+ "drawn": "2026-11-04T08:44:20",
+ "seed": 1,
+ "from": "135 unlabelled run-B untraced figures",
+ "note": "drawn before any check was changed; label after the fix, to measure precision on findings the fix was not tuned on",
+ "rows": [
+  36,
+  37,
+  39,
+  41,
+  55,
+  62,
+  72,
+  88,
+  89,
+  92,
+  93,
+  101,
+  116,
+  136,
+  137,
+  144,
+  146,
+  157,
+  168,
+  171,
+  180,
+  194,
+  203,
+  213,
+  237,
+  240,
+  249,
+  260,
+  261,
+  264,
+  270,
+  280,
+  282,
+  292,
+  294,
+  302,
+  304,
+  311,
+  312,
+  329
+ ],
+ "keys": [
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/investigation/prevention-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.945 p.u. \u2014 \u201cAt , Bus_29 was at 0.945 p.u.\u2014about 0.005 p.u. below the 0.950 limit. The warni\u201d  (nearest source 0.95 at grid.vm_lower)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/investigation/prevention-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.005 p.u. \u2014 \u201cAt , Bus_29 was at 0.945 p.u.\u2014about 0.005 p.u. below the 0.950 limit. The warning threshold was\u201d  (nearest source 0 at grid.n_trafos)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/investigation/prevention-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.95003 \u2014 \u201cthe episode; its checked voltage at was 0.950 p.u. (0.95003 before rounding). \ud83d\udccb Data source: measurements\u201d  (nearest source 0.95 at grid.vm_lower)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/investigation/prevention-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.945 p.u. \u2014 \u201cFor the episode, Bus_29 reached 0.945 p.u., below the 0.950 p.u. limit. The warning was at\u201d  (nearest source 0.95 at grid.vm_lower)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/options/n1_corrective-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "4.873 MW \u2014 \u201c, Bus_25 by 0.380 MW, Bus_28 by 0.261 MW and Bus_29 by 4.873 MW (1.152 MW demand response + 3.721 MW relief). | | B\u201d  (nearest source 4.93 at optimize_flexibility.options[2].n1.corrective_plan[4].actions[2].dp_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/reasoning/persist_ieee30-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "12.7 MW \u2014 \u201cbaseline to 91.88 MW with reduced wind\u2014an increase of 12.70 MW. The grid stays within the tested limits at that m\u201d  (nearest source 13 at grid.substation_names[10])"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/full/whatif/wind_week-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.09 MW \u2014 \u201c2 MW with the proposal. Both peaks occurred at \u2014about 0.09 MW lower with the proposal. The proposal\u2019s wind outpu\u201d  (nearest source 0 at edit_proposal.edits_hash)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-ask-first/investigation/why_outage-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.019 p.u. \u2014 \u201c2 p.u., just above the 0.950 limit. - : 0.931 p.u., a 0.019 p.u. violation. The main difference is higher demand,\u201d  (nearest source 0.021 at investigate.message)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-ask-first/narration/historical_risk-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "56 \u2014 \u201c4.0%). So it was either violating or near the limit in 56 intervals (8.3%). The worst episode was , \u2013 , lasti\u201d  (nearest source 41 at grid.n_lines)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-ask-first/options/n1_corrective-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "1.4 MW \u2014 \u201cts as specified. Demand response at Bus_28 and Bus_29: 1.40 MW total. | | L4 \u2014 Bus_1\u2013Bus_4 | Increase Gen_bus4 +3.\u201d  (nearest source 1.32 at optimize_flexibility.options[2].n1.corrective_plan[7].actions[4].dp_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-ask-first/options/n1_corrective-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "4.87 MW \u2014 \u201cW, Bus_25 by 0.38 MW, Bus_28 by 0.26 MW, and Bus_29 by 4.87 MW in total (1.15 MW demand response plus 3.72 MW load\u201d  (nearest source 4.93 at optimize_flexibility.options[2].n1.corrective_plan[4].actions[2].dp_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-ask-first/reasoning/switches_line148-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "-8 \u2014 \u201cS1 controls the tie on -8, at the end. Its normal state is open.\u201d  (nearest source 0 at describe_network.switches[0].name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-evidence-wording/investigation/why_outage-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.019 p.u. \u2014 \u201c: - : 0.952 p.u. (limit: 0.950) - : 0.931 p.u., a 0.019 p.u. undervoltage The main difference is higher deman\u201d  (nearest source 0.021 at investigate.message)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/classical_views-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "14.7 \u2014 \u201ce L0 (Bus_0\u2013Bus_1) was at 114.7% of its 130 MVA rating\u201414.7 percentage points over the 100% limit. The same assess\u201d  (nearest source 15 at run_rsa.all_voltages[15].bus_name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/deep_why-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.007 p.u. \u2014 \u201c_29 at 0.943 p.u., below the 0.950 p.u. lower limit by 0.007 p.u. It also flags Bus_0\u2013Bus_1 [L0] at 114.7% loading.\u201d  (nearest source 0 at run_rsa.voltage_controlled_buses[5].bus)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/prevention-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.956 p.u. \u2014 \u201c-limit sample was at \u2014just 15 minutes before onset\u2014at 0.956 p.u. Thus the sampled data show little advance lead be\u201d  (nearest source 0.961092 at optimize_flexibility.bus_voltages_base[28].vm_pu)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/prevention-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.005 p.u. \u2014 \u201cor the undervoltage: Bus_29 was at 0.945 p.u., about 0.005 p.u. below the 0.950 limit. A corrective redispatch op\u201d  (nearest source 0 at get_element_timeseries.n_non_converged)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/why_so_close-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.041 p.u. \u2014 \u201cy\u2019s voltage profile was at its highest: 0.991 p.u., or 0.041 p.u. above the lower limit. The backend flagged that\u201d  (nearest source 0 at get_element_timeseries.n_non_converged)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/reasoning/drop_cigre_declared-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.46 MW \u2014 \u201cExternal Grid import from 29.41 MW to 29.87 MW (about 0.46 MW). The 50% scaling affected these units: PV 3, PV 4\u201d  (nearest source 0.5 at scan_scenarios.scenarios[0].sgen_scale)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-investigation-tools/reasoning/switches_line148-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "-8 \u2014 \u201cS1 controls the tie at on -8. Its normal state is open (and it is currently open).\u201d  (nearest source 0 at describe_network.switches[0].name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-reading-check/clarify/unstated_margin-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "31.7 \u2014 \u201cm gives the greatest reported margin on L30: 68.3%, or 31.7 percentage points below rating. Least import minimizes\u201d  (nearest source 31.3438 at optimize_flexibility.options[2].dispatch[3].p_mw_after)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-reading-check/narration/historical_risk-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "45 \u2014 \u201chout violating it in 27 intervals (4.0%)\u2014about 6 hours 45 minutes. These near-misses are additional to the viola\u201d  (nearest source 41 at grid.n_lines)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-reading-check/reasoning/switches_line148-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "-8 \u2014 \u201cS1 controls the tie on -8, located at Bus 8. Its normal state is open (and it is\u201d  (nearest source 0 at describe_network.switches[0].name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-routing-rules/clarify/unstated_margin-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "80 % \u2014 \u201cing ceiling should \u201ccomfortably below\u201d mean? I suggest 80% of L30\u2019s rating; alternatives are 70% or 90%.\u201d  (nearest source 100 at grid.max_loading_pct)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-routing-rules/investigation/why_outage-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.002 p.u. \u2014 \u201cn. At , Bus_29 is at 0.952 p.u. after the outage\u2014only 0.002 p.u. above the 0.950 limit. At , it falls to 0.931 p.\u201d  (nearest source 3.3e-05 at investigate.levers.drivers[1].d_per_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-routing-rules/narration/historical_risk-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "45 \u2014 \u201chout crossing it\u2014in 27 intervals (4.0%), about 6 hours 45 minutes. The worst breaches clustered in the evenings,\u201d  (nearest source 41 at grid.n_lines)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-routing-rules/reasoning/switches_line148-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "-8 \u2014 \u201cS1 controls the tie on -8, located at Bus 8. Its normal state is open (normally\u201d  (nearest source 0 at describe_network.switches[0].name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/clarify/unstated_margin-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "80 % \u2014 \u201cWhat maximum loading should I target for L30? 1. 80% (suggested) or 2. another percentage?\u201d  (nearest source 100 at grid.max_loading_pct)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/clarify/unstated_margin-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "6.7 \u2014 \u201con with the clearest reported margin on L30: 68.3%, or 6.7 percentage points below your 75% target. Least import\u201d  (nearest source 6.5808 at optimize_flexibility.options[3].dispatch[3].dq_mvar)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/investigation/prevention-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.945 p.u. \u2014 \u201cFor the dip, Bus_29 was at 0.945 p.u. The warning threshold was reached at \u201460 minutes\u201d  (nearest source 0.95 at grid.vm_lower)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/investigation/why_insecure-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "8.35 MW \u2014 \u201c- Lower output from the five dispatchable units: down 8.35 MW combined, contributing 33.8%. - Demand in the other\u201d  (nearest source 8 at investigate.factors[0].factor)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/semantics-cigre/cigre_outage-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.23 \u2014 \u201ce affected loads are: | Bus | Load (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |\u201d  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/no-semantic-layer/semantics-cigre/cigre_outage-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.23 \u2014 \u201cected load by bus is: | Bus | Load (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |\u201d  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/deep_why-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.007 p.u. \u2014 \u201cAt on , Bus_29 was at 0.943 p.u., 0.007 p.u. below the 0.950 p.u. lower limit. The comparison\u201d  (nearest source 0.009 at investigate.message)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/prevention-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.945 p.u. \u2014 \u201cFor the point, Bus_29 was at 0.945 p.u. without intervention. The warning threshold had b\u201d  (nearest source 0.95 at grid.vm_lower)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/what_caused_overload-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "14.4 \u2014 \u201c[L0], from the external-grid bus, was loaded to 114.4%\u201414.4 percentage points above the 100% limit. It was already\u201d  (nearest source 14.5785 at run_rsa.all_line_loading[19].loading_percent)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/what_caused_overload-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "8.35 MW \u2014 \u201cecked. - Lower output across the five generators: down 8.35 MW, accounting for 33.7%. The unusual data jumps mean\u201d  (nearest source 8 at investigate.factors[0].factor)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-01.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "1.25 \u2014 \u201c[L0], was overloaded for 2.5 hours on , compared with 1.25 hours on . The difference was mainly a demand-driven\u201d  (nearest source 1.05 at investigate.thresholds_used.vm_upper_pu)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-02.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "2.5 \u2014 \u201cexceeded the 100% limit for 10 quarter-hour intervals (2.50 hours total), versus 5 intervals (1.25 hours) on The\u201d  (nearest source 3 at locate_network_element.connected_to[1].name)"
+  },
+  {
+   "source": "papers/cimcontext/runs/B-components/runs/solver-only/whatif/wind_week-03.jsonl",
+   "turn": "1",
+   "code": "ungrounded_figure",
+   "finding": "0.09 MW \u2014 \u201c42 MW with the proposal, both at . The peak was about 0.09 MW lower with the proposal. The wind farm follows the\u201d  (nearest source 0 at edit_proposal.summary.added_load_mw)"
+  }
+ ]
+}

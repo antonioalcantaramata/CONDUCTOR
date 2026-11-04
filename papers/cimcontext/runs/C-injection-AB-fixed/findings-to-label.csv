@@ -1,0 +1,649 @@
+source,turn,code,finding,question,answer,label,note
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/compose_tie-01.jsonl,1,entity_contradicted,"“The topological bypass is **Line 3-8**, connecting Bus 3 to Bus 8 around the Line 2-3 section.” — places Line 2-3 | Bus 2 -> Bus 3 [L1] between Bus 3 and Bus 8; its ends are Bus 2 and Bus 3","If Line 2-3 trips, which switch could restore supply to the far end of the feeder, and is it normally open?","The topological bypass is **Line 3-8**, connecting Bus 3 to Bus 8 around the Line 2-3 section. But the model does not identify it as a switch or give a normally-open status; it reports the line **in service**. So I can’t confirm that it is a normally open restoration switch from the available topology data. 📋 Data source: measurements",error,"Line 3-8 does not bypass Line 2-3 (the tie is S1 on Line 14-8); the reason the check gives is imprecise. Rechecked: with Line 2-3 out, Buses 3-11 (both ends of Line 3-8) are cut off; only S1 on Line 14-8 restores. The check flags the right sentence for the wrong reason."
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre-01.jsonl,1,entity_contradicted,"“There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East**.” — lists Solar Farm North among the solar units, but it is thermal (stated)","Which units in this network are solar, and how many are there?","There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East**.",error,Follows a misleading name. Rechecked against the network data: confirmed.
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre-04.jsonl,1,entity_contradicted,"“There are **10 solar units**: PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East.” — lists Solar Farm North among the solar units, but it is thermal (stated)","Which units in this network are solar, and how many are there?","There are **10 solar units**: PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North, and PV Park East.",error,Follows a misleading name. Rechecked against the network data: confirmed.
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/names_cigre_storage-04.jsonl,1,entity_contradicted,"“The storage unit, **Battery Storage 3**, is connected at **Bus 5**.” — lists Battery Storage 3 among the storage units, but it is thermal (stated)",Where is the storage in this network?,"The storage unit, **Battery Storage 3**, is connected at **Bus 5**.",error,Follows a misleading name. Rechecked against the network data: confirmed.
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-01.jsonl,1,entity_unsupported,"“- **Gen_bus12 (wind farm):** 24.39 → 12.19 MW.” — says Gen_bus12 is wind, but the network does not say what drives it (describe_network; the operator can declare it)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half_20000103** (Gen_bus12’s measured output scaled to 50%), the grid **stays within normal-operation limits** at **2000-01-03 12:00**. This is an intact-grid assessment at that timestamp, not an N-1 check.
+
+- **Gen_bus12 (wind farm):** 24.39 → 12.19 MW.
+- **External Grid:** import rises from 79.18 to 91.88 MW (+12.70 MW), supplying most of the lost active power.
+- **Other local units:** Gen_bus1, Gen_bus4, Gen_bus7 and Gen_bus10 keep the same active-power outputs in the power-flow snapshot. Their reactive outputs adjust under voltage control.
+- **Security:** 0 violations; voltage range is 0.974–1.026 p.u., and the highest line loading is 80.8%.
+
+The measured loads’ reactive demand was modeled using the default 0.95 power factor. These results describe this timestamp only; they do not establish security across other times or after contingencies.
+
+📋 Data source: measurements",false alarm,The operator stated Gen_bus12 is a wind farm earlier in the conversation (none arm ignores the declaration)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"0.24 MVAr — “reactive outputs shift: +2.07 MVAr, +0.24 MVAr, +1.83 MVAr, -0.05 MVAr, and”  (nearest source 0.0007 at compare_networks.changes.min_vm_pu)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"1.83 MVAr — “t: +2.07 MVAr, +0.24 MVAr, +1.83 MVAr, -0.05 MVAr, and +0.76 MVAr.”  (nearest source 1.8482 at get_current_conditions.loads[1].P_mw)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"-0.05 MVAr — “r, +0.24 MVAr, +1.83 MVAr, -0.05 MVAr, and +0.76 MVAr. The proposal’s minimu”  (nearest source -0.0015 at compare_networks.largest_voltage_changes[0].change)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-02.jsonl,1,ungrounded_figure,"0.76 MVAr — “+1.83 MVAr, -0.05 MVAr, and +0.76 MVAr. The proposal’s minimum voltage is 0.974 p.u., m”  (nearest source 0.81 at get_current_conditions.loads[12].Q_mvar)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half** (Gen_bus12’s output halved), the grid **stays within limits at 2000-01-03 12:00**. This is a single-time-point assessment, not a finding for other hours.
+
+- **Gen_bus12:** active output falls from **24.39 MW to 12.19 MW**.
+- **Other generators:** their active outputs do not change in this power-flow assessment. The external-grid import rises from **79.18 MW to 91.88 MW**—an increase of **12.70 MW**, including the change in losses.
+- **Reactive response:** the voltage-controlled units’ reactive outputs shift: Gen_bus1 **+2.07 MVAr**, Gen_bus4 **+0.24 MVAr**, Gen_bus7 **+1.83 MVAr**, Gen_bus10 **−0.05 MVAr**, and Gen_bus12 **+0.76 MVAr**.
+
+The proposal’s minimum voltage is **0.974 p.u.**, maximum voltage **1.026 p.u.**, and highest line loading **80.8%**; there are no limit violations. Note that the twin currently models Gen_bus12 as a **dispatchable, voltage-controlled unit**, rather than a wind-following unit. The scenario halves its active-power profile; it does not model wind-specific controls or uncertainty.
+
+📋 Data source: measurements",false alarm,Difference between the two results (e.g. Gen_bus4 25.019 - 24.784 = 0.235 Mvar)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-04.jsonl,1,entity_unsupported,"“- **Gen_bus12 (wind):** output falls from **24.39 MW to 12.19 MW**.” — says Gen_bus12 is wind, but the network does not say what drives it (describe_network; the operator can declare it)","If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind12_half_20000103_1200** (base network with Gen_bus12’s output halved), the grid **remains secure at 2000-01-03 12:00** in the intact-grid assessment: no voltage or thermal violations. Voltage ranged from **0.974 to 1.026 p.u.**, and the highest line loading was **80.8%**. This is an N-0 result for that timestamp, not an N-1 assessment.
+
+- **Gen_bus12 (wind):** output falls from **24.39 MW to 12.19 MW**.
+- **External Grid:** import rises from **79.18 MW to 91.88 MW** (**+12.70 MW**) to cover the shortfall.
+- **Other units:** their active-power outputs stay unchanged in the optimized comparison. Their reactive outputs shift slightly; the largest changes are Gen_bus1 **+2.07 MVAr** and Gen_bus7 **+1.83 MVAr**.
+
+📋 Data source: measurements",false alarm,The operator stated Gen_bus12 is a wind farm earlier in the conversation (none arm ignores the declaration)
+papers/cimcontext/runs/A-ontology/runs/none/reasoning/persist_ieee30-05.jsonl,1,ungrounded_figure,12.19 MW — “( ): output falls from 24.39 MW to about 12.19 MW. - External Grid: import rises from 79.18 MW to 91.”  (nearest source 12 at set_generator_model.units[1].unit),"If wind output dropped by 50 % at 2000-01-03 12:00, which units would be affected, and would the grid stay secure?","On proposal **wind50_bus12_20000103** (Gen_bus12’s measured output scaled by 50%), the grid **stays within limits at 2000-01-03 12:00**: no voltage or line-loading violations.
+
+- **Gen_bus12 (Bus_12):** output falls from 24.39 MW to about **12.19 MW**.
+- **External Grid:** import rises from 79.18 MW to **91.88 MW** (+12.70 MW); it balances the lost generation and changed losses. The other local generators are not redispatched in this power-flow assessment.
+- Voltage range: **0.974–1.026 p.u.**; maximum line loading: **80.8%**.
+
+This is an N-0 check at that timestamp, not an N-1 assessment. The twin models Gen_bus12 as a dispatchable, voltage-controlled `gen`; for this what-if, I scaled its measured output profile directly.
+
+📋 Data source: measurements",false alarm,"24.39/2 = 12.195, the halved output (derived, arithmetic in words)"
+papers/cimcontext/runs/A-ontology/runs/none/semantics-cigre/cigre_outage-03.jsonl,1,ungrounded_figure,"0.23 MW — “ed trip of , supply is lost to loads at (0.23 MW), (0.19 MW), (0.33 MW), (0.25 MW)”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)","If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At the simulated trip of **Line 2-3**, supply is lost to loads at **Bus 3 (0.23 MW), Bus 4 (0.19 MW), Bus 5 (0.33 MW), Bus 6 (0.25 MW), Bus 7 (0.03 MW), Bus 8 (0.26 MW), Bus 9 (0.26 MW), Bus 10 (0.25 MW), and Bus 11 (0.15 MW)** — **1.95 MW total** at this snapshot.
+
+I can’t reliably identify a **normally open tie** from the available results: the contingency result identifies the unsupplied buses but not a restoration tie, and the topology lookup shows candidate interconnections such as **Line 14-8** as in service, not normally open. I’d need the switching/normal-open status to name a tie confidently.
+
+📋 Data source: measurements (snapshot at 2000-01-01 00:00)",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/none/semantics-cigre/cigre_outage-05.jsonl,1,ungrounded_figure,0.23 MW — “pping [L1] cuts supply to loads at: - : 0.23 MW - : 0.19 MW - : 0.33 MW - : 0.25 MW”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At the simulation clock, **2000-01-01 00:00**, tripping **Line 2-3 [L1]** cuts supply to loads at:
+
+- Bus 3: **0.23 MW**
+- Bus 4: **0.19 MW**
+- Bus 5: **0.33 MW**
+- Bus 6: **0.25 MW**
+- Bus 7: **0.03 MW**
+- Bus 8: **0.26 MW**
+- Bus 9: **0.26 MW**
+- Bus 10: **0.25 MW**
+- Bus 11: **0.15 MW**
+
+That is **1.95 MW** total across the nine unsupplied buses.
+
+**Line 14-8 [L14]** is the topology’s candidate tie: it joins Bus 8 to Bus 14, which connects onward toward the source through Bus 13, Bus 12 and a transformer. However, the model reports Line 14-8 as **in service** and does not show its switch position, so I can’t confirm that it is normally open or verify a switching restoration.
+
+📋 Data source: measurements",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/none/semantics-ieee30/ieee30_level-03.jsonl,1,ungrounded_figure,132 kV — “The network’s nominal voltage is 132 kV.”  (nearest source 134.1 at get_current_conditions.nominal.forecasts.total_load_mw.min),What is the nominal voltage of this network?,The network’s nominal voltage is **132 kV**.,error,"135 kV network called 132 kV. Rechecked: the IEEE 30 data has one level, 135 kV. Same error as the entity finding on this sentence (counted once as an error)."
+papers/cimcontext/runs/A-ontology/runs/none/semantics-ieee30/ieee30_level-03.jsonl,1,entity_unsupported,"“The network’s nominal voltage is **132 kV**.” — speaks of 132 kV, but the network has no such level (135 kV)",What is the nominal voltage of this network?,The network’s nominal voltage is **132 kV**.,error,135 kV network called 132 kV. Rechecked: same error as the untraced-figure finding on this sentence.
+papers/cimcontext/runs/A-ontology/runs/off/reasoning/drop_ieee30_none-04.jsonl,1,entity_unsupported,"“To assess that drop, the renewable units need to be identified in the model.” — speaks of renewable units, but no unit of this network is stated or named to be bioenergy/hydro/solar/wind","If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","At **2000-01-03 12:00**, the grid stayed within the assessed limits in both the baseline and the nominal “50% lower renewables” scenario: **0 violations** in each, with external-grid import at **79.18 MW** in both.
+
+However, the model identifies **no wind or solar units**, so the 50% scaling changed **no units**; this does not establish what would happen if actual renewable units were reduced. The five listed generators—Gen_bus1, Gen_bus12, Gen_bus4, Gen_bus7 and Gen_bus10—are not identified as wind or solar in the model. To assess that drop, the renewable units need to be identified in the model.
+
+📋 Data source: measurements",false alarm,"Generic mention of renewable units, no claim about a unit"
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_feeder-05.jsonl,1,entity_contradicted,"“The external grid connects through **Transformer T0 (Bus 0–Bus 1)**, then **Line L0 (Bus 1–Bus 2)** and **Line L1 (Bus 2–Bus 3)**.” — has Line 2-3 | Bus 2 -> Bus 3 [L1] carrying the external grid's power; the branches that do are Line 1-2 | Bus 1 -> Bus 2 [L0], Line 12-13 | Bus 12 -> Bus 13 [L10], Trafo 0-1 | Bus 0 -> Bus 1 [T0], Trafo 0-12 | Bus 0 -> Bus 12 [T1]","Which feeder supplies Load R11, and through which lines does its power come from the external grid?","Load R11 is at **Bus 11**. The external grid connects through **Transformer T0 (Bus 0–Bus 1)**, then **Line L0 (Bus 1–Bus 2)** and **Line L1 (Bus 2–Bus 3)**.
+
+From Bus 3, the network is meshed, so there isn’t one unique feeder route to Bus 11. Topological routes include:
+
+- **L2 (Bus 3–Bus 4) → L13 (Bus 4–Bus 11)**
+- **L9 (Bus 3–Bus 8) → L6 (Bus 8–Bus 9) → L7 (Bus 9–Bus 10) → L8 (Bus 10–Bus 11)**
+
+These are connected paths, not a measurement of how power is split between them at a particular time.",false alarm,The flagged route sentence is true (Line 2-3 is on the route to Bus 11)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_outage-01.jsonl,1,ungrounded_figure,0.23 MW — “e measured load by bus is: | Bus | Load | | | 0.23 MW | | | 0.19 MW | | | 0.33 MW | | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, the Line 2-3 outage leaves the loads at **Buses 3–11** without a source path: **1.95 MW total**. The measured load by bus is:
+
+| Bus | Load |
+|---|---:|
+| Bus 3 | 0.23 MW |
+| Bus 4 | 0.19 MW |
+| Bus 5 | 0.33 MW |
+| Bus 6 | 0.25 MW |
+| Bus 7 | 0.03 MW |
+| Bus 8 | 0.26 MW |
+| Bus 9 | 0.26 MW |
+| Bus 10 | 0.25 MW |
+| Bus 11 | 0.15 MW |
+
+The plausible tie to check is **Line 14-8 (Bus 14–Bus 8, L14)**, which would connect the affected area toward Bus 14. However, the topology lookup reports that line as *in service*; it does not confirm a normally-open switch or verify that closing it restores supply. The contingency assessment reports no voltage or thermal-limit violations, but the supply loss means the system is **not secure** for this outage.
+
+📋 Data source: measurements.",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-cigre/cigre_outage-03.jsonl,1,ungrounded_figure,"0.23 — “ed by bus, were: | Bus | Load lost (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw)","If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, the Line 2–3 outage was reported to leave **1.95 MW** of load unsupplied. The affected loads, grouped by bus, were:
+
+| Bus | Load lost (MW) |
+|---|---:|
+| Bus 3 | 0.23 |
+| Bus 4 | 0.19 |
+| Bus 5 | 0.33 |
+| Bus 6 | 0.25 |
+| Bus 7 | 0.03 |
+| Bus 8 | 0.26 |
+| Bus 9 | 0.26 |
+| Bus 10 | 0.25 |
+| Bus 11 | 0.15 |
+
+I **could not reliably identify a normally open tie** from the results. The topology lookup showed **Line 14–8** in service, linking the affected area toward Bus 12 and the source, which conflicts with the contingency result that buses 3–11 lose supply. So I can’t recommend Line 14–8 as the normally open restoration tie without resolving that discrepancy. A generic line-name lookup also returned an HTTP 400 error, preventing a complete line inventory.
+
+📋 Data source: measurements
+
+*CONDUCTOR used all 16 steps allowed for one question (`DT_MAX_AGENT_TURNS`) before finishing; this answer is built from the results so far.*",false alarm,Sum of the loads at the bus (e.g. Bus 3: 0.226 MW)
+papers/cimcontext/runs/A-ontology/runs/off/semantics-ieee30/ieee30_external-04.jsonl,1,ungrounded_figure,"0.52 MW — “nto the network: 7.38 MW. - → [L0] carries 0.52 MW back toward , so it is not carrying incoming p”  (nearest source 0.19062 at get_element_timeseries.series.i_ka[0])",Which lines carry the power coming in from the external grid?,"At the simulation time **2000-01-01 00:00**, the external grid connects to **Bus_0** through two lines:
+
+- **Bus_0 → Bus_2 [L1]** carries power into the network: **7.38 MW**.
+- **Bus_0 → Bus_1 [L0]** carries **0.52 MW back toward Bus_0**, so it is not carrying incoming power at that moment.
+
+The external-grid import is **6.86 MW** overall; the difference reflects network losses. These flow directions are for this timestamp and can change over time.
+
+📋 Data source: measurements
+
+**Reading check.** CONDUCTOR re-ran the studies under readings the question left open, and the conclusion changes: with loads at power factor 1.00 instead of 0.95 (the default), the security assessment finds it not secure, 1 violation (first at Bus_23). Say which reading you meant.",false alarm,"P_from_mw = -0.5233, sign stated in words"
+papers/cimcontext/runs/B-components/runs/full/investigation/what_if-01.jsonl,1,ungrounded_figure,"0.0002 p.u. — “ts, reaching 121.1% on L0; the minimum voltage dips by 0.0002 p.u. to 0.943 p.u. The maximum voltage is unchanged at”  (nearest source 0 at edit_proposal.summary.added_load_mw)",What happens if Gen_bus4 produces 10 MW less at 20:00 on 6 January?,"On proposal **gen_bus4_minus10_20000106_2000**, Gen_bus4 is set to **18.75 MW**, 10 MW below its measured **28.75 MW** at 20:00 on 6 January.
+
+At that moment, the external-grid import rises by **11.37 MW** to **196.71 MW**. The highest line loading increases by **6.5 percentage points**, reaching **121.1%** on **L0**; the minimum voltage dips by **0.0002 p.u.** to **0.943 p.u.** The maximum voltage is unchanged at **1.025 p.u.**
+
+The base case already had **2 security violations**; the reduction neither adds nor resolves any, but worsens the peak line loading. This is a verdict for 20:00 only. The proposal holds Gen_bus4 at 18.75 MW at every tick, though it was assessed here only at the requested time.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/full/options/n1_corrective-02.jsonl,1,ungrounded_figure,"33 — “y screened all 41 lines, but its report says the other 33 were not given corrective plans in this run; it theref”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January 2000**, the **N‑1 corrective** dispatch is the plan for the eight critical line outages studied: it sets a pre-contingency schedule, then calls for a quick action after the outage. All eight studied outages were secured in the power-flow checks—but **four plans also require demand reduction**, so this is not a redispatch-only solution for every case.
+
+The pre-contingency schedule is **Gen_bus1 64.00 MW, Gen_bus4 40.98 MW, Gen_bus7 30.07 MW, Gen_bus10 6.00 MW and Gen_bus12 29.94 MW**; External Grid import is **146.55 MW**. The plan moves **58.38 MW** and **47.40 MVAr** from the original schedule. Its estimated cost is **€276.54/h** at the modeled prices (from a mix of case and synthetic prices).
+
+**Post-outage actions** below are changes from that schedule; voltage figures are generator voltage set-points in p.u.:
+
+| Outaged line | Quick action |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00 MW**, set-point **1.023→1.048**; Gen_bus4 **+2.33 MW**, **0.997→1.050**; Gen_bus7 **0 MW**, **1.005→1.050**; Gen_bus10 **−6.00 MW**, **1.043→1.050**; Gen_bus12 **+8.00 MW**. Also reduce demand: Load 16 at Bus_22 **0.348 MW**, Load 17 at Bus_23 **0.945 MW**, Load 18 at Bus_25 **0.380 MW**, Load 19 at Bus_28 **0.261 MW** (demand response), and Load 20 at Bus_29 **1.152 MW** demand response plus **3.721 MW** load relief. |
+| **Bus_0–Bus_1 [L0]** | Increase Gen_bus1 **4.32 MW**, Gen_bus4 **4.72 MW**, Gen_bus7 **4.38 MW**, Gen_bus10 **4.38 MW**, Gen_bus12 **4.09 MW**. |
+| **Bus_0–Bus_2 [L1]** | Increase Gen_bus1 **3.40 MW** (set-point **1.023→0.989**), Gen_bus4 **4.05 MW**, Gen_bus7 **4.09 MW** (set-point **1.005→1.007**), Gen_bus10 **4.09 MW**, Gen_bus12 **3.78 MW**. |
+| **Bus_2–Bus_3 [L3]** | Increase Gen_bus1 **2.92 MW** (set-point **1.023→0.989**), Gen_bus4 **3.53 MW**, Gen_bus7 **3.58 MW**, Gen_bus10 **3.57 MW**, Gen_bus12 **3.27 MW**. |
+| **Bus_14–Bus_22 [L29]** | Increase Gen_bus1 **6.38 MW** and Gen_bus4 **9.02 MW** (set-point **0.997→0.990**); increase Gen_bus7 **4.93 MW** (**1.005→0.977**); reduce Gen_bus10 **6.00 MW** (**1.043→1.050**) and Gen_bus12 **8.00 MW**. Also demand response: Load 17 at Bus_23 **0.482 MW**, Load 18 at Bus_25 **0.380 MW**, Load 19 at Bus_28 **0.261 MW**, Load 20 at Bus_29 **1.152 MW**. |
+| **Bus_26–Bus_29 [L37]** | Increase Gen_bus1 **16.00 MW** (**1.023→1.048**), Gen_bus4 **9.02 MW** (**0.997→1.050**), Gen_bus7 **4.93 MW** (**1.005→1.050**) and Gen_bus10 **6.00 MW** (**1.043→1.050**); reduce Gen_bus12 **8.00 MW**. Also reduce Load 18 at Bus_25 **0.380 MW** and Load 19 at Bus_28 **0.261 MW** by demand response, plus **1.12 MW** load relief at Load 20, Bus_29. |
+| **Bus_26–Bus_28 [L36]** | Increase Gen_bus1 **10.02 MW** (**1.023→1.048**), Gen_bus4 **9.02 MW** (**0.997→1.050**), Gen_bus7 **4.93 MW** (**1.005→1.050**) and Gen_bus10 **6.00 MW** (**1.043→1.050**); reduce Gen_bus12 **5.66 MW**. Also demand response: Load 19 at Bus_28 **0.261 MW** and Load 20 at Bus_29 **1.137 MW**. |
+| **Bus_1–Bus_4 [L4]** | Gen_bus1 **0 MW** change, set-point **1.023→1.035**; increase Gen_bus4 **3.87 MW**, Gen_bus7 **2.91 MW**, Gen_bus10 **2.55 MW** and Gen_bus12 **1.32 MW**. |
+
+Scope note: the corrective plan covers those **eight selected critical outages**. The study screened all 41 lines, but its report says the other 33 were not given corrective plans in this run; it therefore does **not** establish a corrective action for every line outage. Among the eight planned cases, four need load reduction in addition to generator action.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-ask-first/investigation/why_outage-01.jsonl,1,ungrounded_figure,"0.002 p.u. — “the same in both cases; at the system had only about 0.002 p.u. of voltage margin at after the outage, and”  (nearest source 3.3e-05 at investigate.levers.drivers[1].d_per_mw)",Why would losing the line Bus_28 -> Bus_29 be critical at 18:00 on 6 January when it was not at 15:00?,"With **Bus_28 → Bus_29 [L38] out at both times**, Bus_29 was only just within the voltage limit at 15:00: **0.952 p.u.** against a **0.950 p.u.** minimum. By 18:00 it had fallen to **0.931 p.u.**, a **0.021 p.u.** drop that put it below the limit.
+
+The difference is mainly higher demand near Bus_29. Demand at Bus_28 and Bus_29 rose from **10.50 MW to 12.77 MW**; that local increase accounts for **78.4%** of the voltage fall, with Bus_29’s demand responsible for most of the local effect. Higher demand elsewhere accounts for the remaining **21.6%**. Changes in the five units’ output were ruled out as a meaningful contributor.
+
+So the line outage is the same in both cases; at 15:00 the system had only about **0.002 p.u.** of voltage margin at Bus_29 after the outage, and the later demand increase pushed it below the limit. Demand reactive power was derived using the default **0.95 lagging power factor**.
+
+📋 Data source: measurements.",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-ask-first/narration/historical_risk-03.jsonl,1,ungrounded_figure,"56 — “4.0%). So it was either violating or near the limit in 56 intervals (8.3%). The worst episode was , – , lasti”  (nearest source 41 at grid.n_lines)","How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the 672 measured 15-minute intervals from **Jan 1–7**, Bus_29 was below its voltage limit of **0.950 p.u.** in **29 intervals (4.3%)**. It came close—within **0.005 p.u. of the limit without crossing it**—in another **27 intervals (4.0%)**. So it was either violating or near the limit in **56 intervals (8.3%)**.
+
+The worst episode was **Jan 6, 18:45–20:45**, lasting 9 intervals; voltage reached **0.932 p.u.** at 19:15. Other notable episodes were **Jan 5, 18:00–19:30** (minimum **0.945 p.u.**) and **Jan 7, 18:30–19:00** (minimum **0.943 p.u.**). The duration curve places the violation threshold at about **4.3%** of intervals, consistent with the observed exceedance frequency.
+
+📋 Data source: measurements",false alarm,Held-out sample (drawn before the fix); a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-ask-first/narration/historical_risk-03.jsonl,1,ungrounded_figure,"8.3 % — “as either violating or near the limit in 56 intervals (8.3%). The worst episode was , – , lasting 9 intervals;”  (nearest source 8 at grid.names_key)","How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the 672 measured 15-minute intervals from **Jan 1–7**, Bus_29 was below its voltage limit of **0.950 p.u.** in **29 intervals (4.3%)**. It came close—within **0.005 p.u. of the limit without crossing it**—in another **27 intervals (4.0%)**. So it was either violating or near the limit in **56 intervals (8.3%)**.
+
+The worst episode was **Jan 6, 18:45–20:45**, lasting 9 intervals; voltage reached **0.932 p.u.** at 19:15. Other notable episodes were **Jan 5, 18:00–19:30** (minimum **0.945 p.u.**) and **Jan 7, 18:30–19:00** (minimum **0.943 p.u.**). The duration curve places the violation threshold at about **4.3%** of intervals, consistent with the observed exceedance frequency.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-ask-first/options/n1_corrective-01.jsonl,1,ungrounded_figure,1.4 MW — “ts as specified. Demand response at and : 1.40 MW total. | | L4 — – | Increase +3.”  (nearest source 1.32 at optimize_flexibility.options[2].n1.corrective_plan[7].actions[4].dp_mw),"At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January 2000**, the study found an **N‑1 corrective dispatch** that was checked for the **eight most severe line outages selected**. Before any outage, it raises Gen_bus1 to **64.00 MW**, Gen_bus4 to **40.98 MW**, Gen_bus7 to **30.07 MW**, and Gen_bus12 to **29.94 MW**; it lowers Gen_bus10 to **6.00 MW**. The plan also changes voltage set-points. After the outage, make the listed quick redispatch:
+
+| Outaged line | Post-outage action |
+|---|---|
+| **L35 — Bus_27–Bus_26** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+2.33 MW**, Gen_bus10 **−6.00 MW**, Gen_bus12 **+8.00 MW**; adjust voltage set-points: Gen_bus1 **1.048 p.u.**, Gen_bus4/Gen_bus7/Gen_bus10 **1.050 p.u.** Demand response and relief at loads on Bus_22, Bus_23, Bus_25, Bus_28 and Bus_29: **6.81 MW total**. |
+| **L0 — Bus_0–Bus_1** | Increase Gen_bus1 **+4.32 MW**, Gen_bus4 **+4.72 MW**, Gen_bus7 **+4.38 MW**, Gen_bus10 **+4.38 MW**, Gen_bus12 **+4.09 MW**. |
+| **L1 — Bus_0–Bus_2** | Increase Gen_bus1 **+3.40 MW**, Gen_bus4 **+4.05 MW**, Gen_bus7 **+4.09 MW**, Gen_bus10 **+4.09 MW**, Gen_bus12 **+3.78 MW**; set Gen_bus1 to **0.989 p.u.** and Gen_bus7 to **1.007 p.u.** |
+| **L3 — Bus_2–Bus_3** | Increase Gen_bus1 **+2.92 MW**, Gen_bus4 **+3.53 MW**, Gen_bus7 **+3.58 MW**, Gen_bus10 **+3.57 MW**, Gen_bus12 **+3.27 MW**; set Gen_bus1 to **0.989 p.u.** |
+| **L29 — Bus_14–Bus_22** | Gen_bus1 **+6.38 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **−6.00 MW**, Gen_bus12 **−8.00 MW**; adjust voltage set-points as specified in the plan. Demand response on loads at Bus_23, Bus_25 and Bus_28: **1.12 MW total**. |
+| **L37 — Bus_26–Bus_29** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−8.00 MW**; adjust voltage set-points as specified. Demand response and relief at Bus_25, Bus_28 and Bus_29: **2.91 MW total**. |
+| **L36 — Bus_26–Bus_28** | Gen_bus1 **+10.02 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−5.66 MW**; adjust voltage set-points as specified. Demand response at Bus_28 and Bus_29: **1.40 MW total**. |
+| **L4 — Bus_1–Bus_4** | Increase Gen_bus4 **+3.87 MW**, Gen_bus7 **+2.91 MW**, Gen_bus10 **+2.55 MW**, Gen_bus12 **+1.32 MW**; adjust Gen_bus1’s set-point to **1.035 p.u.** |
+
+The corrective plans were power-flow checked for those eight outages; the four plans that include load actions rely on demand response and, where specified, load relief as well as generator redispatch. **This does not establish coverage for every critical line outage:** the study selected only eight outages for corrective planning, and its broader 41-outage screen still reports violations for 19 outages before corrective action.  
+
+📋 Data source: measurements",false alarm,Held-out sample (drawn before the fix); derived from results whose operands the answer does not state (e.g. a change of a total): correct
+papers/cimcontext/runs/B-components/runs/no-ask-first/options/n1_corrective-02.jsonl,1,ungrounded_figure,"33 — “red in that set. It screened 41 outages, but the other 33 did not receive individual corrective plans here; so t”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the dispatch matching your request is **N‑1 corrective**: it prepares the schedule so that, for each of the **8 critical line outages studied**, a post-outage action plan brings the grid back within limits. The base dispatch sets Gen_bus1 to **64.00 MW**, Gen_bus4 to **40.98 MW**, Gen_bus7 to **30.07 MW**, Gen_bus10 to **6.00 MW**, and Gen_bus12 to **29.94 MW**. All five units are available for active-power and voltage-setpoint changes. The AC checks confirmed the prepared dispatch.
+
+| Outage | Post-outage action |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+2.33 MW**, Gen_bus12 **+8.00 MW**, Gen_bus10 **−6.00 MW**; adjust voltage setpoints: Gen_bus1 **1.048 p.u.**, Gen_bus4/Gen_bus7/Gen_bus10 **1.050 p.u.** Gen_bus12 also changes voltage setpoint as specified by the plan. Reduce demand at Bus_22 by **0.35 MW**, Bus_23 by **0.95 MW**, Bus_25 by **0.38 MW**, Bus_28 by **0.26 MW**, and Bus_29 by **4.87 MW** in total (**1.15 MW** demand response plus **3.72 MW** load relief). |
+| **Bus_0–Bus_1 [L0]** | Increase generation: Gen_bus1 **+4.32 MW**, Gen_bus4 **+4.72 MW**, Gen_bus7 **+4.38 MW**, Gen_bus10 **+4.38 MW**, Gen_bus12 **+4.09 MW**. |
+| **Bus_0–Bus_2 [L1]** | Gen_bus1 **+3.40 MW**, Gen_bus4 **+4.05 MW**, Gen_bus7 **+4.09 MW**, Gen_bus10 **+4.09 MW**, Gen_bus12 **+3.78 MW**; set Gen_bus1 to **0.989 p.u.** and Gen_bus7 to **1.007 p.u.** |
+| **Bus_2–Bus_3 [L3]** | Gen_bus1 **+2.92 MW**, Gen_bus4 **+3.53 MW**, Gen_bus7 **+3.58 MW**, Gen_bus10 **+3.57 MW**, Gen_bus12 **+3.27 MW**; set Gen_bus1 to **0.989 p.u.** |
+| **Bus_14–Bus_22 [L29]** | Gen_bus1 **+6.38 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **−6.00 MW**, Gen_bus12 **−8.00 MW**; adjust setpoints: Gen_bus4 **0.990**, Gen_bus7 **0.977**, Gen_bus10 **1.050 p.u.** Reduce demand at Bus_23 by **0.48 MW**, Bus_25 by **0.38 MW**, Bus_28 by **0.26 MW**, and Bus_29 by **1.15 MW** (demand response). |
+| **Bus_26–Bus_29 [L37]** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−8.00 MW**; set Gen_bus1 to **1.048 p.u.**, Gen_bus4/Gen_bus7/Gen_bus10 to **1.050 p.u.** Reduce demand at Bus_25 by **0.38 MW**, Bus_28 by **0.26 MW**, and Bus_29 by **2.27 MW** (including **1.15 MW** demand response and **1.12 MW** load relief). |
+| **Bus_26–Bus_28 [L36]** | Gen_bus1 **+10.02 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−5.66 MW**; set Gen_bus1 to **1.048 p.u.**, Gen_bus4/Gen_bus7/Gen_bus10 to **1.050 p.u.** Reduce demand at Bus_28 by **0.26 MW** and Bus_29 by **1.14 MW** (demand response). |
+| **Bus_1–Bus_4 [L4]** | Gen_bus4 **+3.87 MW**, Gen_bus7 **+2.91 MW**, Gen_bus10 **+2.55 MW**, Gen_bus12 **+1.32 MW**; set Gen_bus1 to **1.035 p.u.** |
+
+**Scope caveat:** the optimizer generated corrective plans for these 8 critical outages, and none was left unsecured in that set. It screened **41** outages, but the other **33** did not receive individual corrective plans here; so this result does **not** establish that the plan covers every possible line outage. Four of the eight plans also require load reduction, so those cases are not achieved by generator redispatch alone.
+
+The prepared N‑1 corrective dispatch costs **€276.54/h** at the configured price mix (mostly synthetic prices). That is the cost of the prepared dispatch, not the cost of executing each individual post-outage action.
+
+📋 Data source: measurements.",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-ask-first/options/n1_corrective-03.jsonl,1,ungrounded_figure,"33 — “41-outage screen still found violations, and the other 33 outages were not given individual corrective plans in”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January 2000**, the **N‑1 corrective** dispatch is the option that prepares for a quick redispatch after each of the **8 critical line outages studied**. Its pre-contingency dispatch is:
+
+| Unit | Active power | Voltage set-point |
+|---|---:|---:|
+| Gen_bus1 | 64.00 MW | 1.023 p.u. |
+| Gen_bus4 | 40.98 MW | 0.997 p.u. |
+| Gen_bus7 | 30.07 MW | 1.005 p.u. |
+| Gen_bus10 | 6.00 MW | 1.043 p.u. |
+| Gen_bus12 | 29.94 MW | 1.050 p.u. |
+
+After each outage, the tested corrective action is:
+
+| Outaged line | Quick action after the outage |
+|---|---|
+| **L35, Bus_27–Bus_26** | Gen_bus1 **+16.00 MW**; Gen_bus4 **+2.33 MW** and set-point to **1.050 p.u.**; Gen_bus7 holds P and set-point to **1.050 p.u.**; Gen_bus10 **−6.00 MW** and set-point to **1.050 p.u.**; Gen_bus12 **+8.00 MW**. Also demand response at Loads 16–20 and **3.72 MW load relief at Load 20 (Bus_29)**. |
+| **L0, Bus_0–Bus_1** | Raise Gen_bus1/4/7/10/12 by **4.32/4.72/4.38/4.38/4.09 MW**, respectively. |
+| **L1, Bus_0–Bus_2** | Raise Gen_bus1/4/7/10/12 by **3.40/4.05/4.09/4.09/3.78 MW**; adjust Gen_bus1’s set-point to **0.989 p.u.** and Gen_bus7’s to **1.007 p.u.** |
+| **L3, Bus_2–Bus_3** | Raise Gen_bus1/4/7/10/12 by **2.92/3.53/3.58/3.57/3.27 MW**; adjust Gen_bus1’s set-point to **0.989 p.u.** |
+| **L29, Bus_14–Bus_22** | Gen_bus1 **+6.38 MW**, Gen_bus4 **+9.02 MW** (set-point **0.990 p.u.**), Gen_bus7 **+4.93 MW** (set-point **0.977 p.u.**), Gen_bus10 **−6.00 MW** (set-point **1.050 p.u.**), Gen_bus12 **−8.00 MW**. Demand response at Loads 17–20. |
+| **L37, Bus_26–Bus_29** | Gen_bus1 **+16.00 MW**; Gen_bus4 **+9.02 MW** and Gen_bus7 **+4.93 MW** (both set-points to **1.050 p.u.**); Gen_bus10 **+6.00 MW** (set-point **1.050 p.u.**); Gen_bus12 **−8.00 MW**. Also **1.12 MW load relief at Load 20 (Bus_29)**, alongside demand response. |
+| **L36, Bus_26–Bus_28** | Gen_bus1 **+10.02 MW**; Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, and Gen_bus10 **+6.00 MW** (each set-point to **1.050 p.u.**); Gen_bus12 **−5.66 MW**. Demand response at Loads 19–20. |
+| **L4, Bus_1–Bus_4** | Gen_bus4/7/10/12 **+3.87/2.91/2.55/1.32 MW**; Gen_bus1 holds P and changes its set-point to **1.035 p.u.** |
+
+The corrective plans were power-flow checked and cleared the limits for those eight studied outages; **four plans also use demand response or load relief**. This does **not** establish coverage for every line outage: the full 41-outage screen still found violations, and the other 33 outages were not given individual corrective plans in this study. The dispatch cost is **€276.54/h** at the configured prices (mostly synthetic); the security study allowed up to **100%** thermal loading after an outage.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-ask-first/whatif/new_substation_trafo-02.jsonl,1,ungrounded_figure,"0.84 MVA — “umed data-centre power factor of 0.95, 0.8 MW is about 0.84 MVA, above the 0.63 MVA rating of one transformer. The”  (nearest source 0.8 at edit_proposal.edits[1].p_mw)","Build a new 0.4 kV substation at Bus 9 with two 0.63 MVA transformers (vk 6 %, vkr 1 %) and connect a 0.8 MW data centre to it. Is it N-1 secure?","On proposal **dc_bus9_04kv** (the base network plus the new 0.4 kV substation at Bus 9, two 0.63 MVA transformers, and a 0.8 MW data-centre load), **the modeled system is not N-1 secure**. This is a what-if proposal; it does not modify the base network.
+
+- **At 18:00**, the N-1 screen found violations for **12 of 18 outages**. The worst reported undervoltage was **0.914 p.u.** at the new data-centre bus following loss of **Line 7-8**. The screen also found outages that disconnected load.
+- In the **hourly scan of Jan 1**, the proposal had voltage violations in **17 of 24 sampled hours**; its lowest voltage was **0.920 p.u.** at the new bus at **18:00**. The base had no violations in those hourly samples.
+- **Transformer-model caveat:** the two transformers are represented together as one branch, so the N-1 screen removes both together; it does **not** separately test loss of just one transformer. Also, at the proposal’s assumed data-centre power factor of 0.95, 0.8 MW is about **0.84 MVA**, above the **0.63 MVA** rating of one transformer. The proposal therefore does not establish that the centre could be supplied after one unit is lost.
+
+The screen at 00:00 had no voltage or thermal violations, but did identify load-disconnecting outages. Screens were run at different timestamps; the results above are labeled by their respective times. The data-centre load was assumed flat at pf 0.95; measured loads used pf 0.97.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/clarify/unstated_margin-01.jsonl,1,ungrounded_figure,80 % — “ing should “comfortably below” mean for L30? I suggest 80%; you can choose 85% or 90% instead.”  (nearest source 100 at grid.max_loading_pct),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What maximum loading should “comfortably below” mean for L30? I suggest **80%**; you can choose **85%** or **90%** instead.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/clarify/unstated_margin-01.jsonl,1,ungrounded_figure,85 % — “bly below” mean for L30? I suggest 80%; you can choose 85% or 90% instead.”  (nearest source 100 at grid.max_loading_pct),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What maximum loading should “comfortably below” mean for L30? I suggest **80%**; you can choose **85%** or **90%** instead.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/clarify/unstated_margin-01.jsonl,1,ungrounded_figure,90 % — “ow” mean for L30? I suggest 80%; you can choose 85% or 90% instead.”  (nearest source 100 at grid.max_loading_pct),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What maximum loading should “comfortably below” mean for L30? I suggest **80%**; you can choose **85%** or **90%** instead.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/narration/historical_risk-02.jsonl,1,ungrounded_figure,7.25 — “e limits in 29 of 672 15-minute intervals (4.3%)—about 7.25 hours total. It came close without violating in 27 int”  (nearest source 7 at grid.substation_names[5]),"How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the 7-day measurement week, Bus_29 violated its voltage limits in **29 of 672 15-minute intervals (4.3%)**—about **7.25 hours** total. It came close without violating in **27 intervals (4.0%)**, using a near-miss band of **0.005 p.u.** from the limit.
+
+The worst stretch was **Jan 6, 18:45–20:45**, when voltage reached a low of **0.932 p.u.** against the **0.950 p.u.** lower limit. The recorded low-voltage episodes clustered mainly in the evenings.
+
+📋 Data source: measurements. Load reactive demand was derived using the default **0.95 lagging power factor**.",false alarm,Remaining after the fix; a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/options/n1_corrective-02.jsonl,1,ungrounded_figure,"33 — “redispatch plan is available for every line: the other 33 lines were screened, but not given corrective plans. T”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the **N-1 corrective** dispatch provides a pre-outage operating point plus a quick corrective plan for each of the **eight most severe line outages studied**. It does **not** establish that a quick-redispatch plan is available for every line: the other 33 lines were screened, but not given corrective plans. The listed plans were power-flow checked and brought the studied outages within the stated limits; **four also require load reduction**, so those are not generator redispatch alone.
+
+The pre-outage dispatch sets Gen_bus1 to **64.00 MW**, Gen_bus12 to **29.94 MW**, Gen_bus4 to **40.98 MW**, Gen_bus7 to **30.07 MW**, and Gen_bus10 to **6.00 MW**; external-grid import is **146.55 MW**. The dispatch costs **€276.54/h** at the cost table’s prices, which are mostly synthetic.
+
+**Corrective action after each outage** (MW figures are changes from that pre-outage dispatch; voltage figures are new set-points where specified):
+
+| Line outage | Quick action |
+|---|---|
+| **Bus_27 → Bus_26 [L35]** | Gen_bus1 **+16.00 MW**; Gen_bus4 **+2.33 MW**; Gen_bus7 **0.00 MW**; Gen_bus10 **−6.00 MW**; Gen_bus12 **+8.00 MW**. Set voltage targets: Gen_bus1 **1.048**, Gen_bus4 **1.050**, Gen_bus7 **1.050**, Gen_bus10 **1.050 p.u.** Also reduce demand: Load 16 **0.348 MW**, Load 17 **0.945 MW**, Load 18 **0.380 MW**, Load 19 **0.261 MW**, and Load 20 **1.152 MW** demand response plus **3.721 MW** load relief. |
+| **Bus_0 → Bus_1 [L0]** | Gen_bus1 **+4.32 MW**, Gen_bus4 **+4.72 MW**, Gen_bus7 **+4.38 MW**, Gen_bus10 **+4.38 MW**, Gen_bus12 **+4.09 MW**. |
+| **Bus_0 → Bus_2 [L1]** | Gen_bus1 **+3.40 MW**, Gen_bus4 **+4.05 MW**, Gen_bus7 **+4.09 MW**, Gen_bus10 **+4.09 MW**, Gen_bus12 **+3.78 MW**. Gen_bus1 voltage target **0.989 p.u.**; Gen_bus7 **1.007 p.u.** |
+| **Bus_2 → Bus_3 [L3]** | Gen_bus1 **+2.92 MW**, Gen_bus4 **+3.53 MW**, Gen_bus7 **+3.58 MW**, Gen_bus10 **+3.57 MW**, Gen_bus12 **+3.27 MW**. Gen_bus1 voltage target **0.989 p.u.** |
+| **Bus_14 → Bus_22 [L29]** | Gen_bus1 **+6.38 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **−6.00 MW**, Gen_bus12 **−8.00 MW**. Set targets: Gen_bus4 **0.990**, Gen_bus7 **0.977**, Gen_bus10 **1.050 p.u.** Also apply demand response: Load 17 **0.482 MW**, Load 18 **0.380 MW**, Load 19 **0.261 MW**, Load 20 **1.152 MW**. |
+| **Bus_26 → Bus_29 [L37]** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−8.00 MW**. Set targets: Gen_bus1 **1.048**, Gen_bus4 **1.050**, Gen_bus7 **1.050**, Gen_bus10 **1.050 p.u.** Also reduce Load 18 by **0.380 MW** and Load 19 by **0.261 MW** through demand response, and provide **1.152 MW** demand response plus **1.120 MW** load relief at Load 20. |
+| **Bus_26 → Bus_28 [L36]** | Gen_bus1 **+10.02 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−5.66 MW**. Set targets: Gen_bus1 **1.048**, Gen_bus4 **1.050**, Gen_bus7 **1.050**, Gen_bus10 **1.050 p.u.** Also apply demand response: Load 19 **0.261 MW**, Load 20 **1.137 MW**. |
+| **Bus_1 → Bus_4 [L4]** | Gen_bus1 **0.00 MW**, Gen_bus4 **+3.87 MW**, Gen_bus7 **+2.91 MW**, Gen_bus10 **+2.55 MW**, Gen_bus12 **+1.32 MW**. Gen_bus1 voltage target **1.035 p.u.** |
+
+The reported N-1 corrective plan secured all **8 studied outages**; **4 of the 8** used load reduction as well as generator action. The broader screen still found violations for **19 of 41 outages before corrective action**, so this result should not be read as a plan for every line outage.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-evidence-wording/whatif/new_substation_trafo-03.jsonl,1,ungrounded_figure,"0.84 MVA — “0.95 lagging power factor, 0.8 MW corresponds to about 0.84 MVA, above the 0.63 MVA rating of one unit; a single r”  (nearest source 0.8 at edit_proposal.edits[1].p_mw)","Build a new 0.4 kV substation at Bus 9 with two 0.63 MVA transformers (vk 6 %, vkr 1 %) and connect a 0.8 MW data centre to it. Is it N-1 secure?","On proposal **bus9_datacentre_04kv**, the answer is **no**: the N‑1 study does not meet the model’s security criterion at **2000-01-01 00:00**.
+
+- The study tested 18 outages; **15 disconnected load**. No voltage or thermal violations were reported, but that does not make the result secure when load is disconnected.
+- Losing the new transformer branch disconnects the new **0.8 MW** data-centre load. An outage of line **Bus 8–Bus 9 [L6]** also disconnects the new substation along with other load.
+- Important modelling limitation: the two 0.63 MVA transformers are represented as **one branch**, so the outage removes both together. The study therefore does not simulate the loss of just one transformer with the other remaining. Also, at the stated 0.95 lagging power factor, 0.8 MW corresponds to about **0.84 MVA**, above the 0.63 MVA rating of one unit; a single remaining unit would be undersized by nameplate.
+- The base network also fails the N‑1 criterion in this study because contingencies disconnect existing loads.
+
+The proposal uses a flat 0.8 MW data-centre load at assumed pf 0.95 lagging; transformer no-load losses and magnetising current were set to zero. To assess single-transformer redundancy faithfully, the two transformers need to be represented as separate outage elements.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/clarify/unstated_margin-03.jsonl,1,ungrounded_figure,80 % — “What maximum loading should I enforce for L30? 80% is a reasonable “comfortably below” target; I can als”  (nearest source 100 at grid.max_loading_pct),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What maximum loading should I enforce for L30? **80%** is a reasonable “comfortably below” target; I can also use 70% or another limit you specify.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/clarify/unstated_margin-03.jsonl,1,ungrounded_figure,70 % — “reasonable “comfortably below” target; I can also use 70% or another limit you specify.”  (nearest source 41 at grid.n_lines),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What maximum loading should I enforce for L30? **80%** is a reasonable “comfortably below” target; I can also use 70% or another limit you specify.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/injected_setpoint-01.jsonl,1,ungrounded_figure,"0.004 p.u. — “gh that part of the network. The base had only 0.004 p.u. of margin, so it was already close to the limit.”  (nearest source 0 at compare_networks.base.total_violations)","On proposal inj_setpoint, Bus_29 is below its limit at 18:00 on 6 January but on the base it is fine. Why?","On proposal *inj_setpoint* (Gen_bus12 voltage set-point changed from 1.025 to 0.950 p.u.), Bus_29 violates its lower voltage limit at **18:00 on 6 January**, while it is only just above the limit on the base.
+
+The comparison points to the set-point change as the immediate reason: **Bus_29 falls from 0.954 p.u. on the base to 0.942 p.u. on the proposal** (limit: 0.950 p.u.). Because Gen_bus12 is voltage-controlled, the proposal holds Bus_12 at 0.950 p.u.; its reactive output shifts from **+11.82 MVAr** on the base to **−11.40 MVAr** on the proposal. That reduced local voltage support coincides with a broader voltage drop: for example, Bus_28 falls from 0.969 to 0.957 p.u. Bus_29 is a 135 kV bus with a 5.58 MW load, connected to Bus_26 and Bus_28 by lines L37 and L38, so the drop reaches it through that part of the network.
+
+The base Bus_29 had only **0.004 p.u.** of margin, so it was already close to the limit. Line loadings remain below 100% in both cases; this is a voltage-limit issue, not a thermal overload. I can show the direct comparison, but I don’t have a causal-attribution tool here to quantify each factor’s share.
+
+📋 Data source: measurements
+
+**Reading check.** CONDUCTOR re-ran the studies under readings the question left open, and the conclusion changes: with the forecast for 2000-01-06 18:00:00 instead of the measurements, the security assessment finds it not secure, 2 violations (first at Bus_29); with loads at power factor 0.90 instead of 0.95 (the default), the security assessment finds it not secure, 2 violations (first at Bus_28); with branches judged at 90 % of their rating instead of 100 % (the network's own limit), the security assessment finds it not secure, 1 violation (first at Bus_0 -> Bus_1 [L0]). Say which reading you meant.",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/investigation/prevention-02.jsonl,1,ungrounded_figure,"90 — “ore the breach. Once it began, the lowest reading came 90 minutes later. I can’t quantify forecast notice from t”  (nearest source 96 at args:get_element_timeseries.n_steps)","Could the undervoltage at Bus_29 on the evening of 5 January have been avoided, and how much warning did we have?","**Probably avoidable by redispatch at the time, but the available study does not establish that it could have been prevented in advance.** Bus_29 first fell below the 0.950 p.u. limit at **18:00**; it was last within limits at **17:45**. The lowest reading was **0.944 p.u. at 19:30**, or **0.006 p.u. below the limit**. There were six below-limit readings in the 17:00–23:45 window.
+
+A corrective AC-OPF at 19:30 found a feasible redispatch that brought Bus_29 to **0.950 p.u.** It increased output from all five generators and reduced external-grid import. That shows a correction was feasible for that snapshot; it is not proof that a preventive action would have held through the whole episode.
+
+**Warning:** the measurements show only one 15-minute interval between the last in-limit reading and the first undervoltage. The data therefore don’t show meaningful advance warning before the breach. Once it began, the lowest reading came 90 minutes later. I can’t quantify forecast notice from these historical measurements.
+
+📋 Data source: measurements.",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/options/n1_secure-01.jsonl,1,ungrounded_figure,"33 — “( – ), and L36 ( – ). For the other 33 lines, this result does not establish a post-trip corr”  (nearest source 32 at optimize_flexibility.n1_study.skipped[3].outage)","At 20:00 on 6 January, give me corrective options that stay secure if a line trips.","At **20:00 on 6 January 2000**, the **N‑1 corrective** option is the one designed to restore limits after a trip. Its plan passed a power-flow check for the **8 critical line outages studied**; it is **not confirmation for every one of the 41 lines**.
+
+- **N‑1 corrective:** €304.95/h; 64.07 MW moved; external-grid import 152.59 MW. It redispatches all five generators, including voltage-setpoint changes. Its corrective plans secure the 8 studied outages; **4 plans use load reduction**.
+- **Cheapest:** €95.16/h; 47.63 MW moved; import 146.38 MW. Its pre-correction contingency screen has violations for 29 of 41 outages, so it is **not** a stand-alone “secure after any line trip” option.
+- **Least disturbance:** €217.35/h; 40.41 MW moved; import 153.42 MW. Its pre-correction screen has violations for 30 of 41 outages, so it likewise does **not** establish security after any line trip.
+
+The eight outages covered by the N‑1 corrective plans are **L35** (Bus_27–Bus_26), **L0** (Bus_0–Bus_1), **L1** (Bus_0–Bus_2), **L3** (Bus_2–Bus_3), **L37** (Bus_26–Bus_29), **L29** (Bus_14–Bus_22), **L4** (Bus_1–Bus_4), and **L36** (Bus_26–Bus_28). For the other 33 lines, this result does not establish a post-trip corrective plan. Costs use a mix of case and synthetic prices.
+
+📋 Data source: forecasts",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/reasoning/drop_cigre_declared-03.jsonl,1,ungrounded_figure,"0.46 MW — “External Grid import from 29.41 MW to 29.87 MW (about 0.46 MW). The 50% scaling affected these units: PV 3, PV 4”  (nearest source 0.5 at scan_scenarios.scenarios[0].sgen_scale)","If wind and solar output dropped by 50 % at 2000-01-03 12:00, would the grid stay secure, and which units would that affect?","Yes. At **2000-01-03 12:00**, the grid had **0 security violations** both with output reduced to 50% and at the baseline. The reduced-output case increased External Grid import from **29.41 MW to 29.87 MW** (about **0.46 MW**).
+
+The 50% scaling affected these units: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10 and PV 11** (solar), and **WKA 7** (wind). The model also included **CHP diesel 1** in its stated wind/solar scaling list, so it was scaled too, despite its name.
+
+This is a result for that single timestamp, with the network’s load power-factor assumption. 📋 Data source: measurements",false alarm,"Held-out sample (drawn before the fix); derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-investigation-tools/whatif/new_substation_trafo-03.jsonl,1,ungrounded_figure,"0.84 MVA — “0.95 lagging power factor, 0.8 MW corresponds to about 0.84 MVA. The remaining transformer cannot carry that full”  (nearest source 0.8 at edit_proposal.edits[1].p_mw)","Build a new 0.4 kV substation at Bus 9 with two 0.63 MVA transformers (vk 6 %, vkr 1 %) and connect a 0.8 MW data centre to it. Is it N-1 secure?","On proposal **dc_bus9_04kv** (a 0.4 kV bus at Bus 9, two 0.63 MVA transformers, and a flat 0.8 MW data-centre load), **it is not N-1 secure** at the study point, 2000-01-01 00:00.
+
+The N-1 sweep reports the data-centre bus disconnected when its transformer branch is lost, cutting off the full 0.8 MW load. There were no voltage or thermal violations reported, but that does **not** mean the case is secure: the load was disconnected. The model represents the two parallel transformers as one branch, so its outage removes both together rather than testing the loss of just one.
+
+Even for a single-transformer outage, the remaining 0.63 MVA unit would be undersized: at the proposal’s assumed 0.95 lagging power factor, 0.8 MW corresponds to about **0.84 MVA**. The remaining transformer cannot carry that full demand at its stated rating.
+
+📋 Data source: measurements.",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-reading-check/clarify/unstated_margin-01.jsonl,1,ungrounded_figure,31.7 — “om option leaves L30 with the most reported clearance: 31.7 percentage points below rating. It moves all five gene”  (nearest source 31.3438 at optimize_flexibility.options[2].dispatch[3].p_mw_after),75 %.,"At **20:00 on 6 January 2000**, the optimizer found five confirmed dispatch options enforcing **L30 ≤ 75%**—a 25-percentage-point margin below its rating. The exact L30 loading was reported for two options; for the others, the summary confirms the limit but does not give L30’s individual loading.
+
+| Option | L30 loading | Redispatch moved | External-grid import | Cost |
+|---|---:|---:|---:|---:|
+| **Cheapest** | ≤75% (exact value not reported) | 33.64 MW | 148.88 MW | €34.18/h |
+| **Least disturbance** | ≤75% (exact value not reported) | 30.35 MW | 151.95 MW | €116.13/h |
+| **Without Gen_bus1** | ≤75% (exact value not reported) | 44.15 MW | 137.08 MW | €220.16/h |
+| **Least import** | **75.0%** | 99.82 MW | **78.36 MW** | €580.22/h |
+| **Most headroom** | **68.3%** | 51.00 MW | 130.14 MW | €575.32/h |
+
+The **Most headroom** option leaves L30 with the most reported clearance: **31.7 percentage points below rating**. It moves all five generators’ active power and voltage set-points. The least-import option also meets the requested ceiling, but L30 sits right at the 75% limit.
+
+All five options passed their AC power-flow checks with no violations. The cheapest option uses active-power and voltage-setpoint changes at Gen_bus1, Gen_bus12 and Gen_bus7, plus voltage-setpoint changes at Gen_bus4 and Gen_bus10. Its cost is based on a mix of case-file and synthetic prices; the solver’s bound allows another feasible dispatch to be up to €9.50/h cheaper, so it is **not established as the global best possible**. These are alternatives for the operator to choose among.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-reading-check/investigation/why_window-03.jsonl,1,ungrounded_figure,"2.5 — “exceeded its 100% limit for 10 quarter-hour intervals (2.5 hours in total), including a sustained episode from”  (nearest source 2.25 at investigate.events[1].hours_outside)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The overloaded external-grid branch was **Bus_0 → Bus_1 [L0]**; the other external-grid branch, **Bus_0 → Bus_2 [L1]**, had no overloads on either day.
+
+On Jan 6, L0 exceeded its 100% limit for **10 quarter-hour intervals (2.5 hours in total)**, including a sustained episode from **19:15 to 21:00** that peaked at **134.1%**. On Jan 5 it exceeded the limit for **5 intervals (1.25 hours total)**, peaking at **107.6%**.
+
+The investigations point to **demand as the main driver on both days**. For the sustained Jan 6 episode, demand near L0 accounted for 59.5% of the change and demand elsewhere for another 24.4%. Generation changes contributed in that episode, but they do not consistently explain the longer duration: their effect varied across Jan 5’s episodes. So the evidence points to a stronger, more sustained demand-driven stress on Jan 6—not to a consistent generation-output shift.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/no-reading-check/investigation/why_window-03.jsonl,1,ungrounded_figure,"1.25 — “at 134.1%. On it exceeded the limit for 5 intervals (1.25 hours total), peaking at 107.6%. The investigations p”  (nearest source 1.05 at investigate.thresholds_used.vm_upper_pu)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The overloaded external-grid branch was **Bus_0 → Bus_1 [L0]**; the other external-grid branch, **Bus_0 → Bus_2 [L1]**, had no overloads on either day.
+
+On Jan 6, L0 exceeded its 100% limit for **10 quarter-hour intervals (2.5 hours in total)**, including a sustained episode from **19:15 to 21:00** that peaked at **134.1%**. On Jan 5 it exceeded the limit for **5 intervals (1.25 hours total)**, peaking at **107.6%**.
+
+The investigations point to **demand as the main driver on both days**. For the sustained Jan 6 episode, demand near L0 accounted for 59.5% of the change and demand elsewhere for another 24.4%. Generation changes contributed in that episode, but they do not consistently explain the longer duration: their effect varied across Jan 5’s episodes. So the evidence points to a stronger, more sustained demand-driven stress on Jan 6—not to a consistent generation-output shift.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-reading-check/narration/historical_risk-01.jsonl,1,ungrounded_figure,"56 — “ating in another 27 intervals (4.0%). Together, that’s 56 intervals, or 8.3% of the week. The worst episode was”  (nearest source 41 at grid.n_lines)","How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the week (672 15-minute measurements), **Bus_29 violated its voltage limits in 29 intervals (4.3%)**. All recorded violations were undervoltages below **0.950 p.u.** It came within **0.005 p.u.** of the lower limit without violating in another **27 intervals (4.0%)**. Together, that’s 56 intervals, or **8.3%** of the week.
+
+The worst episode was **6 Jan, 18:45–20:45**: 9 intervals, reaching **0.932 p.u.** Other notable episodes were **5 Jan, 18:00–19:00** (5 intervals; **0.945 p.u.** peak) and **7 Jan, 18:30–19:00** (3 intervals; **0.943 p.u.**). A separate brief low occurred on **6 Jan at 18:15** (**0.945 p.u.**).
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-reading-check/narration/historical_risk-01.jsonl,1,ungrounded_figure,"8.3 % — “27 intervals (4.0%). Together, that’s 56 intervals, or 8.3% of the week. The worst episode was , – : 9 interva”  (nearest source 8 at grid.names_key)","How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the week (672 15-minute measurements), **Bus_29 violated its voltage limits in 29 intervals (4.3%)**. All recorded violations were undervoltages below **0.950 p.u.** It came within **0.005 p.u.** of the lower limit without violating in another **27 intervals (4.0%)**. Together, that’s 56 intervals, or **8.3%** of the week.
+
+The worst episode was **6 Jan, 18:45–20:45**: 9 intervals, reaching **0.932 p.u.** Other notable episodes were **5 Jan, 18:00–19:00** (5 intervals; **0.945 p.u.** peak) and **7 Jan, 18:30–19:00** (3 intervals; **0.943 p.u.**). A separate brief low occurred on **6 Jan at 18:15** (**0.945 p.u.**).
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-reading-check/narration/historical_risk-03.jsonl,1,ungrounded_figure,45 — “hout violating it in 27 intervals (4.0%)—about 6 hours 45 minutes. These near-misses are additional to the viola”  (nearest source 41 at grid.n_lines),"How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the week (672 15-minute measurements), **Bus_29 was outside its voltage limits in 29 intervals (4.3%)**—about **7 hours 15 minutes** in total. All recorded violations were **undervoltage** against the 0.95 p.u. lower limit.
+
+It came **within 0.005 p.u. of a limit without violating it in 27 intervals (4.0%)**—about **6 hours 45 minutes**. These near-misses are additional to the violating intervals.
+
+The worst episode ran **Jan 6, 18:45–20:45**, reaching **0.932 p.u.** at 19:15 (0.018 p.u. below the limit). Other notable episodes occurred on the evenings of Jan 5 and Jan 7. The duration curve crosses the limit at roughly the same **4.3%** exceedance frequency.
+
+📋 Data source: measurements (synthetic weekly series).",false alarm,Held-out sample (drawn before the fix); a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/no-reading-check/options/n1_corrective-02.jsonl,1,ungrounded_figure,"3.09 MW — “050, 1.043→1.050. Also needs load reduction: 3.09 MW demand response plus 3.72 MW load relief at Load 20”  (nearest source 3 at optimize_flexibility.n1_study.outages_studied[3])","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the option that provides post-outage corrective plans is **N-1 corrective**. Its preventive dispatch is **Gen_bus1 64.00 MW, Gen_bus4 40.98 MW, Gen_bus7 30.07 MW, Gen_bus10 6.00 MW, and Gen_bus12 29.94 MW**; external-grid import is **146.55 MW**. All five units are called for P and voltage-setpoint control.
+
+The plans below were AC-power-flow checked for the **eight critical line outages studied**. P changes are MW changes from that preventive dispatch; setpoint changes are p.u.
+
+| Outaged line | Corrective action |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00**, Gen_bus4 **+2.33**, Gen_bus7 **0.00**, Gen_bus10 **−6.00**, Gen_bus12 **+8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs load reduction:** 3.09 MW demand response plus 3.72 MW load relief at Load 20. |
+| **Bus_0–Bus_1 [L0]** | Gen_bus1 **+4.32**, Gen_bus4 **+4.72**, Gen_bus7 **+4.38**, Gen_bus10 **+4.38**, Gen_bus12 **+4.09**. |
+| **Bus_0–Bus_2 [L1]** | Gen_bus1 **+3.40**, Gen_bus4 **+4.05**, Gen_bus7 **+4.09**, Gen_bus10 **+4.09**, Gen_bus12 **+3.78**. Setpoints: Gen_bus1 **1.023→0.989**, Gen_bus7 **1.005→1.007**. |
+| **Bus_2–Bus_3 [L3]** | Gen_bus1 **+2.92**, Gen_bus4 **+3.53**, Gen_bus7 **+3.58**, Gen_bus10 **+3.57**, Gen_bus12 **+3.27**. Gen_bus1 setpoint **1.023→0.989**. |
+| **Bus_14–Bus_22 [L29]** | Gen_bus1 **+6.38**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **−6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus4 **0.997→0.990**, Gen_bus7 **1.005→0.977**, Gen_bus10 **1.043→1.050**. **Also needs 2.28 MW demand response.** |
+| **Bus_26–Bus_29 [L37]** | Gen_bus1 **+16.00**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.79 MW demand response and 1.12 MW load relief.** |
+| **Bus_26–Bus_28 [L36]** | Gen_bus1 **+10.02**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−5.66**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.40 MW demand response.** |
+| **Bus_1–Bus_4 [L4]** | Gen_bus1 **0.00**, Gen_bus4 **+3.87**, Gen_bus7 **+2.91**, Gen_bus10 **+2.55**, Gen_bus12 **+1.32**. Gen_bus1 setpoint **1.023→1.035**. |
+
+**Scope caveat:** this supports corrective plans for the eight selected critical outages—not every line outage. The screen covered all 41 lines, but it showed violations for 19 outages before corrective action; no corrective plan was established here for the other outages. Four of the eight studied plans also rely on load reduction, so they are not redispatch-only fixes. The study models post-outage corrective actions but does not establish real-world response times. The N-1 corrective option costs **€276.54/h** at the cost table’s prices, which are mostly synthetic.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-reading-check/options/n1_corrective-02.jsonl,1,ungrounded_figure,"1.79 MW — “1.005→1.050, 1.043→1.050. Also needs 1.79 MW demand response and 1.12 MW load relief. | |”  (nearest source 1.8934 at optimize_flexibility.options[0].dispatch[4].q_mvar_before)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the option that provides post-outage corrective plans is **N-1 corrective**. Its preventive dispatch is **Gen_bus1 64.00 MW, Gen_bus4 40.98 MW, Gen_bus7 30.07 MW, Gen_bus10 6.00 MW, and Gen_bus12 29.94 MW**; external-grid import is **146.55 MW**. All five units are called for P and voltage-setpoint control.
+
+The plans below were AC-power-flow checked for the **eight critical line outages studied**. P changes are MW changes from that preventive dispatch; setpoint changes are p.u.
+
+| Outaged line | Corrective action |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00**, Gen_bus4 **+2.33**, Gen_bus7 **0.00**, Gen_bus10 **−6.00**, Gen_bus12 **+8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs load reduction:** 3.09 MW demand response plus 3.72 MW load relief at Load 20. |
+| **Bus_0–Bus_1 [L0]** | Gen_bus1 **+4.32**, Gen_bus4 **+4.72**, Gen_bus7 **+4.38**, Gen_bus10 **+4.38**, Gen_bus12 **+4.09**. |
+| **Bus_0–Bus_2 [L1]** | Gen_bus1 **+3.40**, Gen_bus4 **+4.05**, Gen_bus7 **+4.09**, Gen_bus10 **+4.09**, Gen_bus12 **+3.78**. Setpoints: Gen_bus1 **1.023→0.989**, Gen_bus7 **1.005→1.007**. |
+| **Bus_2–Bus_3 [L3]** | Gen_bus1 **+2.92**, Gen_bus4 **+3.53**, Gen_bus7 **+3.58**, Gen_bus10 **+3.57**, Gen_bus12 **+3.27**. Gen_bus1 setpoint **1.023→0.989**. |
+| **Bus_14–Bus_22 [L29]** | Gen_bus1 **+6.38**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **−6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus4 **0.997→0.990**, Gen_bus7 **1.005→0.977**, Gen_bus10 **1.043→1.050**. **Also needs 2.28 MW demand response.** |
+| **Bus_26–Bus_29 [L37]** | Gen_bus1 **+16.00**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.79 MW demand response and 1.12 MW load relief.** |
+| **Bus_26–Bus_28 [L36]** | Gen_bus1 **+10.02**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−5.66**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.40 MW demand response.** |
+| **Bus_1–Bus_4 [L4]** | Gen_bus1 **0.00**, Gen_bus4 **+3.87**, Gen_bus7 **+2.91**, Gen_bus10 **+2.55**, Gen_bus12 **+1.32**. Gen_bus1 setpoint **1.023→1.035**. |
+
+**Scope caveat:** this supports corrective plans for the eight selected critical outages—not every line outage. The screen covered all 41 lines, but it showed violations for 19 outages before corrective action; no corrective plan was established here for the other outages. Four of the eight studied plans also rely on load reduction, so they are not redispatch-only fixes. The study models post-outage corrective actions but does not establish real-world response times. The N-1 corrective option costs **€276.54/h** at the cost table’s prices, which are mostly synthetic.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; derived from results whose operands the answer does not state (e.g. a change of a total): correct
+papers/cimcontext/runs/B-components/runs/no-reading-check/options/n1_corrective-02.jsonl,1,ungrounded_figure,"1.4 MW — “1.005→1.050, 1.043→1.050. Also needs 1.40 MW demand response. | | – [L4] | 0.”  (nearest source 1.32 at optimize_flexibility.options[2].n1.corrective_plan[7].actions[4].dp_mw)","At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the option that provides post-outage corrective plans is **N-1 corrective**. Its preventive dispatch is **Gen_bus1 64.00 MW, Gen_bus4 40.98 MW, Gen_bus7 30.07 MW, Gen_bus10 6.00 MW, and Gen_bus12 29.94 MW**; external-grid import is **146.55 MW**. All five units are called for P and voltage-setpoint control.
+
+The plans below were AC-power-flow checked for the **eight critical line outages studied**. P changes are MW changes from that preventive dispatch; setpoint changes are p.u.
+
+| Outaged line | Corrective action |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00**, Gen_bus4 **+2.33**, Gen_bus7 **0.00**, Gen_bus10 **−6.00**, Gen_bus12 **+8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs load reduction:** 3.09 MW demand response plus 3.72 MW load relief at Load 20. |
+| **Bus_0–Bus_1 [L0]** | Gen_bus1 **+4.32**, Gen_bus4 **+4.72**, Gen_bus7 **+4.38**, Gen_bus10 **+4.38**, Gen_bus12 **+4.09**. |
+| **Bus_0–Bus_2 [L1]** | Gen_bus1 **+3.40**, Gen_bus4 **+4.05**, Gen_bus7 **+4.09**, Gen_bus10 **+4.09**, Gen_bus12 **+3.78**. Setpoints: Gen_bus1 **1.023→0.989**, Gen_bus7 **1.005→1.007**. |
+| **Bus_2–Bus_3 [L3]** | Gen_bus1 **+2.92**, Gen_bus4 **+3.53**, Gen_bus7 **+3.58**, Gen_bus10 **+3.57**, Gen_bus12 **+3.27**. Gen_bus1 setpoint **1.023→0.989**. |
+| **Bus_14–Bus_22 [L29]** | Gen_bus1 **+6.38**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **−6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus4 **0.997→0.990**, Gen_bus7 **1.005→0.977**, Gen_bus10 **1.043→1.050**. **Also needs 2.28 MW demand response.** |
+| **Bus_26–Bus_29 [L37]** | Gen_bus1 **+16.00**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−8.00**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.79 MW demand response and 1.12 MW load relief.** |
+| **Bus_26–Bus_28 [L36]** | Gen_bus1 **+10.02**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−5.66**. Setpoints: Gen_bus1 **1.023→1.048**, Gen_bus4 **0.997→1.050**, Gen_bus7 **1.005→1.050**, Gen_bus10 **1.043→1.050**. **Also needs 1.40 MW demand response.** |
+| **Bus_1–Bus_4 [L4]** | Gen_bus1 **0.00**, Gen_bus4 **+3.87**, Gen_bus7 **+2.91**, Gen_bus10 **+2.55**, Gen_bus12 **+1.32**. Gen_bus1 setpoint **1.023→1.035**. |
+
+**Scope caveat:** this supports corrective plans for the eight selected critical outages—not every line outage. The screen covered all 41 lines, but it showed violations for 19 outages before corrective action; no corrective plan was established here for the other outages. Four of the eight studied plans also rely on load reduction, so they are not redispatch-only fixes. The study models post-outage corrective actions but does not establish real-world response times. The N-1 corrective option costs **€276.54/h** at the cost table’s prices, which are mostly synthetic.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-reading-check/semantics-cigre/cigre_outage-03.jsonl,1,entity_contradicted,"“At **2000-01-01 00:00**, losing **Line 2-3** cuts supply to **Load R3, Load CI3, Load R4, Load R5, Load R6, Load CI7, Load R8, Load CI9, Load R9, Load R10, and Load R11**.” — names Load R9, which this network does not have","If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, losing **Line 2-3** cuts supply to **Load R3, Load CI3, Load R4, Load R5, Load R6, Load CI7, Load R8, Load CI9, Load R9, Load R10, and Load R11**. The contingency assessment reports about **1.95 MW** of unsupplied load.
+
+The normally open tie identified as able to restore the cut-off area is **S1**, on **Line 14-8**, at **Bus 8**. This is a topology-based restoration path; its ability to carry the resulting flows was not checked.
+
+📋 Data source: measurements",error,"Lists Load R9, which does not exist (the eleventh load is Load CI10). Rechecked against the network data: confirmed."
+papers/cimcontext/runs/B-components/runs/no-routing-rules/clarify/unstated_margin-02.jsonl,1,ungrounded_figure,80 % — “it should “comfortably below” mean for L30? Suggested: 80% of rating.”  (nearest source 100 at grid.max_loading_pct),"At 20:00 on 6 January, give me options that keep L30 comfortably below its rating.",What loading limit should “comfortably below” mean for L30? Suggested: **80% of rating**.,false alarm,Remaining after the fix; a choice offered in a clarifying question
+papers/cimcontext/runs/B-components/runs/no-routing-rules/narration/historical_risk-02.jsonl,1,ungrounded_figure,"45 — “hout crossing it—in 27 intervals (4.0%), about 6 hours 45 minutes. The worst breaches clustered in the evenings,”  (nearest source 41 at grid.n_lines)","How often does Bus_29 violate its limits over the week, and how often does it come close?","Over the week, **Bus_29 was outside its voltage limits in 29 of 672 intervals (4.3%)**—about **7 hours 15 minutes** in total. These were undervoltage events; the lowest recorded voltage was **0.932 p.u.** on **Jan 6 at 19:15**.
+
+It came close—within **0.005 p.u.** of the lower limit without crossing it—in **27 intervals (4.0%)**, about **6 hours 45 minutes**. The worst breaches clustered in the evenings, especially Jan 6 (**18:45–20:45**) and Jan 7 (**18:30–19:00**).
+
+📋 Data source: measurements",false alarm,Held-out sample (drawn before the fix); a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/no-routing-rules/options/n1_corrective-02.jsonl,1,ungrounded_figure,33 — “ve plans cover those eight selected outages; the other 33 were skipped for plan generation. The all-line screen”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar),"At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the **N‑1 corrective** dispatch is the option designed to restore limits with post-outage actions. Its pre-contingency setpoints are **Gen_bus1 64.00 MW, Gen_bus4 40.98 MW, Gen_bus7 30.07 MW, Gen_bus10 6.00 MW and Gen_bus12 29.94 MW**. The solver’s action plans were power-flow checked for the eight most severe outages it studied:
+
+| Outaged line | Post-outage action |
+|---|---|
+| **L35, Bus_27–Bus_26** | Gen_bus1 **+16.00 MW**; Gen_bus4 **+2.33 MW**; Gen_bus10 **−6.00 MW**; Gen_bus12 **+8.00 MW**. Adjust voltage setpoints: Gen_bus1 **1.048**, Gen_bus4/Gen_bus7/Gen_bus10 **1.050 p.u.** Also demand response at Loads 16–20, plus **3.72 MW load relief at Load 20**. |
+| **L0, Bus_0–Bus_1** | Increase output: Gen_bus1 **+4.32 MW**, Gen_bus4 **+4.72 MW**, Gen_bus7 **+4.38 MW**, Gen_bus10 **+4.38 MW**, Gen_bus12 **+4.09 MW**. |
+| **L1, Bus_0–Bus_2** | Gen_bus1 **+3.40 MW**, Gen_bus4 **+4.05 MW**, Gen_bus7 **+4.09 MW**, Gen_bus10 **+4.09 MW**, Gen_bus12 **+3.78 MW**; Gen_bus1 voltage setpoint **0.989 p.u.**, Gen_bus7 **1.007 p.u.** |
+| **L3, Bus_2–Bus_3** | Gen_bus1 **+2.92 MW**, Gen_bus4 **+3.53 MW**, Gen_bus7 **+3.58 MW**, Gen_bus10 **+3.57 MW**, Gen_bus12 **+3.27 MW**; Gen_bus1 voltage setpoint **0.989 p.u.** |
+| **L29, Bus_14–Bus_22** | Gen_bus1 **+6.38 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **−6.00 MW**, Gen_bus12 **−8.00 MW**; setpoints: Gen_bus4 **0.990**, Gen_bus7 **0.977**, Gen_bus10 **1.050 p.u.** Also demand response at Loads 17–20. |
+| **L37, Bus_26–Bus_29** | Gen_bus1 **+16.00 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−8.00 MW**; setpoints: Gen_bus1 **1.048**, Gen_bus4/Gen_bus7/Gen_bus10 **1.050 p.u.** Also demand response at Loads 18–20 and **1.12 MW load relief at Load 20**. |
+| **L36, Bus_26–Bus_28** | Gen_bus1 **+10.02 MW**, Gen_bus4 **+9.02 MW**, Gen_bus7 **+4.93 MW**, Gen_bus10 **+6.00 MW**, Gen_bus12 **−5.66 MW**; setpoints: Gen_bus1 **1.048**, Gen_bus4/Gen_bus7/Gen_bus10 **1.050 p.u.** Also demand response at Loads 19–20. |
+| **L4, Bus_1–Bus_4** | Gen_bus4 **+3.87 MW**, Gen_bus7 **+2.91 MW**, Gen_bus10 **+2.55 MW**, Gen_bus12 **+1.32 MW**; Gen_bus1 voltage setpoint **1.035 p.u.** |
+
+**Scope caveat:** this is not evidence that every line outage is covered. The corrective plans cover those eight selected outages; the other **33** were skipped for plan generation. The all-line screen reported **19 of 41 outages with violations before corrective action** under this dispatch, so coverage for those other cases is not established here. Four of the eight listed plans also call for demand response, and some call for load relief—not generator redispatch alone. The corrective action’s reported cost is **€276.54/h**; prices are a mix of synthetic and case-file values.
+
+📋 Data source: measurements",false alarm,"Derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-routing-rules/whatif/dc_follow_worst-01.jsonl,1,ungrounded_figure,0.013 p.u. — “the peak); the proposal lowers the minimum voltage by 0.013 p.u. and raises the highest line loading by 15.9 perce”  (nearest source 0 at edit_proposal.summary.added_generation_mw),Add a 1.5 MW load at Bus 4 that follows the bus's own demand. When in the week is it worst compared with today?,"On proposal **bus4_follow_load_15** (base plus a 1.5 MW load at Bus 4 following Bus 4’s demand), the week’s worst point is **2000-01-05 at 19:30**.
+
+At that point, the proposal’s minimum voltage falls to **0.908 p.u.**, its maximum line loading reaches **123.9%**, and its maximum transformer loading is **100.8%**—all beyond the stated limits. The base grid is also below the voltage limit then (**0.939 p.u.**), but its maximum line loading is **87.0%** and transformer loading **93.0%**. Across the week, the proposal has violations at **237 of 672** ticks, versus **35** for the base.
+
+At the current simulation time, **2000-01-01 00:00**, both base and proposal are within limits. The added load is drawing **0.72 MW** at that moment (its specified 1.5 MW is the peak); the proposal lowers the minimum voltage by **0.013 p.u.** and raises the highest line loading by **15.9 percentage points** versus the base.
+
+The added load uses **pf 0.95**; measured loads use the network-profile assumption of **pf 0.97**. The week scan uses measurements and the grid’s standard limits.
+
+📋 Data source: measurements",false alarm,"The result's -0.013, stated as 'lowers'"
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/clarify/unstated_margin-01.jsonl,1,ungrounded_figure,"6.7 — “e clearest margin on L30: it brings the line to 68.3%, 6.7 percentage points below your limit. Cheapest costs lea”  (nearest source 6.5808 at optimize_flexibility.options[3].dispatch[3].dq_mvar)",75 %.,"At **20:00 on 6 January 2000**, the optimizer found five dispatch options that satisfy the **L30 (Bus_21–Bus_23) limit of 75%**. All five passed an AC power-flow check and met the voltage limits.
+
+| Option | Dispatch instructions | Generation moved | Grid import | Highest line loading | Cost |
+|---|---|---:|---:|---:|---:|
+| **Cheapest** | P+V: Gen_bus1, Gen_bus12, Gen_bus7; V: Gen_bus4, Gen_bus10 | 33.64 MW | 148.88 MW | 90.0% on Bus_0–Bus_1; L30 held within 75% | **€34.18/h** |
+| **Least disturbance** | P+V: all five generators | 30.35 MW | 151.95 MW | 90.0% on Bus_0–Bus_1; L30 held within 75% | €116.13/h |
+| **Without Gen_bus1** | P+V: Gen_bus10, Gen_bus12, Gen_bus4, Gen_bus7; Gen_bus1 gets no instruction | 44.15 MW | 137.08 MW | 90.0% on Bus_0–Bus_1; L30 held within 75% | €220.16/h |
+| **Most headroom** | P+V: all five generators | 51.00 MW | 130.14 MW | **68.3% on L30** | €575.32/h |
+| **Least import** | P+V: all five generators | 99.82 MW | **78.36 MW** | **75.0% on L30** | €580.22/h |
+
+**Most headroom** gives the clearest margin on L30: it brings the line to **68.3%**, 6.7 percentage points below your limit. **Cheapest** costs least, but the result does not report its exact L30 loading—only that it meets the 75% constraint. **Least import** lands exactly at the 75% cap, so it offers no extra margin against that target.
+
+The prices are a mix of case-file and synthetic prices. The cheapest option is not certified as the globally cheapest; the result allows that a lower-cost dispatch may exist. These findings apply to this operating point, not to N-1 contingencies or other times.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/investigation/deep_analysis-02.jsonl,1,ungrounded_figure,62.5 % — “stment. The least-import option lowers L0’s loading to 62.5% and has the lowest import; the most-headroom option r”  (nearest source 61.7425 at optimize_flexibility.options[3].dispatch[5].dq_mvar),"At 20:00 on 6 January, give me options to clear the violations.","At **20:00 on 6 January 2000**, the schedule violates two limits: **Bus_29 is at 0.943 p.u.** (below 0.95), and line **Bus_0–Bus_1 [L0] is at 114.7%** (above 100%). The optimizer found five dispatch options; each was confirmed by an AC power-flow check to clear all violations. Each keeps the maximum line loading at or below **90.0%**.
+
+| Option | Units called and instructions | Redispatch moved | External-grid import | Cost; gap above cheapest |
+|---|---|---:|---:|---:|
+| **Cheapest** | Gen_bus1 (P+V), Gen_bus7 (P+V), Gen_bus10 (P+V), Gen_bus12 (V) | 34.36 MW | 147.81 MW | **€26.48/h; €0** |
+| **Least disturbance** | Gen_bus1, Gen_bus4, Gen_bus7, Gen_bus10, Gen_bus12 (all P+V) | 30.70 MW | 151.56 MW | €111.99/h; +€85.51/h |
+| **Fewest units** | Gen_bus1, Gen_bus4, Gen_bus7 (all P+V) | 29.97 MW | 152.44 MW | €139.17/h; +€112.69/h |
+| **Least import** | All five generators (P+V) | 99.82 MW | **78.26 MW** | €590.59/h; +€564.11/h |
+| **Most headroom** | All five generators (P+V) | 51.00 MW | 130.14 MW | €575.32/h; +€548.84/h |
+
+**P** means active-power adjustment; **V** means voltage-setpoint adjustment. The least-import option lowers L0’s loading to 62.5% and has the lowest import; the most-headroom option reduces the highest line loading to 68.3%. The other three leave L0 as the most-loaded line, at 90.0%.
+
+The **cheapest** option is the lowest-cost one found, not proven to be the absolute cheapest: the solver’s lower bound is €22.48/h, so a less expensive feasible dispatch may exist. Costs use the cost table’s prices, which are mostly synthetic, with one case-derived source. The study used measurements and the default lagging load power factor of 0.95. These options apply to this operating point; I have not selected one.
+
+📋 Data source: measurements",error,"States L0's loading under the least-import option (62.5 %), which no result gives. Rechecked: the option's result gives only the highest loading (L30, 78.08 %); no result gives L0's."
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/options/n1_corrective-01.jsonl,1,ungrounded_figure,33 — “developed for these eight critical outages; the other 33 lines were not given individual corrective plans. Also”  (nearest source 33.6873 at optimize_flexibility.options[1].moved_mvar),"At 20:00 on 6 January, which dispatch lets us fix any critical line outage with a quick redispatch afterwards, and what would we do after each?","At **20:00 on 6 January**, the **N-1 corrective** dispatch is the option designed to restore limits with a post-outage action. It sets all five generators to P+V control: Gen_bus1 **64.00 MW**, Gen_bus12 **29.94 MW**, Gen_bus4 **40.98 MW**, Gen_bus7 **30.07 MW**, and Gen_bus10 **6.00 MW**. Its estimated cost is **€276.54/h**; the prices are a mix of case-file and synthetic prices.
+
+The tool developed corrective plans for the **eight most severe line outages** below. Each plan was checked by power flow and cleared its limits. P changes are in MW; voltage set-points are shown where they change.
+
+| Outaged line | Quick action after the outage |
+|---|---|
+| **Bus_27–Bus_26 [L35]** | Gen_bus1 **+16.00**, Gen_bus4 **+2.33**, Gen_bus7 **0.00**, Gen_bus10 **−6.00**, Gen_bus12 **+8.00**. Set-points: Gen_bus1 **1.048**, Gen_bus4/7/10 **1.050 p.u.** Also demand response: Load 16 **0.35**, Load 17 **0.95**, Load 18 **0.38**, Load 19 **0.26**, Load 20 **1.15 MW**; plus **3.72 MW load relief** at Load 20. |
+| **Bus_0–Bus_1 [L0]** | Gen_bus1 **+4.32**, Gen_bus4 **+4.72**, Gen_bus7 **+4.38**, Gen_bus10 **+4.38**, Gen_bus12 **+4.09**. |
+| **Bus_0–Bus_2 [L1]** | Gen_bus1 **+3.40**, Gen_bus4 **+4.05**, Gen_bus7 **+4.09**, Gen_bus10 **+4.09**, Gen_bus12 **+3.78**. Gen_bus1 set-point **0.989 p.u.** |
+| **Bus_2–Bus_3 [L3]** | Gen_bus1 **+2.92**, Gen_bus4 **+3.53**, Gen_bus7 **+3.58**, Gen_bus10 **+3.57**, Gen_bus12 **+3.27**. Gen_bus1 set-point **0.989 p.u.** |
+| **Bus_14–Bus_22 [L29]** | Gen_bus1 **+6.38**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **−6.00**, Gen_bus12 **−8.00**. Set-points: Gen_bus4 **0.990**, Gen_bus7 **0.977**, Gen_bus10 **1.050 p.u.** Also demand response at Loads 17 **0.48**, 18 **0.38**, 19 **0.26**, and 20 **1.15 MW**. |
+| **Bus_26–Bus_29 [L37]** | Gen_bus1 **+16.00**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−8.00**. Set-points: Gen_bus1 **1.048**, Gen_bus4/7/10 **1.050 p.u.** Also demand response at Loads 18 **0.38**, 19 **0.26**, 20 **1.15 MW**, plus **1.12 MW load relief** at Load 20. |
+| **Bus_26–Bus_28 [L36]** | Gen_bus1 **+10.02**, Gen_bus4 **+9.02**, Gen_bus7 **+4.93**, Gen_bus10 **+6.00**, Gen_bus12 **−5.66**. Set-points: Gen_bus1 **1.048**, Gen_bus4/7/10 **1.050 p.u.** Also demand response at Loads 19 **0.26** and 20 **1.14 MW**. |
+| **Bus_1–Bus_4 [L4]** | Gen_bus1 **0.00**, Gen_bus4 **+3.87**, Gen_bus7 **+2.91**, Gen_bus10 **+2.55**, Gen_bus12 **+1.32**. Gen_bus1 set-point **1.035 p.u.** |
+
+**Scope caveat:** this is not a demonstrated fix for *every* possible line outage. Corrective plans were developed for these eight critical outages; the other **33 lines** were not given individual corrective plans. Also, several of the eight plans rely on demand response, and some require load relief—not generator redispatch alone. The result’s pre-corrective-action N-1 screen still shows violations for other outages.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a count derived from stated counts: correct
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/semantics-cigre/cigre_outage-01.jsonl,1,ungrounded_figure,0.23 — “e affected loads are: | Bus | Load (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, the Line 2-3 outage disconnects **Bus 3 through Bus 11** and leaves **1.95 MW** of load unsupplied. The affected loads are:
+
+| Bus | Load (MW) |
+|---|---:|
+| Bus 3 | 0.23 |
+| Bus 4 | 0.19 |
+| Bus 5 | 0.33 |
+| Bus 6 | 0.25 |
+| Bus 7 | 0.03 |
+| Bus 8 | 0.26 |
+| Bus 9 | 0.26 |
+| Bus 10 | 0.25 |
+| Bus 11 | 0.15 |
+
+The topology points to **Line 14-8 [L14]**, between **Bus 14 and Bus 8**, as the tie that could reconnect the affected section to the source via Bus 14–13–12 and the transformer at Bus 12. The outage study identified the unsupplied buses; it did **not** simulate closing that tie, so restoration is not confirmed.
+
+📋 Data source: measurements",false alarm,Held-out sample (drawn before the fix); the sum of the loads at a bus: correct
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/semantics-cigre/cigre_outage-02.jsonl,1,ungrounded_figure,0.23 MW — “ut a source path. The affected loads are at: - : 0.23 MW - : 0.19 MW - : 0.33 MW - : 0.25 MW”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, a trip of **Line 2-3** leaves **Bus 3 through Bus 11** without a source path. The affected loads are at:
+
+- **Bus 3:** 0.23 MW
+- **Bus 4:** 0.19 MW
+- **Bus 5:** 0.33 MW
+- **Bus 6:** 0.25 MW
+- **Bus 7:** 0.03 MW
+- **Bus 8:** 0.26 MW
+- **Bus 9:** 0.26 MW
+- **Bus 10:** 0.25 MW
+- **Bus 11:** 0.15 MW
+
+That is **1.95 MW** of load in total at this operating point. **Line 14-8** is the candidate tie: it links Bus 8 on the isolated side to Bus 14, which remains supplied. The topology lookup reports the line as in service but does not confirm its normally-open switch position; verify the switch status and operating constraints before closing it.
+
+📋 Data source: measurements (load power factor 0.97, per the network profile).",false alarm,Remaining after the fix; the sum of the loads at a bus: correct
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/semantics-cigre/cigre_outage-03.jsonl,1,ungrounded_figure,0.23 — “ected load by bus is: | Bus | Load (MW) | | | 0.23 | | | 0.19 | | | 0.33 | | | 0.25 | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At the simulation clock, **Line 2-3** (Bus 2–Bus 3) tripping cuts off supply to **Bus 3 and Buses 4–11**. The contingency study reports **1.95 MW of load unsupplied**. The affected load by bus is:
+
+| Bus | Load (MW) |
+|---|---:|
+| Bus 3 | 0.23 |
+| Bus 4 | 0.19 |
+| Bus 5 | 0.33 |
+| Bus 6 | 0.25 |
+| Bus 7 | 0.03 |
+| Bus 8 | 0.26 |
+| Bus 9 | 0.26 |
+| Bus 10 | 0.25 |
+| Bus 11 | 0.15 |
+
+**I could not identify which normally open tie would restore them.** The results obtained identify the unsupplied buses, but do not identify a normally open restoration tie or confirm restoration by switching. The topology lookups completed only through line L12; they showed those queried lines in service, not a normally open tie. The study reported no voltage or thermal limit violations, but the lost supply means this outage is not secure.
+
+📋 Data source: measurements (at the simulation clock, 2000-01-01 00:00).
+
+*CONDUCTOR used all 16 steps allowed for one question (`DT_MAX_AGENT_TURNS`) before finishing; this answer is built from the results so far.*",false alarm,Held-out sample (drawn before the fix); the sum of the loads at a bus: correct
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/whatif/wind_week-02.jsonl,1,ungrounded_figure,"0.09 MW — “occurred at . The proposal’s peak was therefore about 0.09 MW lower; this is a peak comparison, not a comparison”  (nearest source 0 at edit_proposal.summary.added_load_mw)",Add a 2 MW wind farm at Bus 11 and compare the external grid import with today over the week.,"On proposal **wind_bus11_2mw** (the loaded base network plus a 2 MW wind farm at Bus 11), the **peak external-grid import** over the measured week was **41.42 MW**, compared with **41.51 MW** on the base network. Both peaks occurred at **2000-01-05 19:30**. The proposal’s peak was therefore about **0.09 MW lower**; this is a peak comparison, not a comparison of weekly average import or energy.
+
+The wind farm follows measured production at Bus 11, so its output varies over the week. Across the same 672 timestamps, the proposal had violations at 26 ticks versus 35 on the base; it reduced but did not eliminate the voltage-limit violations.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/no-semantic-layer/whatif/wind_week-03.jsonl,1,ungrounded_figure,0.09 MW — “the proposal; both peaks occurred at . That is about 0.09 MW lower at the peak with the wind farm. The added wi”  (nearest source 0 at edit_proposal.summary.added_load_mw),Add a 2 MW wind farm at Bus 11 and compare the external grid import with today over the week.,"On proposal **wind_bus11_2mw** (a 2 MW wind farm at Bus 11), the week’s **peak external-grid import** was **41.51 MW** on the base network and **41.42 MW** with the proposal; both peaks occurred at **2000-01-05 19:30**. That is about **0.09 MW lower** at the peak with the wind farm.
+
+The added wind farm’s actual output varies with Bus 11’s measured production profile; at the first scanned tick it was **0.00 MW**. Over the 672 quarter-hour snapshots, the proposal also reduced the count of ticks with security violations from **35 to 26**, but the minimum voltage was still below the 0.95 p.u. limit (**0.941 p.u.** with the proposal).
+
+The scan reports peak import rather than average or total import over the week. Loads were modelled at pf 0.97.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/solver-only/clarify/unstated_margin-02.jsonl,1,ungrounded_figure,"6.7 — “headroom gives L30 the most clearance: it is at 68.3%, 6.7 percentage points below your ceiling. The cost figures”  (nearest source 6.5808 at optimize_flexibility.options[3].dispatch[3].dq_mvar)",75 %.,"At **20:00 on 6 January**, all five options were confirmed by power flow to meet the **L30 ceiling of 75%** and the network’s other limits. Here are the trade-offs:
+
+| Option | Dispatch instructions | MW moved | External-grid import | Highest line loading | Cost |
+|---|---|---:|---:|---:|---:|
+| **Cheapest** | P and voltage set-point (V) at Gen_bus1, Gen_bus12 and Gen_bus7; V at Gen_bus4 and Gen_bus10 | 33.64 MW | 148.88 MW | 90.0% on another line | €34.18/h |
+| **Least disturbance** | P and V at all five generators | 30.35 MW | 151.95 MW | 90.0% on another line | €116.13/h |
+| **Without Gen_bus1** | P and V at Gen_bus10, Gen_bus12, Gen_bus4 and Gen_bus7; no dispatch instruction to Gen_bus1 | 44.15 MW | 137.08 MW | 90.0% on another line | €220.16/h |
+| **Least import** | P and V at all five generators | 99.82 MW | **78.36 MW** | **75.0% on L30** | €580.22/h |
+| **Most headroom** | P and V at all five generators | 51.00 MW | 130.14 MW | **68.3% on L30** | €575.32/h |
+
+The **Cheapest** option has the lowest listed cost, while **Most headroom** gives L30 the most clearance: it is at 68.3%, 6.7 percentage points below your ceiling. The cost figures use a price table with six synthetic and one case-file price inputs. The optimizer’s lower bound is €24.68/h, so a less expensive feasible dispatch may exist; the cheapest found is not certified as the best possible.
+
+📋 Data source: measurements",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"
+papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-01.jsonl,1,ungrounded_figure,"2.5 — “he external grid, – [L0], was overloaded for 2.5 hours on , compared with 1.25 hours on . The differe”  (nearest source 3 at locate_network_element.connected_to[1].name)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The line from the external grid, **Bus_0–Bus_1 [L0]**, was overloaded for **2.5 hours on 6 January**, compared with **1.25 hours on 5 January**. The difference was mainly a demand-driven evening overload: on 6 January, the longest episode ran from **19:15 to 21:00** and peaked at **134.1%** loading. On 5 January, the overloads were shorter, with a peak of **107.6%**.
+
+Demand was identified as the main cause in all three episodes on both days. In the 6 January episodes, demand near the line contributed **59.5–84.5%** of the change into overload, with demand elsewhere contributing **24.4–34.6%**. The unit-output contribution varied; it was not the main explanation for the longer duration.
+
+These percentages describe contributions to the change at each episode’s onset, not a direct comparison of total demand between the two dates. Reactive demand was estimated using the default **0.95 power factor**.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-01.jsonl,1,ungrounded_figure,"1.25 — “[L0], was overloaded for 2.5 hours on , compared with 1.25 hours on . The difference was mainly a demand-driven”  (nearest source 1.05 at investigate.thresholds_used.vm_upper_pu)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The line from the external grid, **Bus_0–Bus_1 [L0]**, was overloaded for **2.5 hours on 6 January**, compared with **1.25 hours on 5 January**. The difference was mainly a demand-driven evening overload: on 6 January, the longest episode ran from **19:15 to 21:00** and peaked at **134.1%** loading. On 5 January, the overloads were shorter, with a peak of **107.6%**.
+
+Demand was identified as the main cause in all three episodes on both days. In the 6 January episodes, demand near the line contributed **59.5–84.5%** of the change into overload, with demand elsewhere contributing **24.4–34.6%**. The unit-output contribution varied; it was not the main explanation for the longer duration.
+
+These percentages describe contributions to the change at each episode’s onset, not a direct comparison of total demand between the two dates. Reactive demand was estimated using the default **0.95 power factor**.
+
+📋 Data source: measurements",false alarm,Held-out sample (drawn before the fix); a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-02.jsonl,1,ungrounded_figure,"2.5 — “exceeded the 100% limit for 10 quarter-hour intervals (2.50 hours total), versus 5 intervals (1.25 hours) on The”  (nearest source 3 at locate_network_element.connected_to[1].name)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The overloaded branch was **Bus_0 → Bus_1 [L0]**. On 6 January it exceeded the 100% limit for **10 quarter-hour intervals (2.50 hours total)**, versus **5 intervals (1.25 hours)** on 5 January. The longest continuous spell was **19:15–21:00 on 6 January**; the longest on the 5th was **18:30–19:00**.
+
+The investigation points to demand as the recurring driver on both days. On 6 January, demand near the line was the main cause across all three overload episodes, with demand elsewhere also adding to the loading. In the longest episode, generator output contributed too, but was secondary; its effect varied across the other episodes. So the evidence suggests a more severe, sustained evening loading pattern on the 6th—not a single generator-output change—as the reason the overload lasted longer.
+
+📋 Data source: measurements (synthetic)",false alarm,Held-out sample (drawn before the fix); a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/solver-only/investigation/why_window-02.jsonl,1,ungrounded_figure,"1.25 — “hour intervals (2.50 hours total), versus 5 intervals (1.25 hours) on The longest continuous spell was – on ;”  (nearest source 1.05 at investigate.thresholds_used.vm_upper_pu)",Why was the line from the external grid outside its limit for longer on 6 January than on 5 January?,"The overloaded branch was **Bus_0 → Bus_1 [L0]**. On 6 January it exceeded the 100% limit for **10 quarter-hour intervals (2.50 hours total)**, versus **5 intervals (1.25 hours)** on 5 January. The longest continuous spell was **19:15–21:00 on 6 January**; the longest on the 5th was **18:30–19:00**.
+
+The investigation points to demand as the recurring driver on both days. On 6 January, demand near the line was the main cause across all three overload episodes, with demand elsewhere also adding to the loading. In the longest episode, generator output contributed too, but was secondary; its effect varied across the other episodes. So the evidence suggests a more severe, sustained evening loading pattern on the 6th—not a single generator-output change—as the reason the overload lasted longer.
+
+📋 Data source: measurements (synthetic)",false alarm,Remaining after the fix; a duration from a count of 15-minute intervals: correct
+papers/cimcontext/runs/B-components/runs/solver-only/reasoning/names_cigre-01.jsonl,1,entity_contradicted,"“There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North,** and **PV Park East**.” — lists Solar Farm North among the solar units, but it is thermal (stated)","Which units in this network are solar, and how many are there?","There are **10 solar units**: **PV 3, PV 4, PV 5, PV 6, PV 8, PV 9, PV 10, PV 11, Solar Farm North,** and **PV Park East**.",error,Follows a misleading name (Solar Farm North is a CHP unit). Rechecked against the network data: confirmed.
+papers/cimcontext/runs/B-components/runs/solver-only/semantics-cigre/cigre_outage-01.jsonl,1,ungrounded_figure,0.23 MW — “islands the loads on: | Bus | Load lost | | | 0.23 MW | | | 0.19 MW | | | 0.33 MW | | |”  (nearest source 0.2143 at get_current_conditions.loads[6].P_mw),"If Line 2-3 trips, which loads lose supply, and which normally open tie could restore them?","At **2000-01-01 00:00**, tripping **Line 2-3 (L1)** islands the loads on:
+
+| Bus | Load lost |
+|---|---:|
+| Bus 3 | 0.23 MW |
+| Bus 4 | 0.19 MW |
+| Bus 5 | 0.33 MW |
+| Bus 6 | 0.25 MW |
+| Bus 7 | 0.03 MW |
+| Bus 8 | 0.26 MW |
+| Bus 9 | 0.26 MW |
+| Bus 10 | 0.25 MW |
+| Bus 11 | 0.15 MW |
+
+**Total unsupplied load: 1.95 MW.** The apparent backfeed tie is **Line 14-8 (L14), between Bus 14 and Bus 8**; closing it could reconnect the island from the supplied Bus 14 side. This identifies a candidate restoration tie, but the study did not validate the post-switch operating limits.
+
+📋 Data source: measurements",false alarm,Remaining after the fix; the sum of the loads at a bus: correct
+papers/cimcontext/runs/B-components/runs/solver-only/whatif/new_substation_trafo-01.jsonl,1,ungrounded_figure,"0.84 MVA — “tre power factor of 0.95, its apparent demand is about 0.84 MVA, above one 0.63 MVA unit’s rating, so the specifie”  (nearest source 0.8 at edit_proposal.edits[1].p_mw)","Build a new 0.4 kV substation at Bus 9 with two 0.63 MVA transformers (vk 6 %, vkr 1 %) and connect a 0.8 MW data centre to it. Is it N-1 secure?","On proposal **bus9_datacentre** (base network plus the new 0.4 kV substation and 0.8 MW flat-profile data centre), the network is **not N-1 secure at 2000-01-01 00:00**.
+
+The sweep tested 18 outages. No overload or voltage violations were reported, but **15 outages disconnected load**—so zero listed violations does not mean the system stayed supplied. In particular, loss of the new substation’s transformer branch disconnects the data centre’s **0.80 MW**.
+
+**Important model limitation:** the two 0.63 MVA transformers are represented as one parallel branch, so the sweep takes both out together; it does not test the loss of just one transformer. With the assumed data-centre power factor of 0.95, its apparent demand is about **0.84 MVA**, above one 0.63 MVA unit’s rating, so the specified pair would also need review for single-transformer-out operation. The transformer model assumes zero no-load losses and magnetising current.
+
+📋 Data source: measurements (at the simulation clock; the data-centre load is flat).",false alarm,"Remaining after the fix; derived from results, arithmetic not shown (difference, sum, ratio or count): correct"

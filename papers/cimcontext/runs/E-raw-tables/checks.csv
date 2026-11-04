@@ -1,0 +1,326 @@
+arm,suite,task,family,repeat,check,passed
+tables,reasoning,compose_battery,composition,1,found Bus 11 lowest,1
+tables,reasoning,compose_battery,composition,1,"said yes, the same feeder",1
+tables,reasoning,compose_battery,composition,1,named the feeder Line 1-2,0
+tables,reasoning,compose_battery,composition,2,found Bus 11 lowest,1
+tables,reasoning,compose_battery,composition,2,"said yes, the same feeder",1
+tables,reasoning,compose_battery,composition,2,named the feeder Line 1-2,0
+tables,reasoning,compose_battery,composition,3,found Bus 11 lowest,1
+tables,reasoning,compose_battery,composition,3,"said yes, the same feeder",1
+tables,reasoning,compose_battery,composition,3,named the feeder Line 1-2,0
+tables,reasoning,compose_battery,composition,4,found Bus 11 lowest,1
+tables,reasoning,compose_battery,composition,4,"said yes, the same feeder",1
+tables,reasoning,compose_battery,composition,4,named the feeder Line 1-2,0
+tables,reasoning,compose_battery,composition,5,found Bus 11 lowest,1
+tables,reasoning,compose_battery,composition,5,"said yes, the same feeder",1
+tables,reasoning,compose_battery,composition,5,named the feeder Line 1-2,0
+tables,reasoning,compose_l33,composition,1,1.84 MW,1
+tables,reasoning,compose_l33,composition,1,no tie restores it,1
+tables,reasoning,compose_l33,composition,2,1.84 MW,1
+tables,reasoning,compose_l33,composition,2,no tie restores it,1
+tables,reasoning,compose_l33,composition,3,1.84 MW,1
+tables,reasoning,compose_l33,composition,3,no tie restores it,1
+tables,reasoning,compose_l33,composition,4,1.84 MW,1
+tables,reasoning,compose_l33,composition,4,no tie restores it,1
+tables,reasoning,compose_l33,composition,5,1.84 MW,1
+tables,reasoning,compose_l33,composition,5,no tie restores it,1
+tables,reasoning,compose_t0,composition,1,named the wind turbine among them,1
+tables,reasoning,compose_t0,composition,1,eight of them solar,1
+tables,reasoning,compose_t0,composition,1,the tie Line 14-8 restores it,0
+tables,reasoning,compose_t0,composition,2,named the wind turbine among them,1
+tables,reasoning,compose_t0,composition,2,eight of them solar,1
+tables,reasoning,compose_t0,composition,2,the tie Line 14-8 restores it,0
+tables,reasoning,compose_t0,composition,3,named the wind turbine among them,1
+tables,reasoning,compose_t0,composition,3,eight of them solar,1
+tables,reasoning,compose_t0,composition,3,the tie Line 14-8 restores it,0
+tables,reasoning,compose_t0,composition,4,named the wind turbine among them,1
+tables,reasoning,compose_t0,composition,4,eight of them solar,1
+tables,reasoning,compose_t0,composition,4,the tie Line 14-8 restores it,0
+tables,reasoning,compose_t0,composition,5,named the wind turbine among them,1
+tables,reasoning,compose_t0,composition,5,eight of them solar,1
+tables,reasoning,compose_t0,composition,5,the tie Line 14-8 restores it,0
+tables,reasoning,compose_tie,composition,1,named the tie S1 (Line 14-8),1
+tables,reasoning,compose_tie,composition,1,said it is normally open,1
+tables,reasoning,compose_tie,composition,2,named the tie S1 (Line 14-8),1
+tables,reasoning,compose_tie,composition,2,said it is normally open,1
+tables,reasoning,compose_tie,composition,3,named the tie S1 (Line 14-8),0
+tables,reasoning,compose_tie,composition,3,said it is normally open,1
+tables,reasoning,compose_tie,composition,4,named the tie S1 (Line 14-8),1
+tables,reasoning,compose_tie,composition,4,said it is normally open,1
+tables,reasoning,compose_tie,composition,5,named the tie S1 (Line 14-8),1
+tables,reasoning,compose_tie,composition,5,said it is normally open,1
+tables,reasoning,data_cigre,data,1,"Load R5's Q: derived from the power factor, not measured",1
+tables,reasoning,data_cigre,data,1,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre,data,2,"Load R5's Q: derived from the power factor, not measured",1
+tables,reasoning,data_cigre,data,2,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre,data,3,"Load R5's Q: derived from the power factor, not measured",1
+tables,reasoning,data_cigre,data,3,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre,data,4,"Load R5's Q: derived from the power factor, not measured",0
+tables,reasoning,data_cigre,data,4,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre,data,5,"Load R5's Q: derived from the power factor, not measured",1
+tables,reasoning,data_cigre,data,5,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre_battery,data,1,held at its set-point; the data carry no storage,0
+tables,reasoning,data_cigre_battery,data,2,held at its set-point; the data carry no storage,0
+tables,reasoning,data_cigre_battery,data,3,held at its set-point; the data carry no storage,0
+tables,reasoning,data_cigre_battery,data,4,held at its set-point; the data carry no storage,0
+tables,reasoning,data_cigre_battery,data,5,held at its set-point; the data carry no storage,0
+tables,reasoning,data_cigre_load_split,data,1,"a share of Bus 1's measurement, split with Load CI1",0
+tables,reasoning,data_cigre_load_split,data,2,"a share of Bus 1's measurement, split with Load CI1",0
+tables,reasoning,data_cigre_load_split,data,3,"a share of Bus 1's measurement, split with Load CI1",1
+tables,reasoning,data_cigre_load_split,data,4,"a share of Bus 1's measurement, split with Load CI1",0
+tables,reasoning,data_cigre_load_split,data,5,"a share of Bus 1's measurement, split with Load CI1",0
+tables,reasoning,data_cigre_wind,data,1,WKA 7's output: measured,1
+tables,reasoning,data_cigre_wind,data,1,PV 9's output: a share of its bus's measurement,1
+tables,reasoning,data_cigre_wind,data,2,WKA 7's output: measured,1
+tables,reasoning,data_cigre_wind,data,2,PV 9's output: a share of its bus's measurement,1
+tables,reasoning,data_cigre_wind,data,3,WKA 7's output: measured,0
+tables,reasoning,data_cigre_wind,data,3,PV 9's output: a share of its bus's measurement,0
+tables,reasoning,data_cigre_wind,data,4,WKA 7's output: measured,1
+tables,reasoning,data_cigre_wind,data,4,PV 9's output: a share of its bus's measurement,1
+tables,reasoning,data_cigre_wind,data,5,WKA 7's output: measured,1
+tables,reasoning,data_cigre_wind,data,5,PV 9's output: a share of its bus's measurement,1
+tables,reasoning,data_ieee30,data,1,said it is derived from the power factor,1
+tables,reasoning,data_ieee30,data,2,said it is derived from the power factor,1
+tables,reasoning,data_ieee30,data,3,said it is derived from the power factor,0
+tables,reasoning,data_ieee30,data,4,said it is derived from the power factor,1
+tables,reasoning,data_ieee30,data,5,said it is derived from the power factor,1
+tables,reasoning,data_ieee30_solved,data,1,said the power flow solves it,1
+tables,reasoning,data_ieee30_solved,data,2,said the power flow solves it,0
+tables,reasoning,data_ieee30_solved,data,3,said the power flow solves it,0
+tables,reasoning,data_ieee30_solved,data,4,said the power flow solves it,1
+tables,reasoning,data_ieee30_solved,data,5,said the power flow solves it,1
+tables,reasoning,drop_cigre_declared,intervention,1,named CHP diesel 1 as affected (declared solar),1
+tables,reasoning,drop_cigre_declared,intervention,1,the study scaled CHP diesel 1 too,1
+tables,reasoning,drop_cigre_declared,intervention,2,named CHP diesel 1 as affected (declared solar),0
+tables,reasoning,drop_cigre_declared,intervention,2,the study scaled CHP diesel 1 too,1
+tables,reasoning,drop_cigre_declared,intervention,3,named CHP diesel 1 as affected (declared solar),1
+tables,reasoning,drop_cigre_declared,intervention,3,the study scaled CHP diesel 1 too,1
+tables,reasoning,drop_cigre_declared,intervention,4,named CHP diesel 1 as affected (declared solar),1
+tables,reasoning,drop_cigre_declared,intervention,4,the study scaled CHP diesel 1 too,1
+tables,reasoning,drop_cigre_declared,intervention,5,named CHP diesel 1 as affected (declared solar),1
+tables,reasoning,drop_cigre_declared,intervention,5,the study scaled CHP diesel 1 too,1
+tables,reasoning,drop_cigre_stated,intervention,1,named the wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,1,did not count CHP diesel 1,1
+tables,reasoning,drop_cigre_stated,intervention,1,the study scaled the nine wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,2,named the wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,2,did not count CHP diesel 1,1
+tables,reasoning,drop_cigre_stated,intervention,2,the study scaled the nine wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,3,named the wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,3,did not count CHP diesel 1,1
+tables,reasoning,drop_cigre_stated,intervention,3,the study scaled the nine wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,4,named the wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,4,did not count CHP diesel 1,1
+tables,reasoning,drop_cigre_stated,intervention,4,the study scaled the nine wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,5,named the wind and PV units,1
+tables,reasoning,drop_cigre_stated,intervention,5,did not count CHP diesel 1,1
+tables,reasoning,drop_cigre_stated,intervention,5,the study scaled the nine wind and PV units,1
+tables,reasoning,drop_ieee30_declared,intervention,1,named Gen_bus12 as affected,1
+tables,reasoning,drop_ieee30_declared,intervention,1,the study scaled Gen_bus12 only,1
+tables,reasoning,drop_ieee30_declared,intervention,2,named Gen_bus12 as affected,1
+tables,reasoning,drop_ieee30_declared,intervention,2,the study scaled Gen_bus12 only,1
+tables,reasoning,drop_ieee30_declared,intervention,3,named Gen_bus12 as affected,1
+tables,reasoning,drop_ieee30_declared,intervention,3,the study scaled Gen_bus12 only,1
+tables,reasoning,drop_ieee30_declared,intervention,4,named Gen_bus12 as affected,1
+tables,reasoning,drop_ieee30_declared,intervention,4,the study scaled Gen_bus12 only,1
+tables,reasoning,drop_ieee30_declared,intervention,5,named Gen_bus12 as affected,1
+tables,reasoning,drop_ieee30_declared,intervention,5,the study scaled Gen_bus12 only,1
+tables,reasoning,drop_ieee30_none,intervention,1,said no unit is stated wind or solar,1
+tables,reasoning,drop_ieee30_none,intervention,1,named no unit as affected,1
+tables,reasoning,drop_ieee30_none,intervention,2,said no unit is stated wind or solar,1
+tables,reasoning,drop_ieee30_none,intervention,2,named no unit as affected,1
+tables,reasoning,drop_ieee30_none,intervention,3,said no unit is stated wind or solar,1
+tables,reasoning,drop_ieee30_none,intervention,3,named no unit as affected,1
+tables,reasoning,drop_ieee30_none,intervention,4,said no unit is stated wind or solar,1
+tables,reasoning,drop_ieee30_none,intervention,4,named no unit as affected,1
+tables,reasoning,drop_ieee30_none,intervention,5,said no unit is stated wind or solar,1
+tables,reasoning,drop_ieee30_none,intervention,5,named no unit as affected,1
+tables,reasoning,names_cigre,names,1,named the PV units,1
+tables,reasoning,names_cigre,names,1,counted eight,1
+tables,reasoning,names_cigre,names,1,did not take 'Solar Farm North' (a CHP unit) for solar,1
+tables,reasoning,names_cigre,names,1,did not take 'PV Park East' (a fuel cell) for solar,1
+tables,reasoning,names_cigre,names,2,named the PV units,1
+tables,reasoning,names_cigre,names,2,counted eight,1
+tables,reasoning,names_cigre,names,2,did not take 'Solar Farm North' (a CHP unit) for solar,1
+tables,reasoning,names_cigre,names,2,did not take 'PV Park East' (a fuel cell) for solar,1
+tables,reasoning,names_cigre,names,3,named the PV units,1
+tables,reasoning,names_cigre,names,3,counted eight,1
+tables,reasoning,names_cigre,names,3,did not take 'Solar Farm North' (a CHP unit) for solar,1
+tables,reasoning,names_cigre,names,3,did not take 'PV Park East' (a fuel cell) for solar,1
+tables,reasoning,names_cigre,names,4,named the PV units,1
+tables,reasoning,names_cigre,names,4,counted eight,1
+tables,reasoning,names_cigre,names,4,did not take 'Solar Farm North' (a CHP unit) for solar,1
+tables,reasoning,names_cigre,names,4,did not take 'PV Park East' (a fuel cell) for solar,1
+tables,reasoning,names_cigre,names,5,named the PV units,1
+tables,reasoning,names_cigre,names,5,counted eight,1
+tables,reasoning,names_cigre,names,5,did not take 'Solar Farm North' (a CHP unit) for solar,1
+tables,reasoning,names_cigre,names,5,did not take 'PV Park East' (a fuel cell) for solar,1
+tables,reasoning,names_cigre_storage,names,1,named Battery 1 and Battery 2,1
+tables,reasoning,names_cigre_storage,names,1,did not take 'Battery Storage 3' (a fuel cell) for storage,1
+tables,reasoning,names_cigre_storage,names,2,named Battery 1 and Battery 2,1
+tables,reasoning,names_cigre_storage,names,2,did not take 'Battery Storage 3' (a fuel cell) for storage,1
+tables,reasoning,names_cigre_storage,names,3,named Battery 1 and Battery 2,1
+tables,reasoning,names_cigre_storage,names,3,did not take 'Battery Storage 3' (a fuel cell) for storage,1
+tables,reasoning,names_cigre_storage,names,4,named Battery 1 and Battery 2,1
+tables,reasoning,names_cigre_storage,names,4,did not take 'Battery Storage 3' (a fuel cell) for storage,1
+tables,reasoning,names_cigre_storage,names,5,named Battery 1 and Battery 2,1
+tables,reasoning,names_cigre_storage,names,5,did not take 'Battery Storage 3' (a fuel cell) for storage,1
+tables,reasoning,names_cigre_wind,names,1,named WKA 7,1
+tables,reasoning,names_cigre_wind,names,1,did not take 'Wind Park West' (a PV unit) for wind,1
+tables,reasoning,names_cigre_wind,names,2,named WKA 7,1
+tables,reasoning,names_cigre_wind,names,2,did not take 'Wind Park West' (a PV unit) for wind,1
+tables,reasoning,names_cigre_wind,names,3,named WKA 7,1
+tables,reasoning,names_cigre_wind,names,3,did not take 'Wind Park West' (a PV unit) for wind,1
+tables,reasoning,names_cigre_wind,names,4,named WKA 7,1
+tables,reasoning,names_cigre_wind,names,4,did not take 'Wind Park West' (a PV unit) for wind,1
+tables,reasoning,names_cigre_wind,names,5,named WKA 7,1
+tables,reasoning,names_cigre_wind,names,5,did not take 'Wind Park West' (a PV unit) for wind,1
+tables,reasoning,names_ieee30,names,1,said 'Solar Plant A' is solar only by its name,0
+tables,reasoning,names_ieee30,names,2,said 'Solar Plant A' is solar only by its name,0
+tables,reasoning,names_ieee30,names,3,said 'Solar Plant A' is solar only by its name,1
+tables,reasoning,names_ieee30,names,4,said 'Solar Plant A' is solar only by its name,1
+tables,reasoning,names_ieee30,names,5,said 'Solar Plant A' is solar only by its name,1
+tables,reasoning,names_ieee30_wind,names,1,said 'Offshore Wind 1' is wind only by its name,1
+tables,reasoning,names_ieee30_wind,names,2,said 'Offshore Wind 1' is wind only by its name,1
+tables,reasoning,names_ieee30_wind,names,3,said 'Offshore Wind 1' is wind only by its name,1
+tables,reasoning,names_ieee30_wind,names,4,said 'Offshore Wind 1' is wind only by its name,0
+tables,reasoning,names_ieee30_wind,names,5,said 'Offshore Wind 1' is wind only by its name,1
+tables,reasoning,para_variable,consistency,1,named the wind and PV units,1
+tables,reasoning,para_variable,consistency,1,did not count CHP diesel 1,1
+tables,reasoning,para_variable,consistency,2,named the wind and PV units,1
+tables,reasoning,para_variable,consistency,2,did not count CHP diesel 1,1
+tables,reasoning,para_variable,consistency,3,named the wind and PV units,1
+tables,reasoning,para_variable,consistency,3,did not count CHP diesel 1,1
+tables,reasoning,para_variable,consistency,4,named the wind and PV units,1
+tables,reasoning,para_variable,consistency,4,did not count CHP diesel 1,1
+tables,reasoning,para_variable,consistency,5,named the wind and PV units,1
+tables,reasoning,para_variable,consistency,5,did not count CHP diesel 1,1
+tables,reasoning,para_vary,consistency,1,named the wind and PV units,1
+tables,reasoning,para_vary,consistency,1,did not count CHP diesel 1,1
+tables,reasoning,para_vary,consistency,2,named the wind and PV units,1
+tables,reasoning,para_vary,consistency,2,did not count CHP diesel 1,1
+tables,reasoning,para_vary,consistency,3,named the wind and PV units,1
+tables,reasoning,para_vary,consistency,3,did not count CHP diesel 1,1
+tables,reasoning,para_vary,consistency,4,named the wind and PV units,1
+tables,reasoning,para_vary,consistency,4,did not count CHP diesel 1,1
+tables,reasoning,para_vary,consistency,5,named the wind and PV units,1
+tables,reasoning,para_vary,consistency,5,did not count CHP diesel 1,1
+tables,reasoning,para_weather,consistency,1,named the wind and PV units,1
+tables,reasoning,para_weather,consistency,1,did not count CHP diesel 1,1
+tables,reasoning,para_weather,consistency,2,named the wind and PV units,1
+tables,reasoning,para_weather,consistency,2,did not count CHP diesel 1,1
+tables,reasoning,para_weather,consistency,3,named the wind and PV units,1
+tables,reasoning,para_weather,consistency,3,did not count CHP diesel 1,1
+tables,reasoning,para_weather,consistency,4,named the wind and PV units,1
+tables,reasoning,para_weather,consistency,4,did not count CHP diesel 1,1
+tables,reasoning,para_weather,consistency,5,named the wind and PV units,1
+tables,reasoning,para_weather,consistency,5,did not count CHP diesel 1,1
+tables,reasoning,persist_ieee30,consistency,1,named Gen_bus12 as affected,1
+tables,reasoning,persist_ieee30,consistency,1,a study lowered Gen_bus12 only,1
+tables,reasoning,persist_ieee30,consistency,2,named Gen_bus12 as affected,1
+tables,reasoning,persist_ieee30,consistency,2,a study lowered Gen_bus12 only,1
+tables,reasoning,persist_ieee30,consistency,3,named Gen_bus12 as affected,1
+tables,reasoning,persist_ieee30,consistency,3,a study lowered Gen_bus12 only,1
+tables,reasoning,persist_ieee30,consistency,4,named Gen_bus12 as affected,1
+tables,reasoning,persist_ieee30,consistency,4,a study lowered Gen_bus12 only,1
+tables,reasoning,persist_ieee30,consistency,5,named Gen_bus12 as affected,1
+tables,reasoning,persist_ieee30,consistency,5,a study lowered Gen_bus12 only,1
+tables,reasoning,switches_breakers,switches,1,named Switch 6 and Switch 7,0
+tables,reasoning,switches_breakers,switches,1,said they switch the transformers,1
+tables,reasoning,switches_breakers,switches,2,named Switch 6 and Switch 7,0
+tables,reasoning,switches_breakers,switches,2,said they switch the transformers,1
+tables,reasoning,switches_breakers,switches,3,named Switch 6 and Switch 7,0
+tables,reasoning,switches_breakers,switches,3,said they switch the transformers,1
+tables,reasoning,switches_breakers,switches,4,named Switch 6 and Switch 7,0
+tables,reasoning,switches_breakers,switches,4,said they switch the transformers,1
+tables,reasoning,switches_breakers,switches,5,named Switch 6 and Switch 7,0
+tables,reasoning,switches_breakers,switches,5,said they switch the transformers,1
+tables,reasoning,switches_line148,switches,1,named its switch S1,1
+tables,reasoning,switches_line148,switches,1,said it is normally open,1
+tables,reasoning,switches_line148,switches,2,named its switch S1,1
+tables,reasoning,switches_line148,switches,2,said it is normally open,1
+tables,reasoning,switches_line148,switches,3,named its switch S1,1
+tables,reasoning,switches_line148,switches,3,said it is normally open,1
+tables,reasoning,switches_line148,switches,4,named its switch S1,1
+tables,reasoning,switches_line148,switches,4,said it is normally open,1
+tables,reasoning,switches_line148,switches,5,named its switch S1,1
+tables,reasoning,switches_line148,switches,5,said it is normally open,1
+tables,reasoning,switches_loops,switches,1,named S2 and S3,1
+tables,reasoning,switches_loops,switches,1,did not count S1 (it ties two feeders),1
+tables,reasoning,switches_loops,switches,2,named S2 and S3,1
+tables,reasoning,switches_loops,switches,2,did not count S1 (it ties two feeders),1
+tables,reasoning,switches_loops,switches,3,named S2 and S3,1
+tables,reasoning,switches_loops,switches,3,did not count S1 (it ties two feeders),1
+tables,reasoning,switches_loops,switches,4,named S2 and S3,1
+tables,reasoning,switches_loops,switches,4,did not count S1 (it ties two feeders),1
+tables,reasoning,switches_loops,switches,5,named S2 and S3,1
+tables,reasoning,switches_loops,switches,5,did not count S1 (it ties two feeders),1
+tables,reasoning,switches_open,switches,1,named the three normally open switches,1
+tables,reasoning,switches_open,switches,1,said S1 is the tie between feeders,1
+tables,reasoning,switches_open,switches,2,named the three normally open switches,1
+tables,reasoning,switches_open,switches,2,said S1 is the tie between feeders,0
+tables,reasoning,switches_open,switches,3,named the three normally open switches,1
+tables,reasoning,switches_open,switches,3,said S1 is the tie between feeders,1
+tables,reasoning,switches_open,switches,4,named the three normally open switches,1
+tables,reasoning,switches_open,switches,4,said S1 is the tie between feeders,0
+tables,reasoning,switches_open,switches,5,named the three normally open switches,1
+tables,reasoning,switches_open,switches,5,said S1 is the tie between feeders,0
+tables,semantics-cigre,cigre_feeder,,1,feeder Line 1-2 and the route through Line 3-8 to Line 10-11,1
+tables,semantics-cigre,cigre_feeder,,2,feeder Line 1-2 and the route through Line 3-8 to Line 10-11,1
+tables,semantics-cigre,cigre_feeder,,3,feeder Line 1-2 and the route through Line 3-8 to Line 10-11,1
+tables,semantics-cigre,cigre_feeder,,4,feeder Line 1-2 and the route through Line 3-8 to Line 10-11,1
+tables,semantics-cigre,cigre_feeder,,5,feeder Line 1-2 and the route through Line 3-8 to Line 10-11,1
+tables,semantics-cigre,cigre_levels,,1,"20 kV, and Bus 0 at 110 kV",1
+tables,semantics-cigre,cigre_levels,,2,"20 kV, and Bus 0 at 110 kV",1
+tables,semantics-cigre,cigre_levels,,3,"20 kV, and Bus 0 at 110 kV",1
+tables,semantics-cigre,cigre_levels,,4,"20 kV, and Bus 0 at 110 kV",1
+tables,semantics-cigre,cigre_levels,,5,"20 kV, and Bus 0 at 110 kV",1
+tables,semantics-cigre,cigre_outage,,1,"named what loses supply, as far as Bus 11",1
+tables,semantics-cigre,cigre_outage,,1,named the tie Line 14-8,1
+tables,semantics-cigre,cigre_outage,,2,"named what loses supply, as far as Bus 11",1
+tables,semantics-cigre,cigre_outage,,2,named the tie Line 14-8,1
+tables,semantics-cigre,cigre_outage,,3,"named what loses supply, as far as Bus 11",1
+tables,semantics-cigre,cigre_outage,,3,named the tie Line 14-8,1
+tables,semantics-cigre,cigre_outage,,4,"named what loses supply, as far as Bus 11",1
+tables,semantics-cigre,cigre_outage,,4,named the tie Line 14-8,1
+tables,semantics-cigre,cigre_outage,,5,"named what loses supply, as far as Bus 11",1
+tables,semantics-cigre,cigre_outage,,5,named the tie Line 14-8,1
+tables,semantics-cigre,cigre_renewables,,1,named the wind turbine and PV units,1
+tables,semantics-cigre,cigre_renewables,,2,named the wind turbine and PV units,1
+tables,semantics-cigre,cigre_renewables,,3,named the wind turbine and PV units,1
+tables,semantics-cigre,cigre_renewables,,4,named the wind turbine and PV units,1
+tables,semantics-cigre,cigre_renewables,,5,named the wind turbine and PV units,1
+tables,semantics-cigre,cigre_storage,,1,both batteries and their buses,1
+tables,semantics-cigre,cigre_storage,,2,both batteries and their buses,1
+tables,semantics-cigre,cigre_storage,,3,both batteries and their buses,1
+tables,semantics-cigre,cigre_storage,,4,both batteries and their buses,1
+tables,semantics-cigre,cigre_storage,,5,both batteries and their buses,1
+tables,semantics-ieee30,ieee30_customers,,1,said the network does not say,0
+tables,semantics-ieee30,ieee30_customers,,2,said the network does not say,0
+tables,semantics-ieee30,ieee30_customers,,3,said the network does not say,0
+tables,semantics-ieee30,ieee30_customers,,4,said the network does not say,0
+tables,semantics-ieee30,ieee30_customers,,5,said the network does not say,0
+tables,semantics-ieee30,ieee30_external,,1,L0 and L1,1
+tables,semantics-ieee30,ieee30_external,,2,L0 and L1,1
+tables,semantics-ieee30,ieee30_external,,3,L0 and L1,1
+tables,semantics-ieee30,ieee30_external,,4,L0 and L1,1
+tables,semantics-ieee30,ieee30_external,,5,L0 and L1,1
+tables,semantics-ieee30,ieee30_level,,1,135 kV,1
+tables,semantics-ieee30,ieee30_level,,2,135 kV,1
+tables,semantics-ieee30,ieee30_level,,3,135 kV,1
+tables,semantics-ieee30,ieee30_level,,4,135 kV,1
+tables,semantics-ieee30,ieee30_level,,5,135 kV,1
+tables,semantics-ieee30,ieee30_radial,,1,named what is cut off,1
+tables,semantics-ieee30,ieee30_radial,,1,said it loses supply,1
+tables,semantics-ieee30,ieee30_radial,,2,named what is cut off,1
+tables,semantics-ieee30,ieee30_radial,,2,said it loses supply,0
+tables,semantics-ieee30,ieee30_radial,,3,named what is cut off,1
+tables,semantics-ieee30,ieee30_radial,,3,said it loses supply,1
+tables,semantics-ieee30,ieee30_radial,,4,named what is cut off,1
+tables,semantics-ieee30,ieee30_radial,,4,said it loses supply,1
+tables,semantics-ieee30,ieee30_radial,,5,named what is cut off,1
+tables,semantics-ieee30,ieee30_radial,,5,said it loses supply,1
+tables,semantics-ieee30,ieee30_renewables,,1,said the network does not say,0
+tables,semantics-ieee30,ieee30_renewables,,2,said the network does not say,0
+tables,semantics-ieee30,ieee30_renewables,,3,said the network does not say,1
+tables,semantics-ieee30,ieee30_renewables,,4,said the network does not say,0
+tables,semantics-ieee30,ieee30_renewables,,5,said the network does not say,0

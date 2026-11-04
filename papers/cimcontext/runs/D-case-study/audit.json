@@ -1,0 +1,144 @@
+[
+ {
+  "figures": 9,
+  "grounded": 9,
+  "derived": 0,
+  "imprecise": 0,
+  "misattributed": 0,
+  "ungrounded": 0,
+  "mischaracterised": 0,
+  "evidence": {
+   "levels": {
+    "power_flow": 6,
+    "input": 3
+   },
+   "overstated": 0
+  },
+  "findings": [
+   {
+    "code": "simulation_cursor_moved",
+    "detail": "advance_timestamp moved the simulation cursor to 2000-01-03 17:00:00."
+   }
+  ],
+  "reading_check": {
+   "headline": "Depends on the reading: the conclusion changes under 1 of 3 other readings.",
+   "statuses": [
+    "shifts",
+    "changes",
+    "shifts"
+   ]
+  },
+  "tools": [
+   "get_current_timestamp",
+   "advance_timestamp",
+   "find_worst_case_timestamp",
+   "run_rsa"
+  ]
+ },
+ {
+  "figures": 1,
+  "grounded": 1,
+  "derived": 0,
+  "imprecise": 0,
+  "misattributed": 0,
+  "ungrounded": 0,
+  "mischaracterised": 0,
+  "evidence": {
+   "levels": {
+    "power_flow": 1
+   },
+   "overstated": 0
+  },
+  "findings": [],
+  "reading_check": {
+   "headline": "The conclusion holds under 3 other readings.",
+   "statuses": [
+    "holds",
+    "holds",
+    "holds"
+   ]
+  },
+  "tools": [
+   "get_current_timestamp",
+   "locate_network_element",
+   "simulate_contingency",
+   "describe_network",
+   "describe_network"
+  ]
+ },
+ {
+  "figures": 13,
+  "grounded": 13,
+  "derived": 0,
+  "imprecise": 0,
+  "misattributed": 0,
+  "ungrounded": 0,
+  "mischaracterised": 0,
+  "evidence": {
+   "levels": {
+    "power_flow": 4,
+    "input": 9
+   },
+   "overstated": 0
+  },
+  "findings": [],
+  "reading_check": null,
+  "tools": [
+   "get_current_timestamp",
+   "describe_network",
+   "scan_scenarios"
+  ]
+ },
+ {
+  "figures": 16,
+  "grounded": 16,
+  "derived": 0,
+  "imprecise": 0,
+  "misattributed": 0,
+  "ungrounded": 0,
+  "mischaracterised": 0,
+  "evidence": {
+   "levels": {
+    "power_flow": 8,
+    "input": 9
+   },
+   "overstated": 0
+  },
+  "findings": [],
+  "reading_check": null,
+  "tools": [
+   "get_current_timestamp",
+   "declare_network_facts",
+   "scan_scenarios"
+  ]
+ },
+ {
+  "figures": 3,
+  "grounded": 3,
+  "derived": 0,
+  "imprecise": 0,
+  "misattributed": 0,
+  "ungrounded": 0,
+  "mischaracterised": 0,
+  "evidence": {
+   "levels": {
+    "power_flow": 5
+   },
+   "overstated": 0
+  },
+  "findings": [],
+  "reading_check": {
+   "headline": "The conclusion holds under 3 other readings; 1 moves a figure by more than 10%.",
+   "statuses": [
+    "shifts",
+    "holds",
+    "holds"
+   ]
+  },
+  "tools": [
+   "get_current_timestamp",
+   "optimize_flexibility",
+   "simulate_all_contingencies"
+  ]
+ }
+]

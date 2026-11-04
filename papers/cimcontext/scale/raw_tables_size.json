@@ -1,0 +1,77 @@
+{
+ "chars_per_token": 4,
+ "rows": [
+  {
+   "network": "CIGRE MV",
+   "buses": 15,
+   "switches": 8,
+   "characters": 17410,
+   "tokens_estimate": 4352,
+   "tokens_per_bus": 290
+  },
+  {
+   "network": "IEEE 30",
+   "buses": 30,
+   "switches": 0,
+   "characters": 20594,
+   "tokens_estimate": 5148,
+   "tokens_per_bus": 172
+  },
+  {
+   "network": "IEEE 118",
+   "buses": 118,
+   "switches": 0,
+   "characters": 108770,
+   "tokens_estimate": 27192,
+   "tokens_per_bus": 230
+  },
+  {
+   "network": "MV Oberrhein",
+   "buses": 179,
+   "switches": 322,
+   "characters": 200709,
+   "tokens_estimate": 50177,
+   "tokens_per_bus": 280
+  },
+  {
+   "network": "IEEE 300",
+   "buses": 300,
+   "switches": 0,
+   "characters": 238713,
+   "tokens_estimate": 59678,
+   "tokens_per_bus": 199
+  },
+  {
+   "network": "PEGASE 1354",
+   "buses": 1354,
+   "switches": 0,
+   "characters": 977273,
+   "tokens_estimate": 244318,
+   "tokens_per_bus": 180
+  },
+  {
+   "network": "PEGASE 2869",
+   "buses": 2869,
+   "switches": 0,
+   "characters": 2183142,
+   "tokens_estimate": 545786,
+   "tokens_per_bus": 190
+  },
+  {
+   "network": "RTE 6470",
+   "buses": 6470,
+   "switches": 0,
+   "characters": 4834822,
+   "tokens_estimate": 1208706,
+   "tokens_per_bus": 187
+  },
+  {
+   "network": "PEGASE 9241",
+   "buses": 9241,
+   "switches": 0,
+   "characters": 7448016,
+   "tokens_estimate": 1862004,
+   "tokens_per_bus": 201
+  }
+ ]
+}

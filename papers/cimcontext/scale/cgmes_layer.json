@@ -1,0 +1,180 @@
+{
+ "machine": "macOS-27.2-arm64-arm-64bit",
+ "repeats": 5,
+ "rows": [
+  {
+   "model": "pandapower_example_multivoltage.zip",
+   "read_s": 0.28,
+   "build_s": 0.007,
+   "power_flow_converged": true,
+   "elements": {
+    "buses": 111,
+    "lines": 26,
+    "transformers": 2,
+    "generators": 1,
+    "static_generators": 11,
+    "loads": 25,
+    "switches": 88,
+    "external_grids": 1
+   },
+   "mrid_basis": "stated",
+   "substations": {
+    "basis": "stated",
+    "count": 58
+   },
+   "import_notes": [],
+   "facts": {
+    "bus voltage": {
+     "stated": 111
+    },
+    "bus substation": {
+     "stated": 111
+    },
+    "bus feeder (where one applies)": {
+     "inferred": 53
+    },
+    "unit source": {
+     "named": 10,
+     "unknown": 2
+    },
+    "unit source value": {
+     "thermal (named)": 1,
+     "wind (named)": 1,
+     "bioenergy (named)": 1,
+     "unknown (unknown)": 2,
+     "solar (named)": 7
+    },
+    "unit CIM class": {
+     "SynchronousMachine/ThermalGeneratingUnit": 2,
+     "PowerElectronicsConnection/PowerElectronicsWindUnit": 1,
+     "GeneratingUnit/None": 2,
+     "PowerElectronicsConnection/PhotovoltaicUnit": 7
+    },
+    "load category": {
+     "named": 25
+    },
+    "switch class": {
+     "stated": 88
+    },
+    "switch normal state": {
+     "stated": 88
+    },
+    "switches normally open": {
+     "count": 5
+    },
+    "branch kind": {
+     "stated": 28
+    }
+   },
+   "outage_lookup_s": 0.0016
+  },
+  {
+   "model": "SmallGrid_BusBranch.zip",
+   "read_s": 0.34,
+   "build_s": 0.01,
+   "power_flow_converged": true,
+   "elements": {
+    "buses": 118,
+    "lines": 176,
+    "transformers": 10,
+    "generators": 18,
+    "static_generators": 0,
+    "loads": 103,
+    "switches": 0,
+    "external_grids": 1
+   },
+   "mrid_basis": "stated",
+   "substations": {
+    "basis": "stated",
+    "count": 108
+   },
+   "import_notes": [
+    "The model has no external grid: its reference unit 'Sporn SM' is the supply point (the external grid) in CONDUCTOR."
+   ],
+   "facts": {
+    "bus voltage": {
+     "stated": 118
+    },
+    "bus substation": {
+     "stated": 118
+    },
+    "bus feeder (where one applies)": {
+     "inferred": 9
+    },
+    "unit source": {
+     "stated": 18
+    },
+    "unit source value": {
+     "thermal (stated)": 18
+    },
+    "unit CIM class": {
+     "SynchronousMachine/ThermalGeneratingUnit": 18
+    },
+    "load category": {
+     "unknown": 103
+    },
+    "branch kind": {
+     "stated": 186
+    }
+   },
+   "outage_lookup_s": 0.0026
+  },
+  {
+   "model": "SmallGrid_NodeBreaker.zip",
+   "read_s": 0.47,
+   "build_s": 0.053,
+   "power_flow_converged": true,
+   "elements": {
+    "buses": 1225,
+    "lines": 176,
+    "transformers": 10,
+    "generators": 18,
+    "static_generators": 0,
+    "loads": 103,
+    "switches": 1107,
+    "external_grids": 1
+   },
+   "mrid_basis": "stated",
+   "substations": {
+    "basis": "stated",
+    "count": 108
+   },
+   "import_notes": [
+    "The model has no external grid: its reference unit 'Sporn SM' is the supply point (the external grid) in CONDUCTOR."
+   ],
+   "facts": {
+    "bus voltage": {
+     "stated": 1225
+    },
+    "bus substation": {
+     "stated": 1225
+    },
+    "bus feeder (where one applies)": {
+     "inferred": 83
+    },
+    "unit source": {
+     "stated": 18
+    },
+    "unit source value": {
+     "thermal (stated)": 18
+    },
+    "unit CIM class": {
+     "SynchronousMachine/ThermalGeneratingUnit": 18
+    },
+    "load category": {
+     "unknown": 103
+    },
+    "switch class": {
+     "stated": 1107
+    },
+    "switch normal state": {
+     "stated": 1107
+    },
+    "branch kind": {
+     "stated": 186
+    }
+   },
+   "outage_lookup_s": 0.0201
+  }
+ ]
+}
