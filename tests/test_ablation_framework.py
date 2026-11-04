@@ -10,7 +10,7 @@ from evaluation import ablation, ablation_stats as st, arms, suites, whatif
 from llm_agent.agent import loop as loop_module, system_prompt as sp, tool_schemas, usage
 from llm_agent.agent.config import DEFAULT_GRID_CONSTANTS, GridConstants
 from llm_agent.agent.providers.base import ModelResponse, ToolCall
-from llm_agent.agent.tool_registry import ABLATION_GROUPS, REGISTRY, expand_hidden
+from llm_agent.agent.tool_registry import ABLATION_GROUPS, EVALUATION_ONLY, REGISTRY, expand_hidden
 
 PROMPT = sp.build_system_prompt(DEFAULT_GRID_CONSTANTS)
 
@@ -77,7 +77,9 @@ def _declared():
 def test_hidden_tools_are_not_declared(monkeypatch):
     monkeypatch.setenv("CONDUCTOR_ONTOLOGY", "on")
     monkeypatch.delenv("CONDUCTOR_HIDE_TOOLS", raising=False)
-    assert tool_schemas.tools_for_model() is tool_schemas.TOOLS
+    # In normal use every tool is declared but the evaluation-only ones.
+    every = {fd.name for t in tool_schemas.TOOLS for fd in t.function_declarations}
+    assert _declared() == every - EVALUATION_ONLY
     monkeypatch.setenv("CONDUCTOR_HIDE_TOOLS", "group:investigation,edit_proposal")
     declared = _declared()
     assert not declared & (set(ABLATION_GROUPS["investigation"]) | {"edit_proposal"})

@@ -91,6 +91,8 @@ REGISTRY: dict[str, Tool] = {
     "locate_network_element": Tool("Element lookup", GROUPS[0], network=True),
     # What the elements are (units' energy sources, voltage levels, substations), with the basis of each fact.
     "describe_network": Tool("Network description", GROUPS[0], network=True),
+    # The raw data tables, in place of the layer: the evaluation's `tables` arm only (EVALUATION_ONLY).
+    "read_network_tables": Tool("Network data tables", GROUPS[0], network=True),
     "get_current_timestamp": Tool("Reading timestamp", GROUPS[0]),
     "advance_timestamp": Tool("Advancing timestamp", GROUPS[0], effect=MOVES_CLOCK),
     "get_current_conditions": Tool("Current conditions", GROUPS[0], **_AT_A_MOMENT),
@@ -189,6 +191,10 @@ ABLATION_GROUPS: dict[str, tuple[str, ...]] = {
     "semantic_layer": ("describe_network", "declare_network_facts"),
     "lookup": ("locate_network_element",),
 }
+
+# Tools only an evaluation arm gives the model; withheld otherwise (`tool_schemas.hidden_tool_names`) and left
+# out of the tool reference.
+EVALUATION_ONLY: frozenset[str] = frozenset({"read_network_tables"})
 
 
 def expand_hidden(entries) -> frozenset[str]:

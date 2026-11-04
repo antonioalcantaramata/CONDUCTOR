@@ -13,7 +13,7 @@ Ablations, end to end: what each part of CONDUCTOR is worth, one command per que
 
 A study is a set of arms (settings; `evaluation.arms`) run on a set of suites (`evaluation.suites`), each
 task `--repeats` times. The first arm is the baseline. The studies that come ready (`list`): `ontology`,
-`components` (leave one out — the paper's main table), `answer_review`, `reading_check`, `prompt_rules`,
+`raw_tables` (the agent given the raw data tables instead of the layer), `components` (leave one out — the paper's main table), `answer_review`, `reading_check`, `prompt_rules`,
 `tools`, `deep_research`, `advisor`, `step_budget`, `effort`. `--arm` adds arms to a study, or makes one.
 
 How a run is made, so its numbers can be trusted and repeated:
@@ -556,26 +556,31 @@ def analyse(folders: list[pathlib.Path], baseline: str | None = None, arm_names:
     if baseline in arms:
         arms = [baseline] + [a for a in arms if a != baseline]
     md = st.write_outputs(out or folders[0], rows, arms, baseline, manifest)
-    if manifest.get("study") == "ontology":
-        extra = _ontology_sections(pathlib.Path(folders[0]))
+    if manifest.get("study") in _STUDY_COMPARISONS:
+        extra = _ontology_sections(pathlib.Path(folders[0]), _STUDY_COMPARISONS[manifest["study"]])
         if extra:
             md = f"{md}\n\n{extra}"
             (pathlib.Path(out or folders[0]) / "analysis.md").write_text(md + "\n", encoding="utf-8")
     return md
 
 
-# The ontology study's own tables (per network and per reasoning family), next to the generic ones.
-_ONTOLOGY_COMPARISONS = (("on", "off", "What the agent gains: the layer for the agent (both arms' studies use it)"),
-                         ("off", "none", "What grounding the studies gains (neither arm's agent sees the layer)"),
-                         ("on", "none", "The whole contribution"))
-_ONTOLOGY_LABEL = {"on": "Layer on", "off": "Agent without it", "none": "Layer off everywhere"}
+# The layer studies' own tables (per network and per reasoning family), next to the generic ones.
+_STUDY_COMPARISONS = {
+    "ontology": (("on", "off", "What the agent gains: the layer for the agent (both arms' studies use it)"),
+                 ("off", "none", "What grounding the studies gains (neither arm's agent sees the layer)"),
+                 ("on", "none", "The whole contribution")),
+    "raw_tables": (("on", "tables", "What the layer adds over the raw data tables (both arms' studies use it)"),
+                   ("tables", "off", "What the raw data tables give the agent over names alone")),
+}
+_ONTOLOGY_LABEL = {"on": "Layer on", "off": "Agent without it", "none": "Layer off everywhere",
+                   "tables": "Raw tables instead"}
 
 
-def _ontology_sections(out: pathlib.Path) -> str:
+def _ontology_sections(out: pathlib.Path, comparisons=None) -> str:
     from . import reasoning, semantics
     runs = out / "runs"
     parts = []
-    for a, b, title in _ONTOLOGY_COMPARISONS:
+    for a, b, title in comparisons or _STUDY_COMPARISONS["ontology"]:
         labels = (_ONTOLOGY_LABEL[a], _ONTOLOGY_LABEL[b])
         section = []
         for net in ("cigre", "ieee30"):

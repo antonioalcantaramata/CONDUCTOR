@@ -1770,6 +1770,29 @@ _describe_network = genai.types.FunctionDeclaration(
     ),
 )
 
+_read_network_tables = genai.types.FunctionDeclaration(
+    name="read_network_tables",
+    description=(
+        "The network's own data tables, as the network stores them: one row per element, with its columns. "
+        "bus (name, vn_kv, type, zone, in_service); line (name, from_bus, to_bus, length_km, std_type, "
+        "in_service); trafo (name, hv_bus, lv_bus, sn_mva, std_type); switch (name, bus, element, et — b bus, "
+        "l line, t transformer —, type, closed); load (name, bus, p_mw, q_mvar, type); sgen, gen and storage "
+        "(name, bus, p_mw, type…); ext_grid (bus). Use it to find what an element is, how elements connect and "
+        "how switches stand."
+    ),
+    parameters=genai.types.Schema(
+        type=genai.types.Type.OBJECT,
+        properties={
+            "tables": genai.types.Schema(
+                type=genai.types.Type.ARRAY,
+                items=genai.types.Schema(
+                    type=genai.types.Type.STRING,
+                    enum=["bus", "line", "trafo", "switch", "load", "sgen", "gen", "storage", "ext_grid"]),
+                description="The tables to read (default all)."),
+        },
+    ),
+)
+
 _declare_network_facts = genai.types.FunctionDeclaration(
     name="declare_network_facts",
     description=(
@@ -2197,13 +2220,16 @@ _flexibility_over_time = genai.types.FunctionDeclaration(
 
 def hidden_tool_names() -> frozenset[str]:
     """Tools withheld from the model this turn: the semantic layer's when it is
-    switched off (`config.ontology_enabled`), and those an ablation hides
-    (`config.hidden_tools`). Empty in normal use."""
-    from .config import hidden_tools, ontology_enabled
-    from .tool_registry import expand_hidden
+    switched off (`config.ontology_enabled`), those an ablation hides
+    (`config.hidden_tools`), and the evaluation-only ones unless their arm is on
+    (`tool_registry.EVALUATION_ONLY`). Only the last in normal use."""
+    from .config import hidden_tools, ontology_enabled, raw_tables_enabled
+    from .tool_registry import EVALUATION_ONLY, expand_hidden
     hidden = set(expand_hidden(hidden_tools()))
     if not ontology_enabled():
         hidden |= {"describe_network", "declare_network_facts"}
+    if not raw_tables_enabled():
+        hidden |= EVALUATION_ONLY
     return frozenset(hidden)
 
 
@@ -2250,6 +2276,7 @@ TOOLS: list = [
             _set_load_power_factor,
             _set_generator_model,
             _describe_network,
+            _read_network_tables,
             _declare_network_facts,
             _set_unit_costs,
             _rename_elements,
@@ -2349,6 +2376,7 @@ TOOL_DISPATCH: dict[str, Callable] = {
     "set_load_power_factor": tools.set_load_power_factor,
     "set_generator_model": tools.set_generator_model,
     "describe_network": tools.describe_network,
+    "read_network_tables": tools.read_network_tables,
     "declare_network_facts": tools.declare_network_facts,
     "set_unit_costs": tools.set_unit_costs,
     "rename_elements": tools.rename_elements,

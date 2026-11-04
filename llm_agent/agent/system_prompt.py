@@ -708,13 +708,36 @@ def drop_parts(prompt: str, parts) -> tuple[str, dict[str, int]]:
     return re.sub(r"\n{3,}", "\n\n", prompt), removed
 
 
+# The rule on what an element is, for the evaluation's `tables` arm (`config.raw_tables_enabled`): the same
+# question answered from the raw data tables instead of the semantic layer, with the same care about names.
+RAW_TABLES_RULE = """\
+- **What an element is** — a unit's energy source (wind, solar, conventional…), a load's category \
+(residential, industrial…), a bus's voltage level, a switch's state, what an element supplies — read it from \
+the network's own data tables (`read_network_tables`): a unit's `type`, a load's `type`, a bus's `vn_kv`, a \
+switch's `closed`, and how elements connect. A name is only a hint: say what the tables state, and when they \
+do not state it, say so — never guess it."""
+
+
+def replace_part(prompt: str, part: str, text: str) -> str:
+    """The prompt with one part (found exactly once) replaced by `text`."""
+    found = _part_spans(prompt, part)
+    if len(found) != 1:
+        raise ValueError(f"Prompt part {part!r} found {len(found)} times, expected once: the prompt changed; "
+                         "update PROMPT_PARTS.")
+    a, b = found[0]
+    return prompt[:a] + text + prompt[b:]
+
+
 def get_system_prompt() -> str:
     """Return the compacted system prompt built from live grid constants."""
     status = fetch_grid_constants()
     prompt = build_system_prompt(status.values)
-    from .config import dropped_prompt_rules, ontology_enabled
+    from .config import dropped_prompt_rules, ontology_enabled, raw_tables_enabled
     drop = list(dropped_prompt_rules())
-    if not ontology_enabled() and "element_identity" not in drop:
+    if raw_tables_enabled() and "element_identity" not in drop:
+        # The raw-tables baseline (evaluation only): the rule points to the tables instead of the layer.
+        prompt = replace_part(prompt, "element_identity", RAW_TABLES_RULE)
+    elif not ontology_enabled() and "element_identity" not in drop:
         # The semantic layer switched off (evaluation only): its rule goes with its tools.
         drop.append("element_identity")
     if drop:

@@ -909,6 +909,26 @@ def describe_network(about: str = "summary", element: str | None = None, network
     return _record("describe_network", _get("/api/network/semantics?" + urlencode(params)))
 
 
+def read_network_tables(tables: list | None = None, network: str | None = None, **kwargs) -> dict:
+    """
+    GET /api/network/tables?tables=…
+
+    The network's own data tables — pandapower's standard element tables (bus,
+    line, trafo, switch, load, sgen, gen, storage, ext_grid), one row per element
+    with its columns as the network stores them, uninterpreted. Offered only in
+    the evaluation's `tables` arm (`config.raw_tables_enabled`), in place of the
+    semantic layer: the baseline that asks what the layer adds over the data.
+    """
+    unsupported = _unsupported_kwargs_result("read_network_tables", kwargs, supported_extra=set())
+    if unsupported is not None:
+        return unsupported
+    from urllib.parse import urlencode
+    names = [str(t).strip().casefold() for t in (tables or []) if str(t).strip()]
+    on = network if network and network != "base" else None
+    params = {**({"tables": ",".join(names)} if names else {}), **({"network": on} if on else {})}
+    return _record("read_network_tables", _get("/api/network/tables" + ("?" + urlencode(params) if params else "")))
+
+
 def declare_network_facts(units: list | None = None, loads: list | None = None, reset: bool = False,
                           **kwargs) -> dict:
     """

@@ -294,10 +294,20 @@ def ontology_enabled() -> bool:
     `declare_network_facts`, the facts `locate_network_element` adds, and the
     prompt's rule on what an element is). Off only to measure what it is worth
     (`python -m evaluation.ablation run ontology`): `off` hides it from the agent,
-    `none` also from the studies (the backend's `studies_use_semantic_layer`).
-    Read per turn, so one process can run several arms. Answers are checked
-    against the layer either way."""
-    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() not in ("off", "none", "0", "false")
+    `none` also from the studies (the backend's `studies_use_semantic_layer`),
+    `tables` hides it from the agent and gives it the raw data tables instead
+    (`raw_tables_enabled`). Read per turn, so one process can run several arms.
+    Answers are checked against the layer either way."""
+    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() not in ("off", "none", "tables", "0", "false")
+
+
+def raw_tables_enabled() -> bool:
+    """Whether the agent is given the network's raw data tables
+    (`read_network_tables`: pandapower's standard element tables, uninterpreted)
+    in place of the semantic layer — the baseline that asks what the layer adds
+    over the data it is built from (`CONDUCTOR_ONTOLOGY=tables`, evaluation
+    only). The studies still read the layer, as with `off`."""
+    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() == "tables"
 
 
 def _env_list(name: str) -> tuple[str, ...]:

@@ -11,7 +11,7 @@ settings ("full:") is CONDUCTOR as it is. The knobs:
 
 | knob | values | what it changes |
 |---|---|---|
-| ontology | on, off, none | the semantic layer: for the agent (off hides it), and for the studies (none; its own backend) |
+| ontology | on, off, none, tables | the semantic layer: for the agent (off hides it; tables gives it the raw data tables instead), and for the studies (none; its own backend) |
 | review | off, warn, inform | the answer checks shown to the agent before the answer goes out (`CONDUCTOR_REFLECTION`) |
 | reading_check | on, off | the decisive studies re-run under the question's other readings (`robustness.py`) |
 | deep | task, on, off | Deep Research on the first question: as each task says, always, never |
@@ -42,7 +42,7 @@ _EFFORT_ENV = {"google": "GEMINI_THINKING_LEVEL", "openai": "OPENAI_REASONING_EF
                "anthropic": "ANTHROPIC_EFFORT"}
 
 KNOBS = {
-    "ontology": ("on", "off", "none"),
+    "ontology": ("on", "off", "none", "tables"),
     "review": ("off", "warn", "inform"),
     "reading_check": ("on", "off"),
     "deep": ("task", "on", "off"),
@@ -167,9 +167,13 @@ def footprint(arm: Arm) -> dict:
         drop.append("element_identity")
     _, removed = drop_parts(prompt, drop) if drop else (prompt, {})
     hidden = set(expand_hidden(arm.get("hide_tools") or []))
-    if arm.get("ontology") in ("off", "none"):
+    if arm.get("ontology") in ("off", "none", "tables"):
         hidden |= {"describe_network", "declare_network_facts"}
-    return {"prompt_chars": len(prompt), "prompt_chars_removed": removed, "tools_hidden": sorted(hidden)}
+    out = {"prompt_chars": len(prompt), "prompt_chars_removed": removed, "tools_hidden": sorted(hidden)}
+    if arm.get("ontology") == "tables":
+        # The baseline's own tool, and its rule on what an element is in place of the layer's.
+        out.update(tools_added=["read_network_tables"], prompt_parts_replaced=["element_identity"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +193,10 @@ _ALL = ("whatif", "investigation", "options", "clarify", "narration", "semantics
 PRESETS: dict[str, Preset] = {p.name: p for p in (
     Preset("ontology", "What the semantic layer is worth — to the agent, and to the studies.",
            ("on: ontology=on", "off: ontology=off", "none: ontology=none"),
+           ("semantics-cigre", "semantics-ieee30", "reasoning")),
+    Preset("raw_tables", "What the layer adds over the data it is built from: the agent given the network's raw "
+           "data tables instead of the layer (the studies read the layer in every arm).",
+           ("on: ontology=on", "off: ontology=off", "tables: ontology=tables"),
            ("semantics-cigre", "semantics-ieee30", "reasoning")),
     Preset("components", "Leave one out: what each part of CONDUCTOR adds over the rest (the paper's main table).",
            ("full:", "no-semantic-layer: ontology=off", "no-reading-check: reading_check=off",

@@ -110,3 +110,17 @@ def test_the_evening_sag_is_not_called_restored(cigre_client):
     out = client.post("/api/flexibility/optimize", json={"timestamp": "2000-01-03 18:00:00"}).json()
     assert "restored" not in (out.get("message") or "").lower()
     assert "tap-changer" in out["message"]
+
+
+def test_the_raw_tables_are_the_networks_own_columns(cigre_client):
+    # The raw-tables baseline (`CONDUCTOR_ONTOLOGY=tables`) reads these instead of the layer: each unit's
+    # type and each switch's state as the network stores them, none of the columns loading the data added.
+    client, mb = cigre_client
+    out = client.get("/api/network/tables", params={"tables": "sgen,switch,load"}).json()["tables"]
+    assert {"sgen", "switch", "load"} == set(out)
+    types = {row["name"]: row["type"] for row in out["sgen"]}
+    assert types["CHP diesel 1"] == "CHP diesel" and types["PV 3"] == "PV"
+    assert all("closed" in row and "et" in row for row in out["switch"])
+    added = {"production", "substation_name", "bus_name", "consumption"}
+    assert not any(k.startswith("_") or k in added for rows in out.values() for row in rows for k in row)
+    assert client.get("/api/network/tables", params={"tables": "sgens"}).status_code == 400

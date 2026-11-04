@@ -3466,6 +3466,23 @@ async def resolve_name(name: str, network: str | None = None, kinds: str = "bus,
     return out
 
 
+@app.get("/api/network/tables")
+@_off_event_loop
+async def network_tables(network: str | None = None, tables: str = ""):
+    """The network's own data tables — pandapower's standard element tables,
+    uninterpreted (`raw_tables`) — of the network loaded or a proposal. The
+    baseline the semantic layer is measured against (`CONDUCTOR_ONTOLOGY=tables`):
+    the agent reads these instead of the layer. `tables`: comma-separated names
+    (default all)."""
+    import types
+    import raw_tables as rt
+    net = _net_for(types.SimpleNamespace(network=network))
+    try:
+        return {"tables": rt.raw_tables(net, [t.strip() for t in tables.split(",") if t.strip()] or None)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
 @app.get("/api/network/topology")
 @_off_event_loop
 async def network_topology(network: str | None = None):
