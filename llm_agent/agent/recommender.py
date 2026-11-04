@@ -340,11 +340,13 @@ def capability_list() -> list[tuple[str, str]]:
     agents cannot disagree about what CONDUCTOR can do.
     """
     from .providers.schema import function_declarations
+    from .tool_registry import EVALUATION_ONLY
     from .tool_schemas import TOOLS
 
     out = []
     for fd in function_declarations(TOOLS):
-        if fd.name in _EXCLUDED_CAPABILITIES:
+        # Evaluation-only tools are withheld from the orchestrator in normal use, so from here too.
+        if fd.name in _EXCLUDED_CAPABILITIES or fd.name in EVALUATION_ONLY:
             continue
         out.append((fd.name, _first_sentence(fd.description or "")))
     return out
