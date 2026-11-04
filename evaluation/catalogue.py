@@ -1,7 +1,7 @@
 """
 The task catalogue: every evaluation task, written out from the same definitions the runner uses.
 
-    python -m evaluation.catalogue [--out papers/gm2027/task-catalogue.md]
+    python -m evaluation.catalogue [--out papers/cimcontext/task-catalogue.md]
 
 A paper can quote only a few tasks; the catalogue lists them all — the question (or the turns), the network, what is
 set up before it, and every check it is graded on — so a reader can see exactly what was asked and how each answer
@@ -18,7 +18,7 @@ import pathlib
 import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEFAULT_OUT = _ROOT / "papers" / "gm2027" / "task-catalogue.md"
+DEFAULT_OUT = _ROOT / "papers" / "cimcontext" / "task-catalogue.md"
 
 NETWORKS = {"cigre": "CIGRE MV (pandapower; 110/20 kV, two radial feeders, typed DER)",
             "ieee30": "IEEE 30 (PGLib; unit types not stated)"}
