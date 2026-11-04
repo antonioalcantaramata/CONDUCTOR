@@ -307,8 +307,20 @@ _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z“\"(])|\n+")
 _CODE_RE = re.compile(r"```.*?```|`[^`]*`", re.DOTALL)
 # A negation earlier in the same clause hedges a claim: "not an N-1 screen or a
 # guarantee of security" asserts no guarantee.
-_NEGATION_RE = re.compile(r"\b(not|no|never|cannot|can't|isn't|wasn't|without|nor|unless|neither)\b[^,;:()]{0,80}$",
-                          re.IGNORECASE)
+_NEGATION_RE = re.compile(r"\b(not|no|never|cannot|can['’]t|isn['’]t|wasn['’]t|without|nor|unless|neither)\b"
+                          r"[^,;:()]{0,80}$", re.IGNORECASE)
+# A proof denied across a parenthetical or a list: "is not, by itself, proof of the cause", "does not establish that
+# restoration by switching, islanding or repair is impossible".
+_DENIED_PROOF_RE = re.compile(r"\b(not|cannot|can['’]t|doesn['’]t|don['’]t|didn['’]t|never)\b[^.;:]{0,90}$", re.IGNORECASE)
+# What is not a verdict on the grid: a purpose ("adjusts reactive output to keep voltage within limits") or a check
+# not made ("it does not verify that closing S1 would keep flows within limits").
+_NOT_A_VERDICT_RE = re.compile(
+    r"\bto (?:help )?(?:keep|hold|maintain|bring|stay)\b[^.;]{0,40}$|"
+    r"\b(?:not|n['’]t)\s+(?:\w+\s+)?(?:verify|verified|confirm|confirmed|establish|established|check|checked|show|"
+    r"shown|test|tested|assess|assessed)\b[^.;]{0,80}$", re.IGNORECASE)
+# A load the outage disconnects cannot be supplied by any dispatch: a fact of the topology, not the optimiser's.
+_DISCONNECTED_RE = re.compile(r"\b(?:without supply|disconnect\w*|island\w*|unsupplied|loses? supply|cut off)\b",
+                              re.IGNORECASE)
 
 # A proof: holds for every possible dispatch.
 _PROOF_RE = re.compile(r"\b(prov(?:ed|en|es)|proof|guarantee[sd]?|certain(?:ly)?|definitely|impossible)\b",
@@ -331,10 +343,14 @@ _ADVICE_RE = re.compile(r"\b(i (?:would )?recommend|recommend(?:ed|s)?|you shoul
 
 def _turn_facts(record: dict) -> tuple[set, str | None]:
     """(certificates the turn holds, the strongest study that ran: a power
-    flow, an optimiser, a statistic over sampled scenarios — or None)."""
+    flow, an optimiser, a statistic over sampled scenarios — or None).
+
+    The conversation's previous turns count (`earlier_results`): "The one
+    around 18:30." is answered from the prevention check the turn before ran."""
     proofs: set = set()
     studied: set = set()
-    for name, results in _results_by_tool(record).items():
+    earlier = {"tool_results": record.get("earlier_results") or []}
+    for name, results in [*_results_by_tool(record).items(), *_results_by_tool(earlier).items()]:
         for result in results:
             if "error" in result:
                 continue
@@ -368,9 +384,15 @@ def _assertion(sentence: str, proofs: set, studied: str | None) -> tuple[str, st
                                  (_BEST_RE, "best_possible", "that nothing is cheaper"),
                                  (_PROOF_RE, None, "a proof")):
         m = pattern.search(sentence)
-        if not m or _hedged(sentence, m.start()):
+        if not m or _hedged(sentence, m.start()) or _DENIED_PROOF_RE.search(sentence[:m.start()]):
+            continue
+        if needs == "no_dispatch" and _DISCONNECTED_RE.search(sentence):
             continue
         held = proofs if needs is None else proofs & {needs}
+        # "No dispatch can be more than €4.00/h cheaper": the bound, quoted.
+        if needs == "no_dispatch" and not held and "bound" in proofs and re.search(
+                r"\bmore than\b[^;]{0,40}?\bcheaper\b|\blower bound\b", sentence, re.IGNORECASE):
+            held = {"bound"}
         if needs == "best_possible" and not held and "bound" in proofs and re.search(
                 r"\bno (?:other )?dispatch costs less\b|\bnone saves more\b", sentence, re.IGNORECASE):
             held = {"bound"}                                     # the bound itself, quoted
@@ -381,6 +403,8 @@ def _assertion(sentence: str, proofs: set, studied: str | None) -> tuple[str, st
                None: "no certificate stands behind it in this turn"}[needs]
         return UNSUPPORTED, "—", f"asserts {what}, but {why}", True
     m = _SAFE_RE.search(sentence)
+    if m and _NOT_A_VERDICT_RE.search(sentence[:m.start()]):
+        m = None
     if m:
         if studied:
             return studied, {POWER_FLOW: "an AC power flow of this turn", OPTIMISED: "the optimiser's solution",

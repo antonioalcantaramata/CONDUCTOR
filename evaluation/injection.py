@@ -63,6 +63,11 @@ class Injection(NamedTuple):
 # Records
 # ---------------------------------------------------------------------------
 
+def _loop_earlier_turns() -> int:
+    from llm_agent.agent.loop import EARLIER_TURNS
+    return EARLIER_TURNS
+
+
 def load_records(folders) -> list[dict]:
     """Every answered turn in the folders' run files, once (the same answer twice is one record)."""
     seen, out = set(), []
@@ -70,11 +75,18 @@ def load_records(folders) -> list[dict]:
         for path in sorted(pathlib.Path(folder).rglob("*.jsonl")):
             if "_replaced" in path.parts:                       # records set aside by a re-run
                 continue
+            # A run file is one conversation; each turn's checks also read the turns before it, as the live loop
+            # gives them (`earlier_results`), for records written before the loop kept them.
+            earlier: list[list[dict]] = []
             for line in list(open(path, encoding="utf-8"))[1:]:
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if "earlier_results" not in rec and earlier:
+                    rec["earlier_results"] = [r for turn in earlier[-_loop_earlier_turns():] for r in turn]
+                if rec.get("tool_results"):
+                    earlier.append(rec["tool_results"])
                 answer = rec.get("assistant") or ""
                 if rec.get("status") == "runner_error" or not answer or "tool_results" not in rec:
                     continue
@@ -426,12 +438,20 @@ def caught(inj: Injection) -> tuple[bool, str]:
     """Whether the check flagged this injection (its figure or its sentence), and how."""
     rec = _with(inj.record, inj.answer)
     if inj.check == "provenance":
-        for v in _prov.check_turn(rec).verdicts:
-            if _same_value(v.claim.value, inj.target["value"], inj.target["decimals"]):
-                if v.status in ("ungrounded", "misattributed"):
-                    return True, v.status
-                return False, v.status
-        return False, "not extracted"
+        # The injected figure can sit beside the same value quoted rightly (a swap leaves "Bus_28 at 0.936,
+        # Bus_29 at 0.936"): caught means the injected answer has more flagged figures of that value than the
+        # original answer had, whichever of them comes first.
+        def same(r):
+            return [v for v in _prov.check_turn(r).verdicts
+                    if _same_value(v.claim.value, inj.target["value"], inj.target["decimals"])]
+        after = same(rec)
+        if not after:
+            return False, "not extracted"
+        flagged = [v for v in after if v.status in ("ungrounded", "misattributed")]
+        before = [v for v in same(inj.record) if v.status in ("ungrounded", "misattributed")]
+        if len(flagged) > len(before):
+            return True, flagged[0].status
+        return False, after[0].status
     if inj.check == "characterisation":
         # A study-level conflict quotes the start of the answer, not the sentence: caught means the injected
         # answer has a conflict over a study that the original answer did not have.

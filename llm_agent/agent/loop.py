@@ -90,6 +90,11 @@ _TOOL_ARGS = _tool_argument_names()
 
 # Attempt tracking — per-conversation attempt counter
 _attempt_counter: dict[str, int] = {}
+# The tool results of each conversation's last turns. A follow-up ("The one around 18:30.") is answered from the
+# studies the turn before ran, which the model still has in its history; the checks read them too, or every figure
+# quoted from them reads as invented.
+_earlier_results: dict[str, list[list[dict]]] = {}
+EARLIER_TURNS = 2
 
 # ---------------------------------------------------------------------------
 # Session logging — one append-only file per run
@@ -839,6 +844,9 @@ def run_agent_turn(
         "tool_calls": turn_tool_calls,
         "tool_call_count": len(turn_tool_calls),
         "tool_results": turn_tool_results,
+        # The previous turns' results in this conversation (see `_earlier_results`), when there were any.
+        **({"earlier_results": earlier_turns} if (earlier_turns := [r for turn in _earlier_results.get(conversation_id, [])
+                                                         for r in turn]) else {}),
         "tool_error_count": tool_error_count,
         "model_calls": model_calls,
         "prompt_tokens": prompt_tokens,
@@ -858,6 +866,9 @@ def run_agent_turn(
             c.get("name") in ("investigate", "test_prevention") for c in turn_tool_calls)}} if deep else {}),
     })
 
+    if turn_tool_results:
+        _earlier_results[conversation_id] = (_earlier_results.get(conversation_id, []) + [turn_tool_results])[
+            -EARLIER_TURNS:]
     return final_text, history
 
 

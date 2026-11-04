@@ -33,6 +33,7 @@ Its findings are put to the model only in reflection's `inform` mode
 
 from __future__ import annotations
 
+import itertools
 import re
 from typing import Any, Iterable, NamedTuple
 
@@ -96,12 +97,24 @@ _SIGNED_CURRENCY_RE = re.compile(r"-\s?[€$£]\s?$")
 # ends, and a range of elements — "Line 2-3", "Trafo 0-1" (CIGRE's names),
 # "Bus 4–11" (observed live: the "-3" of "Line 2-3" flagged as a figure no
 # result held). A unit after it ("line 95 %") makes it a figure again.
+# A full stop or comma after the name ends the sentence, not the number: the
+# guard against a decimal ("Bus 7.5") once refused "Line 14-8." whole and
+# matched "Line 14" alone, leaving "-8" to be read as a figure (14 of 60
+# untraced figures sampled in the GM 2027 runs were such fragments).
 ELEMENT_NO_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:bus|line|transformer|trafo|gen|generator|unit|node|feeder|substation|outage)"
-    r"\s?#?\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?![\d.,])"
+    r"\s?#?\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?!\d|[.,]\d|\s?[-\u2010\u2011\u2013]\s?\d)"
     r"(?!\s?(?:%|MW|Mvar|MVAr|MVA|kV|p\.?u\.?|€|EUR|h\b|min\b))", re.IGNORECASE)
 
-NK_RE = re.compile(r"(?<![A-Za-z0-9_])[Nn]\s?[-\u2010\u2011\u2013]\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?![\d.])")
+NK_RE = re.compile(r"(?<![A-Za-z0-9_])[Nn]\s?[-\u2010\u2011\u2013]\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?"
+                   r"(?!\d|\.\d)")
+
+# An identifier with an underscore — a proposal's name, "gen_bus4_minus10_2000-01-06-20" — is a label, and so are
+# its digits. Removing the date inside it left "-20" standing alone, read as a figure.
+_IDENTIFIER_RE = re.compile(r"(?<![\w-])[A-Za-z][A-Za-z0-9]*_(?:[A-Za-z0-9_]|[-\u2010\u2011](?=\w))*")
+
+# An exponent in written mathematics: the "-1" of "\cos^{-1}" is not a figure.
+_EXPONENT_RE = re.compile(r"\^\{?-?\d+\}?")
 
 # Digit groups anywhere, used to mine numerals out of *strings* in tool
 # results. Element names carry them ("Oscar 10kV", "Foxtrot Trf 1") and the
@@ -130,10 +143,12 @@ _CLOCK_RE = re.compile(r"(?<![\d:.])\d{1,2}:\d{2}(?::\d{2})?(?!\d|:\d)")
 _MONTH = (r"(?:January|February|March|April|May|June|July|August|September|October|November|December"
           r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\b\.?")
 _DAY = r"(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?"
+# A span of days is a date too: "January 1–7, 2000" left "7" and "2000" as figures.
+_DAYS = rf"{_DAY}(?:\s?[-‐‑–]\s?{_DAY})?"
 _YEAR = r"(?:,?\s+\d{4}\b)?"
 _DAY_MONTH_RE = re.compile(
-    rf"(?<![\w.]){_DAY}\s+(?:of\s+)?{_MONTH}{_YEAR}"
-    rf"|\b{_MONTH}\s+{_DAY}\b{_YEAR}"
+    rf"(?<![\w.]){_DAYS}\s+(?:of\s+)?{_MONTH}{_YEAR}"
+    rf"|\b{_MONTH}\s+{_DAYS}\b{_YEAR}"
 )
 
 # A timestamp inside a result or argument string, as the tools write it —
@@ -180,7 +195,10 @@ _DIRECTION_RE = re.compile(
     r"delivering|withdraw|withdraws|withdrawing|feed|feeds|feeding|"
     # A change said as a fall: "fell by 0.00165 p.u." over `change: -0.00165`.
     r"fell|fall|falls|fallen|dropped|drop|drops|declined|declines|decreased|decrease|decreases|"
-    r"lowered|reduced|down by)\b",
+    r"lowered|reduced|down by|"
+    # The same, said of an action or a comparison: "reduce Gen_bus12 5.66 MW"
+    # over `dp_mw: -5.66`, "16.42 MW lower than in the baseline".
+    r"reduce|reduces|reducing|lower|less)\b",
     re.IGNORECASE,
 )
 
@@ -298,6 +316,9 @@ def _strip_noise(text: str, keep_names: bool = False) -> str:
     text = _INLINE_CODE_RE.sub(" ", text)
     text = _TABLE_RULE_RE.sub(" ", text)
     text = _LIST_MARKER_RE.sub(r"\1\2", text)
+    text = _EXPONENT_RE.sub(lambda m: " " * len(m.group(0)), text)
+    if not keep_names:
+        text = _IDENTIFIER_RE.sub(lambda m: " " * len(m.group(0)), text)
     text = _DATETIME_RE.sub(" ", text)
     text = _DAY_MONTH_RE.sub(" ", text)
     text = _CLOCK_RE.sub(" ", text)
@@ -521,6 +542,12 @@ def collect_sources(record: dict) -> list[Source]:
         if name in AGENT_WRITTEN:
             continue
         _walk(entry.get("result"), name, sources, frozenset(), vocabulary)
+
+    # What the conversation's previous turns returned: the model has them in its history and a follow-up quotes
+    # them. Turn-level, like the arguments: they are not this turn's subject partition.
+    for entry in record.get("earlier_results") or []:
+        if isinstance(entry, dict) and entry.get("name") not in AGENT_WRITTEN:
+            _walk(entry.get("result"), f"earlier:{entry.get('name', 'tool')}", sources)
 
     # The grid facts the system prompt stated. A figure quoted from them —
     # how many buses the network has, its voltage limits — came from the
@@ -803,7 +830,10 @@ def _share_of(claim: Claim, sources: Iterable[Any], answer: str | None) -> str |
 
 # A heading or a rule ends the current subject. Without this the last element
 # named in section 1 would still be the subject halfway through section 3.
-_SECTION_BREAK_RE = re.compile(r"^(#{1,6}\s|-{3,}\s*$|_{3,}\s*$)", re.MULTILINE)
+# So does a paragraph break: "…the assessment also found Bus_29 undervoltage at
+# 0.943 p.u." closed a paragraph, and the next three, about the overloaded line,
+# had all thirteen of their figures read as written about Bus_29 (GM 2027 runs).
+_SECTION_BREAK_RE = re.compile(r"^(#{1,6}\s|-{3,}\s*$|_{3,}\s*$|[ \t]*$)", re.MULTILINE)
 
 
 def _section_start(cleaned: str, position: int) -> int:
@@ -973,7 +1003,115 @@ def check_answer(answer: str, sources: list[Any],
                     answer=answer or "")
         for claim in claims
     ]
+    verdicts = _with_unshown_steps(verdicts, cleaned, sources)
     return ProvenanceReport(verdicts=tuple(verdicts), n_sources=len(sources))
+
+
+# The limits a study applied, by the unit a margin to them is stated in: "0.943 p.u., 0.007 p.u. below the limit".
+_LIMIT_KEYS = {"vm_lower_pu": "p.u.", "vm_upper_pu": "p.u.", "max_line_loading_pct": "%", "max_trafo_loading_pct": "%"}
+# A sentence ends at a stop followed by a space or a line break; the stops inside "p.u." and "e.g." do not end one.
+_SENTENCE_END_RE = re.compile(r"[.!?;](?=\s|$)|\n")
+_ABBREVIATION_RE = re.compile(r"\b(?:p\.u|e\.g|i\.e|approx|vs)\.", re.IGNORECASE)
+# The words that say a figure is a step from others — a margin, a change, a total, a share. Without them a figure
+# that merely equals some difference was excused (error injection: a changed import of 32.19 MW "derived" as
+# 3 + 29.41).
+_STEP_WORDS_RE = re.compile(
+    r"\b(?:below|above|over|under|beyond|margin|headroom|short|by|less|more|lower|higher|increases?|increased|"
+    r"decreases?|decreased|rises?|rose|falls?|fell|drops?|dropped|reduction|reduced|difference|leaving|leaves|"
+    r"violation of|exceed\w*|total|totals|plus|together|combined|altogether|in all|sum|half|halved|halving)\b|\+",
+    re.IGNORECASE)
+_STEP_WINDOW = 45
+
+
+def _sentence_starts(cleaned: str) -> list[int]:
+    masked = _ABBREVIATION_RE.sub(lambda m: "x" * len(m.group(0)), cleaned)
+    return [0] + [m.end() for m in _SENTENCE_END_RE.finditer(masked)]
+
+
+def _quantity(claim: Claim) -> bool:
+    """A figure that can be an operand: one with a unit or decimals. A bare integer is too often a name or a count
+    ("PV 3, 4, 5", "Load 16") to be one."""
+    return claim.unit is not None or claim.decimals > 0
+
+
+def _same_unit(claim: Claim, operand: Claim) -> bool:
+    if claim.unit is None:                        # "14.7 percentage points" from two percentages
+        return operand.unit in (None, "%")
+    return (operand.unit or "").casefold() == claim.unit.casefold()
+
+
+def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: list[Any]) -> list[ClaimVerdict]:
+    """Untraced figures that are one step of arithmetic from figures beside them.
+
+    The model states a margin without the subtraction — "Bus_29 was at 0.943 p.u., 0.007 p.u. below its 0.950
+    p.u. limit", "114.7 %, 14.7 points over" — or a total after its parts. Both operands are on the page and
+    traced, and the operator can check the step; reading such figures as invented was the commonest false alarm
+    in the GM 2027 runs. As narrow as `_derivation`, and measured against error injection: one difference or sum
+    of two traced figures in the same sentence or the one before, in the claim's unit (or of one of them and a
+    limit the study applied in that unit), exact on the figures as written to the claim's precision, and only where
+    the words beside the claim say it is a step ("below", "by", "an increase of", "together")."""
+    if not any(v.status == UNGROUNDED for v in verdicts):
+        return verdicts
+    starts = _sentence_starts(cleaned)
+
+    def sentence_of(position: int) -> int:
+        return max(i for i, start in enumerate(starts) if start <= position)
+
+    traced = [v.claim for v in verdicts if v.status != UNGROUNDED and _quantity(v.claim)]
+    limits = {(round(s[0], 6), unit) for s in sources
+              if (unit := _LIMIT_KEYS.get(str(s[1]).rsplit(".", 1)[-1]))}
+    out = []
+    for v in verdicts:
+        claim = v.claim
+        if v.status != UNGROUNDED or not _quantity(claim) or not _STEP_WORDS_RE.search(
+                cleaned[max(0, claim.position - _STEP_WINDOW):claim.position + _STEP_WINDOW]):
+            out.append(v)
+            continue
+        here = sentence_of(claim.position)
+        operands = [t for t in traced if here - 1 <= sentence_of(t.position) <= here and _same_unit(claim, t)]
+        window = cleaned[starts[max(here - 1, 0)]:starts[here + 1] if here + 1 < len(starts) else len(cleaned)]
+        step = _share_or_total(claim, operands, window)
+        band = _tolerance(claim.decimals)
+        for i, a in enumerate(operands if step is None else ()):
+            pool = [(b.value, f"{b.value:g}") for b in operands[i + 1:]]
+            pool += [(limit, f"limit {limit:g}") for limit, unit in limits if unit == (a.unit or "").casefold()
+                     or (unit == "p.u." and (a.unit or "").casefold() in ("p.u.", "pu"))]
+            for b, name in pool:
+                if abs(abs(a.value - b) - abs(claim.value)) <= band:
+                    step = f"{a.value:g} - {name} (stated)"
+                elif abs(a.value + b - claim.value) <= band:
+                    step = f"{a.value:g} + {name} (stated)"
+                if step:
+                    break
+            if step:
+                break
+        out.append(v._replace(status=DERIVED, source=step) if step else v)
+    return out
+
+
+_HALF_RE = re.compile(r"\b(?:half|halved|halving|halve)\b", re.IGNORECASE)
+_PERCENT_IN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_TOTAL_RE = re.compile(r"\b(?:together|in total|total|combined|altogether|in all|sum)\b", re.IGNORECASE)
+
+
+def _share_or_total(claim: Claim, operands: list[Claim], window: str) -> str | None:
+    """A stated share of a stated figure ("24.39 MW … a 50 % reduction … 12.19 MW", "halved to 12.19 MW"), or a
+    total of three stated figures where the words say it is one ("together, that is 14.806 points")."""
+    shares = [float(m.group(1)) / 100 for m in _PERCENT_IN_RE.finditer(window) if 0 < float(m.group(1)) < 100]
+    if _HALF_RE.search(window):
+        shares.append(0.5)
+    for a in operands:
+        if a.unit == "%" or claim.unit is None:
+            continue
+        for share in shares:
+            for part in (share, 1 - share):
+                if abs(a.value * part - claim.value) <= _tolerance(claim.decimals) + _tolerance(a.decimals) * part:
+                    return f"{part:g} × {a.value:g} (stated)"
+    if _TOTAL_RE.search(window) and len(operands) >= 3:
+        for trio in itertools.combinations(operands, 3):
+            if abs(sum(o.value for o in trio) - claim.value) <= _tolerance(claim.decimals):
+                return " + ".join(f"{o.value:g}" for o in trio) + " (stated)"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1005,11 +1143,28 @@ def is_clarifying_question(answer: str, calls: Iterable[dict] = ()) -> bool:
     return False
 
 
+def _proposes_choices(answer: str, calls: Iterable[dict] = ()) -> bool:
+    """A wider reading of `is_clarifying_question`, for the figure check only (the graders keep the narrow one):
+    the question may sit mid-line ("What should it mean? Choose one:"), and a turn that ran no tool at all and asks
+    is proposing whatever figures it states ("I suggest 80 %; alternatives are 70 % or 90 %")."""
+    if not isinstance(calls, (list, tuple)) or any(
+            not isinstance(c, dict) or c.get("name") not in LOOKUP_TOOLS for c in calls):
+        return False
+    asked = False
+    for line in (answer or "").splitlines():
+        if _CHOICE_LINE.match(line):
+            return asked
+        asked = asked or "?" in line
+    return not calls and asked
+
+
 def answer_to_check(answer: str, calls: Iterable[dict] = ()) -> str:
     """The text whose figures are checked: a clarifying question without its
     choices (the question's own sentences are still checked)."""
-    if not is_clarifying_question(answer, calls):
+    if not (is_clarifying_question(answer, calls) or _proposes_choices(answer, calls)):
         return answer or ""
+    if not any(_CHOICE_LINE.match(line) for line in (answer or "").splitlines()):
+        return ""                         # proposed inline: every figure is a choice
     return "\n".join(line for line in (answer or "").splitlines() if not _CHOICE_LINE.match(line))
 
 

@@ -77,17 +77,44 @@ _CATEGORY_WORDS = {
     "heat_pump": r"\bheat ?pumps?\b",
 }
 _ALSO = {"commercial_industrial": {"commercial", "industrial"}}
-# The head of a list of units by source: "10 solar units:", "the solar PV units are", "solar units —".
+# The head of a list of units by source: "10 solar units:", "the solar PV units are", "solar units —", "the
+# storage unit, Battery Storage 3,". Only with
+# the marker: "the eight PV units and WKA 7" is not a list of PV units that WKA 7 belongs to.
 _LIST_HEAD_RE = re.compile(
     r"\b(?P<src>wind|solar|pv|photovoltaic|hydro|thermal|nuclear|storage|battery)\b(?:\s+(?:pv|photovoltaic))?"
-    r"\s+(?:units?|generators?|plants?|farms?|parks?)\b(?:\s+(?:are|is|include|includes))?\s*[:—–-]?",
+    r"\s+(?:units?|generators?|plants?|farms?|parks?)\b(?:\s+(?:are|is|include|includes)\b\s*:?|\s*[:—–,])",
     re.IGNORECASE)
 _GROUP_RE = re.compile(
     r"\b(?P<kind>renewables?|wind|solar|pv|photovoltaic)\b(?:[- ](?:generation|output|production|capacity|power|"
     r"units?|farms?|parks?|plants?|generators?|in[- ]feed))", re.IGNORECASE)
+_STUDY_TERM = r"[- ]?(?:uncertainty|case|scenario|variability|forecast error)\b"
 _KV_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s?kV\b")
 _BETWEEN_RE = re.compile(r"\b(?:between|connecting|joining|linking)\s+(?P<a>\S+(?: \S+)?)\s+(?:and|to|with)\s+"
                          r"(?P<b>\S+(?: \S+)?)", re.IGNORECASE)
+
+
+# A clause ends at these: "WKA 7 is measured directly; PV 9 is allocated" says nothing measured about PV 9.
+_CLAUSE_RE = re.compile(r"[;:—–]|,\s|\s(?:but|while|whereas|so)\s")
+# The word that says what a value is: a clause that already says it ("allocated", "set") is right, whatever else it
+# says is measured ("allocated as a share of the measured total").
+_KIND_WORDS = re.compile(r"\b(?:allocat\w*|estimat\w*|derived|deriv\w*|solved|set|set-point|setpoint|assum\w*|nominal|"
+                         r"shares?|split)\b", re.IGNORECASE)
+_NOT_MEASURED = re.compile(r"\b(?:rather than|instead of|not|never|isn['’]t|aren['’]t|wasn['’]t)\s+(?:\w+\s+)?"
+                           r"(?:measured|metered)\b", re.IGNORECASE)
+
+
+def _clauses_naming(sentence: str, name: str) -> list[str]:
+    parts, start = [], 0
+    for m in _CLAUSE_RE.finditer(sentence):
+        parts.append(sentence[start:m.start()])
+        start = m.end()
+    parts.append(sentence[start:])
+    return [p for p in parts if _mentions(p, name)]
+
+
+def _calls_measured(clause: str) -> bool:
+    return bool(re.search(r"\b(?:measured|metered)\b", clause, re.IGNORECASE)) \
+        and not _NOT_MEASURED.search(clause) and not _KIND_WORDS.search(clause)
 
 
 def _sentences(text: str) -> list[str]:
@@ -202,7 +229,8 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
         for value, pat in patterns.items():
             # A conjunction ends the description: "PV 11 — and the wind unit WKA 7" says nothing
             # about PV 11 (observed: a false "PV 11 is wind").
-            follows = re.match(r"\s*(?:,\s*(?:an?|the)\s+|\(\s*|(?:is|was|are|were)\s+(?:an?\s+|the\s+)?|"
+            # A closing quote may come first: '"Wind Park West" is listed as solar'.
+            follows = re.match(r"[\s\"”’']*(?:,\s*(?:an?|the)\s+|\(\s*|(?:is|was|are|were)\s+(?:an?\s+|the\s+)?|"
                                r"[—–-]\s*(?:an?\s+|the\s+)?)(?:(?!(?:and|or|but|while|whereas)\b)[\w-]+\s+){0,2}?"
                                r"(?:" + pat + r")", after, re.IGNORECASE)
             precedes = re.search(r"(?:" + pat + r")(?:\s+(?:unit|farm|park|plant|generator|turbine|array|"
@@ -245,7 +273,7 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
                 tail = sentence[m.end():]
                 # The list ends at the next source word or at a closing dash ("—PV 3 … PV 11—and WKA 7").
                 ends = [n.start() for pat in _SOURCE_WORDS.values() for n in re.finditer(pat, masked(tail), re.IGNORECASE)]
-                ends += [n.start() for n in re.finditer(r"[—–]", tail) if n.start() > 0]
+                ends += [n.start() for n in re.finditer(r"[—–;]|\.[\"”’']*\s", tail) if n.start() > 0]
                 stop = min(ends or [len(tail)])
                 for name, unit in units.items():
                     if not _mentions(tail[:stop], name) or _operator_said(name, [src]):
@@ -278,6 +306,11 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
                 kind = m.group("kind").casefold()
                 if re.search(r"\b" + re.escape(kind.rstrip("s")), question, re.IGNORECASE):
                     continue
+                # A study's setting or operation, not a claim about the units: "renewable-output uncertainty was
+                # disabled", "the 50 % renewable-output case", "studies that scale wind or solar output".
+                if re.match(_STUDY_TERM, sentence[m.end():], re.IGNORECASE) or re.search(
+                        r"\bscal\w*\s+(?:\w+\s+){0,2}$", sentence[max(0, m.start() - 30):m.start()], re.IGNORECASE):
+                    continue
                 wanted = RENEWABLE if kind.startswith("renewable") else (
                     {"solar"} if kind in ("solar", "pv", "photovoltaic") else {"wind"})
                 if not any(known_by_source.get(src) for src in wanted):
@@ -293,7 +326,14 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
                 continue                                            # the operator's own figure
             named = [(n, b) for n, b in buses.items() if _mentions(sentence, n)]
             stated = [(n, b) for n, b in named if b.get("kv_basis") == "stated" and b.get("kv") is not None]
-            near = [(n, b) for n, b in stated if abs(sentence.find(n) - m.start()) < 40]
+            # Attached to the bus: "Bus 3 is at 110 kV", "Bus 3 (20 kV)", "the 20 kV Bus 9". Merely near it, the
+            # level may be another's: "Bus 0 feeds the 20 kV network through T0" (Bus 0 is the 110 kV side).
+            near = [(n, b) for n, b in stated if any(
+                re.fullmatch(r"[\s,(:—–-]*(?:(?:is|was|are|were|at|of|rated|nominal)\s+){0,3}[\s(]*",
+                             sentence[at + len(n):m.start()], re.IGNORECASE)
+                or (at >= m.end() and re.fullmatch(r"\s*(?:kV\s+)?(?:bus(?:bar)?\s+)?", sentence[m.end():at],
+                                                   re.IGNORECASE))
+                for at in _mentions(sentence, n))]
             if near and all(abs(float(b["kv"]) - kv) > 1e-6 for _n, b in near):
                 n, b = near[0]
                 issues.append(Issue(CONTRADICTED, raw[:240], f"says {kv:g} kV beside {n}, which is at "
@@ -337,7 +377,10 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
                 break
             if re.search(r"\b(?:from|carr\w*|feed\w*|suppl\w*)\b[^.]{0,30}\bexternal grid\b|\bexternal grid\b[^.]{0,20}"
                          r"\b(?:through|via|over)\b", sentence, re.IGNORECASE) and ext_branches \
-                    and label not in ext_branches and not held:
+                    and label not in ext_branches and not held \
+                    and not re.search(r"\b(?:route|path)\b|→|->", sentence, re.IGNORECASE):
+                # A route from the external grid ("Trafo 0-1 → Line 1-2 → Line 2-3 …") names every branch on it,
+                # not only the first; all of them carry its power.
                 if re.search(r"\b(?:line|branch|transformer)s?\b", sentence, re.IGNORECASE):
                     issues.append(Issue(CONTRADICTED, raw[:240],
                                         f"has {label} carrying the external grid's power; the branches that do are "
@@ -354,7 +397,7 @@ def check_answer(answer: str, record: dict) -> list[Issue]:
         q = "q" if reactive else "p"
         for name, e in {**units, **loads}.items():
             kind = e.get(f"{q}_kind")
-            if not kind or not _mentions(sentence, name):
+            if not kind or not any(_calls_measured(clause) for clause in _clauses_naming(sentence, name)):
                 continue
             what = "reactive" if reactive else "active"
             src = e.get(f"{q}_from") or ""

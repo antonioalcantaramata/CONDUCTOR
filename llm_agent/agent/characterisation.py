@@ -235,6 +235,22 @@ def _qualified_numbers(node: Any, path: str, out: dict[float, list[tuple[str, Qu
             _qualified_numbers(item, f"{path}[{index}]", out)
 
 
+def _favourable_numbers(node: Any, out: dict[str, set]) -> None:
+    """{field: numbers whose own object carries the favourable value of that qualifier}."""
+    if isinstance(node, dict):
+        favourable = [q.field for q in _QUALIFIERS if node.get(q.field) is True] + \
+                     [q.field for q in _INVERTED if node.get(q.field) is False]
+        for key, value in node.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                for field in favourable:
+                    out.setdefault(field, set()).add(round(float(value), 6))
+            else:
+                _favourable_numbers(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _favourable_numbers(item, out)
+
+
 def qualified_numbers(record: dict) -> dict[float, list[tuple[str, Qualifier]]]:
     """Every number in the turn's tool results that carries an unfavourable flag."""
     out: dict[float, list[tuple[str, Qualifier]]] = {}
@@ -261,6 +277,11 @@ def _asserts_favourable(context: str, qualifier: Qualifier) -> bool:
     Without this the check would flag precisely the answers that got it right,
     which is the failure mode that matters most in a guard an agent reads.
     """
+    return next(_favourable_at(context, qualifier), None) is not None
+
+
+def _favourable_at(context: str, qualifier: Qualifier):
+    """Where the sentence asserts the reading the qualifier denies (see `_asserts_favourable`)."""
     lowered = context.lower()
     state = qualifier.field in _STATE_FIELDS
     for word in qualifier.asserts:
@@ -275,8 +296,7 @@ def _asserts_favourable(context: str, qualifier: Qualifier) -> bool:
                 continue
             if state and _HYPOTHETICAL_RE.search(lowered[max(0, match.start() - _HYPOTHETICAL_WINDOW):match.start()]):
                 continue
-            return True
-    return False
+            yield match.start()
 
 
 # A state's verdict (converged, secure, violated) is not contradicted by a
@@ -286,7 +306,8 @@ def _asserts_favourable(context: str, qualifier: Qualifier) -> bool:
 # by 6.24 MW would clear it" is exactly the action claim the movement
 # qualifiers exist to catch.
 _STATE_FIELDS = {"converged", "secure", "violated"}
-_HYPOTHETICAL_RE = re.compile(r"\b(would|undoing|undo|had been|were it|were the)\b")
+# "This increase alone brings Bus_29 back within limits", "removing it alone brings…" are counterfactuals too.
+_HYPOTHETICAL_RE = re.compile(r"\b(would|undoing|undo|had been|were it|were the|alone|removing|removed)\b")
 _HYPOTHETICAL_WINDOW = 60
 
 
@@ -373,8 +394,15 @@ def _corrected(record: dict) -> bool:
 
 def _study_verdicts(record: dict) -> list[tuple[str, Qualifier]]:
     """Unfavourable verdicts each tool result states about itself."""
-    out: list[tuple[str, Qualifier]] = []
-    for entry in record.get("tool_results") or []:
+    return [(name, verdict) for name, verdict, _result in _study_verdicts_with_results(record)]
+
+
+def _study_verdicts_with_results(record: dict, earlier: bool = False) -> list[tuple[str, Qualifier, dict]]:
+    """With `earlier`, the conversation's previous turns too: a follow-up that calls the grid secure contradicts the
+    assessment the turn before ran (`earlier_results`; the evidence check counts that study as behind the verdict)."""
+    out: list[tuple[str, Qualifier, dict]] = []
+    entries = (record.get("tool_results") or []) + ((record.get("earlier_results") or []) if earlier else [])
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         result = entry.get("result")
@@ -383,15 +411,60 @@ def _study_verdicts(record: dict) -> list[tuple[str, Qualifier]]:
         name = entry.get("name", "tool")
         for verdict in _STUDY_VERDICTS:
             if result.get(verdict.field) is False:
-                out.append((name, verdict))
+                out.append((name, verdict, result))
         # A violation count above zero is the same statement as `secure: False`
         # and some endpoints carry only one of the two.
         total = result.get("total_violations")
         if isinstance(total, int) and total > 0 and not any(
-            v.field == "secure" for _, v in out
+            v.field == "secure" for _, v, _r in out
         ):
-            out.append((name, _STUDY_VERDICTS[0]))
+            out.append((name, _STUDY_VERDICTS[0], result))
     return out
+
+
+# A favourable sentence about another state than the study's: another time ("at 15:00, with the same line out, it
+# remains within limits"), the base or the intact grid beside a proposal's or an outage's insecure study, a
+# corrective option, a counterfactual, or what changed rather than what is ("no violations are resolved or newly
+# introduced"). Judging the whole answer, the check read all 24 of its findings in the GM 2027 runs from such
+# sentences, in answers that reported the study's violations correctly.
+# Always another state: a counterfactual or replay, what changed rather than what is, a reference moment.
+_OTHER_STATE_RE = re.compile(
+    r"\b(?:replay|holding|resolved|introduced|added|cleared|newly|new violations?|comparison point|reference|"
+    r"last (?:secure|time)|options?|redispatch|corrective)\b", re.IGNORECASE)
+# Another network, by which one the study ran on: the base beside a proposal's study, a proposal or a corrective
+# state beside the base's ("The proposal is secure." over the proposal's insecure study is still a claim).
+_BASE_WORDS_RE = re.compile(r"\b(?:base|baseline|today|existing network)\b", re.IGNORECASE)
+_CHANGED_WORDS_RE = re.compile(
+    r"\b(?:proposal|dispatch|after the (?:change|upgrade|action)|with the (?:upgrade|proposal|option|action|change))\b",
+    re.IGNORECASE)
+# The intact grid beside an outage study's verdict.
+_INTACT_RE = re.compile(r"\b(?:intact|normal operation|pre-outage|before the outage)\b", re.IGNORECASE)
+_CLOCK_IN_RE = re.compile(r"(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?::\d\d)?(?!\d|:\d)")
+_ASPECTS = {"voltage": r"\bvoltages?\b", "loading": r"\b(?:thermal|loadings?|overloads?|line loading)\b"}
+
+
+def _violated_aspects(result: dict) -> set[str]:
+    kinds = {str(v.get("violation_type", "")) for v in result.get("violations") or [] if isinstance(v, dict)}
+    return {"voltage" for k in kinds if "vm" in k} | {"loading" for k in kinds if "loading" in k}
+
+
+def _about_another_state(sentence: str, at: int, result: dict, study: str = "") -> bool:
+    if _OTHER_STATE_RE.search(sentence):
+        return True
+    if (_CHANGED_WORDS_RE if _network_of(result) == "base" else _BASE_WORDS_RE).search(sentence):
+        return True
+    if "contingenc" in study and _INTACT_RE.search(sentence):
+        return True
+    # The time nearest the favourable words, when the sentence gives one, is the state it describes.
+    clocks = [(abs(m.start() - at), f"{int(m.group(1)):02d}:{m.group(2)}") for m in _CLOCK_IN_RE.finditer(sentence)]
+    stamp = str(result.get("timestamp") or "")
+    if clocks and len(stamp) >= 16 and min(clocks)[1] != stamp[11:16]:
+        return True
+    # One kind of limit, when the study's violations are all of another: "Thermal loading is within limits" beside
+    # an over-voltage.
+    named = {aspect for aspect, pattern in _ASPECTS.items() if re.search(pattern, sentence, re.IGNORECASE)}
+    violated = _violated_aspects(result)
+    return bool(named and violated and not named & violated)
 
 
 def _network_of(result: dict) -> str:
@@ -453,22 +526,42 @@ def check_study_claims(answer: str, record: dict) -> list[Conflict]:
     # An answer that says the operating point is insecure and then describes a
     # corrective dispatch "with no violations" has not called the former fine.
     acknowledged = _corrected(record) and bool(_STATES_INSECURE.search(text))
-    for name, verdict in _study_verdicts(record):
+    for name, verdict, result in _study_verdicts_with_results(record, earlier=not record.get("tool_results")):
         if verdict.field in seen or verdict.field in split:
             continue
         if verdict.field == "secure" and acknowledged:
             continue
-        # Judged over the whole answer rather than a sentence: the claim may be
-        # a standalone "All clear." with the detail in a neighbouring sentence.
-        if _asserts_favourable(text, verdict):
-            seen.add(verdict.field)
-            conflicts.append(Conflict(
-                value=0.0, unit=None,
-                context=" ".join(text.split())[:120],
-                path=name, field=verdict.field, detail=verdict.describe,
-                study=True,
-            ))
+        # Judged sentence by sentence: a standalone "All clear." is still a
+        # claim, but "the base network had no violations" beside a proposal's
+        # insecure study is about another state.
+        for sentence in _sentences_for_study(text):
+            if any(not (verdict.field == "secure" and _about_another_state(sentence, at, result, name))
+                   for at in _favourable_at(sentence, verdict)):
+                seen.add(verdict.field)
+                conflicts.append(Conflict(
+                    value=0.0, unit=None,
+                    context=" ".join(sentence.split())[:120],
+                    path=name, field=verdict.field, detail=verdict.describe,
+                    study=True,
+                ))
+                break
     return conflicts
+
+
+def _sentences_for_study(text: str) -> list[str]:
+    parts, start = [], 0
+    for match in _BOUNDARY_RE.finditer(text):
+        end = match.end()
+        # A full stop between two digits is a decimal point; inside "p.u." it is an abbreviation.
+        if match.group() == "." and ((end < len(text) and text[end].isdigit() and match.start() > 0
+                                      and text[match.start() - 1].isdigit())
+                                     or text[max(0, match.start() - 3):end].lower() in ("p.u.", ".u.")
+                                     or text[max(0, match.start() - 1):end + 2].lower().startswith("p.u")):
+            continue
+        parts.append(text[start:end])
+        start = end
+    parts.append(text[start:])
+    return [p for p in parts if p.strip()]
 
 
 def check_answer(answer: str, record: dict) -> list[Conflict]:
@@ -484,8 +577,19 @@ def check_answer(answer: str, record: dict) -> list[Conflict]:
     # it from the raw answer shifted the window by every `**` and timestamp
     # before the figure: a false conflict and a missed one were both reproduced.
     text = _strip_noise(answer or "")
+    # A value the same results also hold under the favourable flag is ambiguous: the envelope's +16.57 Mvar is
+    # feasible at the unit's present output and infeasible at a higher one, and the answer quoted the first.
+    favourable: dict[str, set] = {}
+    for entry in record.get("tool_results") or []:
+        if isinstance(entry, dict):
+            _favourable_numbers(entry.get("result"), favourable)
     conflicts: list[Conflict] = []
     for claim in extract_claims(text):
+        # 2. The "from" figure of a change ("minimum voltage rose from 0.939 to 0.955 p.u.") describes the state
+        # before it, whatever the sentence says of the state after.
+        before_change = bool(re.search(r"\bfrom\s*$", text[max(0, claim.position - 8):claim.position])) and bool(
+            re.match(r"[\d.,]*\s*(?:p\.u\.|pu|%|MW|MVAr|Mvar|kV)?\s*(?:to|→|->)\s*-?\d", text[claim.position:],
+                     re.IGNORECASE))
         # The claim's own 55-char window is too narrow to judge by: the
         # negation that makes a sentence correct routinely sits before it —
         # "No single source can clear it: the smallest sufficient movement
@@ -511,6 +615,8 @@ def check_answer(answer: str, record: dict) -> list[Conflict]:
                 continue
             matched.extend(
                 (path, q) for path, q in entries if _asserts_favourable(sentence, q)
+                and not (before_change and q.field in _STATE_FIELDS)
+                and round(abs(value), 6) not in {abs(v) for v in favourable.get(q.field, ())}
             )
 
         if matched:
