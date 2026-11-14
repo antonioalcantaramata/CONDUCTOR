@@ -513,6 +513,16 @@ def mentions_power_factor(text: str) -> bool:
     return bool(_PF_WORD_RE.search(text or ""))
 
 
+def power_factor_in_play(text: str, earlier: list[dict] | None = None) -> bool:
+    """Whether the load power factor is the operator's to set in this turn: the question speaks of it, or
+    the question before did, so that a follow-up ("and at 19:00?") keeps the 0.95 asked for a turn ago."""
+    if mentions_power_factor(text):
+        return True
+    previous = next((m["content"] for m in reversed(earlier or [])
+                     if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+    return mentions_power_factor(previous)
+
+
 def compares_power_factors(text: str) -> bool:
     """Whether the question sets one load power factor against another.
 

@@ -2,10 +2,14 @@
 
 The System tab shows the loaded network and everything CONDUCTOR assumes about
 it. At the top: the network's name and size, and a strip of **assumption chips**
-(load power factor, generators, costs, nominal point). A chip is highlighted when
-the assumption differs from the default; clicking it opens the assumptions.
+(load power factor, generators, costs, CIM layer, nominal point). A chip is
+highlighted when the assumption differs from the default; clicking it opens the
+assumptions. The **CIM layer** chip counts the facts you declared and the units
+whose energy source the network does not state (they are not treated as wind or
+solar until you declare them); it opens the CIM layer view.
 
-Three views: **🗺️ Network map**, **⚙️ Model assumptions** and **🏷️ Names**.
+Four views: **🗺️ Network map**, **🧭 CIM layer**, **⚙️ Model assumptions** and
+**🏷️ Names**.
 
 ## Network map
 
@@ -14,8 +18,38 @@ operating point in the sidebar: bus voltages, line and transformer loading,
 generation and demand, the external grid. The subtitle names the moment and any
 assumption that is not the default.
 
+**Colour by** switches what the colours show: the **operating point** (above),
+or what the [CIM layer](what-the-network-is.md) says each bus has — its units'
+**energy source**, its **feeder**, or **what is known** (everything stated, something
+read only from a name, something the network does not say). Hover over a bus for
+each unit and load there, with its basis.
+
 With proposals, choose which network to draw: the base or a proposal, and for a
 proposal its own map or the **difference from the base**.
+
+## CIM layer
+
+The network's **CIM layer**: what each element is (a unit's energy source, a
+load's category, a switch's normal state and role, each feeder) and how
+CONDUCTOR knows it: **stated** by the network, read from a **name**,
+**inferred** from the topology, or **unknown**. The agent answers from these
+facts, the studies use them, and every answer is checked against them.
+
+- **Edit** on a unit or a load sets what the network does not say (*Set what
+  it is* → **Apply**); **Forget** goes back to what the network says.
+- **Look around an element**: where it sits, how it is supplied, and what
+  would lose supply without it.
+- **Export as CIM…**: the whole layer as CIM RDF/XML or JSON-LD.
+- **Possible data issues**: what in the network's own data looks inconsistent —
+  a unit named "Solar Farm North" that the network types a CHP unit, a line
+  joining two voltage levels, a transformer rated for another voltage, a load
+  drawing negative power, loads cut off, a switch away from its normal state.
+  Shown open when something is to check; the agent sees the same.
+- **A proposal as a CIM difference**: what a proposal adds, removes or changes in
+  the layer, and the file — a CIM difference model (IEC 61970-552, as CGMES
+  exchanges changes) that turns the base's export into the proposal's.
+
+See [What the network is](what-the-network-is.md) for what each part shows.
 
 ## Model assumptions
 
@@ -100,7 +134,7 @@ tab per kind of element; **Edit** on a row opens the rename form, and
 - Earlier answers keep the names they ran with and say so.
 - CONDUCTOR can rename too: *"Rename Bus 3 to North."*
 
-Renames, costs, generator models and the power factor are kept for the network
+Renames, declarations, costs, generator models and the power factor are kept for the network
 across restarts; see [Sessions and scenarios](sessions-and-scenarios.md). When
 CONDUCTOR changes any of them in an answer, the answer says so and offers
 **Undo** (see [Reading an answer](reading-an-answer.md#answers-that-changed-a-setting)).

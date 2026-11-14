@@ -37,7 +37,12 @@ reports the buses, their number and the load on them (`unsupplied_load_mw`),
 with a sentence on what was disconnected. An unsupplied bus has no voltage to
 violate, so it adds no violation; but an outage that cuts load off is not
 secure: `system_secure` is false, and when no limit breaks the message says
-how many MW of load the outage cuts off.
+how many MW of load the outage cuts off. The normally open **ties** that join
+the cut-off part to a supplied one are then each checked with a power flow at
+the same moment, the element out and the tie closed
+(`ties_that_could_restore`): how many of the cut-off buses it restores, the
+lowest voltage, the highest loading, and any of the study's limits broken. It
+is one moment's check, not a switching plan.
 
 **Non-convergence.** When the power flow finds no solution after the outage,
 the result says so (`converged: false`) and asks for it to be treated as
@@ -46,7 +51,10 @@ insecure — never as zero violations.
 ## The N-1 screen
 
 The screen repeats the single-outage study for **every in-service line and
-transformer**, one at a time, restoring each before the next. A branch already
+transformer**, one at a time, restoring each before the next. With a
+**scope**, only the outages of one feeder, substation or voltage level, as the
+[CIM layer](what-the-network-is.md) gives them (*N-1 on the 20 kV level*); the
+violations they cause are still looked for in the whole network. A branch already
 out of service is not a contingency, nor is one whose end bus is out of service
 (an island an earlier outage left, in the N-1-1 screen below). For each outage
 it collects the violations, tagged with the outage that caused them

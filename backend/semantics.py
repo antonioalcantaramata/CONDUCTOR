@@ -441,12 +441,14 @@ def _v(kind: str, why: str) -> dict:
 
 
 def value_provenance(net, rows, *, dataset: str = "measurements", moment: str | None = None,
-                     synthetic: bool = True, load_pf: float = 0.95, load_pf_source: str = "default") -> dict:
+                     synthetic: bool = True, load_pf: float = 0.95, load_pf_source: str = "default",
+                     generated: str | None = None) -> dict:
     """Where each load's and unit's P and Q at the present operating point come
     from — the data, a share of them, an assumption, the power flow — worked
     out from the moment's data rows (`rows`: substation_name, consumption,
     production, and consumption_q / production_q when measured) the way the
-    assignment uses them. Pure: the values themselves are not touched."""
+    assignment uses them. `generated`: how synthetic data were made, in words.
+    Pure: the values themselves are not touched."""
     from element_names import measurement_name
     got = "forecast" if dataset == "forecasts" else "measured"
     noun = "forecast" if dataset == "forecasts" else ("synthetic data" if synthetic else "measurements")
@@ -516,6 +518,7 @@ def value_provenance(net, rows, *, dataset: str = "measurements", moment: str | 
         units[f"storage:{int(i)}"] = {"p": _v("set", "held at its set-point; the data carry no storage"),
                                       "q": _v("set", "held at its set-point")}
     context = {"dataset": dataset, "moment": moment, "synthetic": synthetic,
+               **({"generated": generated} if synthetic and generated else {}),
                "load_power_factor": {"value": load_pf, "source": load_pf_source},
                "reactive_in_data": bool(cons_q)}
     return {"context": context, "loads": loads, "units": units}
@@ -559,7 +562,10 @@ def _kv(net, bus: int, per_unit: bool) -> dict:
     proposed = "proposed" in net.bus.columns and bool(net.bus.at[bus, "proposed"] is True)
     if per_unit and not proposed:
         return fact(None, UNKNOWN, "a converted per-unit case: 1 kV stands for the bus's real voltage")
-    return fact(float(net.bus.at[bus, "vn_kv"]), STATED, "the bus's nominal voltage in the network")
+    kv = net.bus.at[bus, "vn_kv"]
+    if pd.isna(kv):
+        return fact(None, UNKNOWN, "the network gives this bus no nominal voltage")
+    return fact(float(kv), STATED, "the bus's nominal voltage in the network")
 
 
 def build(net, declared: dict | None = None, profile: dict | None = None,
@@ -900,8 +906,8 @@ def view(semantics: dict, about: str = "summary") -> dict:
                             "loads": f["loads"][:_MAX_LISTED], "load_mw": f["load_mw"], "ties": f["ties"]}
                            for f in fs[:_MAX_LISTED]]}
         if not fs:
-            out["note"] = ("No feeders: " + next((b["feeder"]["from"] for b in buses if b.get("feeder")),
-                                                 "no external grid") + ".")
+            why = next((b["feeder"]["from"] for b in buses if b.get("feeder")), "no external grid")
+            out["note"] = "No feeders: " + why.removeprefix("no feeder: ") + "."
         return out
     if about == "data":
         ctx = semantics.get("provenance")
@@ -932,7 +938,9 @@ def view(semantics: dict, about: str = "summary") -> dict:
                         "power flow sets it: a unit holding a voltage), set, nominal (not in the data: the case's "
                         "own value), proposal. Say which when it matters: an allocated or derived value is not a "
                         "measurement."
-                        + (" These are synthetic data, not field measurements." if ctx.get("synthetic") else "")}
+                        + (" These are synthetic data, not field measurements"
+                           + (f", generated with: {ctx['generated']}" if ctx.get("generated") else "") + "."
+                           if ctx.get("synthetic") else "")}
     if about == "voltage_levels":
         if semantics["per_unit_case"]:
             return {"about": "voltage_levels", "levels_kv": [], "basis": UNKNOWN,
@@ -989,16 +997,20 @@ def _value_kinds(e: dict) -> dict:
 def compact(semantics: dict) -> dict:
     """The facts an answer is checked against, small enough to keep in each
     turn's record: names, kinds, voltages, ends, sources — with their bases."""
+    # The feeder each bus is on (its head line's short name; None off any feeder), inferred from the topology.
+    feeder = {b["index"]: _short_name((b.get("feeder") or {}).get("value")) or None for b in semantics["buses"]}
     return {
         "per_unit_case": semantics["per_unit_case"],
         "voltage_levels_kv": semantics["voltage_levels_kv"],
         "buses": {b["name"]: {"kv": b["kv"]["value"], "kv_basis": b["kv"]["basis"],
-                              "substation": b["substation"]["value"]} for b in semantics["buses"]},
+                              "substation": b["substation"]["value"], "feeder": feeder.get(b["index"])}
+                  for b in semantics["buses"]},
         "branches": {b["name"]: {"type": b["element_type"], "ends": b["ends"]} for b in semantics["branches"]},
         "units": {u["name"]: {"source": u["source"]["value"], "basis": u["source"]["basis"], "bus": u["bus"],
-                              "type": u["element_type"], **_value_kinds(u)} for u in semantics["units"]},
+                              "type": u["element_type"], "feeder": feeder.get(u["bus_index"]), **_value_kinds(u)}
+                  for u in semantics["units"]},
         "loads": {d["name"]: {"category": d["category"]["value"], "basis": d["category"]["basis"], "bus": d["bus"],
-                              **_value_kinds(d)}
+                              "feeder": feeder.get(d["bus_index"]), **_value_kinds(d)}
                   for d in semantics.get("loads") or []},
         "switches": {s["name"]: {"open": s["open"]["value"], "normal_open": s["normal_open"]["value"],
                                  "role": s["role"]["value"]} for s in semantics.get("switches") or []},
@@ -1062,9 +1074,271 @@ def _cut_off(net, graph, sources: list[int], *, edges=(), nodes=()) -> set[int]:
     return (before - after) | (set(nodes) & before)
 
 
-def _ties(net, names: dict, lost: set[int]) -> list[str]:
-    """Normally open switches whose line joins the cut-off part to a supplied
-    one: what could restore supply (not checked against flows)."""
+def scope_buses(semantics: dict, scope: str) -> tuple[set[int], str, str]:
+    """The buses a scope names, by the CIM layer: a voltage level ("20 kV"), a
+    feeder (by its name) or a substation. Returns ({bus index}, the kind —
+    "level", "feeder" or "substation" — and what it covers, in words). Raises
+    ValueError with the choices when nothing matches."""
+    said = str(scope or "").strip()
+    containers = semantics.get("containers") or {}
+    by_name = {b["name"]: b["index"] for b in semantics["buses"]}
+    levels = [float(v) for v in semantics.get("voltage_levels_kv") or []]
+    m = re.fullmatch(r"(?:the\s+)?(\d+(?:\.\d+)?)\s*kv(?:\s+level)?", said, re.IGNORECASE)
+    if m:
+        kv = float(m.group(1))
+        if not any(abs(kv - level) < 1e-6 for level in levels):
+            raise ValueError(f"This network has no {kv:g} kV level; its levels are "
+                             + (", ".join(f"{v:g} kV" for v in sorted(levels, reverse=True)) or "not stated") + ".")
+        buses = {int(b["index"]) for b in semantics["buses"]
+                 if b["kv"]["value"] is not None and abs(float(b["kv"]["value"]) - kv) < 1e-6}
+        return buses, "level", f"the {kv:g} kV level"
+    folded = re.sub(r"^(?:the\s+)?(?:feeder|substation)\s+", "", said, flags=re.IGNORECASE).casefold()
+    # The name first, as it is said: "the Line 12-13 feeder", "the Bus 5 substation".
+    folded = re.sub(r"^(?:the\s+)?(.+?)\s+(?:feeder|substation)$", r"\1", folded, flags=re.IGNORECASE)
+    for f in containers.get("feeders") or []:
+        if f["name"].casefold() == folded or f["name"].split(" | ")[0].casefold() == folded:
+            return ({by_name[n] for n in f["buses"] if n in by_name}, "feeder",
+                    f"feeder {f['name'].split(' | ')[0]}")
+    for sub in containers.get("substations") or []:
+        if str(sub["name"]).casefold() == folded:
+            return ({by_name[n] for level in sub["voltage_levels"] for n in level["buses"] if n in by_name},
+                    "substation", f"substation {sub['name']}")
+    feeders = [f["name"].split(" | ")[0] for f in containers.get("feeders") or []]
+    raise ValueError(
+        f"No feeder, substation or voltage level is called {said!r}. "
+        + (f"Feeders: {', '.join(feeders[:8])}. " if feeders else "This network has no feeders (none radial). ")
+        + (f"Voltage levels: {', '.join(f'{v:g} kV' for v in sorted(levels, reverse=True))}. " if levels else "")
+        + "Substations: by name (describe_network about='substations').")
+
+
+def scope_branches(semantics: dict, scope: str) -> tuple[set[tuple[str, int]], str]:
+    """The lines and transformers a scope names (`scope_buses`): a voltage
+    level's lines and the transformers that connect it; a feeder's branches
+    among the buses it supplies, and its head line; a substation's branches
+    with an end in it. Returns ({(type, index)}, what the scope covers, in
+    words). Raises ValueError with the choices when nothing matches."""
+    buses, kind, words = scope_buses(semantics, scope)
+    branches = [b for b in semantics["branches"] if b["element_type"] in ("line", "trafo")]
+    if kind == "level":
+        out = {(b["element_type"], int(b["index"])) for b in branches if buses & set(b["ends_index"])}
+        return out, f"{words}: its lines and the transformers that connect it"
+    if kind == "feeder":
+        head = words.removeprefix("feeder ").casefold()
+        out = {(b["element_type"], int(b["index"])) for b in branches
+               if set(b["ends_index"]) <= buses or b["name"].split(" | ")[0].casefold() == head}
+        return out, f"{words}: the branches among the {len(buses)} buses it supplies"
+    out = {(b["element_type"], int(b["index"])) for b in branches if buses & set(b["ends_index"])}
+    return out, f"{words}: the branches with an end in it"
+
+
+# What a selection asks for, by the words people use (`select`).
+_KIND_WORDS = (("units", r"units?|generators?|plants?|farms?|parks?|machines?|ders?"),
+               ("loads", r"loads?|customers?|consumers?|demands?"),
+               ("branches", r"branch(?:es)?|lines?|transformers?|trafos?|cables?"))
+_GROUPS = {"renewable": set(RENEWABLE), "renewables": set(RENEWABLE), "variable": set(VARIABLE),
+           "weather-dependent": set(VARIABLE), "conventional": {"thermal", "nuclear", "conventional"},
+           "dispatchable": {"thermal", "nuclear", "conventional", "hydro", "bioenergy", "storage"}}
+
+
+def _qualifier(words: str, kind: str) -> tuple[set[str] | None, str]:
+    """The sources (units) or categories (loads) a qualifier names, and how it reads. None: every one."""
+    words = words.strip().casefold().replace("-", " ")
+    if not words or words in ("all", "every", "the", "all the"):
+        return None, ""
+    words = re.sub(r"^(?:all|every|the|all the)\s+", "", words)
+    if words in ("unknown", "undescribed", "unidentified"):
+        return {"unknown"}, "whose kind the network does not say"
+    if kind == "units":
+        if words in _GROUPS:
+            return _GROUPS[words], words
+        for value, pattern in _TYPE_PATTERNS:
+            if re.fullmatch(r"(?:" + pattern + r")", words):
+                return {value}, value
+    if kind == "loads":
+        for value, pattern in _LOAD_TYPE_PATTERNS:
+            if re.fullmatch(r"(?:" + pattern + r")", words):
+                return {value}, value.replace("_", " ")
+    raise ValueError(f"{words!r} is not a kind of {kind} the CIM layer knows.")
+
+
+def select(semantics: dict, phrase: str) -> dict:
+    """The elements a phrase names, by the CIM layer, not by their names:
+    "solar units", "the wind units on feeder Line 1-2", "industrial loads at 20 kV",
+    "units in substation Bus 5", "loads whose category is unknown" ("unknown
+    loads"), "lines at the 20 kV level". A qualifier is a source or a group
+    (renewable, variable, conventional, dispatchable) for units, a category for
+    loads; a place is a feeder, a substation or a voltage level (`scope_buses`).
+    Returns {"kind", "elements": [{"name", "type", "index", "bus", "is", "basis"}],
+    "asked", "means"}. Raises ValueError, with the choices, for a phrase it
+    cannot read or one that matches nothing."""
+    said = re.sub(r"\s+", " ", str(phrase or "").strip())
+    place = None
+    m = re.search(r"\s+(?:on|at|in|of|within|along)\s+(?:the\s+)?(?P<place>(?:feeder|substation)\s+.+|"
+                  r"\d+(?:\.\d+)?\s*kv(?:\s+level)?|.+)$", said, re.IGNORECASE)
+    head = said
+    if m:
+        place, head = m.group("place"), said[:m.start()]
+    head = re.sub(r"\s+whose (?:source|category|kind) is unknown$", "", head, flags=re.IGNORECASE) \
+        if re.search(r"whose (?:source|category|kind) is unknown$", head, re.IGNORECASE) else head
+    unknown_tail = bool(re.search(r"whose (?:source|category|kind) is unknown", said, re.IGNORECASE))
+    kind, qualifier_words = None, ""
+    for name, pattern in _KIND_WORDS:
+        k = re.search(r"\b(?:" + pattern + r")$", head.strip(), re.IGNORECASE)
+        if k:
+            kind, qualifier_words = name, head.strip()[:k.start()]
+            # The word itself may qualify: "transformers" are branches of one type, "lines" of another.
+            noun = k.group(0).casefold()
+            break
+    if kind is None:
+        raise ValueError(f"Could not read {phrase!r}: say units, loads or branches, with what kind and where — "
+                         "e.g. 'solar units on feeder Line 1-2', 'industrial loads at 20 kV', 'units in "
+                         "substation Bus 5'.")
+    wanted, reads = ({"unknown"}, "whose kind the network does not say") if unknown_tail else \
+        _qualifier(qualifier_words, kind)
+    buses, where = None, ""
+    if place:
+        buses, _kind, where = scope_buses(semantics, place)
+    out = []
+    if kind == "units":
+        for u in semantics.get("units") or []:
+            value, basis = u["source"]["value"], u["source"]["basis"]
+            if wanted is not None and not ((("unknown" in wanted) and basis == UNKNOWN)
+                                           or (value in wanted and basis != UNKNOWN)):
+                continue
+            if buses is not None and u["bus_index"] not in buses:
+                continue
+            out.append({"name": u["name"], "type": u["element_type"], "index": u["index"],
+                        "bus": u.get("bus"), "is": value, "basis": basis})
+    elif kind == "loads":
+        for d in semantics.get("loads") or []:
+            value, basis = d["category"]["value"], d["category"]["basis"]
+            if wanted is not None and not ((("unknown" in wanted) and basis == UNKNOWN)
+                                           or ((value in wanted or (value == "commercial_industrial" and wanted
+                                                                    & {"commercial", "industrial"}))
+                                               and basis != UNKNOWN)):
+                continue
+            if buses is not None and d["bus_index"] not in buses:
+                continue
+            out.append({"name": d["name"], "type": "load", "index": d["index"], "bus": d.get("bus"),
+                        "is": value, "basis": basis})
+    else:
+        only = "trafo" if noun.startswith(("transformer", "trafo")) else "line" if noun.startswith(("line", "cable")) \
+            else None
+        for b in semantics.get("branches") or []:
+            if b["element_type"] not in ("line", "trafo") or (only and b["element_type"] != only):
+                continue
+            if buses is not None and not buses & set(b["ends_index"]):
+                continue
+            out.append({"name": b["name"].split(" | ")[0], "type": b["element_type"], "index": b["index"],
+                        "bus": " – ".join(b["ends"]), "is": b["element_type"], "basis": STATED})
+    noun_words = kind if kind != "branches" else (noun if only else "branches")
+    parts = (noun_words, reads) if reads.startswith("whose") else (reads, noun_words)
+    means = " ".join(w for w in (*parts, f"in {where}" if where else "") if w)
+    if not out:
+        raise ValueError(f"No {means} in this network, by the CIM layer.")
+    return {"kind": kind, "asked": said, "means": means, "elements": out}
+
+
+# ---------------------------------------------------------------------------
+# The layer checked against itself: what in the network's own data looks wrong
+# ---------------------------------------------------------------------------
+
+def _name_says(name: str, patterns) -> str | None:
+    for value, pattern in patterns:
+        if re.search(pattern, str(name or ""), re.IGNORECASE):
+            return value
+    return None
+
+
+def data_issues(net, semantics: dict) -> list[dict]:
+    """What in the network's own data looks inconsistent, found from the facts
+    (no study run): each {"kind", "element", "note", "level"} — "check" for a
+    likely error, "note" for something worth knowing. For any network:
+
+    - a unit or a load whose name says one thing and whose stated type another
+      ("Solar Farm North", typed a CHP unit) — which the agent must not trust;
+    - a switch operated away from its normal state;
+    - a line between buses at two voltage levels; a transformer whose rated
+      voltages are not its buses';
+    - loads with no path to a source; a load drawing negative power;
+    - some loads with a category and others without; names used twice."""
+    out: list[dict] = []
+    for u in semantics.get("units") or []:
+        f = u["source"]
+        if f["basis"] == STATED and "declared" not in str(f.get("from")):
+            says = _name_says(u["name"], _NAME_PATTERNS)
+            if says and says != f["value"]:
+                typed = re.search(r"\('([^']*)'\)", str(f.get("from") or ""))
+                where = f" ('{typed.group(1)}')" if typed else f" ({f.get('from')})"
+                out.append({"kind": "name_contradicts_type", "element": u["name"], "level": "check",
+                            "note": f"its name says {says}, but its type in the network says {f['value']}{where}: "
+                                    "the name is not to be trusted"})
+    for d in semantics.get("loads") or []:
+        f = d["category"]
+        if f["basis"] == STATED and "declared" not in str(f.get("from")):
+            says = _name_says(d["name"], _LOAD_NAME_PATTERNS)
+            if says and says != f["value"] and not (f["value"] == "commercial_industrial"
+                                                     and says in ("commercial", "industrial")):
+                out.append({"kind": "name_contradicts_type", "element": d["name"], "level": "check",
+                            "note": f"its name says {says.replace('_', ' ')}, but the network states "
+                                    f"{f['value'].replace('_', ' ')}"})
+        if d.get("p_mw") is not None and float(d["p_mw"]) < -1e-6:
+            out.append({"kind": "negative_load", "element": d["name"], "level": "check",
+                        "note": f"draws {float(d['p_mw']):g} MW (negative): a generator entered as a load?"})
+    for sw in semantics.get("switches") or []:
+        normal, now = (sw.get("normal_open") or {}).get("value"), (sw.get("open") or {}).get("value")
+        if normal is not None and now is not None and normal != now:
+            out.append({"kind": "switch_off_normal", "element": sw["name"], "level": "note",
+                        "note": f"normally {'open' if normal else 'closed'}, {'open' if now else 'closed'} now"})
+    kv = {b["index"]: b["kv"]["value"] for b in semantics.get("buses") or []}
+    for b in semantics.get("branches") or []:
+        if b["element_type"] == "line":
+            ends = [kv.get(e) for e in b["ends_index"]]
+            if None not in ends and abs(float(ends[0]) - float(ends[1])) > 1e-6:
+                out.append({"kind": "line_across_levels", "element": b["name"].split(" | ")[0], "level": "check",
+                            "note": f"joins buses at {ends[0]:g} kV and {ends[1]:g} kV: a line cannot change the "
+                                    "voltage (a transformer entered as a line, or a bus's level wrong?)"})
+        elif b["element_type"] == "trafo" and "trafo" in net and int(b["index"]) in net.trafo.index:
+            row = net.trafo.loc[int(b["index"])]
+            hv, lv = kv.get(int(row["hv_bus"])), kv.get(int(row["lv_bus"]))
+            for side, rated, bus_kv in (("high", row.get("vn_hv_kv"), hv), ("low", row.get("vn_lv_kv"), lv)):
+                if rated is not None and bus_kv is not None and rated == rated and bus_kv \
+                        and abs(float(rated) - float(bus_kv)) / float(bus_kv) > 0.15:
+                    out.append({"kind": "trafo_rating_vs_bus", "element": b["name"].split(" | ")[0],
+                                "level": "check",
+                                "note": f"its {side}-voltage side is rated {float(rated):g} kV, its bus is at "
+                                        f"{float(bus_kv):g} kV"})
+    try:
+        import pandapower.topology as top
+        lost = {int(b) for b in top.unsupplied_buses(net)}
+    except Exception:  # noqa: BLE001 — a network the search cannot read says nothing here
+        lost = set()
+    cut = [d["name"] for d in semantics.get("loads") or [] if d.get("bus_index") in lost and d.get("in_service", True)]
+    if cut:
+        out.append({"kind": "loads_without_supply", "element": ", ".join(cut[:5]) + (" …" if len(cut) > 5 else ""),
+                    "level": "check", "note": f"{len(cut)} load(s) with no path to a source as switched now"})
+    loads = semantics.get("loads") or []
+    known = [d for d in loads if d["category"]["basis"] != UNKNOWN]
+    if known and len(known) < len(loads):
+        out.append({"kind": "categories_partly_known", "element": f"{len(loads) - len(known)} loads", "level": "note",
+                    "note": f"{len(known)} of {len(loads)} loads have a category; the others follow the defaults "
+                            "(declare them to use theirs)"})
+    for kind_name, entries in (("bus", semantics.get("buses") or []), ("unit", semantics.get("units") or []),
+                               ("load", loads)):
+        seen: dict[str, int] = {}
+        for e in entries:
+            seen[e["name"]] = seen.get(e["name"], 0) + 1
+        twice = sorted(n for n, k in seen.items() if k > 1)
+        if twice:
+            out.append({"kind": "duplicate_names", "element": ", ".join(twice[:5]), "level": "note",
+                        "note": f"{len(twice)} {kind_name} name(s) used more than once: results tell them apart by "
+                                "index, an answer by name cannot"})
+    return out
+
+
+def tie_switches(net, names: dict, lost: set[int]) -> list[tuple[int, str]]:
+    """(switch index, label) of each open switch whose line joins the cut-off
+    part to a supplied one: what could restore supply, by the topology."""
     out = []
     sw = getattr(net, "switch", None)
     if sw is None or not len(sw):
@@ -1079,17 +1353,28 @@ def _ties(net, names: dict, lost: set[int]) -> list[str]:
         if (a in lost) != (b in lost):
             what = names.get(("line", int(s.element))) if s.et == "l" else f"bus coupler {int(s.bus)}–{int(s.element)}"
             label = clean_label(s.get("name")) if "name" in sw.columns else ""
-            out.append(f"{what} (switch {label or int(i)}, open at {bus_display_name(net, int(s.bus))})")
+            out.append((int(i), f"{what} (switch {label or int(i)}, open at {bus_display_name(net, int(s.bus))})"))
     return out
 
 
-def around(net, semantics: dict, etype: str, idx) -> dict:
+def _ties(net, names: dict, lost: set[int]) -> list[str]:
+    """The labels of `tie_switches`."""
+    return [label for _i, label in tie_switches(net, names, lost)]
+
+
+# At most this many ties are checked with a power flow (each is one).
+MAX_TIES_CHECKED = 5
+
+
+def around(net, semantics: dict, etype: str, idx, check_tie=None) -> dict:
     """An element and everything it is connected to, in one answer: its
     substation (levels, buses, units and loads there, branches leaving and
     where they lead, the external grid), its supply route from the external
     grid and its feeder (inferred from the topology), and — for a bus, a
     branch or a substation — what would be cut off without it, with the open
-    ties that could restore it. `etype`: bus, line, trafo, gen, sgen, storage,
+    ties that could restore it. `check_tie(outage, switch, label, lost)`, when
+    given, checks each tie with a power flow (the backend's: this module runs
+    none) and its result is kept under `ties_checked`. `etype`: bus, line, trafo, gen, sgen, storage,
     load or substation (`idx`: its name)."""
     import networkx as nx
     buses = {b["index"]: b for b in semantics["buses"]}
@@ -1153,11 +1438,16 @@ def around(net, semantics: dict, etype: str, idx) -> dict:
         supply = {"basis": UNKNOWN, "note": "The network has no external grid in service: no supply route."}
     else:
         # The route to the far end of a branch includes the branch itself.
+        # Over the external grids that reach it: with several in separate islands, one that cannot reach
+        # the bus must not hide the one that does.
         def hops(b):
-            try:
-                return min(nx.shortest_path_length(graph, s, b) for s in sources if s in graph)
-            except (nx.NetworkXNoPath, nx.NodeNotFound, ValueError):
-                return -1
+            reach = []
+            for s in sources:
+                try:
+                    reach.append(nx.shortest_path_length(graph, s, b))
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+            return min(reach) if reach else -1
         target = max(anchor, key=hops) if anchor else None
         route = _route(net, graph, names, sources, target) if target is not None and target in graph else None
         if route is None:
@@ -1207,4 +1497,324 @@ def around(net, semantics: dict, etype: str, idx) -> dict:
             "load_cut_off_mw": round(sum(d["p_mw"] for d in lost_loads), 3),
             **({"open_ties_that_could_restore": _ties(net, names, lost)} if lost else {}),
         }
+        ties = tie_switches(net, names, lost) if lost and check_tie else []
+        if ties:
+            outage = ({"etype": etype, "index": int(idx)} if etype in ("line", "trafo")
+                      else {"etype": "buses", "buses": sorted(int(b) for b in anchor)})
+            out["without_it"]["ties_checked"] = [check_tie(outage, switch, label, lost)
+                                                 for switch, label in ties[:MAX_TIES_CHECKED]]
+            out["without_it"]["ties_checked_by"] = ("a power flow per tie at the current operating point, with the "
+                                                    "element out and the tie closed; limits are the network's")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Links from a study's result to the layer: what each element it names is
+# ---------------------------------------------------------------------------
+
+# How many elements of one result are linked (the first named, in the result's own order).
+MAX_LINKED = 8
+MAX_STUDIED = 3          # elements a study's arguments name, linked first
+_LISTED_HERE = 4          # units or loads listed at one bus; more are counted
+_TYPE_ORDER = ("bus", "branch", "unit", "load")
+
+
+def layer_version(semantics: dict) -> str:
+    """A short digest of what the layer says — each element's kind, voltage, substation, feeder, ends, source or
+    category with its basis, and the switches' state — not of the operating point. A study's links carry it: when
+    the layer changes (a declaration, a proposal edit), the version does, so a link can say it is out of date."""
+    import hashlib
+    facts = {
+        "buses": sorted((b["name"], b["kv"]["value"], b["kv"]["basis"], b["substation"]["value"],
+                         (b.get("feeder") or {}).get("value")) for b in semantics["buses"]),
+        "branches": sorted((b["name"], b["element_type"], *b["ends"], b["in_service"]) for b in semantics["branches"]),
+        "units": sorted((u["name"], u["source"]["value"], u["source"]["basis"], u["bus"]) for u in semantics["units"]),
+        "loads": sorted((d["name"], d["category"]["value"], d["category"]["basis"], d["bus"])
+                        for d in semantics.get("loads") or []),
+        "switches": sorted((s["name"], bool(s["open"]["value"]), bool(s["normal_open"]["value"]))
+                           for s in semantics.get("switches") or []),
+    }
+    return hashlib.sha1(json.dumps(facts, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def _short_name(name) -> str:
+    return str(name or "").split(" | ")[0]
+
+
+def link_targets(semantics: dict, candidates, limit: int = MAX_LINKED) -> list[dict]:
+    """The layer's elements that `candidates` name — [(text, kind hint or None)], in the result's order — as
+    [{name, type, index, mrid}], each once, at most `limit`. A text names an element when it is its name (a
+    branch's short name too) or begins with it ("Bus 9 at 0.93 p.u."). The hint ("bus", "branch", "unit",
+    "load") decides between elements of different kinds sharing a name; without one, a bus is taken first."""
+    index: dict[str, dict[str, dict]] = {k: {} for k in _TYPE_ORDER}
+    for b in semantics["buses"]:
+        index["bus"].setdefault(b["name"], {"name": b["name"], "type": "bus", "index": b["index"], "mrid": b["mrid"]})
+    for b in semantics["branches"]:
+        entry = {"name": b["name"], "type": b["element_type"], "index": b["index"], "mrid": b["mrid"]}
+        index["branch"].setdefault(b["name"], entry)
+        index["branch"].setdefault(_short_name(b["name"]), entry)
+    for u in semantics["units"]:
+        index["unit"].setdefault(u["name"], {"name": u["name"], "type": u["element_type"], "index": u["index"],
+                                             "mrid": u["mrid"]})
+    for d in semantics.get("loads") or []:
+        index["load"].setdefault(d["name"], {"name": d["name"], "type": "load", "index": d["index"], "mrid": d["mrid"]})
+    # Longest first, so "Bus 1" never claims "Bus 12 at 0.93 p.u.".
+    prefixes = sorted({n for names in index.values() for n in names}, key=len, reverse=True)
+
+    def lookup(name: str, hint) -> dict | None:
+        order = ((hint,) if hint in index else ()) + _TYPE_ORDER
+        return next((index[k][name] for k in order if name in index[k]), None)
+
+    out, seen = [], set()
+    for text, hint in candidates:
+        t = str(text or "").strip()
+        if not t or len(t) > 120:
+            continue
+        hit = lookup(t, hint)
+        if hit is None:
+            head = next((n for n in prefixes if t.startswith(n) and len(t) > len(n) and not t[len(n)].isalnum()
+                         and t[len(n)] not in "_-."), None)
+            hit = lookup(head, hint) if head else None
+        if hit is None or hit["mrid"] in seen:
+            continue
+        seen.add(hit["mrid"])
+        out.append(hit)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def ref_targets(semantics: dict, refs) -> list[dict]:
+    """`link_targets`' entries for elements given by type and index — what a study's arguments name ("element_type":
+    "line", "element_index": 10) rather than its result. Unknown ones are left out."""
+    def pool(kind: str) -> list[dict]:
+        if kind == "bus":
+            return semantics["buses"]
+        if kind == "load":
+            return semantics.get("loads") or []
+        if kind in ("line", "trafo"):
+            return [b for b in semantics["branches"] if b["element_type"] == kind]
+        if kind in ("gen", "sgen", "storage"):
+            return [u for u in semantics["units"] if u["element_type"] == kind]
+        return []
+
+    out = []
+    for ref in refs or []:
+        kind = str((ref or {}).get("type") or "").lower()
+        try:
+            idx = int(ref.get("index"))
+        except (TypeError, ValueError):
+            continue
+        hit = next((e for e in pool(kind) if e["index"] == idx), None)
+        if hit is not None:
+            out.append({"name": hit["name"], "type": kind, "index": idx, "mrid": hit["mrid"]})
+    return out
+
+
+def feeder_ties(semantics: dict, feeders) -> dict:
+    """{feeder (short name): [its normally open points]} — each switch, the branch it is on and the bus it is at, and
+    the feeder on the other side ("tie") or none (a loop within the feeder). From the layer's switch roles."""
+    full = {_short_name(f["name"]): f["name"] for f in (semantics.get("containers") or {}).get("feeders") or []}
+    out: dict[str, list] = {}
+    for short in dict.fromkeys(f for f in feeders if f):
+        name = full.get(short)
+        if not name:
+            continue
+        rows = []
+        for sw in semantics.get("switches") or []:
+            role = str((sw.get("role") or {}).get("value") or "")
+            if not (sw.get("normal_open") or {}).get("value") or name not in role:
+                continue
+            others = [k for k, v in full.items() if v in role and k != short]
+            where = sw.get("where") or {}
+            rows.append({"switch": sw["name"], "on": _short_name(where.get("element")) or None, "at": where.get("at"),
+                         "to_feeder": others[0] if others else None,
+                         "open_now": bool((sw.get("open") or {}).get("value"))})
+        if rows:
+            out[short] = rows
+    return out
+
+
+def context(net, semantics: dict, targets: list[dict], demand: dict | None = None) -> dict:
+    """{mrid: what the layer says the element is} for `link_targets`' elements, each fact with its basis:
+
+    - a bus: voltage, substation, feeder and where on it (counted in buses from the substation), the units and
+      loads there;
+    - a line or transformer: its ends, voltage, feeder, and which buses and loads lose supply without it
+      (topology only: no demand, which is the operating point's, not the layer's);
+    - a unit or a load: its source or category, its bus and feeder.
+
+    Topology only — no power flow. The feeder is the layer's inference (radial voltage levels only).
+
+    `demand`: {load index: MW} at the moment a study ran (the backend reads it as the study did); with it, a bus
+    says the demand there (`load_mw`) and a branch the demand it cuts off (`load_cut_off_mw`). Without it, no MW:
+    demand is the operating point's, and a figure from another moment would pass for the study's."""
+    import networkx as nx
+    buses = {b["index"]: b for b in semantics["buses"]}
+    graph = _graph(net)
+    sources = [int(b) for b, on in zip(net.ext_grid.bus, net.ext_grid.in_service) if bool(on) and int(b) in graph]
+    depth: dict[int, int] = {}
+    for s in sources:
+        for bus, d in nx.single_source_shortest_path_length(graph, s).items():
+            depth[int(bus)] = min(d, depth.get(int(bus), d))
+    on_feeder: dict[str, list[int]] = {}
+    for b in semantics["buses"]:
+        f = (b.get("feeder") or {}).get("value")
+        if f:
+            on_feeder.setdefault(f, []).append(b["index"])
+    units_at: dict[int, list[dict]] = {}
+    for u in semantics["units"]:
+        units_at.setdefault(u["bus_index"], []).append(u)
+    loads_at: dict[int, list[dict]] = {}
+    for d in semantics.get("loads") or []:
+        loads_at.setdefault(d["bus_index"], []).append(d)
+
+    def basis(f: dict) -> dict:
+        return {"value": f.get("value"), "basis": f.get("basis")}
+
+    def feeder_of(bus: int | None) -> dict | None:
+        f = (buses.get(bus) or {}).get("feeder") or {}
+        if not f.get("value"):
+            why = str(f.get("from") or "")
+            return {"value": None, "basis": f.get("basis"), "why": why.removeprefix("no feeder: ")} if why else None
+        out = {"value": _short_name(f["value"]), "basis": f["basis"]}
+        members = [b for b in on_feeder.get(f["value"], []) if b in depth]
+        if bus in depth and members:
+            top = min(depth[b] for b in members)
+            out["position"] = depth[bus] - top + 1
+            out["of"] = max(depth[b] for b in members) - top + 1
+        return out
+
+    def mw(loads: list[dict]) -> float:
+        return round(sum(demand.get(d["index"], 0.0) for d in loads if d.get("in_service", True)), 3)
+
+    def values(e: dict) -> dict:
+        """How the element's P and Q are obtained from the data (measured, allocated, derived…), when known."""
+        v = e.get("values") or {}
+        if not v.get("p"):
+            return {}
+        return {"p_kind": v["p"].get("kind"), "q_kind": (v.get("q") or {}).get("kind"), "p_from": v["p"].get("from")}
+
+    def here(bus: int) -> dict:
+        units, loads = units_at.get(bus, []), loads_at.get(bus, [])
+        return {"units": [{"name": u["name"], **basis(u["source"]), **values(u)} for u in units[:_LISTED_HERE]],
+                "unit_count": len(units),
+                "loads": [{"name": d["name"], **basis(d["category"]), **values(d)} for d in loads[:_LISTED_HERE]],
+                "load_count": len(loads), **({"load_mw": mw(loads)} if demand is not None and loads else {})}
+
+    out = {}
+    for t in targets:
+        kind, idx = t["type"], int(t["index"])
+        if kind == "bus":
+            b = buses[idx]
+            entry = {"name": b["name"], "kind": "bus", "kv": basis(b["kv"]), "substation": basis(b["substation"]),
+                     "feeder": feeder_of(idx), **here(idx)}
+            if not (entry["feeder"] or {}).get("value") and idx in graph:
+                # Off any feeder (a meshed level, a busbar): the buses next to it say where it is.
+                near = sorted({buses[int(n)]["name"] for n in graph.neighbors(idx) if int(n) in buses})
+                entry["next_to"] = near[:_LISTED_HERE] + ([f"{len(near) - _LISTED_HERE} more"]
+                                                          if len(near) > _LISTED_HERE else [])
+            out[t["mrid"]] = entry
+        elif kind in ("line", "trafo"):
+            br = next(b for b in semantics["branches"] if b["element_type"] == kind and b["index"] == idx)
+            a, z = br["ends_index"]
+            # The end further from the external grid is the one the branch feeds.
+            far = z if depth.get(z, -1) >= depth.get(a, -1) else a
+            entry = {"name": br["name"], "kind": "line" if kind == "line" else "transformer", "ends": br["ends"],
+                     "kv": br.get("kv"), "feeder": feeder_of(far)}
+            if sources and br["in_service"]:
+                lost = _cut_off(net, graph, sources, edges={(kind, idx)})
+                lost_loads = [d for d in semantics.get("loads") or [] if d["bus_index"] in lost]
+                # What loses supply is the topology's, the same at any hour; its MW only at the study's moment.
+                entry["without_it"] = {"basis": INFERRED, "buses_cut_off": len(lost),
+                                       "loads_cut_off": [d["name"] for d in lost_loads[:3]],
+                                       "load_count_cut_off": len(lost_loads),
+                                       **({"load_cut_off_mw": mw(lost_loads)} if demand is not None and lost_loads
+                                          else {})}
+            out[t["mrid"]] = entry
+        elif kind == "load":
+            d = next(x for x in semantics.get("loads") or [] if x["index"] == idx)
+            out[t["mrid"]] = {"name": d["name"], "kind": "load", "category": basis(d["category"]), "bus": d["bus"],
+                              "feeder": feeder_of(d["bus_index"]), **values(d)}
+        else:
+            u = next(x for x in semantics["units"] if x["element_type"] == kind and x["index"] == idx)
+            out[t["mrid"]] = {"name": u["name"], "kind": "unit", "source": basis(u["source"]), "bus": u["bus"],
+                              "feeder": feeder_of(u["bus_index"]), **values(u)}
+    return out
+
+
+# How many of the elements one result names are placed together (`locate`, `where`): cheap facts only.
+MAX_GROUPED = 80
+
+
+def locate(semantics: dict, targets: list[dict]) -> list[dict]:
+    """For `where`: each element's kind, feeder, voltage and substation, read from the layer as it is — no
+    topology search, so every element a result names can be placed, not only the few described in full. A
+    branch's feeder is its ends' (the one on a feeder; a branch leaving the busbar takes its far end's)."""
+    buses = {b["index"]: b for b in semantics["buses"]}
+    feeder = {i: _short_name((b.get("feeder") or {}).get("value")) or None for i, b in buses.items()}
+    units = {(u["element_type"], u["index"]): u for u in semantics["units"]}
+    loads = {d["index"]: d for d in semantics.get("loads") or []}
+    branches = {(b["element_type"], b["index"]): b for b in semantics["branches"]}
+    out = []
+    for t in targets:
+        kind, idx = t["type"], int(t["index"])
+        if kind == "bus" and idx in buses:
+            b = buses[idx]
+            out.append({"kind": "bus", "feeder": feeder.get(idx), "kv": b["kv"]["value"],
+                        "substation": b["substation"]["value"]})
+        elif kind in ("line", "trafo") and (kind, idx) in branches:
+            br = branches[(kind, idx)]
+            ends = [feeder.get(e) for e in br["ends_index"]]
+            on = [f for f in ends if f]
+            out.append({"kind": "line" if kind == "line" else "transformer", "kv": br.get("kv"),
+                        "feeder": on[-1] if on else None})
+        elif kind == "load" and idx in loads:
+            out.append({"kind": "load", "feeder": feeder.get(loads[idx]["bus_index"])})
+        elif (kind, idx) in units:
+            out.append({"kind": "unit", "feeder": feeder.get(units[(kind, idx)]["bus_index"])})
+    return out
+
+
+def where(entries) -> list[str]:
+    """Where the elements sit together, when two or more do — by feeder, voltage level and substation, with how
+    many share each ("feeder: 22 of 25 on Line 1-2, 3 on Line 12-13", "voltage: all 25 at 20 kV"). `entries`:
+    `locate`'s, or `context`'s values."""
+    def val(x):
+        return x.get("value") if isinstance(x, dict) else x
+    entries = list(entries.values()) if isinstance(entries, dict) else list(entries)
+    if len(entries) < 2:
+        return []
+    out = []
+    # Each grouping over the elements it applies to: a unit or a load has a feeder but no voltage of its own here,
+    # a transformer two.
+    for label, kinds, key, fmt in (("feeder", None, "feeder", lambda v: v),
+                                   ("voltage", ("bus", "line"), "kv", lambda v: f"{v:g} kV"),
+                                   ("substation", ("bus",), "substation", lambda v: v)):
+        members = [e for e in entries if kinds is None or e.get("kind") in kinds]
+        n = len(members)
+        counts: dict = {}
+        for e in members:
+            v = val(e.get(key))
+            # A transformer has two voltages: it shares no one level with the rest.
+            if v is not None and not isinstance(v, (list, tuple, dict)):
+                counts[v] = counts.get(v, 0) + 1
+        if n < 2 or not counts or max(counts.values()) < 2:
+            continue
+        # Only what is shared: a value one element has is lumped with the rest ("9 elsewhere").
+        ranked = [(v, k) for v, k in sorted(counts.items(), key=lambda x: -x[1]) if k >= 2 or key == "feeder"]
+        if key == "substation" and ranked[0][1] * 2 < n:
+            continue                    # most of the buses are in substations of their own: nothing shared to say
+        if len(ranked) == 1 and ranked[0][1] == n:
+            out.append(f"{label}: all {n} {'on' if key == 'feeder' else 'at' if key == 'kv' else 'in'} "
+                       f"{fmt(ranked[0][0])}")
+            continue
+        parts = [f"{k} of {n} {'on' if key == 'feeder' else 'at' if key == 'kv' else 'in'} {fmt(v)}" if i == 0
+                 else f"{k} {'on' if key == 'feeder' else 'at' if key == 'kv' else 'in'} {fmt(v)}"
+                 for i, (v, k) in enumerate(ranked[:3])]
+        rest = n - sum(k for _v, k in ranked[:3])
+        off = sum(1 for e in members if val(e.get(key)) is None)
+        if rest:
+            parts.append(f"{rest} on no feeder" if key == "feeder" and rest == off else f"{rest} elsewhere")
+        out.append(f"{label}: " + ", ".join(parts))
     return out

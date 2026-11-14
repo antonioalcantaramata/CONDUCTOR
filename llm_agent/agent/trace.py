@@ -32,6 +32,8 @@ without a browser and could feed a report, an API response or a log line.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, NamedTuple
 
 from .characterisation import check_answer as _check_characterisation
@@ -319,7 +321,8 @@ def _concerns(record: dict, steps: tuple[ToolStep, ...],
     for issue in _check_investigation(answer, record):
         out.append(f"“{issue.text[:160]}” {issue.note}.")
     for issue in _check_entities(answer, record):
-        out.append(f"“{issue.text[:160]}” — the answer {issue.note}.")
+        quoted = re.sub(r"[*`]+", "", issue.text)[:160]          # the sentence as read, without its markdown
+        out.append(f"“{quoted}” — checked against the CIM layer: the answer {issue.note}.")
 
     asking = is_clarifying_question(answer, record.get("tool_calls") or ())
     for gap in () if asking else _check_completeness(record.get("user") or "", answer):

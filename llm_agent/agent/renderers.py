@@ -175,7 +175,8 @@ def _empty_figure(title: str, color: str = "#333") -> go.Figure:
     tone = {_C.VIOLATION: "error", _C.OK: "ok"}.get(color, "info")
     fig = go.Figure()
     fig.update_layout(
-        meta={"conductor_status": title, "tone": tone},
+        # The app shows the status as Markdown, where Plotly's <br> would print as text: a Markdown line break.
+        meta={"conductor_status": re.sub(r"<br\s*/?>", "  \n", title), "tone": tone},
         title={"text": title, "font": {"color": color}},
         **CHART_THEME,
         xaxis={"visible": False},
@@ -464,7 +465,14 @@ def render_contingency_violations(result: dict):
         if result.get("system_secure") or result.get("system_n1_secure"):
             secure = "✅ No violations detected"
             return _empty_figure(f"{secure} — {_screened(result)}" if result.get("option") else secure, color=_C.OK)
-        return figs or _empty_figure("No violation data available")
+        if result.get("message"):
+            # Not a limit break, but said by the engine: load cut off by the outage, say — and the ties that could
+            # restore it, each checked with a power flow.
+            from .semantics_view import tie_line
+            ties = [tie_line(t).replace("**", "") for t in result.get("ties_that_could_restore") or []]
+            text = "<br>".join([str(result["message"]), *ties])
+            return figs or _empty_figure(text, color=_C.VIOLATION if result.get("system_secure") is False else _C.OK)
+        return figs or _empty_figure("This result lists no violations.")
 
     vlo = _float_or_none(thresholds.get("vm_lower_pu"))
     vhi = _float_or_none(thresholds.get("vm_upper_pu"))

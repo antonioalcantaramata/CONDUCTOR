@@ -100,6 +100,7 @@ import nominal as nom
 import resolve as rv
 import sandbox as sb
 import semantics as sem
+import synthetic_timeseries as synth
 
 from dotenv import load_dotenv
 
@@ -837,16 +838,19 @@ def _save_assumptions() -> None:
     names = app_data.get("element_names") or {}
     sources = app_data.get("unit_sources") or {}
     load_categories = app_data.get("load_categories") or {}
+    synthetic = _synthetic_chosen()
     # Keyed to the network as loaded: the generator model changes the base's own
     # fingerprint, the network it applies to does not change.
     store = _read_store(_ASSUMPTIONS_FILE)
     fp = app_data.get("loaded_fingerprint")
-    if value is None and not model and not unit_costs and not names and not sources and not load_categories:
+    if (value is None and not model and not unit_costs and not names and not sources and not load_categories
+            and not synthetic):
         store.pop(fp, None)
     else:
         store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model,
                      "unit_costs": unit_costs, "element_names": names, "unit_sources": sources,
-                     "load_categories": load_categories}
+                     "load_categories": load_categories,
+                     **({"synthetic_data": synthetic} if synthetic else {})}
     _write_store(_ASSUMPTIONS_FILE, store)
     _note_where_changes_are_kept()
 
@@ -890,31 +894,43 @@ def _restore_assumptions() -> None:
             print(f"[assumptions] Names restored for {len(changes)} element(s).")
         except (naming.RenameError, gm.ModelError) as exc:
             print(f"[assumptions] Saved names no longer apply ({exc}) — not restored.")
-    saved_sources = saved.get("unit_sources") or {}
-    if saved_sources:
-        try:
-            # Re-checked against the network as loaded: a unit it no longer has is dropped.
-            app_data["unit_sources"] = sem.normalise_declarations(
-                app_data["net_loaded"], [{"unit": k, "source": v} for k, v in saved_sources.items()], {})
-            print(f"[assumptions] Unit sources restored for {len(saved_sources)} unit(s).")
-        except sem.DeclarationError as exc:
-            print(f"[assumptions] Saved unit sources no longer apply ({exc}) — not restored.")
-    saved_loads = saved.get("load_categories") or {}
-    if saved_loads:
-        try:
-            app_data["load_categories"] = sem.normalise_load_declarations(
-                app_data["net_loaded"], [{"load": k, "category": v} for k, v in saved_loads.items()], {})
-            print(f"[assumptions] Load categories restored for {len(saved_loads)} load(s).")
-        except sem.DeclarationError as exc:
-            print(f"[assumptions] Saved load categories no longer apply ({exc}) — not restored.")
+    # Declarations are re-checked one by one against the network as loaded: one it no longer has (or can no
+    # longer tell apart) is dropped alone, and the others are kept.
+    app_data["unit_sources"] = _restore_declarations(
+        saved.get("unit_sources") or {}, "unit", "source", sem.normalise_declarations, "Unit source")
+    app_data["load_categories"] = _restore_declarations(
+        saved.get("load_categories") or {}, "load", "category", sem.normalise_load_declarations, "Load category")
     saved_costs = saved.get("unit_costs") or {}
     if saved_costs:
         try:
             changes = [{"unit": name, **diff} for name, diff in saved_costs.items()]
-            app_data["unit_costs"] = uc.merge({}, uc.normalise(app_data["net_loaded"], changes))
+            app_data["unit_costs"] = uc.merge({}, uc.normalise(app_data["net_loaded"], changes,
+                                                                variable=_variable_units(app_data["net_loaded"])))
             print(f"[assumptions] Costs restored for {len(saved_costs)} unit(s).")
         except uc.CostError as exc:
             print(f"[assumptions] Saved costs no longer apply ({exc}) — not restored.")
+    # The synthetic data as the operator last generated them: again from the saved settings, with the
+    # units' shapes as the declarations above give them. Only over synthetic data: uploaded ones stay.
+    synthetic = saved.get("synthetic_data")
+    if synthetic and app_data.get("synthetic") and app_data.get("measurements_source") == "synthetic":
+        try:
+            _apply_synthetic(synth.normalise_settings(synthetic, app_data["synthetic"]["base"]), persist=False)
+            print(f"[assumptions] Synthetic data generated again: {synth.describe(app_data['synthetic']['settings'])}.")
+        except synth.SettingsError as exc:
+            print(f"[assumptions] Saved synthetic-data settings no longer apply ({exc}) — not restored.")
+
+
+def _restore_declarations(saved: dict, who: str, what: str, normalise, label: str) -> dict:
+    """Saved declarations ({key: value}) that still apply to the network as loaded, each checked alone."""
+    out: dict = {}
+    for key, declared in saved.items():
+        try:
+            out = normalise(app_data["net_loaded"], [{who: key, what: declared}], out)
+        except sem.DeclarationError as exc:
+            print(f"[assumptions] {label} for {key!r} no longer applies ({exc}) — dropped.")
+    if out:
+        print(f"[assumptions] {label}s restored for {len(out)} of {len(saved)}.")
+    return out
 
 
 def _forget_saved_proposals() -> None:
@@ -1093,7 +1109,82 @@ def _scale_loads(net, factor) -> None:
     net.load.loc[rows, "q_mvar"] *= f
 
 
-def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | None = None):
+# The installed capacity of a unit capped at its resource, kept beside the cap (`_cap_to_resource`).
+CAPACITY_COLUMN = "capacity_mw"
+
+
+def _assumed_sources() -> dict:
+    """This study's assumed unit sources (`assume_unit_sources`), keyed as declarations are (each unit's name
+    as loaded); a unit the network does not have is left out."""
+    raw = getattr(_study, "assumed_sources", None)
+    loaded = app_data.get("net_loaded")
+    if not raw or loaded is None:
+        return {}
+    out: dict = {}
+    for unit, source in raw.items():
+        try:
+            out = sem.normalise_declarations(loaded, [{"unit": unit, "source": source}], out)
+        except sem.DeclarationError:
+            continue
+    return out
+
+
+def _declared_sources() -> dict:
+    """The unit sources the studies read: the operator's declarations, then this study's assumptions."""
+    return {**(app_data.get("unit_sources") or {}), **_assumed_sources()}
+
+
+def _variable_units(net) -> dict:
+    """{(table, index): "wind" | "solar"} — the units of the network as loaded that the CIM layer says are wind
+    or solar (stated, named or declared; a proposal's own are its business). Empty with the layer switched off
+    in the studies (the ablation's third arm), as before the layer."""
+    if net is None or not studies_use_semantic_layer():
+        return {}
+    declared = _declared_sources()
+    profile = (app_data.get("grid_profile") or {}).get("unit_sources") or {}
+    key = (app_data.get("loaded_fingerprint"), json.dumps(declared, sort_keys=True), len(net.sgen), len(net.gen))
+    cached = app_data.get("_variable_units")
+    if cached and cached[0] == key:
+        return cached[1]
+    out = {}
+    for table in ("gen", "sgen"):
+        for i in net[table].index:
+            if gm._proposed(net[table], i):
+                continue
+            f = sem.unit_source(net, table, i, declared, profile)
+            if f["value"] in sem.VARIABLE and f["basis"] in (sem.STATED, sem.NAMED):
+                out[(table, int(i))] = f["value"]
+    app_data["_variable_units"] = (key, out)
+    return out
+
+
+def _cap_to_resource(net) -> None:
+    """Each wind and solar unit of the network (`_variable_units`) at most at its output this tick: the
+    optimisations may curtail it, never raise it beyond what the wind or the sun gives — as a proposal's own
+    pv and wind units already were. Its installed capacity is kept in `CAPACITY_COLUMN`, so the next tick on
+    the same copy caps from it again."""
+    for table, i in _variable_units(net):
+        tbl = net[table]
+        if i not in tbl.index:
+            continue
+        if CAPACITY_COLUMN not in tbl.columns:
+            tbl[CAPACITY_COLUMN] = np.nan
+        if "max_p_mw" not in tbl.columns:
+            tbl["max_p_mw"] = np.nan                  # the other units keep no limit of their own, as before
+        capacity = tbl.at[i, CAPACITY_COLUMN]
+        if pd.isna(capacity):
+            raw = tbl.at[i, "max_p_mw"] if "max_p_mw" in tbl.columns else np.nan
+            # No capacity in the case: unlimited (the resource alone caps it); empty means "not capped yet".
+            capacity = float(raw) if pd.notna(raw) and float(raw) > 0 else np.inf
+            tbl.at[i, CAPACITY_COLUMN] = capacity
+        p = max(float(tbl.at[i, "p_mw"]), 0.0)
+        tbl.at[i, "max_p_mw"] = min(p, capacity)
+        if "min_p_mw" in tbl.columns:
+            tbl.at[i, "min_p_mw"] = 0.0
+
+
+def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | None = None,
+                 resource_caps: bool = True):
     """Give `net` the values of one tick: measured loads and generation, then
     every element a proposal added at its own profile.
 
@@ -1128,6 +1219,9 @@ def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | N
     sb.apply_overrides(net)
     # Units the operator set to a fixed power factor: Q for this tick's P.
     gm.set_reactive(net)
+    # Wind and solar can be curtailed, not raised: an optimisation may not ask for more than the resource gives.
+    if resource_caps and ts != nom.NOMINAL:
+        _cap_to_resource(net)
     if not (lg._proposed_mask(net.load).any() or lg._proposed_mask(net.sgen).any()
             or lg._proposed_mask(net.gen).any()):
         return net, []
@@ -1518,10 +1612,15 @@ class _TimeseriesRequest(_NetworkLimitsMixin):
     prefix matching, e.g. ``'2000-01-09 18'``). When omitted the default above
     applies. The two series may share timestamps (a forecast of measured days).
     ``network`` names the grid studied: ``"base"`` (default) or a proposal id.
+    ``assume_unit_sources``: {unit: source} taken as declared for this study
+    only, nothing kept — how the reading check asks whether a conclusion
+    depends on a fact the CIM layer does not know (an unknown unit counted as
+    wind, a unit known only by its name counted as conventional).
     """
     data_source: str = "measurements"
     timestamp: str | None = None
     network: str | None = None
+    assume_unit_sources: dict[str, str] | None = None
 
 
 class GridRequest(_TimeseriesRequest):
@@ -1617,7 +1716,11 @@ class ContingencySweepRequest(GridRequest):
     corrective option's reference from an options result ("S3:cheapest") —
     the sweep then runs at that option's network and load level, with its
     dispatch applied (and, for an option after an outage, that outage), at
-    its moment or a later one (its set-points held)."""
+    its moment or a later one (its set-points held). ``scope``: only the
+    outages of a feeder, a substation or a voltage level ("20 kV"), as the
+    CIM layer gives them (`semantics.scope_branches`); omitted, every line and
+    transformer."""
+    scope: str | None = None
 
 
 class ContingencyOptimizeRequest(_TimeseriesRequest):
@@ -2571,7 +2674,6 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     populated, False on any error so the caller can fall back to the
     default YAML profile.
     """
-    import synthetic_timeseries as st
 
     _prepare_runtime_reload()
 
@@ -2624,8 +2726,9 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
         print(f"[lifespan] Power flow failed (non-fatal): {exc}")
 
     print("[lifespan] Generating synthetic timeseries for uploaded network...")
-    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42,
-                                           unit_shapes=_unit_shapes(net, {}))
+    # The measurements only: the forecast comes from its saved file (`_restore_forecast_from_sentinel`).
+    timestamps, measurements, _, _ = _start_synthetic(net, _synthetic_defaults(), _unit_shapes(net, {}),
+                                                      forecast=False, load_shapes=_load_shapes(net, {}))
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
 
     # The case's own operating point, before the first tick is written over it.
@@ -2671,7 +2774,6 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
     Loads the network via network_loader, generates a synthetic timeseries,
     builds Ybus databases on-the-fly, and populates all global app_data fields.
     """
-    import synthetic_timeseries as st
 
     _prepare_runtime_reload()
     print(f"[lifespan] Loading profile '{profile_name}'...")
@@ -2721,31 +2823,16 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
     except Exception as exc:
         print(f"[lifespan] Initial power flow failed (non-fatal): {exc}")
 
-    # Synthetic timeseries.
-    n_days      = int(profile.get("synthetic_n_days", 7))
-    resolution  = int(profile.get("synthetic_resolution_min", 15))
-    load_prof   = profile.get("synthetic_load_profile", "residential")
-    gen_prof    = profile.get("synthetic_generation_profile", "wind")
-    print(f"[lifespan] Generating synthetic timeseries ({n_days}d, {resolution}min)...")
-    peak = profile.get("synthetic_peak_load_factor", 1.0)
+    # Synthetic timeseries, with a synthetic forecast, as a network upload gets — so the default
+    # network shows the forecast path too. The forecast covers the last days of the measurements
+    # (measured values with a day-ahead-sized error, so forecast and measured can be compared) and
+    # the days after (an independent realisation). The settings are the profile's.
+    settings = _synthetic_defaults(profile)
+    print(f"[lifespan] Generating synthetic timeseries ({synth.describe(settings)})...")
     shapes = _unit_shapes(net, profile)
-    timestamps, measurements = st.generate(
-        net, n_days=n_days, resolution_min=resolution,
-        load_profile=load_prof, generation_profile=gen_prof, seed=42,
-        peak_load_factor=peak, unit_shapes=shapes,
-    )
+    timestamps, measurements, forecast_timestamps, forecasts = _start_synthetic(
+        net, settings, shapes, load_shapes=_load_shapes(net, profile))
     print(f"[lifespan] Timeseries ready: {len(timestamps)} timestamps.")
-    # A synthetic forecast, as a network upload gets — so the default network
-    # shows the forecast path too. It covers the last days of the measurements
-    # (measured values with a day-ahead-sized error, so forecast and measured
-    # can be compared) and the days after (an independent realisation).
-    forecast_timestamps, forecasts = st.forecast(
-        net, timestamps, measurements,
-        overlap_days=float(profile.get("synthetic_forecast_overlap_days", 2)),
-        n_days=n_days, resolution_min=resolution,
-        load_profile=load_prof, generation_profile=gen_prof, seed=137, peak_load_factor=peak,
-        unit_shapes=shapes,
-    )
 
     # The case's own operating point, before the first tick is written over it.
     app_data["nominal"] = nom.snapshot(net)
@@ -2859,7 +2946,8 @@ def _note_where_changes_are_kept() -> None:
 
 def _kept_changes(keys: dict | None) -> dict:
     """What is saved for a network: renames, cost changes, units modelled
-    differently, a load power factor, proposals (only the non-zero ones)."""
+    differently, a load power factor, what units and loads were declared to be,
+    proposals (only the non-zero ones)."""
     if not keys:
         return {}
     saved = _read_store(_ASSUMPTIONS_FILE).get(keys.get("fingerprint")) or {}
@@ -2869,6 +2957,8 @@ def _kept_changes(keys: dict | None) -> dict:
         "costs": len(saved.get("unit_costs") or {}),
         "generators": len(saved.get("generator_model") or {}),
         "load_power_factor": int(saved.get("load_power_factor") is not None),
+        "declarations": len(saved.get("unit_sources") or {}) + len(saved.get("load_categories") or {}),
+        "synthetic_data": int(bool(saved.get("synthetic_data"))),
         "proposals": len(proposals),
     }
     return {k: v for k, v in counts.items() if v}
@@ -2890,7 +2980,8 @@ def _load_demo(name: str) -> None:
         app_data["measurements"], app_data["timestamps"] = measurements, timestamps
         app_data["current_index"] = 0
         app_data["measurements_source"] = "demo"
-        _assign_tick(_net_for(None), prepare_measurement_df(measurements[timestamps[0]]), timestamps[0])
+        _assign_tick(_net_for(None), prepare_measurement_df(measurements[timestamps[0]]), timestamps[0],
+                     resource_caps=False)
     app_data["scenario"] = name
 
 
@@ -3029,6 +3120,8 @@ def _in_this_study(fn):
 
     def run(*args, **kwargs):
         _study.load_pf, _study.pf_used, _study.q_share = study.get("load_pf"), False, None
+        # The facts this study assumes (`assume_unit_sources`) hold in its workers too.
+        _study.assumed_sources = study.get("assumed_sources")
         _tick_report.first = None
         try:
             return fn(*args, **kwargs)
@@ -3118,8 +3211,13 @@ def _off_event_loop(endpoint):
                 _study.q_share = None
                 _study.tick_resolved = []
                 _study.renewables = None
+                assuming = next((a for a in (*args, *kwargs.values()) if hasattr(a, "assume_unit_sources")), None)
+                _study.assumed_sources = getattr(assuming, "assume_unit_sources", None) or None
                 try:
                     result = asyncio.run(endpoint(*args, **kwargs))
+                    if _study.assumed_sources and isinstance(result, dict):
+                        # Said in the result: this study ran on facts assumed, not on the layer as it stands.
+                        result.setdefault("assumed_unit_sources", _assumed_sources())
                     if _study.tick_resolved and isinstance(result, dict):
                         # A day or an hour asked for as one moment: which moment was used.
                         result.setdefault("timestamp_resolved", _study.tick_resolved)
@@ -3132,6 +3230,7 @@ def _off_event_loop(endpoint):
                     _study.load_pf = None
                     _study.tick_resolved = None
                     _study.renewables = "off"
+                    _study.assumed_sources = None
 
         return await anyio.to_thread.run_sync(locked)
 
@@ -3206,7 +3305,118 @@ def _by_mrid(layer: dict, text) -> tuple[str, object] | None:
     for x in (layer.get("containers") or {}).get("substations") or []:
         if x.get("mrid", "").lower() == t:
             return "substation", x["name"]
+    # Elements that are not looked around on their own: a switch, a shunt, the external grid.
+    for kind, key in (("switch", "switches"), ("shunt", "shunts")):
+        for x in layer.get(key) or []:
+            if x.get("mrid", "").lower() == t:
+                return kind, x["index"]
+    for k, x in enumerate(layer.get("external_grids") or []):
+        if x.get("mrid", "").lower() == t:
+            return "ext_grid", k
     return None
+
+
+def _tie_checker(base, at_tick: bool = False, limits: dict | None = None):
+    """What closing a restoring tie does, by a power flow: the element out, the
+    tie closed. For `semantics.around` (at the clock's operating point, the
+    network prepared once, on the first tie) and the outage studies (`at_tick`:
+    `base` is already the study's network at its moment). `limits`: the
+    study's (vm_lower_pu, vm_upper_pu, max_line_loading_pct,
+    max_trafo_loading_pct); the network's own by default."""
+    prepared: dict = {"net": base} if at_tick else {}
+
+    def network():
+        if "net" not in prepared:
+            net = copy.deepcopy(base)
+            moment = _clock_moment()
+            data = app_data.get("measurements") or {}
+            if moment in data:
+                net, _ = _assign_tick(net, prepare_measurement_df(data[moment]), moment, data)
+            prepared["net"] = net
+        return prepared["net"]
+
+    def check(outage: dict, switch: int, label: str, lost: set) -> dict:
+        nonlocal limits
+        limits = limits or _network_limits()
+        net = copy.deepcopy(network())
+        if outage["etype"] in ("line", "trafo"):
+            net[outage["etype"]].at[outage["index"], "in_service"] = False
+            out_buses: set = set()
+        else:
+            out_buses = set(outage["buses"])
+            net.bus.loc[sorted(out_buses), "in_service"] = False
+        net.switch.at[switch, "closed"] = True
+        tie = label.split(" | ")[0] + (" (" + label.split("(")[-1] if "(" in label else "")
+        try:
+            pp.runpp(net, algorithm="nr", calculate_voltage_angles=True)
+        except Exception:  # noqa: BLE001 — a power flow that fails is the answer
+            return {"tie": tie, "converged": False,
+                    "note": "The power flow does not converge with this tie closed: it may not restore supply."}
+        vm = net.res_bus.vm_pu[net.bus.in_service.astype(bool)].dropna()
+        back = [b for b in lost - out_buses if b in vm.index]
+        result = {"tie": tie, "converged": True, "buses_restored": len(back),
+                  "buses_cut_off": len(lost - out_buses), "violations": []}
+        if len(vm):
+            low, high = vm.idxmin(), vm.idxmax()
+            result["lowest_voltage"] = {"pu": round(float(vm[low]), 4), "at": sem.bus_display_name(net, int(low))}
+            for b, v in vm.items():
+                if v < limits["vm_lower_pu"] - 1e-9 or v > limits["vm_upper_pu"] + 1e-9:
+                    result["violations"].append(f"{sem.bus_display_name(net, int(b))} at {float(v):.3f} p.u.")
+            result["highest_voltage_pu"] = round(float(vm[high]), 4)
+        worst = None
+        for table, limit in (("line", limits["max_line_loading_pct"]), ("trafo", limits["max_trafo_loading_pct"])):
+            res = getattr(net, f"res_{table}", None)
+            if res is None or not len(res):
+                continue
+            loading = res.loading_percent[net[table].in_service.astype(bool)].dropna()
+            for i, v in loading.items():
+                name = sem.clean_label(net[table].at[i, "name"]) if "name" in net[table].columns else ""
+                name = name or f"{table} {i}"
+                if worst is None or v > worst[0]:
+                    worst = (float(v), name)
+                if v > limit + 1e-9:
+                    result["violations"].append(f"{name} at {float(v):.1f} %")
+        if worst:
+            result["highest_loading"] = {"pct": round(worst[0], 1), "on": worst[1]}
+        result["within_limits"] = not result["violations"]
+        result["violations"] = result["violations"][:5]
+        result["limits"] = {"vm_pu": [limits["vm_lower_pu"], limits["vm_upper_pu"]],
+                            "loading_pct": limits["max_line_loading_pct"]}
+        return result
+
+    return check
+
+
+def _names_as_loaded() -> list[str]:
+    """The elements' names as the network was loaded, when the operator has renamed any: the data stay
+    filed under them ("North (data: Bus 3)"), so an answer quoting them names a real element."""
+    loaded = app_data.get("net_loaded")
+    if loaded is None or not app_data.get("element_names"):
+        return []
+    out = set()
+    for table in ("bus", "line", "trafo", "load", "gen", "sgen", "storage"):
+        if table in loaded and len(loaded[table]) and "name" in loaded[table].columns:
+            out |= {str(v).strip() for v in loaded[table]["name"] if isinstance(v, str) and v.strip()}
+    return sorted(out)
+
+
+def _around_target(layer: dict, hit: tuple[str, object]) -> tuple[str, object]:
+    """What to look around for an element found by its mRID: a switch's line (or its bus, for a bus
+    coupler), a shunt's or the external grid's bus; anything else is itself."""
+    kind, idx = hit
+    buses = {b["name"]: b["index"] for b in layer["buses"]}
+    if kind == "switch":
+        sw = next(x for x in layer.get("switches") or [] if x["index"] == idx)
+        where = sw.get("where") or {}
+        branch = next((b for b in layer["branches"] if b["name"] == where.get("element")), None)
+        if branch is not None:
+            return branch["element_type"], branch["index"]
+        return "bus", buses.get(where.get("at"), idx)
+    if kind == "shunt":
+        return "bus", next(x for x in layer.get("shunts") or [] if x["index"] == idx)["bus_index"]
+    if kind == "ext_grid":
+        return "bus", (layer.get("external_grids") or [])[idx]["bus_index"]
+    return hit
 
 
 def _value_provenance(net) -> dict | None:
@@ -3219,25 +3429,209 @@ def _value_provenance(net) -> dict | None:
         return sem.value_provenance(
             net, prepare_measurement_df(rows) if rows is not None else None, dataset="measurements",
             moment=moment, synthetic=app_data.get("measurements_source", "synthetic") != "uploaded",
-            load_pf=pf, load_pf_source=pf_source)
+            load_pf=pf, load_pf_source=pf_source,
+            generated=(synth.describe(app_data["synthetic"]["settings"])
+                       if app_data.get("synthetic") and app_data.get("measurements_source") == "synthetic"
+                       else None))
     except Exception as exc:  # noqa: BLE001 — a description must not fail for want of provenance
         print(f"[semantics] Value provenance unavailable: {exc}")
         return None
 
 
-def _unit_shapes(net, profile: dict) -> dict:
+def _unit_shapes(net, profile: dict, declared: dict | None = None) -> dict:
     """{(table, index): shape} for the synthetic week: a unit the network (or
-    its profile) states or names as solar follows the sun, wind the wind, a
-    fuel-burning or other dispatchable unit a flat output. A unit it says
-    nothing about follows the profile's shape, as every unit did before."""
+    its profile, or the operator: `declared`) states or names as solar follows
+    the sun, wind the wind, a fuel-burning or other dispatchable unit a flat
+    output. A unit it says nothing about follows the profile's shape, as every
+    unit did before."""
     shapes = {}
     for table in ("gen", "sgen"):
         for i in net[table].index:
-            f = sem.unit_source(net, table, i, None, profile.get("unit_sources") or {})
+            f = sem.unit_source(net, table, i, declared, profile.get("unit_sources") or {})
             if f["basis"] not in (sem.STATED, sem.NAMED):
                 continue
             shape = {"solar": "solar", "wind": "wind"}.get(f["value"], "flat")
             shapes[(table, int(i))] = shape
+    return shapes
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data: generated when a network loads; the operator can change how
+# (the Data tab's panel, /api/data/synthetic). What the generator reads from
+# the network (`synth.Basis`) is kept from load time, before a tick overwrites
+# the loads, so the data can be generated again from the network's own values.
+# app_data["synthetic"] = {"basis", "base": the settings it loaded with,
+#   "settings": the ones in use, "shapes": each unit's shape in use,
+#   "load_shapes": the shapes it loaded with}.
+# ---------------------------------------------------------------------------
+
+_SYNTHETIC_PROFILE_KEYS = {"n_days": "synthetic_n_days", "resolution_min": "synthetic_resolution_min",
+                           "load_profile": "synthetic_load_profile",
+                           "generation_profile": "synthetic_generation_profile",
+                           "peak_load_factor": "synthetic_peak_load_factor",
+                           "forecast_overlap_days": "synthetic_forecast_overlap_days"}
+
+
+def _synthetic_defaults(profile: dict | None = None) -> dict:
+    """The generator settings a network loads with: its profile's, else the defaults."""
+    profile = profile or {}
+    return synth.normalise_settings({key: profile[name] for key, name in _SYNTHETIC_PROFILE_KEYS.items()
+                                     if profile.get(name) is not None})
+
+
+def _generate_synthetic(basis, s: dict, shapes: dict, forecast: bool = True, load_shapes: dict | None = None) -> tuple:
+    """(timestamps, measurements, forecast timestamps, forecasts) for settings `s`."""
+    ts, meas = synth.generate(basis, n_days=s["n_days"], resolution_min=s["resolution_min"],
+                              load_profile=s["load_profile"], generation_profile=s["generation_profile"],
+                              seed=s["seed"], stress_events=s["stress_events"],
+                              peak_load_factor=s["peak_load_factor"], unit_shapes=shapes, load_shapes=load_shapes)
+    if not forecast:
+        return ts, meas, [], {}
+    fts, fc = synth.forecast(basis, ts, meas, overlap_days=s["forecast_overlap_days"], n_days=s["n_days"],
+                             resolution_min=s["resolution_min"], load_profile=s["load_profile"],
+                             generation_profile=s["generation_profile"],
+                             seed=s["seed"] + synth.FORECAST_SEED_OFFSET, peak_load_factor=s["peak_load_factor"],
+                             load_error=s["load_error"], generation_error=s["generation_error"],
+                             unit_shapes=shapes, stress_events=s["stress_events"], load_shapes=load_shapes)
+    return ts, meas, fts, fc
+
+
+def _start_synthetic(net, settings: dict, shapes: dict, forecast: bool = True,
+                     load_shapes: dict | None = None) -> tuple:
+    """A network's data as it loads (`_generate_synthetic`), keeping what is
+    needed to generate them again."""
+    basis = synth.basis(net)
+    load_shapes = load_shapes or {}
+    app_data["synthetic"] = {"basis": basis, "base": settings, "settings": settings, "shapes": shapes,
+                             "loaded_shapes": shapes, "load_shapes": load_shapes, "loaded_load_shapes": load_shapes}
+    return _generate_synthetic(basis, settings, shapes, forecast, load_shapes)
+
+
+def _current_load_shapes() -> dict:
+    """Each load's shape as the network, its profile and the operator's declarations say now."""
+    loaded = app_data.get("net_loaded")
+    if loaded is None:
+        return dict((app_data.get("synthetic") or {}).get("load_shapes") or {})
+    return _load_shapes(loaded, app_data.get("grid_profile") or {}, app_data.get("load_categories") or {})
+
+
+def _current_unit_shapes() -> dict:
+    """Each unit's shape as the network, its profile and the operator's declarations say now."""
+    loaded = app_data.get("net_loaded")
+    if loaded is None:
+        return dict((app_data.get("synthetic") or {}).get("shapes") or {})
+    return _unit_shapes(loaded, app_data.get("grid_profile") or {}, app_data.get("unit_sources") or {})
+
+
+def _synthetic_chosen() -> dict | None:
+    """The settings to keep for this network: None when the data are as it loads with."""
+    syn = app_data.get("synthetic")
+    if not syn or (syn["settings"] == syn["base"] and syn["shapes"] == syn["loaded_shapes"]
+                   and syn["load_shapes"] == syn["loaded_load_shapes"]):
+        return None
+    return dict(syn["settings"])
+
+
+def _apply_synthetic(settings: dict, *, persist: bool) -> None:
+    """Generate the measurements and the forecast again with `settings` and the
+    units' shapes as they are now, and make them the session's data. The clock
+    keeps its moment when the new data have it. `persist`: on the operator's
+    own network (Resume), the files the next restart loads are rewritten too;
+    a demo's are never touched."""
+    syn = app_data["synthetic"]
+    shapes, load_shapes = _current_unit_shapes(), _current_load_shapes()
+    ts, meas, fts, fc = _generate_synthetic(syn["basis"], settings, shapes, load_shapes=load_shapes)
+    moment = _clock_moment()
+    app_data["measurements"], app_data["timestamps"] = meas, ts
+    app_data["current_index"] = ts.index(moment) if moment in meas else 0
+    app_data["forecasts"], app_data["forecast_timestamps"] = fc, fts
+    app_data["measurements_source"] = "synthetic"
+    app_data["forecasts_source"] = "synthetic"
+    app_data["_peaks_cache"] = {}
+    syn.update(settings=settings, shapes=shapes, load_shapes=load_shapes)
+    now = ts[app_data["current_index"]]
+    _assign_tick(_net_for(None), prepare_measurement_df(meas[now]), now, resource_caps=False)
+    if persist and app_data.get("scenario") == "resume":
+        try:
+            _write_timeseries_sentinel(_persist_generated_series(meas, ts, "measurements"), source="synthetic")
+            _write_forecast_sentinel(_persist_generated_series(fc, fts, "forecast"), source="synthetic")
+        except Exception as exc:  # noqa: BLE001 — the data are in use; only the restart copy failed
+            print(f"[synthetic] WARNING: Could not save the generated series: {exc}")
+
+
+def _synthetic_stale() -> list[dict]:
+    """Units whose shape in the data is not the one the network and the
+    operator's declarations give them now (declared after the data were made)."""
+    syn = app_data.get("synthetic")
+    if not syn or app_data.get("measurements_source") != "synthetic" or app_data.get("net") is None:
+        return []
+    default = syn["settings"]["generation_profile"]
+    used, now = syn["shapes"], _current_unit_shapes()
+    base = _net_for(None)
+    out = []
+    for table, idx, _bus, _cap in syn["basis"].units:
+        drawn, wanted = used.get((table, idx), default), now.get((table, idx), default)
+        if drawn != wanted and idx in base[table].index:
+            out.append({"unit": gm.unit_name(base, table, idx), "drawn_as": drawn, "now": wanted})
+    load_default = syn["settings"]["load_profile"]
+    used_loads, now_loads = syn.get("load_shapes") or {}, _current_load_shapes()
+    for _bus, _p, idx in syn["basis"].loads:
+        drawn, wanted = used_loads.get(idx, load_default), now_loads.get(idx, load_default)
+        if drawn != wanted and idx in base.load.index:
+            out.append({"unit": sem.load_key(base, idx), "drawn_as": drawn, "now": wanted, "kind": "load"})
+    return out
+
+
+def _synthetic_payload() -> dict:
+    """What the Data tab's panel shows: the settings in use and those the
+    network loads with, the choices, how each unit is drawn, what is stale."""
+    syn = app_data.get("synthetic")
+    source = app_data.get("measurements_source", "synthetic")
+    options = {"load_profile": synth.LOAD_PROFILES, "generation_profile": synth.GENERATION_PROFILES,
+               "resolution_min": list(synth.RESOLUTIONS),
+               "limits": {"n_days": [1, synth.MAX_DAYS], "max_ticks": synth.MAX_TICKS,
+                          "peak_load_factor": list(synth.PEAK_RANGE), "load_error": [0.0, synth.LOAD_ERROR_MAX],
+                          "generation_error": [0.0, synth.GENERATION_ERROR_MAX]}}
+    if not syn or app_data.get("net") is None:
+        return {"available": False, "options": options, "measurements_source": source}
+    settings = syn["settings"]
+    # The shapes the next generation would use: the operator's declarations count.
+    shapes = _current_unit_shapes()
+    units = {"stated": {}, "default": 0}
+    for table, idx, _bus, _cap in syn["basis"].units:
+        if (table, idx) in shapes:
+            units["stated"][shapes[(table, idx)]] = units["stated"].get(shapes[(table, idx)], 0) + 1
+        else:
+            units["default"] += 1
+    load_shapes = _current_load_shapes()
+    loads = {"stated": {}, "default": 0}
+    for _bus, _p, idx in syn["basis"].loads:
+        if idx in load_shapes:
+            loads["stated"][load_shapes[idx]] = loads["stated"].get(load_shapes[idx], 0) + 1
+        else:
+            loads["default"] += 1
+    saved = _read_store(_ASSUMPTIONS_FILE).get(app_data.get("loaded_fingerprint")) or {}
+    return {"available": True, "options": options, "loads": loads,
+            "measurements_source": source, "forecasts_source": app_data.get("forecasts_source", "none"),
+            "in_use": source == "synthetic",
+            "settings": settings, "base": syn["base"], "custom": settings != syn["base"],
+            "summary": synth.describe(settings), "base_summary": synth.describe(syn["base"]),
+            "units": units, "n_loads": len(syn["basis"].loads), "stale": _synthetic_stale(),
+            "kept": bool(saved.get("synthetic_data")), "scenario": app_data.get("scenario"),
+            "demo": app_data.get("scenario") in scn.DEMOS}
+
+
+def _load_shapes(net, profile: dict, declared: dict | None = None) -> dict:
+    """{load index: shape} for the synthetic week: a load the network (or its
+    profile, or the operator) says is residential, commercial, industrial, a
+    data centre… follows that kind of demand (`synth.CATEGORY_SHAPES`). A load
+    it says nothing about follows the shape chosen for the rest."""
+    shapes = {}
+    for i in net.load.index:
+        f = sem.load_category(net, i, declared, profile.get("load_categories") or {})
+        shape = synth.CATEGORY_SHAPES.get(f["value"]) if f["basis"] in (sem.STATED, sem.NAMED) else None
+        if shape:
+            shapes[int(i)] = shape
     return shapes
 
 
@@ -3267,7 +3661,7 @@ def _renewable_rows(net) -> tuple[list[tuple[str, int]], dict]:
         rows = [("sgen", int(i)) for i in net.sgen.index]
         return rows, {"units": [gm.unit_name(net, "sgen", i) for i in net.sgen.index],
                       "basis": "every static generator (the semantic layer is switched off in the studies)"}
-    declared = app_data.get("unit_sources") or {}
+    declared = _declared_sources()
     profile = (app_data.get("grid_profile") or {}).get("unit_sources") or {}
     rows, names = [], []
     for table in ("gen", "sgen"):
@@ -3306,6 +3700,9 @@ def _scale_renewables(net, factor: float, rows: list[tuple[str, int]] | None = N
         net[table].at[i, "p_mw"] *= factor
         if table == "sgen":                 # a voltage-controlled unit's Q follows its set-point
             net.sgen.at[i, "q_mvar"] *= factor
+        # A unit capped at its resource (`_cap_to_resource`): the resource is what was scaled, down or up.
+        if CAPACITY_COLUMN in net[table].columns and pd.notna(net[table].at[i, CAPACITY_COLUMN]):
+            net[table].at[i, "max_p_mw"] = max(float(net[table].at[i, "p_mw"]), 0.0)
 
 
 @app.get("/api/network/semantics")
@@ -3325,7 +3722,37 @@ async def network_semantics(network: str | None = None, about: str | None = None
     if about is None:
         return facts
     if about == "facts":
-        return sem.compact(facts)
+        out = sem.compact(facts)
+        renamed = _names_as_loaded()
+        if renamed:
+            out["names_as_loaded"] = renamed
+        return out
+    if about == "changes":
+        import cim_export as ce
+        base, proposal, network_id, name = _proposal_difference(network)
+        return {"about": "changes", "proposal": name,
+                **ce.difference_summary(ce.difference(base, proposal, network_id)),
+                "note": "What the proposal changes in the CIM layer, element by element: added, removed, or the "
+                        "facts that change (a feeder's members, a unit's source, a bus's level). Exported as a "
+                        "CIM difference model by GET /api/network/cim/difference."}
+    if about == "issues":
+        import types
+        issues = sem.data_issues(_net_for(types.SimpleNamespace(network=network)), facts)
+        return {"about": "issues", "issues": issues,
+                "note": ("What in the network's own data looks inconsistent, found from the facts (no study run). "
+                         "'check': likely an error in the data — say so before relying on it; 'note': worth "
+                         "knowing.") if issues else "Nothing in the network's data looks inconsistent."}
+    if about == "select":
+        if not element or not str(element).strip():
+            raise HTTPException(status_code=400, detail="about=select needs element: what to select, e.g. 'solar "
+                                                        "units on feeder Line 1-2' or 'industrial loads at 20 kV'.")
+        try:
+            return {"about": "select", **sem.select(facts, element),
+                    "note": "Chosen by what the CIM layer says each element is (its basis beside it), not by "
+                            "names. Pass these names to the study, or the phrase itself where a study takes "
+                            "units (disabled_generators, costs, generator models, declarations)."}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     if about == "around":
         if not element or not str(element).strip():
             raise HTTPException(status_code=400, detail="about=around needs an element: a bus, line, transformer, "
@@ -3334,15 +3761,19 @@ async def network_semantics(network: str | None = None, about: str | None = None
         net = _net_for(types.SimpleNamespace(network=network))
         hit = _by_mrid(facts, element)
         if hit:
-            return {**sem.around(net, facts, hit[0], hit[1]), "operating_point": _clock_moment()}
+            kind, idx = _around_target(facts, hit)
+            return {**sem.around(net, facts, kind, idx, check_tie=_tie_checker(net)),
+                    "operating_point": _clock_moment()}
         said = str(element).strip().casefold()
         stations = {b["substation"]["value"] for b in facts["buses"] if b["substation"]["value"]}
         station = next((n for n in stations if n.casefold() in (said, f"substation {said}")), None)
         # A bus is named before its own one-bus substation (they share the name).
         if station and not any(b["name"].casefold() == said for b in facts["buses"]):
-            return sem.around(net, facts, "substation", station)
+            return {**sem.around(net, facts, "substation", station, check_tie=_tie_checker(net)),
+                    "operating_point": _clock_moment()}
         found = _find_element(net, element, ("bus", "line", "trafo", "gen", "sgen", "storage", "load"))
-        return {**sem.around(net, facts, found.etype, found.idx), "operating_point": _clock_moment()}
+        return {**sem.around(net, facts, found.etype, found.idx, check_tie=_tie_checker(net)),
+                "operating_point": _clock_moment()}
     if about not in sem.ABOUT:
         raise HTTPException(status_code=400, detail=f"about must be one of {list(sem.ABOUT) + ['facts']}.")
     out = sem.view(facts, about)
@@ -3372,6 +3803,160 @@ async def network_cim(format: str = "xml", network: str | None = None):
     raise HTTPException(status_code=400, detail="format must be 'xml' (RDF/XML) or 'jsonld'.")
 
 
+def _proposal_difference(network: str | None):
+    """(base layer, proposal layer, network id, proposal name); 400 for the base or an unknown proposal."""
+    import types
+    name = _network_name(types.SimpleNamespace(network=network))
+    if name == BASE_NETWORK:
+        raise HTTPException(status_code=400, detail="Name a proposal (network=<proposal id>): the difference is a "
+                                                    "proposal's against the base.")
+    return _semantics(None), _semantics(name), str(app_data.get("loaded_fingerprint") or "local"), name
+
+
+@app.get("/api/network/cim/difference")
+@_off_event_loop
+async def network_cim_difference(network: str | None = None, format: str = "xml"):
+    """A proposal as a CIM difference model against the base (IEC 61970-552, the way CGMES exchanges changes:
+    forward and reverse differences), or (`format=summary`) what it changes in the CIM layer, element by
+    element, in words."""
+    import datetime as _dt
+
+    import cim_export as ce
+    from fastapi.responses import Response
+    base, proposal, network_id, name = _proposal_difference(network)
+    if format == "summary":
+        return {"proposal": name, **ce.difference_summary(ce.difference(base, proposal, network_id))}
+    if format != "xml":
+        raise HTTPException(status_code=400, detail="format must be 'xml' (the difference model) or 'summary'.")
+    text = ce.to_difference_rdf_xml(base, proposal, network_id, description=f"Proposal {name} against the base",
+                                    created=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"))
+    return Response(text, media_type="application/rdf+xml",
+                    headers={"Content-Disposition": f'attachment; filename="conductor-{name}-difference.xml"'})
+
+
+class CimLinksRequest(BaseModel):
+    """Texts from a study's result that may name elements, each with a kind hint (bus, branch, unit, load or
+    none), in the result's order; `network`: the proposal the study ran on (none: the base). `moment`:
+    {timestamp, data_source} — the one moment the study ran at, on the base network's own demand (the agent
+    sends it only then: no load scaling, no proposal, no option), for the MW at that moment."""
+    names: list[list] = []
+    network: str | None = None
+    moment: dict | None = None
+    # What the study's arguments name — the element studied (an outage, a bus, units left out): texts with a kind
+    # hint, and elements by type and index ({"type": "line", "index": 10}). Linked first, marked "studied".
+    studied: list[list] = []
+    refs: list[dict] = []
+
+
+_DEMAND_CACHE_SIZE = 64
+
+
+def _demand_at(network: str | None, moment: dict | None) -> tuple[dict | None, dict | None]:
+    """({load index: MW}, {timestamp, data_source, data_key}) at a study's moment, read as the study read it —
+    the base network, the loads' measured (or forecast, or nominal) values at that timestamp — or (None, None):
+    no moment, a proposal, a moment the data do not have. Reads the data only: no study runs, nothing is kept."""
+    import copy
+    if not moment or network not in (None, "", "base"):
+        return None, None
+    ts, source = moment.get("timestamp"), moment.get("data_source") or "measurements"
+    try:
+        _stamps, table, label = _resolve_dataset(source)
+    except HTTPException:
+        return None, None
+    if not isinstance(ts, str) or ts not in table:
+        return None, None
+    # Read once per network, moment and data: every link and every later reading of a study's links asks again,
+    # and each reading copies the network.
+    base = _net_for(None)
+    key = (app_data.get("loaded_fingerprint"), id(base), ts, label, _data_key())
+    cache = app_data.setdefault("_demand_cache", {})
+    if key in cache:
+        demand = cache[key]
+        return dict(demand), {"timestamp": ts, "data_source": label, "data_key": key[-1]}
+    net = copy.deepcopy(base)
+    try:
+        if ts == nom.NOMINAL:
+            net = nom.apply(net, _nominal_snapshot())
+        else:
+            # Active power only: the load power factor sets Q, never P.
+            net, _ = lg.assign_load_values_from_measurements(net, table[ts], substations,
+                                                             power_factor=_load_pf_setting()[0])
+    except (HTTPException, nom.NominalError, KeyError, ValueError):
+        return None, None
+    demand = {int(i): float(p) for i, p in net.load["p_mw"].items() if pd.notna(p)}
+    if len(cache) >= _DEMAND_CACHE_SIZE:
+        cache.pop(next(iter(cache)))                    # the oldest first
+    cache[key] = demand
+    return dict(demand), {"timestamp": ts, "data_source": label, "data_key": key[-1]}
+
+
+def _resolved(facts: dict, network: str | None, targets: list[dict], demand: dict | None = None) -> dict:
+    import types
+    net = _net_for(types.SimpleNamespace(network=network))
+    return sem.context(net, facts, targets, demand)
+
+
+@app.post("/api/network/cim/links")
+@_off_event_loop
+async def network_cim_links(request: CimLinksRequest):
+    """Links from a study's result to the CIM layer: the elements its texts name (at most `semantics.MAX_LINKED`),
+    each by its mRID, with the layer's version (`semantics.layer_version`) — and what the layer says each is, for
+    the agent's copy of the result only (`semantics.context`). The result as logged keeps the links; whatever
+    reads them later resolves them (GET /api/network/cim/resolve) and learns whether the layer has changed."""
+    facts = _semantics(request.network)
+    pairs = [(p[0], p[1] if len(p) > 1 else None) for p in request.names if p]
+    # The element studied first (from the arguments), then every element the result names — placed cheaply; the
+    # first few are linked and described in full.
+    studied = sem.ref_targets(facts, request.refs) + sem.link_targets(
+        facts, [(p[0], p[1] if len(p) > 1 else None) for p in request.studied if p], limit=sem.MAX_STUDIED)
+    seen = {t["mrid"] for t in studied}
+    studied = [t for i, t in enumerate(studied) if t["mrid"] not in {x["mrid"] for x in studied[:i]}]
+    named = studied + [t for t in sem.link_targets(facts, pairs, limit=sem.MAX_GROUPED) if t["mrid"] not in seen]
+    targets = named[:sem.MAX_LINKED]
+    demand, moment = _demand_at(request.network, request.moment) if targets else (None, None)
+    context = _resolved(facts, request.network, targets, demand) if targets else {}
+    roles = {t["mrid"] for t in studied}
+    return {"version": sem.layer_version(facts), "network": request.network,
+            "elements": [{"name": t["name"], "type": t["type"], "mrid": t["mrid"],
+                          **({"role": "studied"} if t["mrid"] in roles else {})} for t in targets],
+            "context": context, "named": len(named), "where": sem.where(sem.locate(facts, named)),
+            "ties": sem.feeder_ties(facts, [(f.get("feeder") or {}).get("value") for f in context.values()]),
+            **({"moment": moment} if moment else {})}
+
+
+@app.get("/api/network/cim/resolve")
+@_off_event_loop
+async def network_cim_resolve(mrids: str = "", version: str | None = None, network: str | None = None,
+                              timestamp: str | None = None, data_source: str | None = None,
+                              data_key: str | None = None):
+    """What the CIM layer says now about the elements a study's links name (`mrids`, comma-separated), and
+    whether the layer has changed since the links were made (`version`). An mRID the layer no longer has is
+    listed under `missing`. With the study's moment (`timestamp`, `data_source`, `data_key`), the MW at that
+    moment too — unless other data have been loaded since (`demand` then says so)."""
+    facts = _semantics(network)
+    wanted = [m.strip().lstrip("_").lower() for m in mrids.split(",") if m.strip()]
+    targets, missing = [], []
+    for m in wanted:
+        hit = _by_mrid(facts, m)
+        if hit is None or hit[0] not in ("bus", "line", "trafo", "gen", "sgen", "storage", "load"):
+            missing.append(m)
+            continue
+        kind, idx = hit
+        targets.append({"type": kind, "index": idx, "mrid": m})
+    now = sem.layer_version(facts)
+    demand, moment, demand_note = None, None, None
+    if timestamp and targets:
+        if data_key and data_key != _data_key():
+            demand_note = "Other data have been loaded since the study ran: its moment's demand is not shown."
+        else:
+            demand, moment = _demand_at(network, {"timestamp": timestamp, "data_source": data_source})
+    context = _resolved(facts, network, targets, demand) if targets else {}
+    return {"version": now, "changed": bool(version) and version != now, "network": network,
+            "context": context, "where": sem.where(sem.locate(facts, targets)), "missing": missing,
+            "ties": sem.feeder_ties(facts, [(f.get("feeder") or {}).get("value") for f in context.values()]),
+            **({"moment": moment} if moment else {}), **({"demand": demand_note} if demand_note else {})}
+
+
 class DeclarationRequest(BaseModel):
     """What the network does not state, declared by the operator: units'
     energy sources [{unit, source}] and loads' categories [{load, category}]
@@ -3395,10 +3980,13 @@ async def declare_units(request: DeclarationRequest):
             loads = app_data.get("load_categories") or {}
             if request.reset:
                 declared, loads = {}, {}
+            # "The units on feeder Line 1-2 are solar": each unit the CIM layer finds there (`semantics.select`).
             if request.units:
-                declared = sem.normalise_declarations(_net_for(None), request.units, declared)
+                declared = sem.normalise_declarations(_net_for(None), _expand_by_meaning(request.units, "units",
+                                                                                         key="unit"), declared)
             if request.loads:
-                loads = sem.normalise_load_declarations(_net_for(None), request.loads, loads)
+                loads = sem.normalise_load_declarations(_net_for(None), _expand_by_meaning(request.loads, "loads",
+                                                                                           key="load"), loads)
         except sem.DeclarationError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         app_data["unit_sources"], app_data["load_categories"] = declared, loads
@@ -3443,7 +4031,15 @@ async def resolve_name(name: str, network: str | None = None, kinds: str = "bus,
     external grid), is 400 saying which or what it is."""
     import types
     net = _net_for(types.SimpleNamespace(network=network))
-    hit = _by_mrid(_semantics(network), name) if _MRID_RE.fullmatch(str(name or "").strip()) else None
+    layer_now = _semantics(network) if _MRID_RE.fullmatch(str(name or "").strip()) else None
+    hit = _by_mrid(layer_now, name) if layer_now else None
+    if hit and hit[0] in ("switch", "shunt", "ext_grid"):
+        # Not a bus, branch, unit or load: said as what it is, by its own name in the layer.
+        pool = {"switch": layer_now.get("switches"), "shunt": layer_now.get("shunts")}.get(hit[0])
+        entry = (pool and next(x for x in pool if x["index"] == hit[1])) or \
+            (layer_now.get("external_grids") or [])[hit[1]]
+        return {"element_type": hit[0], "index": int(entry.get("index", hit[1])), "name": entry["name"],
+                "how": "mrid"}
     if hit and hit[0] != "substation":
         found = rv.Match(hit[0], int(hit[1]), rv.display(net, hit[0], int(hit[1])), "mrid")
     else:
@@ -3568,6 +4164,7 @@ async def network_topology(network: str | None = None):
             "trafos": int(len(net.trafo)),
             "loads": int(len(net.load)),
             "generators": int(len(net.sgen)) + int(len(net.gen)),
+            "storage": int(len(getattr(net, "storage", []))),
         },
         "voltage_levels": sorted({b["vn_kv"] for b in buses}, reverse=True),
         **({"voltage_note": sb.PLACEHOLDER_KV_NOTE} if sb.placeholder_voltages(net) else {}),
@@ -3845,8 +4442,18 @@ async def forget_scenario_changes(request: ForgetRequest):
         if keys.get("fingerprint") == app_data.get("loaded_fingerprint"):
             app_data["load_power_factor"] = None
             app_data["unit_costs"] = {}
+            # What the operator declared units and loads to be goes too: Start fresh is the network as loaded.
+            app_data["unit_sources"] = {}
+            app_data["load_categories"] = {}
             _apply_generator_model({}, {})
             _discard_proposals()
+            # The data as the network loads with them, when the operator had generated others.
+            syn = app_data.get("synthetic")
+            if syn and _synthetic_chosen():
+                if app_data.get("measurements_source") == "synthetic":
+                    _apply_synthetic(syn["base"], persist=True)
+                else:
+                    syn.update(settings=syn["base"], shapes=syn["loaded_shapes"], load_shapes=syn["loaded_load_shapes"])
         for path, key in ((_ASSUMPTIONS_FILE, "fingerprint"), (_PROPOSALS_FILE, "proposals_fingerprint")):
             store = _read_store(path)
             if store.pop(keys.get(key), None) is not None:
@@ -3871,7 +4478,11 @@ def _assumptions_key() -> str:
     """Changes whenever an assumption does: the UI keys its caches on it, so a
     map drawn before a change is never shown after it."""
     payload = {"pf": app_data.get("load_power_factor"), "gm": app_data.get("generator_model") or {},
-               "costs": app_data.get("unit_costs") or {}, "names": app_data.get("element_names") or {}}
+               "costs": app_data.get("unit_costs") or {}, "names": app_data.get("element_names") or {},
+               # What the operator declared a unit or a load to be: the CIM export and the views change with it.
+               "sources": app_data.get("unit_sources") or {}, "categories": app_data.get("load_categories") or {},
+               # Other data (uploaded, or generated again): the map and the export show another operating point.
+               "data": _data_key()}
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
@@ -3919,6 +4530,27 @@ def _names_key() -> str:
                         .encode()).hexdigest()[:8]
 
 
+def _cim_layer_summary() -> dict:
+    """For the System tab's chip: how many facts the operator declared, and how many units' energy source the
+    network does not state (they are not treated as wind or solar until declared). Cached per network and
+    declarations: the chip is drawn on every page."""
+    loaded = app_data.get("net_loaded")
+    declared = app_data.get("unit_sources") or {}
+    categories = app_data.get("load_categories") or {}
+    if loaded is None:
+        return {}
+    key = (app_data.get("loaded_fingerprint"), json.dumps([declared, categories], sort_keys=True))
+    cached = app_data.get("_cim_summary")
+    if cached and cached[0] == key:
+        return cached[1]
+    profile = (app_data.get("grid_profile") or {}).get("unit_sources") or {}
+    unknown = sum(1 for table in ("gen", "sgen") for i in loaded[table].index
+                  if sem.unit_source(loaded, table, i, declared, profile)["basis"] == sem.UNKNOWN)
+    out = {"declared": len(declared) + len(categories), "units_unknown": unknown}
+    app_data["_cim_summary"] = (key, out)
+    return out
+
+
 def _assumptions_payload() -> dict:
     value, source = _load_pf_setting()
     return {"key": _assumptions_key(), "data_key": _data_key(), "names_key": _names_key(),
@@ -3929,6 +4561,7 @@ def _assumptions_payload() -> dict:
                               if app_data.get("net") is not None else []),
             "reactive_measured": {"measurements": dq.has_reactive(app_data.get("measurements") or {}),
                                   "forecasts": dq.has_reactive(app_data.get("forecasts") or {})},
+            "cim_layer": _cim_layer_summary(),
             "load_power_factor": {
         "value": value, "default": _default_load_pf()[0], "source": source, "lagging": True,
         "meaning": "The measurements carry active power only: each measured load's reactive power is "
@@ -3976,6 +4609,52 @@ def _by_name_now(keyed: dict) -> dict:
     """A {unit or load name as loaded: …} table under their names now."""
     now = _renames_now()
     return {now.get(k, k): v for k, v in keyed.items()}
+
+
+def _known_names(kind: str) -> set[str]:
+    """Every name an element of `kind` ("units" or "loads") answers to now — as loaded and as renamed —
+    casefolded."""
+    base = _net_for(None)
+    if kind == "units":
+        names = {gm.unit_name(base, t, i) for t in ("gen", "sgen") for i in base[t].index}
+        names |= {gm.unit_key(base, t, i) for t in ("gen", "sgen") for i in base[t].index}
+        names |= set(_sgen_names(base))
+    else:
+        names = {sem.load_key(base, i) for i in base.load.index}
+        names |= {str(n) for n in base.load.get("name", []) if isinstance(n, str)}
+    return {str(n).strip().casefold() for n in names if str(n).strip()}
+
+
+def _expand_by_meaning(entries: list, kind: str = "units", key: str | None = None,
+                       network: str | None = None) -> list:
+    """Entries that name elements by meaning — "the solar units on feeder Line 1-2", "industrial loads at
+    20 kV" (`semantics.select`) — replaced by the elements the CIM layer gives, one entry per element; an
+    entry that is an element's own name, or that the layer cannot read, is kept as it is (and checked where
+    it is used). `key`: the field of a dict entry that names the element ("unit", "load")."""
+    known = None
+    out: list = []
+    for entry in entries or []:
+        text = entry.get(key) if key and isinstance(entry, dict) else entry
+        if not isinstance(text, str) or not text.strip():
+            out.append(entry)
+            continue
+        known = known if known is not None else _known_names(kind)
+        if text.strip().casefold() in known:
+            out.append(entry)
+            continue
+        try:
+            chosen = sem.select(_semantics(network), text)
+        except ValueError:
+            out.append(entry)
+            continue
+        if chosen["kind"] != kind:
+            out.append(entry)
+            continue
+        # Units here are generators: storage is not declared, priced or re-modelled the same way.
+        elements = [e for e in chosen["elements"] if kind != "units" or e["type"] in ("gen", "sgen")]
+        for element in elements:
+            out.append({**entry, key: element["name"]} if key and isinstance(entry, dict) else element["name"])
+    return out
 
 
 def _by_name_loaded(changes: list) -> list:
@@ -4029,7 +4708,8 @@ async def set_generators(request: GeneratorModelRequest):
                 if not request.changes:
                     raise gm.ModelError("Give at least one unit change, or reset=true.")
                 current = app_data.get("generator_model") or {}
-                model = gm.merge(current, gm.normalise(loaded, _by_name_loaded(request.changes), current))
+                changes = _expand_by_meaning(request.changes, "units", key="unit")
+                model = gm.merge(current, gm.normalise(loaded, _by_name_loaded(changes), current))
             dropped = _apply_generator_model(model)
         except gm.ModelError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -4053,7 +4733,7 @@ def _costs_payload() -> dict:
     loaded = app_data.get("net_loaded")
     if loaded is None:
         raise HTTPException(status_code=503, detail="No network loaded yet.")
-    rows = uc.table(loaded, app_data.get("unit_costs") or {})
+    rows = uc.table(loaded, app_data.get("unit_costs") or {}, _variable_units(loaded))
     loads = uc.load_table(loaded, app_data.get("unit_costs") or {})
     base = _net_for(None)
     now = {**naming.unit_renames(base), **naming.load_renames(base)}
@@ -4104,7 +4784,9 @@ async def set_costs(request: CostsRequest):
                 model = {}
             else:
                 current = app_data.get("unit_costs") or {}
-                model = uc.merge(current, uc.normalise(loaded, _by_name_loaded(request.changes), current))
+                changes = _expand_by_meaning(request.changes, "units", key="unit")
+                model = uc.merge(current, uc.normalise(loaded, _by_name_loaded(changes), current,
+                                                       variable=_variable_units(loaded)))
         except uc.CostError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         app_data["unit_costs"] = model
@@ -4250,7 +4932,8 @@ async def revert_settings(request: SettingsRevertRequest):
             # Validated as if entered by hand, then applied together.
             model = gm.merge({}, gm.normalise(loaded, [{"unit": u, **d} for u, d in new_gm.items()])) \
                 if new_gm else {}
-            costs = uc.merge({}, uc.normalise(loaded, [{"unit": u, **d} for u, d in new_costs.items()])) \
+            costs = uc.merge({}, uc.normalise(loaded, [{"unit": u, **d} for u, d in new_costs.items()],
+                                              variable=_variable_units(loaded))) \
                 if new_costs else {}
             current_names = _flat_names(app_data.get("element_names"))
             renames = [{"element_type": k.split(":")[0], "element": int(k.split(":")[1]),
@@ -4350,6 +5033,94 @@ def _nominal_for_series(wanted: set) -> dict | None:
                                "production": round(float(df.at[name, "production"]), 4)}
                         for name in wanted if name in df.index},
     }
+
+
+class SyntheticPreviewRequest(BaseModel):
+    """Settings to preview: the ones to change; the rest stay as they are now."""
+    settings: dict = {}
+    max_points: int = 700
+
+
+class SyntheticRequest(SyntheticPreviewRequest):
+    """Generate the synthetic data again. `reset`: with the settings the
+    network loads with; `replace`: confirms replacing uploaded data."""
+    reset: bool = False
+    replace: bool = False
+
+
+def _thin(timestamps: list, *series: list, max_points: int) -> tuple:
+    stride = max(1, -(-len(timestamps) // max(1, int(max_points))))
+    return (stride, timestamps[::stride], *(s[::stride] for s in series))
+
+
+@app.get("/api/data/synthetic")
+@_off_event_loop
+async def synthetic_data():
+    """How the synthetic data are generated: the settings in use, those the
+    network loads with, the choices, and units drawn with a shape their
+    declared source no longer has."""
+    return _synthetic_payload()
+
+
+@app.post("/api/data/synthetic/preview")
+@_off_event_loop
+async def synthetic_preview(request: SyntheticPreviewRequest):
+    """The system totals the settings would give (nothing changes), beside the data in use."""
+    syn = app_data.get("synthetic")
+    if not syn or app_data.get("net") is None:
+        raise HTTPException(status_code=409, detail="No network with synthetic data is loaded.")
+    try:
+        settings = synth.normalise_settings(request.settings, syn["settings"])
+    except synth.SettingsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    new = synth.preview(syn["basis"], settings, _current_unit_shapes(), _current_load_shapes())
+    stride, ts, cons, prod = _thin(new["timestamps"], new["consumption"], new["production"],
+                                   max_points=request.max_points)
+    by_shape = {shape: series[::stride] for shape, series in new["production_by_shape"].items()}
+    current = {}
+    measured, ticks = app_data.get("measurements") or {}, app_data.get("timestamps") or []
+    if ticks:
+        _, picked = _thin(ticks, max_points=request.max_points)
+        frames = [prepare_measurement_df(measured[t]) for t in picked]
+        current = {"timestamps": picked, "source": app_data.get("measurements_source", "synthetic"),
+                   "consumption": [round(float(f["consumption"].sum()), 4) for f in frames],
+                   "production": [round(float(f["production"].sum()), 4) for f in frames]}
+    return {"settings": settings, "summary": synth.describe(settings), "n_ticks": len(new["timestamps"]),
+            "stride": stride, "timestamps": ts, "consumption": cons, "production": prod,
+            "production_by_shape": by_shape,
+            "peaks": {"consumption": max(new["consumption"], default=0.0),
+                      "production": max(new["production"], default=0.0)},
+            "current": current}
+
+
+@app.post("/api/data/synthetic")
+@_off_event_loop
+async def synthetic_generate(request: SyntheticRequest):
+    """Generate the measurements and the forecast again, with the settings
+    given (or, `reset`, those the network loads with) and the units' shapes as
+    their sources are now. Kept for this network across restarts. Uploaded
+    data are replaced only with `replace`. (`_off_event_loop` holds the state
+    lock: no study runs meanwhile.)"""
+    syn = app_data.get("synthetic")
+    if not syn or app_data.get("net") is None:
+        raise HTTPException(status_code=409, detail="No network with synthetic data is loaded.")
+    try:
+        settings = syn["base"] if request.reset else synth.normalise_settings(request.settings, syn["settings"])
+    except synth.SettingsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    origin = {"uploaded": "uploaded", "demo": "the demo's own"}
+    theirs = [f"the {what} in use ({origin[app_data.get(key)]})"
+              for what, key in (("measurements", "measurements_source"), ("forecast", "forecasts_source"))
+              if app_data.get(key) in origin]
+    if theirs and not request.replace:
+        return {"status": "confirm_required",
+                "message": f"This replaces {' and '.join(theirs)} with synthetic data. Upload them again to go back."}
+    _apply_synthetic(settings, persist=True)
+    _save_assumptions()
+    ts = app_data["timestamps"]
+    return {"status": "success", "n_timestamps": len(ts), "first_timestamp": ts[0], "last_timestamp": ts[-1],
+            "clock": ts[app_data["current_index"]], "n_forecast_timestamps": len(app_data["forecast_timestamps"]),
+            **_synthetic_payload()}
 
 
 @app.post("/api/time/advance")
@@ -4667,20 +5438,15 @@ async def upload_network(
     }
 
     # Build synthetic multi-timestamp measurement series (7 days, 15-min resolution).
-    import synthetic_timeseries as st
     print(f"[upload] Generating synthetic timeseries ({len(net.load)} load buses, {len(net.sgen)} sgens, {len(net.gen)} gens remaining)...")
     shapes = _unit_shapes(net, {})
-    timestamps, measurements = st.generate(net, n_days=7, resolution_min=15, seed=42, unit_shapes=shapes)
-    print(f"[upload] Timeseries ready: {len(timestamps)} timestamps from {timestamps[0]} to {timestamps[-1]}.")
-
-    # A synthetic forecast: the last 2 measured days with a day-ahead-sized
+    # With a synthetic forecast: the last 2 measured days with a day-ahead-sized
     # error (so forecast and measured can be compared) and the 7 days after
     # (an independent realisation). Measurements are the historical actuals
     # that drive the simulation clock; forecasts are read-only, for planning.
-    forecast_timestamps, forecasts = st.forecast(
-        net, timestamps, measurements, overlap_days=2, n_days=7, resolution_min=15, seed=137,
-        unit_shapes=shapes,
-    )
+    timestamps, measurements, forecast_timestamps, forecasts = _start_synthetic(net, _synthetic_defaults(), shapes,
+                                                                                load_shapes=_load_shapes(net, {}))
+    print(f"[upload] Timeseries ready: {len(timestamps)} timestamps from {timestamps[0]} to {timestamps[-1]}.")
     print(f"[upload] Forecast ready: {len(forecast_timestamps)} timestamps from "
           f"{forecast_timestamps[0]} to {forecast_timestamps[-1]}.")
 
@@ -7099,6 +7865,28 @@ def _supply_lost(net, element_type: str, element_index: int) -> dict:
     }
 
 
+def _restoring_ties(intact, network: str | None, element_type: str, element_index: int, limits: dict) -> list[dict]:
+    """The normally open ties that could restore what an outage cuts off, each
+    checked with a power flow on `intact` (the study's network at its moment,
+    before the outage): what closing it restores, the lowest voltage, the
+    highest loading, the study's limits broken (`_tie_checker`)."""
+    try:
+        import pandapower.topology as top
+        before = {int(b) for b in top.unsupplied_buses(intact)}
+        outaged = copy.deepcopy(intact)
+        outaged[element_type].at[element_index, "in_service"] = False
+        lost = {int(b) for b in top.unsupplied_buses(outaged)} - before
+        if not lost:
+            return []
+        names = {(b["element_type"], b["index"]): b["name"] for b in _semantics(network)["branches"]}
+        check = _tie_checker(intact, at_tick=True, limits=limits)
+        return [check({"etype": element_type, "index": int(element_index)}, switch, label, lost)
+                for switch, label in sem.tie_switches(intact, names, lost)[:sem.MAX_TIES_CHECKED]]
+    except Exception as exc:  # noqa: BLE001 — the outage's result stands without the ties
+        print(f"[contingency] Restoring ties not checked: {exc}")
+        return []
+
+
 @app.post("/api/contingency/simulate")
 @_off_event_loop
 async def simulate_contingency(request: ContingencyRequest):
@@ -7134,6 +7922,7 @@ async def simulate_contingency(request: ContingencyRequest):
     def echoed(result: dict) -> dict:
         return {**result, "option": _option_echo(applied[0], applied[1], current_ts, applied[2])} if applied else result
 
+    intact = copy.deepcopy(net_copy)          # before the outage: where a restoring tie is checked from
     if request.element_type == "line":
         net_copy.line.at[request.element_index, "in_service"] = False
     elif request.element_type == "trafo":
@@ -7153,6 +7942,13 @@ async def simulate_contingency(request: ContingencyRequest):
     supply = _supply_lost(net_copy, request.element_type, request.element_index)
     # Load cut off is not a limit violation, but the outage is not secure.
     cuts_load = (supply.get("unsupplied_load_mw") or 0.0) > 1e-6
+    if cuts_load:
+        ties = _restoring_ties(intact, getattr(request, "network", None), request.element_type,
+                               request.element_index, _thresholds_used(request))
+        if ties:
+            supply["ties_that_could_restore"] = ties
+            supply["ties_checked_by"] = ("a power flow per normally open tie at this moment, with the element "
+                                         "out and the tie closed, against this study's limits")
 
     if isinstance(df_results_ca, list): df_results_ca = pd.DataFrame(df_results_ca)
 
@@ -7225,7 +8021,7 @@ def _load_cut_off(net) -> tuple[list[str], float]:
 
 
 def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
-              max_line_loading_pct: float, max_trafo_loading_pct: float) -> dict:
+              max_line_loading_pct: float, max_trafo_loading_pct: float, only: set | None = None) -> dict:
     """Every single outage of an in-service line or transformer, one power
     flow each, on `net_copy` as prepared (an operating point, maybe a dispatch
     applied, maybe a branch already out). Returns the counts, the violation
@@ -7248,6 +8044,8 @@ def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
         # Nor is one whose bus is out (an island an earlier outage left, N-1-1).
         live = table["in_service"].astype(bool) & table[ends[0]].isin(live_buses) & table[ends[1]].isin(live_buses)
         for idx in table.index[live]:
+            if only is not None and (el_type, int(idx)) not in only:
+                continue                                  # outside the scope asked for
             total_tested += 1
             table.at[idx, "in_service"] = False
             try:
@@ -7383,13 +8181,23 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
         screened_with = _option_echo(stored, option, current_ts, held,
                                      screen="N-1-1" if stored.get("outage") else "N-1")
 
+    only, scope = None, None
+    asked = getattr(request, "scope", None)        # other studies call the sweep with a plain GridRequest
+    if asked:
+        try:
+            only, covers = sem.scope_branches(_semantics(getattr(request, "network", None)), asked)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scope = {"asked": asked, "covers": covers, "outages_in_scope": len(only),
+                 "note": "Only these outages were tested; violations are looked for in the whole network."}
     sweep = _n1_sweep(net_copy, current_ts, request.vm_lower_pu, request.vm_upper_pu,
-                      request.max_line_loading_pct, request.max_trafo_loading_pct)
+                      request.max_line_loading_pct, request.max_trafo_loading_pct, only=only)
     all_violations, non_converged_outages = sweep["violations"], sweep["non_converged_outages"]
     total_tested, outages_with_violations = sweep["total_outages_tested"], sweep["total_outages_causing_violations"]
     disconnecting = sweep["outages_disconnecting_load"]
 
     return {
+        **({"scope": scope} if scope else {}),
         "timestamp": current_ts,
         "total_outages_tested": total_tested,
         "total_outages_causing_violations": outages_with_violations,
@@ -10010,7 +10818,8 @@ def _flex_prices(net, model) -> tuple[fo.Prices, dict]:
     """The cost table's prices for the units and external grid in `model`, and
     where each came from. Units a proposal added get the default for their kind."""
     loaded = app_data.get("net_loaded")
-    rows = {r["unit"]: r for r in uc.table(loaded, app_data.get("unit_costs") or {})} if loaded is not None else {}
+    rows = ({r["unit"]: r for r in uc.table(loaded, app_data.get("unit_costs") or {}, _variable_units(loaded))}
+            if loaded is not None else {})
     added = {r["unit"]: r for r in uc.defaults(net) if r.get("proposed")}
     key_of = {gm.unit_name(net, t, i): gm.unit_key(net, t, i) for t in ("gen", "sgen") for i in net[t].index}
     up, down, q, sources = {}, {}, {}, {}
@@ -11012,7 +11821,8 @@ async def optimise_flexibility(request: FlexibilityRequest):
     if start:
         _apply_option_dispatch(net_base, start[1], loads=False, held=start[2])   # the held set-points: the schedule now
 
-    disabled_gens = request.disabled_generators
+    # "Without the CHP units", "no wind units": each unit the CIM layer finds (`semantics.select`).
+    disabled_gens = _expand_by_meaning(request.disabled_generators, "units", network=getattr(request, "network", None))
 
     # Issue 3: capture the full-grid operating point *before* any generators are
     # removed so the dispatch chart can show all three stages:

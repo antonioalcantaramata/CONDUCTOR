@@ -300,11 +300,19 @@ _simulate_all_contingencies = genai.types.FunctionDeclaration(
         "Returns whether the system is N-1 secure, total outages tested, "
         "number causing violations, and the full violation table. "
         "Use this when the user asks 'which contingency is worst' or "
-        "'is the grid N-1 secure'. With option, it screens a corrective option instead of the schedule."
+        "'is the grid N-1 secure'. With option, it screens a corrective option instead of the schedule. "
+        "With scope, only the outages of one feeder, substation or voltage level ('N-1 on the 20 kV level', "
+        "'on feeder Line 1-2'); violations are still looked for in the whole network."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
         properties={
+            "scope": genai.types.Schema(
+                type=genai.types.Type.STRING,
+                description=("Only these outages, by the CIM layer: a voltage level ('20 kV'), a feeder by name "
+                             "(describe_network about='feeders') or a substation by name. Omitted: every line and "
+                             "transformer."),
+            ),
             "option": genai.types.Schema(
                 type=genai.types.Type.STRING,
                 description=("A corrective option's `ref` (e.g. 'S2:cheapest'): the sweep runs with its "
@@ -1751,9 +1759,14 @@ _describe_network = genai.types.FunctionDeclaration(
         "it connects and which branches carry its power; 'summary'; 'around' with element: that element and "
         "everything connected to it in one answer — its substation (units, loads, branches leaving and where "
         "they lead), its supply route from the external grid and feeder, and what would be cut off without "
-        "it with the open ties that could restore supply (topology only). Use it before saying what a unit "
+        "it (topology) with the open ties that could restore supply, each checked with a power flow at the current "
+        "operating point (what closing it restores, the lowest voltage, the highest loading, any limit broken). Use it before saying what a unit "
         "or a load is, which units are renewable, what voltage level, substation or feeder something "
-        "belongs to, or what an element supplies."
+        "belongs to, or what an element supplies. about='select' with element: the units, loads or branches a "
+        "phrase names by meaning ('the wind units on feeder Line 1-2'), each with its basis; studies that take "
+        "units accept such a phrase too. about='issues': what in the network's own data looks inconsistent "
+        "(a name its type contradicts, a line across voltage levels, loads cut off). about='changes' with "
+        "network=<proposal>: what the proposal changes in the CIM layer, element by element."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1761,11 +1774,14 @@ _describe_network = genai.types.FunctionDeclaration(
             "about": genai.types.Schema(
                 type=genai.types.Type.STRING,
                 enum=["summary", "units", "loads", "voltage_levels", "substations", "external_grid", "switches",
-                      "feeders", "data", "around"],
+                      "feeders", "data", "around", "select", "issues", "changes"],
                 description="The aspect to describe (default summary)."),
             "element": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description="For about='around': a bus, line, transformer, unit, load or substation, by name."),
+                description=("For about='around': a bus, line, transformer, unit, load or substation, by name. "
+                             "For about='select': what to select, by meaning — 'solar units on feeder Line 1-2', "
+                             "'industrial loads at 20 kV', 'units in substation Bus 5', 'unknown units', "
+                             "'transformers'.")),
         },
     ),
 )

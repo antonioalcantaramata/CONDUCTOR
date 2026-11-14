@@ -170,8 +170,9 @@ def test_a_unit_listed_under_the_wrong_source_is_contradicted():
     net.sgen.at[10, "name"], net.sgen.at[11, "name"] = "Solar Farm North", "PV Park East"
     text = "There are 10 solar units: PV 3, PV 4, PV 11, Solar Farm North, and PV Park East."
     issues = en.check_answer(text, _record(net, text))
-    assert [i.kind for i in issues] == [en.CONTRADICTED]
-    assert "Solar Farm North" in issues[0].note or "PV Park East" in issues[0].note
+    # Each unit listed wrongly is named (one finding per sentence hid the second).
+    assert [i.kind for i in issues] == [en.CONTRADICTED, en.CONTRADICTED]
+    assert "Solar Farm North" in issues[0].note and "PV Park East" in issues[1].note
     # The list stops at the next source word.
     ok = "The solar PV units are PV 3, PV 4 and PV 11, and the wind unit WKA 7."
     assert en.check_answer(ok, _record(net, ok)) == []

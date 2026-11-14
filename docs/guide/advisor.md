@@ -90,6 +90,24 @@ By default suggestions are made only when you ask. In the sidebar,
 **Advisor suggestions → Suggest after every answer** makes them automatic, at
 the cost of one extra model call per answer.
 
+## The advisor and the network
+
+The advisor sees what the [CIM layer](what-the-network-is.md) says about the
+elements the latest results name — their feeder, voltage, what is connected —
+and what it writes about elements is checked against the layer like an answer.
+Under a suggestion, a reply or a note you may see:
+
+- **⚠️ Against the CIM layer: …** — it said something about an element the
+  network contradicts or does not state (*WKA 7, a solar unit* — it is wind).
+- **📍 "the solar units on feeder Line 1-2" — 8 element(s) by the CIM layer: …** —
+  a group a proposed study names by meaning, and the elements it resolves to;
+  **⚠️** when the layer cannot resolve it (*no thermal units on that feeder*).
+
+When a conclusion depends on what some units are and the network does not say —
+the reading check shows it moving when they are counted as wind or solar — the
+advisor asks you to say what they are (a *Step back* suggestion naming them).
+It never assumes it: only you can declare it.
+
 ## Cost
 
 One model call per suggestion round, per message in a discussion, and per

@@ -52,7 +52,8 @@ def test_loads_get_their_own_picture_and_rows():
 def test_looking_around_a_line_shows_both_ends_its_supply_and_what_it_cuts_off():
     net = pn.create_cigre_network_mv(with_der="all")
     s = sm.build(net)
-    assert ("Substation · Substation Bus 0", "Substation Bus 0") in sv.around_choices(s)
+    station = next(x for x in s["containers"]["substations"] if x["name"] == "Substation Bus 0")
+    assert ("Substation · Substation Bus 0", station["mrid"]) in sv.around_choices(s)   # sent by its mRID
     cards = dict(sv.around_cards(sm.around(net, s, "line", 1)))                  # Line 2-3
     assert set(cards) == {"Where it sits", "How it is supplied", "Without it"}
     assert any("Feeder: **Line 1-2**" in x for x in cards["How it is supplied"])

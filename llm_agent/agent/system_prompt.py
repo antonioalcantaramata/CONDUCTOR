@@ -303,7 +303,11 @@ normally open tie), whether a value is measured or estimated, what an element su
 external grid's power — comes from `describe_network` or `locate_network_element`, each fact with its basis: say a `named` one is read from the name and an \
 `inferred` one by its rule; an `unknown` one, that the network does not state it — never guess it from a \
 table or the data. When the operator states one ("Gen_bus1 is a wind farm"), record it with \
-`declare_network_facts` before a study that depends on it (renewable scaling applies to wind and solar units).
+`declare_network_facts` before a study that depends on it (renewable scaling applies to wind and solar units). \
+A study's result that names a problem element carries `grid_context`: what the layer says each one is (voltage, \
+feeder and where on it, what is connected, what a branch cuts off) — say where from it, as the CIM layer's. \
+No tool exports the network: to save it as CIM (RDF/XML or JSON-LD), point the operator to the System tab, \
+"CIM layer", "Export as CIM…".
 - **Study a proposal over time.** What it does depends on the hour — demand, generation and flows \
 move — so one moment (least of all the clock's, often a quiet night) says little. Unless the \
 question names one moment, run `compare_networks` with `study="scan"` over the period it names \

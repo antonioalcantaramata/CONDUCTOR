@@ -24,9 +24,15 @@ Every start shows a launch screen in two columns.
   purpose, so the data-quality report has gaps to show.
 - **Demo: CIGRE MV · distribution with DER** — the CIGRE medium-voltage
   benchmark: a 110/20 kV substation and two radial feeders with PV, wind, CHP,
-  fuel cells and batteries, each typed by the network (so *System → What it is*
+  fuel cells and batteries, each typed by the network (so *System → CIM layer*
   shows every unit's source as stated). The feeder ends sag below 0.95 p.u. at
   the evening peaks. The what-if evaluation is written for it.
+- **Upload your own network** — a MATPOWER (`.m`), pandapower (`.json`,
+  `.xlsx`), UCTE (`.uct`) or CGMES (`.zip`) file, loaded at once with a
+  synthetic week of data; it becomes what *Resume* loads. Open on a first
+  visit, when there is nothing to resume yet. Your own data are uploaded
+  afterwards, with *Upload Data* in the header (see
+  [Data and the operating point](data-and-operating-point.md)).
 
 When a session was saved for the network loaded, the launch screen also asks
 whether to **continue from it** — see

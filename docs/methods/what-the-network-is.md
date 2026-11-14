@@ -9,11 +9,11 @@ a table, and reading it off one goes wrong. Three examples, all observed:
 - the 1 kV of a converted per-unit case taken for a voltage level;
 - the external grid's injection taken for the lines that carry it.
 
-CONDUCTOR therefore keeps a **semantic layer** over whatever network is loaded
-(`backend/semantics.py`). It states what each element is, in the classes of the
+CONDUCTOR therefore keeps a **CIM layer** over whatever network is loaded
+(the *semantic layer* in the code, `backend/semantics.py`). It states what each element is, in the classes of the
 Common Information Model (IEC 61970), and how that is known. The agent answers
 from it, every answer is checked against it, and the operator sees and corrects
-it under **System → What it is**.
+it under **System → CIM layer**.
 
 ## Every fact has a basis
 
@@ -99,7 +99,7 @@ so instead of hiding it.
 
 ## As CIM, for other tools
 
-**System → What it is → Export as CIM** (or `GET /api/network/cim`) writes the
+**System → CIM layer → Export as CIM** (or `GET /api/network/cim`) writes the
 layer as CIM RDF/XML or JSON-LD in the distribution namespace (CIM100): base
 voltages, substations, voltage levels, topological nodes with a terminal per
 piece of equipment, the equipment above with its units, controls and switches
@@ -138,18 +138,125 @@ carry it. The agent follows those links in one call. `describe_network` with
   result says power may take others;
 - **without it** (a bus, branch or substation): the buses, units and loads that
   would lose every connection to an external grid, with their demand, and the
-  **normally open ties** that could restore them. Topology only: no power
-  flow is run, and closing a tie is not checked against flows.
+  **normally open ties** that could restore them. What is cut off comes from
+  the topology. Each tie (up to five) is then checked with a power flow at the
+  clock's operating point, with the element out and the tie closed: how many of
+  the cut-off buses it restores, the lowest voltage, the highest loading, and any
+  of the network's limits broken.
 
 ## The operator's declarations
 
 What the network does not state, the operator can: a unit's energy source or a
 load's category, in the chat (*"Gen_bus1 is a wind farm"* — the agent records it
-with `declare_network_facts`) or in **System → What it is** (**Edit**). A
+with `declare_network_facts`) or in **System → CIM layer** (**Edit**). A
 declaration is stated, overrides a name, and is kept for that network across
 restarts, like a rename. **Forget** goes back to what the network says. A
 network's profile can state the same (`unit_sources`, `load_categories`), and
 also its loads' own power factor (`load_power_factor`).
+
+## What the studies use it for
+
+The studies read the layer, not the names, for any network loaded:
+
+| Study | What it takes from the layer |
+| --- | --- |
+| Renewable scaling (what-if, scenario scans) | the units that are wind or solar: only those are scaled |
+| Probabilistic and robust studies, the look-ahead | the same units: only their output is uncertain |
+| Optimisations (OPF, flexibility options, N-1 corrective and preventive plans) | wind and solar units are curtailable at 40 €/MWh, produce at 0 €/MWh, and are capped at what their resource gives at the moment studied |
+| Outage studies | the normally open ties that could restore what an outage cuts off, each checked with a power flow |
+| N-1 screen | a scope: the outages of one feeder, substation or voltage level |
+| Synthetic data | each unit follows its source, each load its category (residential, commercial, industrial, a data centre…) |
+| The reading check | a study that depends on which units are wind or solar is re-run with the unknown units counted as wind or solar, and the name-only ones not counted (`assume_unit_sources`, nothing kept) |
+| Where values come from | which values are measured, allocated, derived, solved or set |
+
+A unit or a load counts by what is **stated** (by the network, its profile or
+you) or **named**; one that is **unknown** keeps the default treatment, and the
+result says so. With the layer switched off in the studies (the CIM layer
+paper's ablation, `CONDUCTOR_ONTOLOGY=none`), every study behaves as before it.
+
+## Results linked to the layer
+
+A study's result names elements (*Bus 14 at 0.912 p.u.*, *Line 12-13 cuts off
+supply*) but not where they are. The elements a result names **as a problem** — a
+violation, an outage that cuts supply, a binding limit, a curtailed unit, a
+probability of violating — are linked to the layer by their mRIDs
+(`llm_agent/agent/grid_context.py`; `POST /api/network/cim/links`). The fields are
+found generically, by what they say (violations, outages, cut off, worst, binding…),
+never the lists of every element (all voltages, every unit's dispatch). The element
+the study is **about** is linked too, first, and marked *studied*: what its
+arguments name — the outage (by type and index), the bus of a hosting-capacity
+study, the units left out or held.
+
+- **The logged result keeps only the links**: the layer's version and, for the
+  first eight elements named, each one's mRID (`cim_links`). The facts stay in one
+  place, the layer.
+- **The agent's copy of the result** carries what the layer says each of those
+  eight is, with its basis (`grid_context`): a bus's voltage, feeder and where on
+  it (*bus 2 of 2 from the substation, its far end*), the units and loads there; a
+  branch's ends and which buses and loads lose supply without it (topology only);
+  a unit's source
+  or a load's category; for each unit and load, how its P and Q are obtained from
+  the data (*P allocated, Q derived*: a share of its bus's measurement, Q from the
+  power factor), so an answer does not call measured what is not; and for each
+  feeder, its normally open points — the switch, the branch it is on, and the
+  feeder on the other side or a loop within the feeder (whether closing one
+  restores supply is a study: an outage study checks each with a power flow).
+  Every element the result names, however many, is placed by
+  feeder and voltage level together (*feeder: 19 of 27 on Line 1-2, 4 on Line
+  12-13*). A bus on no feeder (a meshed level, a busbar) gets the buses next to
+  it, and why it has no feeder is said once.
+- **MW only at the study's moment.** Demand belongs to the operating point, not to
+  the layer. A study of one moment on the network's own demand — an assessment, an
+  outage, an N-1 sweep or a violation attribution, with no load scaling, no
+  proposal and no option applied — sends its moment (the result's timestamp and
+  data source), and the layer adds the demand there: at a bus, and cut off by a
+  branch (*0.258 MW at the study's moment*), read from the same data the study
+  read; it equals the MW the study reports cut off. Any other study gets counts and
+  names only, and its own result is where its MW comes from. The links keep the
+  moment and the data's identity, so a later reading shows the same MW whatever the
+  clock says — or, if other data have been loaded since, says so and shows none.
+- **Whatever reads the links later resolves them** (`GET
+  /api/network/cim/resolve`): the turn's record keeps them resolved for the answer
+  checks (`cim_context`), so a figure the answer takes from them traces to the
+  layer, and the answer card's **Where** section shows them. The layer's version
+  (`semantics.layer_version`: a digest of what the layer says, not of the
+  operating point) tells when the layer has changed since the study ran — after a
+  declaration, say.
+
+With the layer hidden from the agent (`CONDUCTOR_ONTOLOGY=off`, `none` or
+`tables`) nothing is linked, so the arms of the CIM layer paper's ablation stay
+comparable.
+
+## Choosing elements by meaning
+
+`semantics.select` reads a phrase as the layer, not names, would: *the solar
+units*, *the wind units on feeder Line 1-2*, *industrial loads at 20 kV*, *units in
+substation Bus 5*, *unknown units*, *transformers*. A qualifier is an energy source
+or a group (renewable, variable, conventional, dispatchable) for units, a category
+for loads; a place is a feeder, a substation or a voltage level. The agent reads
+it with `describe_network(about="select")`, and the phrase itself is accepted
+where a study takes units: the units left out of a flexibility study, cost and
+generator-model changes, and declarations (*"the units on feeder Line 1-2 are
+solar"*). Storage is left out where only generators apply.
+
+## The layer checked against itself
+
+`semantics.data_issues` (and `describe_network(about="issues")`) looks for what
+in the network's own data is inconsistent, from the facts alone: a unit or a load
+whose name says one thing and whose stated type another, a line between buses at
+two voltage levels, a transformer whose rated voltage is not its bus's, a load
+drawing negative power, loads with no path to a source, a switch away from its
+normal state, loads partly categorised, names used twice.
+
+## A proposal as a difference
+
+Elements keep their mRIDs between the base and a proposal (they are derived from
+the network as loaded), so `cim_export.difference` compares the two layers
+element by element: added, removed, or the statements that changed. It is written
+as a CIM difference model (`GET /api/network/cim/difference?network=<proposal>`;
+IEC 61970-552: forward and reverse differences) — applied to the base's export, it
+gives the proposal's — and summarised for the agent
+(`describe_network(network=<proposal>, about="changes")`).
 
 ## Checked in every answer
 
@@ -163,15 +270,21 @@ checked against the studies (`llm_agent/agent/entities.py`):
 | A load's category | the network does not say | it says otherwise |
 | A group (*"the solar generation"*) | no unit is stated or named of that kind | — |
 | A voltage (*"the 132 kV substation"*) | the network has no such level (none at all in a per-unit case) | the bus named beside it is at another |
+| A feeder (*"Bus 14, at the end of feeder Line 1-2"*) | the element is on no feeder (a busbar, a meshed level) | the layer infers another feeder for it, in every network the turn studied |
 | A branch's kind or ends | — | a line called a transformer (or the reverse), a branch placed between other buses |
 | What carries the external grid | — | a branch that does not |
 | An element (*"Load R9"*) | — | named like the network's own but not among them, in every network the turn studied |
 | A value called measured (*"Load 5's measured reactive demand"*) | it is a share of its bus's measurement | it is derived, solved, set or the case's own |
+| A fact only a name gives (*"Solar Plant A is the solar unit"*, basis *named*) | said as a fact, not as read from the name | — |
 
-A source or category counts only when it is attached to the element's name
-(*"WKA 7, a wind turbine"*, *"the solar unit PV 3"*, *"Load 5 is a data
-centre"*): a word that is merely near it, in a list of units, says nothing about
-it. A sentence that holds a claim back (*if*, *would*, *not stated*) or denies it
+A source or category counts where the answer attaches it to the element: beside
+its name (*"WKA 7, a wind turbine"*, *"the solar unit PV 3"*, *"Load 5 is a data
+centre"*, *"Solar Plant A at Bus 1 is the solar unit"*), in a list under a source
+(*"The wind units are Wind Park West and WKA 7"*, or a bulleted list under
+*"Solar units:"*), in a table row with a source or type column, or as the answer
+to a question about a source (*"Where is the storage?"* — *"Battery Storage 3 is
+at Bus 5"*, whose name says storage). A word that is merely near a name, in a
+list of units, says nothing about it. A sentence that holds a claim back (*if*, *would*, *not stated*) or denies it
 (*no wind units*, *there is no Load R9*) is not a claim. A figure or a name the
 operator gave in the question is theirs to use.
 

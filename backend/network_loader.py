@@ -139,6 +139,36 @@ class CgmesError(ValueError):
     """A CGMES upload that cannot be used; the message says why and what to add."""
 
 
+def _name_switch_nodes(net) -> None:
+    """pandapower's CIM converter adds a node at the far side of each switch
+    without a name of its own ("be-sw nan"): every such node then shares one
+    name, and a substation named after one of them merges with others. Each is
+    named after the bus its switch joins it to, and takes that bus's substation
+    when it has none."""
+    names = net.bus["name"]
+    unnamed = [int(i) for i, v in names.items()
+               if pd.isna(v) or str(v).strip().casefold() in ("", "nan", "none", "be-sw nan")]
+    if not unnamed:
+        return
+    taken = {str(v) for v in names if pd.notna(v)}
+    sw = net.switch[net.switch.et == "b"] if len(getattr(net, "switch", [])) else net.switch
+    for b in unnamed:
+        joined = sw[(sw.bus == b) | (sw.element == b)]
+        other = None
+        if len(joined):
+            row = joined.iloc[0]
+            other = int(row.element) if int(row.bus) == b else int(row.bus)
+        base = f"{names.at[other]} node" if other is not None and pd.notna(names.at[other]) else f"Node {b}"
+        name, k = base, 2
+        while name in taken:
+            name, k = f"{base} {k}", k + 1
+        taken.add(name)
+        net.bus.at[b, "name"] = name
+        if (other is not None and "Substation_id" in net.bus.columns
+                and pd.isna(net.bus.at[b, "Substation_id"]) and pd.notna(net.bus.at[other, "Substation_id"])):
+            net.bus.at[b, "Substation_id"] = net.bus.at[other, "Substation_id"]
+
+
 def read_cgmes(path: str) -> pp.pandapowerNet:
     """A CGMES model (CIM 2.4.15 or 3.0) from a zip of its profiles — EQ, SSH,
     TP, SV, and the boundary set when the model has one — or a zip of such
@@ -182,6 +212,19 @@ def read_cgmes(path: str) -> pp.pandapowerNet:
             logging.disable(logging.NOTSET)
     if not len(net.bus):
         raise CgmesError("The CGMES profiles describe no topology: include the TP (or EQ with connectivity) profile.")
+    equipment = sum(len(net[t]) for t in ("line", "trafo", "trafo3w", "load", "gen", "sgen", "ext_grid") if t in net)
+    if not equipment or net.bus["vn_kv"].isna().all():
+        raise CgmesError("The CGMES profiles describe no equipment (no lines, transformers, loads, units or "
+                         "voltages): include the EQ profile.")
+    # The operating point — what each load draws and each unit produces — is the SSH profile's. Without
+    # it the converter leaves those values empty, and the synthetic data and every study built on them
+    # would be empty too.
+    missing = [what for tbl, what in (("load", "loads' demand"), ("gen", "units' output"), ("sgen", "units' output"))
+               if tbl in net and len(net[tbl]) and pd.to_numeric(net[tbl]["p_mw"], errors="coerce").isna().all()]
+    if missing:
+        raise CgmesError(f"The CGMES profiles give no operating point (the {' and the '.join(dict.fromkeys(missing))} "
+                         "are missing): include the SSH profile.")
+    _name_switch_nodes(net)
     dangling = []
     for tbl, a, b in (("line", "from_bus", "to_bus"), ("trafo", "hv_bus", "lv_bus")):
         bad = net[tbl][net[tbl][a].isna() | net[tbl][b].isna()]
@@ -196,9 +239,12 @@ def read_cgmes(path: str) -> pp.pandapowerNet:
     net["_import_notes"] = []
     if not len(net.ext_grid) and len(net.gen):
         slack = net.gen[net.gen["slack"].fillna(False).astype(bool)] if "slack" in net.gen.columns else net.gen.iloc[0:0]
-        ref = slack.index[0] if len(slack) else net.gen["max_p_mw"].fillna(0).idxmax()
+        biggest = (net.gen["max_p_mw"].fillna(0).idxmax() if "max_p_mw" in net.gen.columns
+                   and net.gen["max_p_mw"].notna().any() else net.gen.index[0])
+        ref = slack.index[0] if len(slack) else biggest
         row = net.gen.loc[ref]
-        idx = pp.create_ext_grid(net, bus=int(row["bus"]), vm_pu=float(row.get("vm_pu", 1.0) or 1.0),
+        vm = row.get("vm_pu")                              # NaN is truthy: `or 1.0` would keep it
+        idx = pp.create_ext_grid(net, bus=int(row["bus"]), vm_pu=float(vm) if pd.notna(vm) and vm else 1.0,
                                  name=f"{row.get('name') or 'Reference unit'} (reference)")
         if "origin_id" in net.gen.columns:
             net.ext_grid.at[idx, "origin_id"] = row.get("origin_id")

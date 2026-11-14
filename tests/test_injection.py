@@ -95,7 +95,7 @@ def test_a_figure_from_another_violation_is_caught_with_spaced_names():
 
 
 # ---------------------------------------------------------------------------
-# False alarms on the agent's own answers (GM 2027 runs, labelled by hand), each fixed and pinned here — with the
+# False alarms on the agent's own answers (the CIM layer paper's runs, labelled by hand), each fixed and pinned here — with the
 # error the same check must still catch beside it
 # ---------------------------------------------------------------------------
 

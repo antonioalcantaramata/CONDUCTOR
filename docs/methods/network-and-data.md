@@ -92,7 +92,13 @@ substation (a bus with load or generation), at a regular interval.
 
 Seven days at 15 minutes (672 moments from Saturday 1 January 2000), generated
 with fixed seeds (42 for measurements, 137 for the forecast), so every run
-sees the same week.
+sees the same week. These are the defaults: the length, step, load shape, peak,
+default generation shape, forecast errors, stress windows and seed can be changed
+in the Data tab ([Synthetic data](../guide/data-and-operating-point.md#synthetic-data)),
+and are then kept for the network (the forecast's seed is the measurements' plus
+95). The generator reads the network once, as it loads (`basis`): each unit's
+bus and capacity, each load's bus and demand. Data generated later start from
+those values, not from a tick's.
 
 **Load.** Every load follows one shape $s(h, d)$ of the hour $h$ and day $d$,
 with noise $u_t \sim \mathcal U(1 - \nu, 1 + \nu)$:
@@ -236,6 +242,7 @@ proposal (see [Risk, uncertainty and capacity](risk-and-capacity.md#comparing-a-
 | Finding an element by its name | `find`, `find_unit` in `backend/resolve.py`; `GET /api/network/resolve` |
 | Data to loads and units | `assign_load_values_from_measurements`, `assign_generators_values_from_measurements` in `backend/load_gen_assignment.py` |
 | Synthetic measurements and forecast | `generate`, `forecast` in `backend/synthetic_timeseries.py` |
+| The settings an operator can change, and their preview | `normalise_settings`, `preview` in `backend/synthetic_timeseries.py`; `/api/data/synthetic` in `backend/main_backend.py` |
 | Data quality, the nominal point | `backend/data_quality.py`, `backend/nominal.py` |
 | One moment | `_assign_tick`, `_prepared_net`, `_resolve_tick` in `backend/main_backend.py` |
 | Proposals | `backend/sandbox.py`, `POST /api/proposals/edit`, `POST /api/proposals/compare` |

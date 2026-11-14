@@ -37,6 +37,8 @@ import itertools
 import re
 from typing import Any, Iterable, NamedTuple
 
+from .grid_context import LINKS_KEY
+
 # ---------------------------------------------------------------------------
 # Claims
 # ---------------------------------------------------------------------------
@@ -100,7 +102,7 @@ _SIGNED_CURRENCY_RE = re.compile(r"-\s?[€$£]\s?$")
 # A full stop or comma after the name ends the sentence, not the number: the
 # guard against a decimal ("Bus 7.5") once refused "Line 14-8." whole and
 # matched "Line 14" alone, leaving "-8" to be read as a figure (14 of 60
-# untraced figures sampled in the GM 2027 runs were such fragments).
+# untraced figures sampled in the CIM layer paper's runs were such fragments).
 ELEMENT_NO_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:bus|line|transformer|trafo|gen|generator|unit|node|feeder|substation|outage)"
     r"\s?#?\s?\d+(?:\s?[-\u2010\u2011\u2013]\s?\d+)?(?!\d|[.,]\d|\s?[-\u2010\u2011\u2013]\s?\d)"
@@ -198,7 +200,9 @@ _DIRECTION_RE = re.compile(
     r"lowered|reduced|down by|"
     # The same, said of an action or a comparison: "reduce Gen_bus12 5.66 MW"
     # over `dp_mw: -5.66`, "16.42 MW lower than in the baseline".
-    r"reduce|reduces|reducing|lower|less)\b",
+    r"reduce|reduces|reducing|lower|lowers|less|"
+    # A flow said against its sign: "carries 0.52 MW back toward Bus 1" over `p_from_mw: -0.5233`.
+    r"back|reverse|reversed)\b",
     re.IGNORECASE,
 )
 
@@ -432,6 +436,10 @@ def _walk(node: Any, path: str, out: list[Source],
         name = _entity_name(node)
         inner = scopes | {name} if name else scopes
         for key, value in node.items():
+            # A study's links to the CIM layer are identifiers (mRIDs, a version digest): their digits are no
+            # figure. What the links resolve to is a source of its own (`cim_context`, below).
+            if key == LINKS_KEY:
+                continue
             # A dict keyed by entity names — `bus_violation_probability`,
             # `voltage_percentiles` — partitions its values the same way a
             # list of violations does.
@@ -555,6 +563,14 @@ def collect_sources(record: dict) -> list[Source]:
     # fabricated. Turn-level, since they describe the network, not an element.
     _walk(record.get("grid") or {}, "grid", sources)
 
+    # What the CIM layer says about the elements the studies named, through their links (`grid_context`): the
+    # model was told it with the result — a voltage level, a feeder position, the loads a branch cuts off.
+    # Scoped to its element, like a result's own row.
+    for facts in ((record.get("cim_context") or {}).get("elements") or {}).values():
+        if isinstance(facts, dict) and facts.get("name"):
+            names = frozenset({facts["name"], facts["name"].split(" | ")[0]})
+            _walk(facts, f"cim layer:{facts['name']}", sources, names, vocabulary)
+
     # Arguments and the prompt belong to the turn, not to any one element.
     for call in record.get("tool_calls") or []:
         if not isinstance(call, dict):
@@ -565,7 +581,57 @@ def collect_sources(record: dict) -> list[Source]:
         _walk(call.get("args"), f"args:{name}", sources)
 
     _walk(record.get("user") or "", "prompt", sources)
+    sources += _bus_sums(record)
     return sources
+
+
+# A figure the answer adds up from the rows at one bus: "loads at Bus 3 (0.23 MW)" over two loads there, 0.2143
+# and 0.0153 MW. The commonest false alarm left in the CIM layer paper's labelled findings. Kept apart (`SUM_PREFIX`):
+# a figure that matches only such a sum is `derived`, never `grounded`.
+SUM_PREFIX = "sum:"
+_GROUP_KEYS = ("bus", "bus_name")
+# A list's total is read only for power: a total of maximum voltages or severities means nothing.
+_POWER_FIELD_RE = re.compile(r"(?:^|_)(?:mw|mvar)(?:$|_)", re.IGNORECASE)
+
+
+def _bus_sums(record: dict) -> list[Source]:
+    """Per bus, the sum of each numeric field over the rows of a tool's list
+    that sit at that bus — only where two rows or more do."""
+    out: list[Source] = []
+
+    def visit(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                visit(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            rows = [r for r in node if isinstance(r, dict)]
+            key = next((k for k in _GROUP_KEYS if rows and all(isinstance(r.get(k), str) for r in rows)), None)
+            if len(rows) >= 2:
+                # The whole list's total of a field, said as a total ("1.40 MW total", "plus").
+                fields = {f for r in rows for f, v in r.items()
+                          if isinstance(v, (int, float)) and not isinstance(v, bool) and not f.endswith("index")}
+                for field in sorted(f for f in fields if _POWER_FIELD_RE.search(f)):
+                    out.append(Source(sum(float(r.get(field) or 0.0) for r in rows),
+                                      f"{SUM_PREFIX}{path}[*].{field}"))
+            if key:
+                groups: dict[str, list[dict]] = {}
+                for r in rows:
+                    groups.setdefault(r[key], []).append(r)
+                for bus, members in groups.items():
+                    if len(members) < 2:
+                        continue
+                    fields = {f for r in members for f, v in r.items()
+                              if isinstance(v, (int, float)) and not isinstance(v, bool) and not f.endswith("index")}
+                    for field in sorted(fields):
+                        total = sum(float(r.get(field) or 0.0) for r in members)
+                        out.append(Source(total, f"{SUM_PREFIX}{path}[{key}={bus}].{field}", frozenset({bus})))
+            for index, value in enumerate(node):
+                visit(value, f"{path}[{index}]")
+
+    for entry in record.get("tool_results") or []:
+        if isinstance(entry, dict) and entry.get("name") not in AGENT_WRITTEN:
+            visit(entry.get("result"), entry.get("name", "tool"))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +702,8 @@ def check_claim(claim: Claim, sources: Iterable[Any], subject: str | None = None
 
     for source in sources:
         value, path = source[0], source[1]
+        if str(path).startswith(SUM_PREFIX):
+            continue                                  # read by `_sum_steps`, where the words say it is a sum
         for target, scale, inverted in targets:
             difference = abs(value - target)
             if difference <= exact / scale:
@@ -832,7 +900,7 @@ def _share_of(claim: Claim, sources: Iterable[Any], answer: str | None) -> str |
 # named in section 1 would still be the subject halfway through section 3.
 # So does a paragraph break: "…the assessment also found Bus_29 undervoltage at
 # 0.943 p.u." closed a paragraph, and the next three, about the overloaded line,
-# had all thirteen of their figures read as written about Bus_29 (GM 2027 runs).
+# had all thirteen of their figures read as written about Bus_29 (the CIM layer paper's runs).
 _SECTION_BREAK_RE = re.compile(r"^(#{1,6}\s|-{3,}\s*$|_{3,}\s*$|[ \t]*$)", re.MULTILINE)
 
 
@@ -1004,11 +1072,47 @@ def check_answer(answer: str, sources: list[Any],
         for claim in claims
     ]
     verdicts = _with_unshown_steps(verdicts, cleaned, sources)
+    verdicts = _sum_steps(verdicts, cleaned, sources)
     return ProvenanceReport(verdicts=tuple(verdicts), n_sources=len(sources))
 
 
+def _sum_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: list[Any]) -> list[ClaimVerdict]:
+    """Untraced figures that are a sum the tools' rows give: the rows at one bus, where that bus is named on the
+    claim's own line ("Bus 3 (0.23 MW)", a table row); or a list's total power, where the words say it is a total
+    ("1.40 MW total"). Measured against error injection: a figure changed to another bus's sum, or to a total of
+    an unrelated field, stays ungrounded."""
+    sums = [s for s in sources if str(s[1]).startswith(SUM_PREFIX)]
+    if not sums or not any(v.status == UNGROUNDED for v in verdicts):
+        return verdicts
+    out = []
+    for v in verdicts:
+        claim = v.claim
+        if v.status != UNGROUNDED:
+            out.append(v)
+            continue
+        band = _tolerance(claim.decimals)
+        start = cleaned.rfind("\n", 0, claim.position) + 1
+        end = cleaned.find("\n", claim.position)
+        line = cleaned[start:end if end >= 0 else len(cleaned)]
+        total = bool(_TOTAL_RE.search(cleaned[max(0, claim.position - _STEP_WINDOW):claim.position + _STEP_WINDOW]))
+        step = None
+        for value, path, *rest in sums:
+            if abs(value - claim.value) > band:
+                continue
+            scopes = rest[0] if rest else frozenset()
+            if scopes and any(re.search(r"(?<![\w])" + re.escape(b) + r"(?![\w])", line) for b in scopes):
+                step = "sum of " + str(path)[len(SUM_PREFIX):]
+            elif not scopes and total:
+                step = "total of " + str(path)[len(SUM_PREFIX):]
+            if step:
+                break
+        out.append(v._replace(status=DERIVED, source=step) if step else v)
+    return out
+
+
 # The limits a study applied, by the unit a margin to them is stated in: "0.943 p.u., 0.007 p.u. below the limit".
-_LIMIT_KEYS = {"vm_lower_pu": "p.u.", "vm_upper_pu": "p.u.", "max_line_loading_pct": "%", "max_trafo_loading_pct": "%"}
+_LIMIT_KEYS = {"vm_lower_pu": "p.u.", "vm_upper_pu": "p.u.", "max_line_loading_pct": "%", "max_trafo_loading_pct": "%",
+               "max_loading_pct": "%", "vm_lower": "p.u.", "vm_upper": "p.u."}
 # A sentence ends at a stop followed by a space or a line break; the stops inside "p.u." and "e.g." do not end one.
 _SENTENCE_END_RE = re.compile(r"[.!?;](?=\s|$)|\n")
 _ABBREVIATION_RE = re.compile(r"\b(?:p\.u|e\.g|i\.e|approx|vs)\.", re.IGNORECASE)
@@ -1018,9 +1122,14 @@ _ABBREVIATION_RE = re.compile(r"\b(?:p\.u|e\.g|i\.e|approx|vs)\.", re.IGNORECASE
 _STEP_WORDS_RE = re.compile(
     r"\b(?:below|above|over|under|beyond|margin|headroom|short|by|less|more|lower|higher|increases?|increased|"
     r"decreases?|decreased|rises?|rose|falls?|fell|drops?|dropped|reduction|reduced|difference|leaving|leaves|"
-    r"violation of|exceed\w*|total|totals|plus|together|combined|altogether|in all|sum|half|halved|halving)\b|\+",
+    r"violation of|exceed\w*|total|totals|plus|together|combined|altogether|in all|sum|half|halved|halving|"
+    # A change written as its two ends: "from 29.41 MW to 29.87 MW (about 0.46 MW)", "shifts by", "→".
+    r"from|shifts?|shifted|chang\w*|compared)\b|\+|→|->",
     re.IGNORECASE)
 _STEP_WINDOW = 45
+# How far back a step's operands may be: the same paragraph, up to three sentences before the claim ("41.42 MW,
+# compared with 41.51 MW … Both peaks occurred at … The proposal's peak was about 0.09 MW lower").
+_STEP_SENTENCES = 3
 
 
 def _sentence_starts(cleaned: str) -> list[int]:
@@ -1046,7 +1155,7 @@ def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: lis
     The model states a margin without the subtraction — "Bus_29 was at 0.943 p.u., 0.007 p.u. below its 0.950
     p.u. limit", "114.7 %, 14.7 points over" — or a total after its parts. Both operands are on the page and
     traced, and the operator can check the step; reading such figures as invented was the commonest false alarm
-    in the GM 2027 runs. As narrow as `_derivation`, and measured against error injection: one difference or sum
+    in the CIM layer paper's runs. As narrow as `_derivation`, and measured against error injection: one difference or sum
     of two traced figures in the same sentence or the one before, in the claim's unit (or of one of them and a
     limit the study applied in that unit), exact on the figures as written to the claim's precision, and only where
     the words beside the claim say it is a step ("below", "by", "an increase of", "together")."""
@@ -1058,8 +1167,11 @@ def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: lis
         return max(i for i, start in enumerate(starts) if start <= position)
 
     traced = [v.claim for v in verdicts if v.status != UNGROUNDED and _quantity(v.claim)]
+    breaks = [0] + [m.start() for m in _SECTION_BREAK_RE.finditer(cleaned)]
     limits = {(round(s[0], 6), unit) for s in sources
               if (unit := _LIMIT_KEYS.get(str(s[1]).rsplit(".", 1)[-1]))}
+    # Figures the operator wrote in the question: their limit, quoted as "your limit".
+    asked = sorted({round(s[0], 6) for s in sources if str(s[1]) == "prompt"})
     out = []
     for v in verdicts:
         claim = v.claim
@@ -1068,7 +1180,9 @@ def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: lis
             out.append(v)
             continue
         here = sentence_of(claim.position)
-        operands = [t for t in traced if here - 1 <= sentence_of(t.position) <= here and _same_unit(claim, t)]
+        paragraph = max(b for b in breaks if b <= claim.position)
+        operands = [t for t in traced if here - _STEP_SENTENCES <= sentence_of(t.position) <= here
+                    and t.position >= paragraph and _same_unit(claim, t)]
         window = cleaned[starts[max(here - 1, 0)]:starts[here + 1] if here + 1 < len(starts) else len(cleaned)]
         step = _share_or_total(claim, operands, window)
         band = _tolerance(claim.decimals)
@@ -1076,6 +1190,7 @@ def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: lis
             pool = [(b.value, f"{b.value:g}") for b in operands[i + 1:]]
             pool += [(limit, f"limit {limit:g}") for limit, unit in limits if unit == (a.unit or "").casefold()
                      or (unit == "p.u." and (a.unit or "").casefold() in ("p.u.", "pu"))]
+            pool += [(value, f"your {value:g}") for value in asked]
             for b, name in pool:
                 if abs(abs(a.value - b) - abs(claim.value)) <= band:
                     step = f"{a.value:g} - {name} (stated)"
@@ -1085,6 +1200,136 @@ def _with_unshown_steps(verdicts: list[ClaimVerdict], cleaned: str, sources: lis
                     break
             if step:
                 break
+        out.append(v._replace(status=DERIVED, source=step) if step else v)
+    for _ in range(2):
+        out = _count_steps(out, cleaned, starts)
+    return out
+
+
+# Counts, and what is computed from them. A bare integer is too often a name or an index to be an operand in
+# general (`_quantity`); these steps read one only where the words say what it counts.
+_NUMBER_WORDS = {w: n for n, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+    "seventeen eighteen nineteen twenty".split())}
+_OTHER_RE = re.compile(r"\b(?:the\s+)?(?:other|remaining|rest of the)\s*$", re.IGNORECASE)
+_COUNT_NOUN_RE = re.compile(r"\s*(?:[\w-]+\s+){0,3}?(intervals?|ticks|steps|periods|quarter-hours|lines|outages|"
+                            r"units|buses|loads|branches|transformers|hours|days|moments|samples|cases|options)\b",
+                            re.IGNORECASE)
+_RESOLUTION_RE = re.compile(r"\b(\d+)[- ]?min(?:ute)?s?\b|\b(quarter[- ]hour)|\b(half[- ]hour)", re.IGNORECASE)
+_HOURS_RE = re.compile(r"\s*(?:h\b|hours?\b|hrs?\b)(?:\s*(?:and\s+)?(\d{1,2})\s*min(?:ute)?s?\b)?", re.IGNORECASE)
+_MINUTES_AFTER_HOURS_RE = re.compile(r"(\d{1,3})\s*(?:h|hours?)\s*(?:and\s+)?$", re.IGNORECASE)
+_PF_RE = re.compile(r"power factor(?: of)?\s*(0\.\d+)|\b(0\.\d+)\s*(?:lagging|leading)?\s*power factor",
+                    re.IGNORECASE)
+
+
+def _end_of(cleaned: str, claim: Claim) -> int:
+    """Where the figure ends as written ("2.50", not "2.5")."""
+    m = _NUMBER_RE.match(cleaned, claim.position)
+    return m.end() if m else claim.position + len(f"{claim.value:g}")
+
+
+def _noun_after(cleaned: str, claim: Claim) -> str | None:
+    """The noun a count is of: "29 intervals", "41 lines", "10 quarter-hour intervals"."""
+    m = _COUNT_NOUN_RE.match(cleaned, _end_of(cleaned, claim))
+    return m.group(1).casefold().rstrip("s") if m else None
+
+
+def _count_steps(verdicts: list[ClaimVerdict], cleaned: str, starts: list[int]) -> list[ClaimVerdict]:
+    """Untraced figures computed from counts the answer states, where the words say so:
+
+    - "the other 33" — the difference of two stated counts ("screened all 41 lines … these eight outages");
+    - a total of stated counts of the same thing ("29 intervals … 27 intervals … together, 56 intervals");
+    - a duration from a count of intervals at the step the answer states ("10 quarter-hour intervals (2.5
+      hours)", "27 intervals, about 6 hours 45 minutes");
+    - a share of a stated count in % ("56 intervals, or 8.3 %" of the "672 15-minute intervals");
+    - an apparent power from a stated active power and power factor ("0.8 MW at 0.95 … about 0.84 MVA").
+
+    Each operand must be traced (or itself derived), or, for the difference of counts, written as a word."""
+    if not any(v.status == UNGROUNDED for v in verdicts):
+        return verdicts
+    counts = [v.claim for v in verdicts if v.status != UNGROUNDED and v.claim.decimals == 0 and v.claim.unit is None]
+    known = [v.claim for v in verdicts if v.status != UNGROUNDED]
+    resolution = None
+    m = _RESOLUTION_RE.search(cleaned)
+    if m:
+        resolution = float(m.group(1)) if m.group(1) else (15.0 if m.group(2) else 30.0)
+    words = [(_NUMBER_WORDS[w.group(0).casefold()], w.start())
+             for w in re.finditer(r"\b(?:" + "|".join(_NUMBER_WORDS) + r")\b", cleaned, re.IGNORECASE)]
+
+    def sentence_of(position: int) -> int:
+        return max(i for i, start in enumerate(starts) if start <= position)
+
+    out = []
+    for v in verdicts:
+        claim, step = v.claim, None
+        if v.status != UNGROUNDED:
+            out.append(v)
+            continue
+        band = _tolerance(claim.decimals)
+        before = cleaned[max(0, claim.position - 30):claim.position]
+        after = cleaned[_end_of(cleaned, claim):_end_of(cleaned, claim) + 40]
+        here = sentence_of(claim.position)
+        near = [c for c in counts if c is not claim and here - _STEP_SENTENCES <= sentence_of(c.position) <= here]
+        noun = _noun_after(cleaned, claim) if claim.decimals == 0 and claim.unit is None else None
+        if claim.decimals == 0 and claim.unit is None and _OTHER_RE.search(before):
+            pool = [(c.value, f"{c.value:g}") for c in counts if c is not claim] + \
+                   [(float(n), word) for n, at in words for word in [cleaned[at:at + 12].split()[0]]]
+            step = next((f"{a:g} - {name_b}" for (a, _na), (b, name_b) in itertools.permutations(pool, 2)
+                         if a > b and abs(a - b - claim.value) < 1e-9), None)
+        elif noun and (_TOTAL_RE.search(cleaned[max(0, claim.position - 45):claim.position + 45])
+                       or re.search(r"\beither\b[^.]{0,60}\bor\b", cleaned[starts[here]:claim.position])):
+            same = [c for c in near if _noun_after(cleaned, c) == noun]
+            for r in (2, 3):
+                hit = next((combo for combo in itertools.combinations(same, r)
+                            if abs(sum(c.value for c in combo) - claim.value) < 1e-9), None)
+                if hit:
+                    step = " + ".join(f"{c.value:g}" for c in hit) + f" {noun}s"
+                    break
+        if step is None and resolution and _HOURS_RE.match(after):
+            intervals = [c for c in near if _noun_after(cleaned, c) in ("interval", "tick", "step", "period",
+                                                                         "quarter-hour")]
+            minutes = _HOURS_RE.match(after).group(1)
+            for c in intervals:
+                total = c.value * resolution
+                if abs(total / 60.0 - claim.value) <= band or (
+                        minutes and abs(total - (claim.value * 60 + float(minutes))) < 1e-9):
+                    step = f"{c.value:g} intervals × {resolution:g} min"
+                    break
+        if step is None and resolution and claim.unit is None and claim.decimals == 0 and \
+                re.match(r"\s*min(?:ute)?s?\b", after, re.IGNORECASE):
+            hours = _MINUTES_AFTER_HOURS_RE.search(before)
+            if hours:
+                for c in near:
+                    if _noun_after(cleaned, c) in ("interval", "tick", "step", "period") and \
+                            abs(c.value * resolution - (float(hours.group(1)) * 60 + claim.value)) < 1e-9:
+                        step = f"{c.value:g} intervals × {resolution:g} min"
+                        break
+        if step is None and claim.unit == "%":
+            for a in counts:
+                if not (0 <= claim.position - _end_of(cleaned, a) <= 40):
+                    continue
+                noun_a = _noun_after(cleaned, a)
+                for b in counts:
+                    if b.value <= a.value or not (noun_a and _noun_after(cleaned, b) == noun_a
+                                                  or re.search(r"\b(?:of|out of)\s*$",
+                                                               cleaned[max(0, b.position - 8):b.position])):
+                        continue
+                    if abs(100.0 * a.value / b.value - claim.value) <= band:
+                        step = f"{a.value:g} / {b.value:g}"
+                        break
+                if step:
+                    break
+        if step is None and (claim.unit or "").casefold() == "mva":
+            window = cleaned[starts[max(here - 1, 0)]:starts[here + 1] if here + 1 < len(starts) else len(cleaned)]
+            pfs = [float(m.group(1) or m.group(2)) for m in _PF_RE.finditer(window)]
+            for p in [k for k in known if (k.unit or "").casefold() == "mw"
+                      and here - _STEP_SENTENCES <= sentence_of(k.position) <= here]:
+                for pf in pfs:
+                    if 0.5 <= pf <= 1.0 and abs(p.value / pf - claim.value) <= band:
+                        step = f"{p.value:g} MW / {pf:g}"
+                        break
+                if step:
+                    break
         out.append(v._replace(status=DERIVED, source=step) if step else v)
     return out
 
@@ -1158,11 +1403,33 @@ def _proposes_choices(answer: str, calls: Iterable[dict] = ()) -> bool:
     return not calls and asked
 
 
+# A sentence that offers the operator values to choose from: "I suggest 80 %; you can choose 85 % or 90 % instead",
+# "80 % is a reasonable target; I can also use 70 %". Its figures are proposals, not results — six of the false
+# alarms left in the CIM layer paper's labelled findings.
+_OFFER_RE = re.compile(
+    r"\b(?:I (?:would )?suggest|suggested|you (?:can|could|may) (?:choose|pick|use|set)|I can (?:also )?use|"
+    r"or another (?:limit|value|threshold)|reasonable\b[^.?;]{0,40}\b(?:target|limit|choice|threshold))\b",
+    re.IGNORECASE)
+# A sentence within a line; a stop inside a figure ("77.9") does not end it.
+_OFFER_SENTENCE_RE = re.compile(r"[^.?!]*(?:\.(?=\d)[^.?!]*)*(?:[.?!]+|$)")
+
+
+def _without_offers(answer: str) -> str:
+    """The answer without the sentences that offer values (blanked, so positions and lines stay), when it asks
+    the operator something."""
+    if "?" not in (answer or ""):
+        return answer or ""
+    return "\n".join("".join(" " * len(part) if _OFFER_RE.search(part) else part
+                              for part in _OFFER_SENTENCE_RE.findall(line))
+                      for line in answer.split("\n"))
+
+
 def answer_to_check(answer: str, calls: Iterable[dict] = ()) -> str:
     """The text whose figures are checked: a clarifying question without its
-    choices (the question's own sentences are still checked)."""
+    choices (the question's own sentences are still checked), and without the
+    sentences that offer the operator values to choose from."""
     if not (is_clarifying_question(answer, calls) or _proposes_choices(answer, calls)):
-        return answer or ""
+        return _without_offers(answer or "")
     if not any(_CHOICE_LINE.match(line) for line in (answer or "").splitlines()):
         return ""                         # proposed inline: every figure is a choice
     return "\n".join(line for line in (answer or "").splitlines() if not _CHOICE_LINE.match(line))

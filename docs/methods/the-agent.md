@@ -111,13 +111,18 @@ the answer silently.
 | --- | --- |
 | **grounded** | a source rounds to it |
 | **imprecise** | truncated rather than rounded: within one unit of the last decimal |
-| **derived** | the answer shows the division that produces it (`a / b`), with both operands from the results |
+| **derived** | one step of arithmetic from figures the answer or the results give, where the words say it is one: a division the answer shows (`a / b`); a margin, change or total of two figures written beside it (*"0.007 p.u. below the 0.950 limit"*, *"from 29.41 MW to 29.87 MW (about 0.46 MW)"*); a count (*"the other 33"*, *"56 intervals"* from 29 and 27) or a share of one (*"8.3 %"* of 672); a duration from a count of intervals at the step the answer states; an apparent power from a stated MW and power factor; the sum of the loads or units at a bus named on the same line, or a list's total power said as a total |
 | **misattributed** | the number exists, but only under *another* violated element than the one the sentence is about (the most recently named element before it) |
 | **ungrounded** | no source |
 
 The traceable rate is (grounded + imprecise) / numbers. Derived figures are
 counted apart, as not traceable, on purpose: a calculation in prose is the kind
-of figure the design keeps out of answers.
+of figure the design keeps out of answers. Values the answer offers you in a
+question (*"I suggest 80 %; you can choose 85 % or 90 %"*) are proposals, not
+results, and are not checked. Each step was added from the CIM layer paper's
+labelled findings and measured with error injection (`evaluation/injection.py`):
+a figure changed to another bus's sum, or to a total of an unrelated field, stays
+ungrounded.
 
 ### Characterisation: is a true figure described truly?
 
@@ -140,7 +145,7 @@ correct decline uses them too.
 A figure can be traced and described truly while the element it is about is
 called something it is not: a conventional unit *a wind farm*, a 20 kV bus *the
 132 kV substation*, a line *a transformer*. Each turn's record keeps the facts
-of the elements its answer names (`network_facts`, from the semantic layer — see
+of the elements its answer names (`network_facts`, from the CIM layer — see
 [What the network is](what-the-network-is.md)). The answer is checked against
 them: a unit's source or a load's category the network does not state is
 *unsupported* (a warning), one it states otherwise is *contradicted* (a
@@ -279,6 +284,30 @@ on the table with their solver figures — and does three things on request:
 It cannot run a study or move the clock, and its own figures are checked against
 every result of the conversation; untraced ones are listed as unverified.
 
+**The advisor and the CIM layer** (`llm_agent/agent/advisor_layer.py`), for any network:
+
+- **What it is shown.** With the session, what the [CIM layer](what-the-network-is.md#results-linked-to-the-layer)
+  says about the elements the latest results name, through their links: feeder and
+  where on it, voltage, what is connected, what a branch cuts off, each fact with its
+  basis — and how to use it. Sent only when there is something to show, so its
+  system prompt does not grow.
+- **What it says, checked.** Its comment, suggestions, discussion replies, proposed
+  studies and decision notes go through the same statement check as the answers: a
+  source, a category, a feeder or a voltage the layer contradicts or does not
+  support, an element the network does not have. What is found is shown under the
+  text (*Against the CIM layer: … says WKA 7 is solar, but it is wind (stated)*).
+- **What the network does not say, as a question.** When the reading check finds
+  that the conclusion moves with what units the layer does not know are, the
+  advisor is told which units and what the study found under each reading, and asks
+  the operator to say what they are — it never assumes it; declaring is the
+  operator's alone. If a round of suggestions does not ask, a *Step back* suggestion
+  is added that does.
+- **Groups by meaning, resolved.** A study it proposes may name a group as the tools
+  accept it (*the solar units on feeder Line 1-2*, *the loads on the Line 12-13
+  feeder*, *units at 20 kV*). Each such phrase is resolved against the layer before
+  the operator sees it: the elements it means, or why the layer cannot resolve it
+  (*No thermal units in feeder Line 12-13*).
+
 ## Models
 
 The orchestrator and the advisor run on the model the operator chooses: Google
@@ -322,7 +351,7 @@ use these in studies. In short:
   reported as that guidance says), ten semantic look-up tasks and twenty-seven
   reasoning tasks (misleading names, interventions, composition, switches,
   data, consistency)
-  run with the semantic layer and without it — `python -m evaluation.ablation
+  run with the CIM layer and without it — `python -m evaluation.ablation
   run ontology`. They run with answer review off. Any part of the agent can be
   ablated the same way, on any of these suites: the answer checks, the reading
   check, rules of the prompt, groups of tools, the step budget, the model

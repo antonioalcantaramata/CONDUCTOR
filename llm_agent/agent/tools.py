@@ -44,7 +44,8 @@ def _unsupported_kwargs_result(tool_name: str, kwargs: dict, supported_extra: se
     makes for impossible parameters, one level up: the study a caller asked for
     does not exist, and no combination of the studies that do exist answers it.
     """
-    unsupported = sorted(set(kwargs) - supported_extra)
+    # The reading check's own argument (facts assumed for one study), never one the model is offered.
+    unsupported = sorted(set(kwargs) - supported_extra - {"assume_unit_sources"})
     if not unsupported:
         return None
 
@@ -182,11 +183,19 @@ def _get(endpoint: str) -> dict:
             response.raise_for_status()
             return response.json()
     except httpx.HTTPStatusError as exc:
-        return {
+        result = {
             "error": str(exc),
             "endpoint": url,
             "status_code": exc.response.status_code,
         }
+        # The backend's own reason, as `_post` keeps it ("No thermal units on feeder …").
+        try:
+            payload = exc.response.json()
+            if isinstance(payload, dict) and payload.get("detail") is not None:
+                result["detail"] = payload["detail"]
+        except Exception:  # noqa: BLE001
+            pass
+        return result
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "endpoint": url, "status_code": None}
 
@@ -466,7 +475,7 @@ def simulate_all_contingencies(
         "simulate_all_contingencies",
         kwargs,
         supported_extra={"sgen_scaling_factor", "data_source", "timestamp", "network",
-                         "load_power_factor", "option"},
+                         "load_power_factor", "option", "scope"},
     )
     if unsupported is not None:
         return unsupported
@@ -903,8 +912,11 @@ def describe_network(about: str = "summary", element: str | None = None, network
     if about == "around" and not str(element or "").strip():
         return {"error": "describe_network(about='around') needs element: a bus, line, transformer, unit, load or "
                          "substation, by name."}
+    if about == "select" and not str(element or "").strip():
+        return {"error": "describe_network(about='select') needs element: what to select, e.g. 'solar units on "
+                         "feeder Line 1-2', 'industrial loads at 20 kV', 'units in substation Bus 5'."}
     on = network if network and network != "base" else None
-    params = {"about": about, **({"element": str(element).strip()} if about == "around" else {}),
+    params = {"about": about, **({"element": str(element).strip()} if about in ("around", "select") else {}),
               **({"network": on} if on else {})}
     return _record("describe_network", _get("/api/network/semantics?" + urlencode(params)))
 

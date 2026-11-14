@@ -269,8 +269,9 @@ The first arm of each is its baseline.
 
 | Study | Question | Arms | Suites |
 | --- | --- | --- | --- |
-| `components` | What each part adds over the rest (leave one out), and against an agent with solvers only | full; without the semantic layer, the reading check, the routing rules, the evidence wording, the ask-first rule, the investigation tools; solver-only (no semantics for the agent or the studies, no reading check) | all |
-| `ontology` | What the semantic layer is worth (below) | on, off, none | semantics, reasoning |
+| `components` | What each part adds over the rest (leave one out), and against an agent with solvers only | full; without the CIM layer, the reading check, the routing rules, the evidence wording, the ask-first rule, the investigation tools; solver-only (no CIM layer for the agent or the studies, no reading check) | all |
+| `ontology` | What the CIM layer is worth (below) | on, off, none | semantics, reasoning |
+| `raw_tables` | What the layer adds over the data it is built from: the agent reads the network's raw data tables instead (below) | on, off, tables | semantics, reasoning |
 | `answer_review` | Do the answer checks, shown to the agent, ground its answers better? | off, inform | narration, options, what-if |
 | `reading_check` | What re-running the decisive studies under the question's other readings changes | on, off | clarify, narration, options |
 | `prompt_rules` | What each behavioural rule of the prompt is worth | full; without each of six rules | clarify, narration, options, investigation, what-if |
@@ -293,7 +294,7 @@ python -m evaluation.ablation run --suites options,narration --repeats 3 \
 
 | Knob | Values | What it changes |
 | --- | --- | --- |
-| `ontology` | `on`, `off`, `none` | the semantic layer, for the agent (`off`) and also for the studies (`none`) |
+| `ontology` | `on`, `off`, `none`, `tables` | the CIM layer, for the agent (`off`) and also for the studies (`none`); `tables` gives the agent the raw data tables instead (`none` gets its own backend) |
 | `review` | `off`, `warn`, `inform` | the answer checks shown to the agent before its answer goes out |
 | `reading_check` | `on`, `off` | the reading check |
 | `deep` | `task`, `on`, `off` | Deep Research on the first question |
@@ -404,9 +405,9 @@ and `results.json`. `analyse` can merge folders, for example an arm added
 later. It grades with today's checks, so a grader fix applies to old records
 too; say so when you report it.
 
-### The semantic layer
+### The CIM layer
 
-The `ontology` study measures the semantic layer
+The `ontology` study measures the CIM layer
 ([What the network is](../methods/what-the-network-is.md)), in three arms
 (`CONDUCTOR_ONTOLOGY`):
 
@@ -423,6 +424,18 @@ checked against the layer in every arm.
 ```bash
 python -m evaluation.ablation run ontology --repeats 3 [--only on,off]
 ```
+
+The `raw_tables` study adds a fourth arm, `tables`: the agent is given the
+network's raw pandapower tables (`read_network_tables`) instead of the layer,
+with the same rule on names, while the studies still read the layer. It
+separates what the layer adds from simply showing the agent the data:
+
+```bash
+python -m evaluation.ablation run raw_tables --only tables --repeats 5 --out <folder>
+```
+
+The runs, analyses and scripts behind the CIM layer paper are in
+[`papers/cim_layer`](https://github.com/antonioalcantaramata/CONDUCTOR/tree/main/papers/cim_layer).
 
 `none` gets its own backend, started with `CONDUCTOR_ONTOLOGY=none`, and an
 arm refuses a backend in the wrong mode. Besides the general tables, its
@@ -520,6 +533,22 @@ fixed, and report the model, its reasoning setting and the date (providers
 change models without notice). An ablation with one arm per model
 (`--arm "a: model=…" --arm "b: provider=… model=…"`) does all of that, on the
 same tasks, interleaved.
+
+## A test set from any network
+
+`evaluation.generated` builds questions whose answers the loaded network's CIM
+layer already knows — what kind of unit X is (or that the network does not say),
+which units are of a source, a bus's voltage, the feeder that supplies a load,
+the loads an outage cuts off — with deterministic checks, for whatever network is
+loaded. It measures a model on *your* network before you rely on it, and can be
+re-run across models or with and without the layer:
+
+    python -m evaluation.generated generate --out tasks.json [--per-kind 3] [--seed 0]
+    python -m evaluation.generated run --tasks tasks.json --out <folder> [--repeats 1]
+    python -m evaluation.generated grade <folder> --tasks tasks.json
+
+The task file records the network it was built from (name, fingerprint, commit,
+seed). `run` spends model credit (it asks first); `generate` and `grade` do not.
 
 ## What the checks can and cannot see
 

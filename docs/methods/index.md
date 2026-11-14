@@ -40,7 +40,7 @@ sequenceDiagram
 
 See [The agent and its checks](the-agent.md) for the orchestrator, the
 advisor and the safeguards between them and the solvers, and
-[What the network is](what-the-network-is.md) for the semantic layer the
+[What the network is](what-the-network-is.md) for the CIM layer the
 agent answers from: what each element is, how that is known, and what it is
 connected to.
 

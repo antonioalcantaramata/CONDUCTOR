@@ -9,7 +9,9 @@ CONDUCTOR is an assistant for studying distribution grids in plain language.
 You ask a question; it runs the power-system studies that answer it (security
 assessment, N-1 contingencies, risk, optimal and robust dispatch, flexibility,
 hosting capacity, KPIs), shows the results as charts, and tells you where every
-figure in its answer came from. Corrective actions come as *options* to choose
+figure in its answer came from. It reads the network in the grid's own
+language, the Common Information Model (CIM): what each element is, and how
+that is known, so a unit renamed "Solar Farm North" is not taken for solar. Corrective actions come as *options* to choose
 from — cheapest, least disturbance, near-optimal alternatives, dispatches that
 stay secure after an outage — each re-checked by a power flow. Changes to the
 grid can be tried as *proposals* without touching the loaded network, and an
@@ -30,11 +32,12 @@ studies or evaluating it. To install and launch it, start with the
 | --- | --- |
 | [Getting started](guide/getting-started.md) | The launch screen, your first questions, the layout of the app |
 | [Choosing a model](guide/choosing-a-model.md) | Free, paid and local options, their limits and data terms |
-| [Data and the operating point](guide/data-and-operating-point.md) | Measurements, forecasts and the nominal point; uploading a network and data; data quality |
-| [Asking questions](guide/asking-questions.md) | What CONDUCTOR can study, with example questions for each kind of study — corrective options, N-1 secure dispatches, *why* questions and what is coming among them — Deep Research, and when it asks you first |
+| [Data and the operating point](guide/data-and-operating-point.md) | Measurements, forecasts and the nominal point; uploading a network and data; the synthetic data's settings; data quality |
+| [What the network is](guide/what-the-network-is.md) | The CIM layer: what each element is and how CONDUCTOR knows it, correcting a fact, CGMES models and CIM export |
+| [Asking questions](guide/asking-questions.md) | What CONDUCTOR can study, with example questions for each kind of study — what the network is, corrective options, N-1 secure dispatches, *why* questions and what is coming among them — Deep Research, and when it asks you first |
 | [Reading an answer](guide/reading-an-answer.md) | "What backs this answer", the investigation card and report, charts and their captions, answer checks, answers computed under other settings |
 | [What-if proposals](guide/what-if-proposals.md) | Changing the grid without touching it: every kind of change, combining and comparing proposals |
-| [The System tab](guide/system-tab.md) | The network map, generator models, costs, the load power factor, renaming elements |
+| [The System tab](guide/system-tab.md) | The network map, what each element is, generator models, costs, the load power factor, renaming elements |
 | [The advisor](guide/advisor.md) | Discussing results and corrective options, and getting suggested next steps |
 | [Sessions and scenarios](guide/sessions-and-scenarios.md) | Resume and the demos, what is kept between sessions, Start fresh, session context, the session reports (raw and written by the model) |
 | [Troubleshooting](guide/troubleshooting.md) | Limits reached, slow or retired models, common problems |
@@ -49,6 +52,7 @@ researchers who want to know exactly what a figure means.
 | --- | --- |
 | [Overview](methods/index.md) | The division of labour, the principles every study follows, conventions and notation |
 | [Network, data and the operating point](methods/network-and-data.md) | From a network file and a moment of data to a solvable operating point |
+| [What the network is](methods/what-the-network-is.md) | The CIM layer in full: every CIM class, the rules behind each inference, declarations, the export, and the checks against it |
 | [Power flow and security assessment](methods/power-flow-and-security.md) | The AC power flow and the limits |
 | [Contingency analysis (N-1)](methods/contingency-analysis.md) | Single outages, the N-1 screen, N-1-1, attribution |
 | [Investigating a cause](methods/investigation.md) | Why an element is outside its limits: what changed, and how much of the change is each cause; the agent's hypotheses and record, recurrence, prevention, the data check, looking ahead, Deep Research |

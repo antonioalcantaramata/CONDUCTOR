@@ -34,6 +34,7 @@ Pure: from the layer's dict to text. Two formats: RDF/XML and JSON-LD.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -43,8 +44,15 @@ RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 _ID_NS = uuid.UUID("6f1c2a3e-1d7b-5c4e-9a8f-0c0d0c7a0b12")
 
 
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 def _urn(mrid: str) -> str:
-    return f"urn:uuid:{mrid}"
+    """The resource IRI of an mRID: a UUID as urn:uuid; any other identifier (some CIM models use their
+    own) percent-encoded under CONDUCTOR's namespace, so the IRI stays valid."""
+    from urllib.parse import quote
+    text = str(mrid)
+    return f"urn:uuid:{text}" if _UUID.fullmatch(text) else f"urn:conductor:mrid:{quote(text, safe='')}"
 
 
 def _child_id(parent: str, part) -> str:
@@ -71,11 +79,20 @@ def _ref(prop: str, target_mrid: str | None):
     return (prop, _urn(target_mrid) if target_mrid else None, True)
 
 
+_INTERNAL_KEY = re.compile(r" \| [^|\[\]]*? -> [^|\[\]]*? \[[LT]\d+\]")
+
+
+def _label(text):
+    """A branch as people name it ("Line 1-2"): the layer's display label adds its ends and its internal
+    key ("Line 1-2 | Bus 1 -> Bus 2 [L0]"), which CIM states otherwise (terminals, the mRID)."""
+    return _INTERNAL_KEY.sub("", text) if isinstance(text, str) else text
+
+
 def _fact(prefix: str, fact: dict | None) -> list:
     """A fact's value, basis and origin as cdr: properties."""
     if not fact:
         return []
-    return [_lit(f"cdr:{prefix}", fact.get("value")), _lit(f"cdr:{prefix}Basis", fact.get("basis")),
+    return [_lit(f"cdr:{prefix}", _label(fact.get("value"))), _lit(f"cdr:{prefix}Basis", fact.get("basis")),
             _lit(f"cdr:{prefix}From", fact.get("from"))]
 
 
@@ -137,7 +154,7 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
     for br in semantics["branches"]:
         if br["element_type"] == "line":
             g.add(br["mrid"], "cim:ACLineSegment",
-                  [_lit("cim:IdentifiedObject.mRID", br["mrid"]), _lit("cim:IdentifiedObject.name", br["name"]),
+                  [_lit("cim:IdentifiedObject.mRID", br["mrid"]), _lit("cim:IdentifiedObject.name", _label(br["name"])),
                    _ref("cim:ConductingEquipment.BaseVoltage", base_voltage.get(br["kv"])),
                    _lit("cim:Equipment.inService", br["in_service"]),
                    *_fact("ratingMVA", br.get("rating_mva"))])
@@ -145,7 +162,7 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
         else:
             sub = buses[br["ends_index"][0]]["substation"]["value"]
             g.add(br["mrid"], "cim:PowerTransformer",
-                  [_lit("cim:IdentifiedObject.mRID", br["mrid"]), _lit("cim:IdentifiedObject.name", br["name"]),
+                  [_lit("cim:IdentifiedObject.mRID", br["mrid"]), _lit("cim:IdentifiedObject.name", _label(br["name"])),
                    _ref("cim:Equipment.EquipmentContainer", sub_of_name.get(sub)),
                    _lit("cim:Equipment.inService", br["in_service"])])
             ts = terminals(br["mrid"], br["ends_index"])
@@ -233,10 +250,13 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
     # Feeders: containers, energised from a substation through their head line.
     for f in containers.get("feeders") or []:
         head = line_terminal.get(f["name"], [None])[0]
-        first = next((buses[i]["substation"]["value"] for i, b in buses.items()
-                      if b["name"] in (f["buses"] or [])[:1]), None)
+        head_line = next((b for b in semantics["branches"] if b["name"] == f["name"]), None)
+        fed = set(f["buses"] or [])
+        busbar = next((i for i in (head_line or {}).get("ends_index") or []
+                       if i in buses and buses[i]["name"] not in fed), None)
+        first = buses[busbar]["substation"]["value"] if busbar is not None else None
         g.add(f["mrid"], "cim:Feeder",
-              [_lit("cim:IdentifiedObject.mRID", f["mrid"]), _lit("cim:IdentifiedObject.name", f["name"]),
+              [_lit("cim:IdentifiedObject.mRID", f["mrid"]), _lit("cim:IdentifiedObject.name", _label(f["name"])),
                _ref("cim:Feeder.NormalHeadTerminal", head),
                _ref("cim:Feeder.NormalEnergizingSubstation", sub_of_name.get(first)),
                _lit("cdr:basis", f["basis"]), _lit("cdr:from", f["from"])])
@@ -283,3 +303,120 @@ def to_json_ld(semantics: dict, network_id: str = "local") -> str:
         graph.append(node)
     return json.dumps({"@context": {"cim": CIM_NS, "cdr": CDR_NS, "rdf": RDF_NS}, "@graph": graph}, indent=1,
                       default=str)
+
+
+# ---------------------------------------------------------------------------
+# A proposal as a difference: what it changes in the CIM layer
+# ---------------------------------------------------------------------------
+
+DM_NS = "http://iec.ch/2002/schema/CIM_difference_model#"
+MD_NS = "http://iec.ch/TC57/61970-552/ModelDescription/1#"
+
+
+def _statements(semantics: dict, network_id: str) -> dict:
+    """{subject: (class, {(property, value as text, is reference)})} of the layer's graph."""
+    out = {}
+    for node_id, cls, props in build_graph(semantics, network_id).nodes:
+        stmts = {(p, v if r else _value_text(v), r) for p, v, r in props}
+        if node_id in out:                      # one subject written twice: its statements together
+            cls0, before = out[node_id]
+            out[node_id] = (cls0, before | stmts)
+        else:
+            out[node_id] = (cls, stmts)
+    return out
+
+
+def difference(base: dict, proposal: dict, network_id: str = "local") -> dict:
+    """What a proposal changes in the CIM layer, element by element: {"added": [(id, class, statements)],
+    "removed": [...], "changed": [(id, class, added statements, removed statements)]}. Elements keep their
+    mRIDs across the two (the layer derives them from the network as loaded), so an element the proposal
+    leaves alone is not in it."""
+    before, after = _statements(base, network_id), _statements(proposal, network_id)
+    added = [(s, after[s][0], after[s][1]) for s in after if s not in before]
+    removed = [(s, before[s][0], before[s][1]) for s in before if s not in after]
+    changed = []
+    for s in after:
+        if s in before:
+            plus, minus = after[s][1] - before[s][1], before[s][1] - after[s][1]
+            if plus or minus:
+                changed.append((s, after[s][0], plus, minus))
+    # Each element's name as the proposal has it (or the base, for one it removes): the changed statements
+    # alone may hold both an old and a new name, or none.
+    names = {s: _name(st) for s, (_c, st) in before.items()}
+    names.update({s: _name(st) for s, (_c, st) in after.items()})
+    return {"added": added, "removed": removed, "changed": changed, "names": names}
+
+
+def _name(statements) -> str:
+    return next((v for p, v, _r in statements if p == "cim:IdentifiedObject.name"), "")
+
+
+def difference_summary(diff: dict) -> dict:
+    """The difference in words, for the agent and the operator: each element added, removed or changed,
+    with the properties that changed (old → new)."""
+    def short(prop: str) -> str:
+        return prop.split(":", 1)[1]
+
+    names = diff.get("names") or {}
+
+    def entry(sid, cls, stmts):
+        # A part without a name of its own (a terminal, a control): its class, and its mRID to find it.
+        name = names.get(sid) or _name(stmts)
+        return {"element": name or f"a {cls.split(':', 1)[1]}", "class": cls.split(":", 1)[1],
+                **({} if name else {"mrid": sid})}
+
+    changed = []
+    for sid, cls, plus, minus in diff["changed"]:
+        old = {short(p): v for p, v, _r in minus}
+        new = {short(p): v for p, v, _r in plus}
+        what = [f"{p}: {old.get(p, '—')} → {new.get(p, '—')}" for p in sorted(set(old) | set(new))]
+        changed.append({**entry(sid, cls, plus | minus), "changes": what[:8]})
+    return {"added": [entry(*a) for a in diff["added"]], "removed": [entry(*r) for r in diff["removed"]],
+            "changed": changed,
+            "counts": {k: len(diff[k]) for k in ("added", "removed", "changed")}}
+
+
+def to_difference_rdf_xml(base: dict, proposal: dict, network_id: str = "local", description: str = "",
+                          created: str = "") -> str:
+    """The proposal as a CIM difference model (IEC 61970-552, as CGMES exchanges changes): forward differences
+    (what it adds — whole elements, or the properties it sets) and reverse differences (what it removes).
+    Applied to the base's export (`to_rdf_xml`), it gives the proposal's."""
+    diff = difference(base, proposal, network_id)
+    ET.register_namespace("rdf", RDF_NS)
+    ET.register_namespace("cim", CIM_NS)
+    ET.register_namespace("cdr", CDR_NS)
+    ET.register_namespace("dm", DM_NS)
+    ET.register_namespace("md", MD_NS)
+    ns = {"cim": CIM_NS, "cdr": CDR_NS}
+    root = ET.Element(f"{{{RDF_NS}}}RDF")
+    model = ET.SubElement(root, f"{{{DM_NS}}}DifferenceModel",
+                          {f"{{{RDF_NS}}}about": _urn(_child_id(network_id, f"difference:{description}"))})
+    if created:
+        ET.SubElement(model, f"{{{MD_NS}}}Model.created").text = created
+    if description:
+        ET.SubElement(model, f"{{{MD_NS}}}Model.description").text = description
+
+    def write(parent, sid: str, cls: str | None, stmts):
+        tag = f"{{{ns[cls.split(':')[0]]}}}{cls.split(':')[1]}" if cls else f"{{{RDF_NS}}}Description"
+        el = ET.SubElement(parent, tag, {f"{{{RDF_NS}}}about": _urn(sid)})
+        for prop, value, is_ref in sorted(stmts):
+            p_prefix, p_local = prop.split(":")
+            child = ET.SubElement(el, f"{{{ns[p_prefix]}}}{p_local}")
+            if is_ref:
+                child.set(f"{{{RDF_NS}}}resource", value)
+            else:
+                child.text = value
+
+    forward = ET.SubElement(model, f"{{{DM_NS}}}forwardDifferences", {f"{{{RDF_NS}}}parseType": "Statements"})
+    reverse = ET.SubElement(model, f"{{{DM_NS}}}reverseDifferences", {f"{{{RDF_NS}}}parseType": "Statements"})
+    for sid, cls, stmts in diff["added"]:
+        write(forward, sid, cls, stmts)
+    for sid, cls, stmts in diff["removed"]:
+        write(reverse, sid, cls, stmts)
+    for sid, _cls, plus, minus in diff["changed"]:
+        if plus:
+            write(forward, sid, None, plus)
+        if minus:
+            write(reverse, sid, None, minus)
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode")

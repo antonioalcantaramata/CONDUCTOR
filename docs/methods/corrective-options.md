@@ -162,8 +162,11 @@ stays smooth.
    negative marginal cost counts as zero); 3 €/Mvarh for reactive power; import
    60 €/MWh (or the case's), a free band of $\tan\varphi = 0.4$, 10 €/Mvarh
    beyond it; demand response on 10 % of each load at 150 €/MWh, load relief at
-   3,000 €/MWh; a PV or wind unit a proposal adds can be curtailed at 40 €/MWh
-   and has no upward price;
+   3,000 €/MWh; a wind or solar unit — one the [CIM layer](what-the-network-is.md)
+   states, names or you declared, or one a proposal adds — produces at 0 €/MWh,
+   can be curtailed at 40 €/MWh, and has no upward price: every study caps it at
+   what its resource gives at the moment studied, so no option raises it beyond
+   the wind or the sun;
 3. the **operator's edits** in the System tab, kept per network.
 
 A **synchronous condenser** — a voltage-controlled unit with under 1 MW of

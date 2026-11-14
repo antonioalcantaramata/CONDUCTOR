@@ -98,9 +98,12 @@ def tier_picker(key: str) -> cat.Option:
         o = cat.option(oid)
         return o["display_name"] + ("  · recommended" if o.get("recommended") else "")
 
+    # Short labels; the chosen option's note below them (the info card after it says the rest).
     chosen = st.radio("Option", ids, index=index, key=f"{key}_option_{tier}", format_func=_label,
-                      label_visibility="collapsed",
-                      captions=[_first_sentence(o.get("signup_note") or "") for o in opts])
+                      label_visibility="collapsed")
+    note = _first_sentence(cat.option(chosen).get("signup_note") or "")
+    if note:
+        st.caption(note)
     return cat.option(chosen)
 
 

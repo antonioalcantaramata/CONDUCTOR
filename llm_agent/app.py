@@ -69,6 +69,9 @@ from agent import generator_table as _gen_table
 from agent import system_tables as _sys_table
 from agent import semantics_view as _sem_view
 from agent import data_view as _dv
+from agent import synthetic_view as _syn_view
+from agent import layer_map as _layer_map
+from agent import grid_context as _grid_context
 from agent import settings_change as _settings_change
 from agent import session_context as _sc
 from agent import tailored_report as _tailored
@@ -132,8 +135,8 @@ _BRAND_NAME = "CONDUCTOR"
 _BRAND_TAGLINE = "Ask, test and decide: a solver-grounded AI assistant for distribution grids"
 _BRAND_CAPTION = (
     "Grid studies in plain language — security, N-1, probabilistic risk, flexibility and "
-    "hosting capacity — changes to the grid tested as proposals, and every figure traced "
-    "to the solver that produced it."
+    "hosting capacity — on a network read in its own language, CIM, with changes tested as "
+    "proposals and every figure traced to the solver that produced it."
 )
 
 
@@ -1467,8 +1470,10 @@ full,,branch_to_trafo,3,33,0,,</pre>
                     <li><strong>Hosting Capacity Analysis</strong> — maximum DER penetration per bus without constraint violations</li>
                     <li><strong>Key Performance Indicators</strong> — the schedule against a corrective action: flexibility required, activated and deliverable within limits, N-0/N-1 margins and costs, at a moment or over a window</li>
                     <li><strong>Time-series Scanning</strong> — multi-timestamp horizon sweeps for violations and trend detection</li>
-                    <li><strong>Custom Network Loading</strong> — MATPOWER .m, pandapower JSON / Excel, and UCTE files</li>
-                    <li><strong>Custom Time-series Data</strong> — CSV upload with per-substation production &amp; consumption</li>
+                    <li><strong>CIM Layer</strong> — what each element is (a unit's energy source, a load's category, a switch's role, each feeder) and how that is known; the studies and every answer's checks read it; exported as CIM</li>
+                    <li><strong>Proposals and Corrective Options</strong> — changes to the grid tested without touching it; options to choose from (cheapest, fewest units, most headroom, N-1 secure); an advisor to think them through</li>
+                    <li><strong>Custom Network Loading</strong> — MATPOWER .m, pandapower JSON / Excel, UCTE and CGMES (CIM) files</li>
+                    <li><strong>Custom Time-series Data</strong> — CSV upload with per-substation production &amp; consumption, or synthetic data whose settings you choose</li>
                 </ul>
             `;
             parentDoc.body.appendChild(infoPanel);
@@ -2760,9 +2765,15 @@ def _render_scenario_picker(*, key: str, immediate: bool) -> None:
         kept = _sys_table.kept_line(options[n].get("kept"))
         return options[n]["description"] + (f"  \n🗂 {kept}." if kept else "")
 
+    # On the launch screen the options are short labels and the chosen one is described below them: the same
+    # words, without four paragraphs to read before choosing. The sidebar keeps every description in view.
+    compact = key == "launch"
     st.radio("Scenario", names, key=widget, format_func=lambda n: options[n]["label"], label_visibility="collapsed",
-             captions=[_caption(n) for n in names], on_change=_on_change)
+             captions=None if compact else [_caption(n) for n in names], on_change=_on_change)
     chosen_now = st.session_state[widget]
+    if compact and chosen_now in options:
+        with st.container(border=True, key="launch_scenario_card"):
+            st.caption(_caption(chosen_now))
     if options.get(chosen_now, {}).get("kept"):
         with st.popover("Start fresh", icon=":material/restart_alt:", type="tertiary"):
             st.markdown(f"Clear what is saved for **{options[chosen_now]['label']}**: "
@@ -2778,6 +2789,53 @@ def _render_scenario_picker(*, key: str, immediate: bool) -> None:
                   disabled=chosen == data["current"] or not options[chosen]["available"],
                   help="Loads it now and starts a new conversation.", on_click=_switch_scenario, args=(chosen,))
         st.caption(f"Loaded now: **{data['label']}**. Demos never replace your uploads.")
+
+
+_NETWORK_FORMATS = ["m", "json", "xlsx", "uct", "zip"]
+
+
+def _render_launch_upload() -> None:
+    """Upload a network from the launch screen, before Start: it is loaded at
+    once and becomes what Resume loads, so a first visit is not forced through
+    a demo. The same upload as the header's Upload Network (same backend call
+    and options); data are uploaded later, from the header."""
+    data = _fetch_scenarios() or {}
+    resume = next((o for o in data.get("options") or [] if o["name"] == "resume"), {})
+    note = st.session_state.pop("_launch_upload_note", None)
+    if note:
+        st.success(note)
+    with st.expander("Upload your own network", icon=":material/upload:", expanded=not resume.get("available")):
+        file = st.file_uploader(
+            "Network file", type=_NETWORK_FORMATS, key="launch_net_file", label_visibility="collapsed",
+            help="MATPOWER (.m), pandapower JSON or Excel (.json, .xlsx), UCTE (.uct), or CGMES (.zip: the CIM "
+                 "profiles, with the boundary set if the model has one).")
+        st.caption("MATPOWER `.m` · pandapower `.json` / `.xlsx` · UCTE `.uct` · CGMES `.zip` (CIM 2.4.15 or 3.0). "
+                   "A synthetic week of data is generated for it; upload your own data from the header later.")
+        fixed_pf = st.checkbox("Start generators at a fixed power factor (pf 1.0)", value=True, key="launch_net_pf",
+                               help="Unticked, they keep voltage control. Change each unit afterwards in the "
+                                    "System tab.")
+        if st.button("Upload and load", key="launch_net_upload", type="primary", width="stretch",
+                     disabled=file is None, icon=":material/upload:"):
+            with st.spinner("Loading the network and generating a synthetic week…"):
+                try:
+                    with httpx.Client(timeout=max(HTTP_TIMEOUT, 300)) as client:
+                        r = client.post(f"{BASE_URL}/api/network/upload",
+                                        files={"file": (file.name, file.getvalue())},
+                                        data={"convert_gen_to_sgen": "true" if fixed_pf else "false",
+                                              "tap_policy": "current"})
+                    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"The upload could not reach the backend: {exc}")
+                    return
+            if r.status_code >= 400:
+                st.error(str(body.get("detail") or r.text))
+                return
+            st.cache_data.clear()
+            st.session_state.pop("scenario_launch", None)            # the picker reads Resume, now loaded
+            st.session_state._launch_upload_note = (
+                f"Loaded **{file.name}**: {body.get('n_buses', '?')} buses · {body.get('n_lines', '?')} lines · "
+                f"{body.get('n_trafos', '?')} transformers. It is what *Resume* loads from now on.")
+            st.rerun()
 
 
 def _render_ready_to_start(provider: str) -> None:
@@ -2912,11 +2970,11 @@ if not st.session_state.get("_launched"):
     with _col_load:
         st.markdown("### 1 · Choose what to load")
         _render_scenario_picker(key="launch", immediate=True)
+        _render_launch_upload()
         _render_context_choice("launch")
         st.divider()
-        st.caption("Switch any time from the sidebar (**Settings → Scenario**). To work on your own grid, "
-                   "start with any option and use **Upload Network** / **Upload Data** in the header — "
-                   "they become what *Resume* loads. Demos never replace your uploads.")
+        st.caption("Switch any time from **Settings → Scenario**. Your uploads, here or from the header "
+                   "(**Upload Network**, **Upload Data**), are what *Resume* loads; demos never replace them.")
     with _col_model:
         st.markdown("### 2 · Choose how to run the assistant")
         # Tier, option and model, then everything worth knowing before Start —
@@ -2935,7 +2993,9 @@ if not st.session_state.get("_launched"):
         _picked = _option.provider
         if _picked not in _lui.COMPAT and _model is not None and _provider_configured(_picked):
             _lui.smoke_test_button(_option, _model, "launch")
-        st.divider()
+    # Start, under both choices: the columns hold only what to choose, and the last step is one place.
+    _, _col_start, _ = st.columns([1, 2, 1])
+    with _col_start:
         if _picked in _lui.COMPAT and not _provider_configured(_picked):
             _blocked_now = st.session_state._launch_blocked
             if _lui.compat_form(_option, _model, "launch", _write_env, choices=_choices,
@@ -3501,6 +3561,48 @@ def _table_of(fig) -> tuple[str, str, "pd.DataFrame"] | None:
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _resolve_links(links_json: str) -> dict | None:
+    """A result's links to the CIM layer, resolved by the backend (cached briefly: a rerun redraws every card)."""
+    return _grid_context.resolve(json.loads(links_json))
+
+
+def _render_where(result: dict, key: str) -> None:
+    """Where the elements a study named sit in the network — from the CIM layer, through the result's links,
+    as the layer says now (and whether it has changed since the study ran)."""
+    links = result.get(_grid_context.LINKS_KEY) if isinstance(result, dict) else None
+    if not links or not links.get("elements"):
+        return
+    n = len(links["elements"])
+    with st.expander(f"📍 Where {'this element is' if n == 1 else f'these {n} elements are'} · CIM layer",
+                     expanded=False):
+        resolved = _resolve_links(json.dumps(links, sort_keys=True))
+        if not resolved:
+            st.caption("The CIM layer could not be reached to say where these elements are.")
+            return
+        if resolved.get("changed"):
+            st.warning("The CIM layer has changed since this study ran (a declaration, or a proposal edited): "
+                       "shown as it is now.", icon=":material/update:")
+        table = _grid_context.rows(resolved, {e["mrid"]: e.get("role") for e in links["elements"]})
+        if table:
+            st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch",
+                         height=min(38 + 35 * len(table), 353), key=key)
+        if resolved.get("where"):
+            st.caption("Together: " + "; ".join(resolved["where"]))
+        for feeder, points in _grid_context.tie_lines(resolved.get("ties")).items():
+            st.caption(f"Normally open points of feeder {feeder}: {points}")
+        moment = resolved.get("moment")
+        if moment:
+            st.caption(f"MW: the loads' demand at {moment['timestamp']} ({moment.get('data_source')}), the moment "
+                       "the study ran.")
+        elif resolved.get("demand"):
+            st.caption(resolved["demand"])
+        if resolved.get("missing"):
+            st.caption(f"{len(resolved['missing'])} element(s) the study named are no longer in the network.")
+        st.caption("From the CIM layer through the study's links (by mRID). Feeders are inferred from the topology "
+                   "as switched now; what loses supply is topology only.")
+
+
 def render_charts(tool_results: list) -> None:
     """
     Render Plotly charts for a list of (tool_name, result) tuples.
@@ -3528,7 +3630,13 @@ def render_charts(tool_results: list) -> None:
     varying = _varying_args(tool_results)
     for chart_idx, (tool_name, result) in enumerate(tool_results):
         renderer = RENDERER_MAP.get(tool_name)
-        if renderer is None or not isinstance(result, dict) or "error" in result:
+        if not isinstance(result, dict) or "error" in result:
+            continue
+        # Where the elements the study named are (CIM layer) — also when it has no chart: an N-1 sweep with no
+        # violation draws nothing, yet its outages cut supply somewhere.
+        where_key = f"where_{chart_idx}_{id(result)}"
+        if renderer is None:
+            _render_where(result, key=where_key)
             continue
 
         try:
@@ -3538,15 +3646,18 @@ def render_charts(tool_results: list) -> None:
                 "Renderer for %s failed.", tool_name, exc_info=True)
             label = _tools_reg.label(tool_name)
             st.caption(f"⚠️ The chart for {label} could not be drawn; the answer above is unaffected.")
+            _render_where(result, key=where_key)
             continue
 
         if figs is None or (isinstance(figs, list) and not figs):
+            _render_where(result, key=where_key)
             continue
         if not isinstance(figs, list):
             figs = [figs]
         flat = [fig for row in figs for fig in (row if isinstance(row, list) else [row])
                 if fig is not None]
         if not flat:
+            _render_where(result, key=where_key)
             continue
 
         st.caption(_chart_caption(tool_name, result, show_pf=show_pf,
@@ -3567,6 +3678,7 @@ def render_charts(tool_results: list) -> None:
                 st.caption(subtitle)
             st.dataframe(frame, hide_index=True, width="stretch",
                          height=min(38 + 35 * len(frame), 458))
+        _render_where(result, key=where_key)
 
         rows = [charts[i:i + _CHARTS_PER_ROW] for i in range(0, len(charts), _CHARTS_PER_ROW)]
         visible, hidden = rows[:_VISIBLE_CHART_ROWS], rows[_VISIBLE_CHART_ROWS:]
@@ -3912,15 +4024,20 @@ def _report_charts_html(tool_results: list) -> str:
     varying = _varying_args(tool_results)
     for tool_name, result in tool_results or []:
         renderer = RENDERER_MAP.get(tool_name)
-        if renderer is None or not isinstance(result, dict) or "error" in result:
+        if not isinstance(result, dict) or "error" in result:
             continue
+        # Where the elements the study named are (CIM layer) — also under a study with no chart.
+        where = _where_html(result)
         try:
-            figs = renderer(result)
+            figs = renderer(result) if renderer is not None else []
         except Exception:  # noqa: BLE001 — one chart, never the report
-            continue
+            figs = []
         figs = figs if isinstance(figs, list) else [figs] if figs is not None else []
         flat = [f for row in figs for f in (row if isinstance(row, list) else [row]) if f is not None]
         if not flat:
+            if where:
+                out.append(f"<div class='chart-caption'>{_report.markdown(_chart_caption(tool_name, result))}</div>"
+                           + where)
             continue
         caption = _chart_caption(tool_name, result, show_pf=show_pf, extra=_arg_bits(tool_name, result, varying))
         out.append(f"<div class='chart-caption'>{_report.markdown(caption)}</div>")
@@ -3948,7 +4065,39 @@ def _report_charts_html(tool_results: list) -> str:
                     continue
         if charts:
             out.append(f"<div class='charts'>{''.join(charts)}</div>")
+        out.append(where)
     return "".join(out)
+
+
+def _where_html(result: dict) -> str:
+    """The "Where" section of a result for the report: its links to the CIM layer, resolved now, as a table with
+    the same notes as the card (`_render_where`). "" when the result has no links or the layer cannot be reached."""
+    links = result.get(_grid_context.LINKS_KEY) if isinstance(result, dict) else None
+    if not links or not links.get("elements"):
+        return ""
+    resolved = _resolve_links(json.dumps(links, sort_keys=True))
+    if not resolved:
+        return ""
+    table = _grid_context.rows(resolved, {e["mrid"]: e.get("role") for e in links["elements"]})
+    if not table:
+        return ""
+    notes = []
+    if resolved.get("changed"):
+        notes.append("The CIM layer has changed since this study ran: shown as it is now.")
+    if resolved.get("where"):
+        notes.append("Together: " + "; ".join(resolved["where"]))
+    notes += [f"Normally open points of feeder {f}: {t}" for f, t in _grid_context.tie_lines(resolved.get("ties")).items()]
+    moment = resolved.get("moment")
+    if moment:
+        notes.append(f"MW: the loads' demand at {moment['timestamp']} ({moment.get('data_source')}), the moment the "
+                     "study ran.")
+    elif resolved.get("demand"):
+        notes.append(resolved["demand"])
+    notes.append("From the CIM layer through the study's links (by mRID). Feeders are inferred from the topology as "
+                 "switched now; what loses supply is topology only.")
+    return ("<p><strong>📍 Where these elements are · CIM layer</strong></p>"
+            + pd.DataFrame(table).to_html(index=False, border=0)
+            + "".join(f"<p class='limits'>{html.escape(n)}</p>" for n in notes))
 
 
 def _data_line(grid: dict) -> str | None:
@@ -4347,12 +4496,35 @@ def _assumptions_note(assumptions: dict) -> str:
     return "".join(f" · {x}" for x in notes)
 
 
+def _live_fingerprint() -> str:
+    """The network the backend serves now, for keying the System tab's caches.
+
+    `_network_fingerprint` is refreshed only when a question is sent (to reset
+    the conversation on a swap), so after an upload it still names the network
+    before it: a cache keyed on it drew the old network. The live one is read
+    here and never written back, so the conversation's own check is untouched."""
+    return _current_fingerprint() or st.session_state.get("_network_fingerprint") or "unknown"
+
+
 def _state_fingerprint() -> str:
     """The network and the model assumptions together: a change of either
     (load power factor, generator models) redraws the map instead of serving
     the cached one."""
-    return (f"{st.session_state.get('_network_fingerprint') or ''}|"
+    return (f"{_live_fingerprint()}|"
             f"{st.session_state.get('_assumptions_key') or ''}")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_layer(fingerprint: str, network: str, assumptions_key: str) -> dict | None:
+    """The CIM layer of the network drawn (the base or a proposal). The key changes with the network, its
+    names and what the operator declared."""
+    try:
+        params = {} if network in (None, "", "base") else {"network": network}
+        r = httpx.get(f"{BASE_URL}/api/network/semantics", params=params, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -4434,7 +4606,7 @@ def _render_system_view() -> None:
     # cached drawing (the network's identity does not change with it).
     names_key = hashlib.sha1(json.dumps(assumptions.get("element_names") or [], sort_keys=True,
                                         default=str).encode()).hexdigest()[:8]
-    fingerprint = f"{st.session_state.get('_network_fingerprint') or 'unknown'}|{names_key}"
+    fingerprint = f"{_live_fingerprint()}|{names_key}"
 
     # Which grid the picture is of: the base, or one of the proposals.
     proposals = {p["id"]: p for p in (_list_proposals() or [])}
@@ -4453,7 +4625,7 @@ def _render_system_view() -> None:
     st.session_state.setdefault("system_pane", "map")
     pane = st.segmented_control(
         "System view", ["map", "semantics", "assumptions", "names"], key="system_pane", label_visibility="collapsed",
-        format_func={"map": "🗺️ Network map", "semantics": "🧭 What it is", "assumptions": "⚙️ Model assumptions",
+        format_func={"map": "🗺️ Network map", "semantics": "🧭 CIM layer", "assumptions": "⚙️ Model assumptions",
                      "names": "🏷️ Names"}.get,
         selection_mode="single") or "map"
     if pane == "semantics":
@@ -4481,10 +4653,33 @@ def _render_system_view() -> None:
                 + "; ".join((proposal.get("summary") or {}).get("edits") or []) + ".",
                 icon=":material/edit_note:")
 
+    # What the colours show: the operating point, or what the CIM layer says each bus has.
+    colour_by = "state"
+    if not diff:
+        st.session_state.setdefault("map_colour", "state")
+        colour_by = st.segmented_control(
+            "Colour by", ["state", *_layer_map.MODES], key="map_colour",
+            format_func={"state": "Operating point", **_layer_map.MODES}.get, selection_mode="single",
+            help="Operating point: voltages and loadings at a moment. The others come from the CIM layer: each "
+                 "bus by its units' energy source, by its feeder, or by how well the layer knows what is there."
+        ) or "state"
+
     network, positions = _layout_for(f"{fingerprint}|{chosen}|{edits_hash}", payload)
     # The cached objects are shared between reruns, so state is joined onto a
     # copy: mutating the cache would leave last hour's voltages on the map.
     network = copy.deepcopy(network)
+    if colour_by != "state":
+        layer = _fetch_layer(fingerprint, chosen, st.session_state.get("_assumptions_key") or "")
+        if not layer:
+            st.warning("Could not read the CIM layer from the backend.")
+            return
+        st.plotly_chart(_layer_map.render_layer_map(
+            network, positions, layer, colour_by,
+            subtitle=(f"Proposal {chosen} · " if proposal else "") + "what each bus has, as the CIM layer says"),
+            width="stretch", theme=None, key="layer_map")
+        st.caption("Hover over a bus for what is there and how it is known. Set what the network does not say in "
+                   "the **CIM layer** view.")
+        return
 
     timestamp = _system_operating_point()
     following = st.session_state.get("system_ts") is None
@@ -4697,8 +4892,9 @@ def _render_plain_table(key: str, title: str, caption: str, columns: list[str], 
                     tag = f" <span class='gen-changed'>{mark}</span>" if k == 0 and row.get(flag) else ""
                     col.markdown(f"<span class='gen-cell'>{html.escape(str(text))}</span>{tag}",
                                  unsafe_allow_html=True)
-                cols[-1].button("Edit", key=f"edit_{key}_{n}", type="tertiary", icon=":material/edit:",
-                                on_click=on_edit, args=(row[ident],))
+                if row.get("editable", True):
+                    cols[-1].button("Edit", key=f"edit_{key}_{n}", type="tertiary", icon=":material/edit:",
+                                    on_click=on_edit, args=(row[ident],))
 
 
 def _render_unit_costs() -> None:
@@ -4785,6 +4981,60 @@ def _edit_cost_dialog(unit: dict) -> None:
         st.rerun()
 
 
+def _render_proposal_difference() -> None:
+    """A proposal as a CIM difference against the base: what it changes in the layer, and the file."""
+    proposals = [p["id"] for p in (_list_proposals() or [])]
+    if not proposals:
+        return
+    with st.expander("A proposal as a CIM difference", icon=":material/difference:", key="sem_diff"):
+        chosen = st.selectbox("Proposal", proposals, key="sem_diff_pick")
+        summary = _api_request("get", f"/api/network/cim/difference?network={chosen}&format=summary",
+                               error_key="_sem_diff_error")
+        error = st.session_state.pop("_sem_diff_error", None)
+        if error or not summary:
+            st.warning(error or "The difference could not be read.")
+            return
+        counts = summary.get("counts") or {}
+        st.caption(f"Against the base: {counts.get('added', 0)} element(s) added, {counts.get('removed', 0)} "
+                   f"removed, {counts.get('changed', 0)} changed — as CIM exchanges changes (a difference model: "
+                   "forward and reverse differences).")
+        rows = ([{"Element": a["element"], "Class": a["class"], "Change": "added", "What": ""}
+                 for a in summary.get("added") or []]
+                + [{"Element": r["element"], "Class": r["class"], "Change": "removed", "What": ""}
+                   for r in summary.get("removed") or []]
+                + [{"Element": c["element"], "Class": c["class"], "Change": "changed",
+                    "What": "; ".join(c.get("changes") or [])} for c in summary.get("changed") or []])
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=min(320, 38 + 35 * len(rows)))
+        try:
+            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+                r = client.get(f"{BASE_URL}/api/network/cim/difference", params={"network": chosen})
+                r.raise_for_status()
+            st.download_button("CIM difference (RDF/XML)", r.content, file_name=f"conductor-{chosen}-difference.xml",
+                               mime="application/rdf+xml", key="sem_diff_xml", icon=":material/download:")
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"The difference file could not be prepared: {exc}")
+
+
+def _render_data_issues() -> None:
+    """What in the network's own data looks inconsistent (`semantics.data_issues`), folded unless something
+    looks wrong."""
+    out = _api_request("get", "/api/network/semantics?about=issues", error_key="_sem_issues_error")
+    st.session_state.pop("_sem_issues_error", None)
+    issues = (out or {}).get("issues") or []
+    if not issues:
+        return
+    checks = [i for i in issues if i.get("level") == "check"]
+    title = (f"Possible data issues · {len(checks)} to check" if checks else f"Notes on the data · {len(issues)}")
+    with st.expander(title, icon=":material/rule:", expanded=bool(checks), key="sem_issues"):
+        st.caption("Found in the network's own data, from the facts above — no study run. The agent is told the "
+                   "same when it asks.")
+        for i in issues:
+            mark = "⚠️" if i.get("level") == "check" else "ℹ️"
+            st.markdown(f"{mark} **{html.escape(str(i.get('element')))}** — {html.escape(str(i.get('note')))}"
+                        .replace("$", "\\$"))
+
+
 def _render_semantics() -> None:
     """What each element is — a unit's energy source, a load's category, a
     bus's voltage level and substation, a branch's ends and rating, where the
@@ -4798,11 +5048,14 @@ def _render_semantics() -> None:
     if data is None:
         st.caption("Could not read the network description from the backend.")
         return
-    st.caption("What each element is and how CONDUCTOR knows it: **stated** by the network, read from its "
-               "**name**, **inferred** by a rule, or **unknown** — never guessed. The agent answers from these "
-               "facts and every answer is checked against them. Set what the network does not say; renewable "
-               "scaling applies to the units set to wind or solar. Kept for this network across restarts; "
-               "CONDUCTOR records what you tell it in the chat here too.")
+    st.caption("What each element of the network is, and how CONDUCTOR knows it: **stated** by the network, read "
+               "from its **name**, **inferred** by a rule, or **unknown** — never guessed. The agent answers from "
+               "these facts and every answer is checked against them. The studies use them too: only wind and solar "
+               "units are scaled or uncertain, and they can only be curtailed; the synthetic data follow each unit's "
+               "source and each load's category; an outage study checks the ties that could restore supply. Set "
+               "what the network does not say (**Edit**): kept for this network across restarts, and what you tell "
+               "CONDUCTOR in the chat is recorded here too.")
+    _render_data_issues()
     with st.container(key="sem_headline"):
         for col, (label, value, how) in zip(st.columns(5), _sem_view.headline(data)):
             col.markdown(f"<div class='sem-label'>{html.escape(label)}</div>"
@@ -4869,7 +5122,8 @@ def _render_semantics() -> None:
                 st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch",
                              height=min(420, 38 + 35 * len(table)))
     # The export on demand: a large network's RDF is megabytes, not worth fetching on every render.
-    key = (st.session_state.get("_network_fingerprint"), st.session_state.get("_assumptions_key"))
+    # The export carries the operating point at the clock's moment too: it is redone when the clock moves.
+    key = (_live_fingerprint(), st.session_state.get("_assumptions_key"), st.session_state.get("current_ts"))
     ready = st.session_state.get("_sem_export")
     if not ready or ready.get("key") != key:
         if st.button("Export as CIM…", key="sem_export", icon=":material/download:",
@@ -4892,6 +5146,7 @@ def _render_semantics() -> None:
                               mime="application/rdf+xml", key="sem_export_xml", icon=":material/download:")
         c_jl.download_button("JSON-LD", ready["jsonld"], file_name="conductor-network.jsonld",
                              mime="application/ld+json", key="sem_export_jsonld", icon=":material/download:")
+    _render_proposal_difference()
     if st.button("Forget everything I set", key="sem_reset",
                  disabled=not any(r["declared"] for r in units + loads)):
         _api_request("post", "/api/network/declare", {"reset": True}, error_key="_sem_error")
@@ -4900,8 +5155,9 @@ def _render_semantics() -> None:
     if ext:
         st.markdown("**External grid**")
         for e in ext:
-            st.caption(f"Connected at **{e['bus']}** ({e['substation']}); its power comes in over "
-                       + ", ".join(f"`{b}`" for b in e["branches"]) + ".")
+            over = (("its power comes in over " + ", ".join(_sem_view.short_label(b) for b in e["branches"]))
+                    if e["branches"] else "no line or transformer leaves its substation")
+            st.caption(f"Connected at **{e['bus']}** ({e['substation']}); {over}.")
     _render_around(data)
     editing = st.session_state.pop("_sem_editing", None)
     if editing:
@@ -5054,6 +5310,10 @@ def _open_assumptions() -> None:
     st.session_state.system_pane = "assumptions"
 
 
+def _open_cim_layer() -> None:
+    st.session_state.system_pane = "semantics"
+
+
 def _toggle_nominal() -> None:
     st.session_state.op_nominal = not st.session_state.get("op_nominal", False)
 
@@ -5065,6 +5325,8 @@ def _render_system_header(payload: dict, assumptions: dict) -> None:
     parts = [f"{counts.get(k, '—')} {label}" for k, label in (
         ("buses", "buses"), ("lines", "lines"), ("trafos", "transformers"),
         ("loads", "loads"), ("generators", "units"))]
+    if counts.get("storage"):
+        parts.append(f"{counts['storage']} storage unit{'s' if counts['storage'] != 1 else ''}")
     levels = payload.get("voltage_levels") or []
     if len(levels) == 1 and (counts.get("buses") or 0) > 1:
         volts = ("per-unit case (every bus at 1 kV)" if abs(levels[0] - 1.0) < 1e-9
@@ -5100,6 +5362,15 @@ def _render_system_header(payload: dict, assumptions: dict) -> None:
                   key="chip_costs", type="primary" if n_costs else "secondary",
                   help="What each unit costs to produce and to redispatch — open the model assumptions",
                   on_click=_open_assumptions)
+        layer = assumptions.get("cim_layer") or {}
+        parts = [f"{layer['declared']} declared"] if layer.get("declared") else []
+        if layer.get("units_unknown"):
+            parts.append(f"{layer['units_unknown']} unit{'s' if layer['units_unknown'] != 1 else ''} unknown")
+        st.button("CIM layer · " + (" · ".join(parts) or "as loaded"), key="chip_cim",
+                  type="primary" if layer.get("declared") else "secondary",
+                  help=("The facts you declared, and the units whose energy source the network does not state "
+                        "(not treated as wind or solar until you declare them). Click to open the CIM layer."),
+                  on_click=_open_cim_layer)
         st.button("Nominal point · " + ("on" if nominal_on else "off"), key="chip_nominal",
                   type="primary" if nominal_on else "secondary", disabled=not timeline.nominal_available,
                   help=("Studies use the network's own operating point instead of a moment of the data — "
@@ -5207,7 +5478,9 @@ def _ev_help(tip_html: str) -> str:
 
 # Lookups: a turn that ran only these ran no study the reading check could cover.
 _NOT_STUDIES = {"get_current_timestamp", "locate_network_element", "get_current_conditions",
-                "get_element_timeseries", "get_data_quality", "advance_timestamp"}
+                "get_element_timeseries", "get_data_quality", "advance_timestamp",
+                # The CIM layer's own look-ups and declarations, and the raw-tables baseline's.
+                "describe_network", "declare_network_facts", "read_network_tables"}
 
 _READING_STATUS = {
     _robustness.HOLDS: ("✓", "Holds"),
@@ -5772,6 +6045,7 @@ def _run_ai_suggestion(idx: int, trigger: str) -> None:
         "id": round_id,
         "comment": result.comment,
         "comment_unverified": list(result.comment_unverified),
+        "comment_layer": list(result.comment_layer),
         "suggestions": [s.as_record() for s in result.suggestions],
         "note": result.note,
         "error": result.error,
@@ -5794,6 +6068,7 @@ def _run_ai_suggestion(idx: int, trigger: str) -> None:
         "attention": msg.get("attention") or [],
         "comment": result.comment,
         "comment_unverified": entry["comment_unverified"],
+        "comment_layer": entry["comment_layer"],
         "suggestions": entry["suggestions"],
         "note": result.note,
         "error": result.error,
@@ -5834,6 +6109,16 @@ def _log_suggestion_outcome(sent: str) -> None:
     _loop_module.log_event(record)
 
 
+def _layer_notes(item: dict) -> None:
+    """Under an advisor's text: what the CIM layer contradicts or does not support in it, and each group its
+    request names by meaning with the elements the layer resolves it to (advisor_layer)."""
+    for flag in item.get("layer") or []:
+        st.caption(("⚠️ Against the CIM layer: " + flag).replace("$", "\\$"))
+    from agent.advisor_layer import group_line
+    for g in item.get("groups") or []:
+        st.caption(("⚠️ " if g.get("error") else "📍 ") + group_line(g).replace("$", "\\$"))
+
+
 def _ai_box(label: str, text: str, key: str) -> None:
     """The AI agent's prose in its purple box, rendered as Markdown (bold,
     lists, code). Drawn as a keyed container styled by CSS rather than an
@@ -5864,6 +6149,7 @@ def _render_suggestion_round(rnd: dict, idx: int, r_i: int, expanded: bool = Tru
             if rnd.get("comment_unverified"):
                 st.caption("⚠️ Not found in this conversation's results: "
                            + ", ".join(rnd["comment_unverified"]))
+            _layer_notes({"layer": rnd.get("comment_layer")})
         if not rnd.get("suggestions"):
             st.caption(rnd.get("note") or "The advisor had nothing new to suggest.")
             return
@@ -5897,6 +6183,7 @@ def _suggestion_card(rnd: dict, sug: dict, idx: int, r_i: int, s_i: int) -> None
         st.caption(sug["why"].replace("$", "\\$"))
     if sug.get("unverified"):
         st.caption("⚠️ Not found in this conversation's results: " + ", ".join(sug["unverified"]))
+    _layer_notes(sug)
 
 
 # ---------------------------------------------------------------------------
@@ -6006,6 +6293,7 @@ def _study_card_body(study: dict, key: str, disc: dict | None) -> None:
                       width="content")
     if study.get("unverified"):
         st.caption("⚠️ Not found in this conversation's results: " + ", ".join(study["unverified"]))
+    _layer_notes(study)
 
 
 def _option_line(o: dict) -> str:
@@ -6054,6 +6342,7 @@ def _render_decision_note(note: dict) -> None:
                 st.markdown(f"**{label}:**\n" + "\n".join(f"- {x}" for x in note[key]).replace("$", "\\$"))
         if note.get("unverified"):
             st.caption("⚠️ Not found in this conversation's results: " + ", ".join(note["unverified"]))
+        _layer_notes({"layer": note.get("layer")})
         st.caption("Written by the advisor from the discussion; recorded in the session log.")
 
 
@@ -6076,6 +6365,7 @@ def _render_thread_item(disc: dict, k: int, t_i: int, item: dict, interactive: b
         _ai_box("Advisor", item.get("text") or "", key=f"t_{k}_{t_i}")
         if item.get("unverified"):
             st.caption("⚠️ Not found in this conversation's results: " + ", ".join(item["unverified"]))
+        _layer_notes({"layer": item.get("layer")})
         if item.get("criteria"):
             st.markdown("<div class='conductor-criteria'>Noted as what matters to you: "
                         + " · ".join(html.escape(c) for c in item["criteria"]) + "</div>",
@@ -6188,11 +6478,12 @@ def _run_advisor(kind: str, text: str, idx: int) -> None:
     thread.append({"role": "operator", "text": text})
     thread.append({"role": "advisor", "text": result.text, "error": result.error,
                    "studies": [s.as_record() for s in result.studies],
-                   "unverified": list(result.unverified), "criteria": list(result.criteria)})
+                   "unverified": list(result.unverified), "criteria": list(result.criteria),
+                   "layer": list(result.layer)})
     _loop_module.log_event({"kind": "advisor_message", **base, "question": text,
                             "reply": result.text, "studies": [s.as_record() for s in result.studies],
                             "unverified": list(result.unverified), "criteria": list(result.criteria),
-                            "error": result.error})
+                            "layer": list(result.layer), "error": result.error})
 
 
 # The opening request "Discuss these options" sends; the advisor's rules for
@@ -6280,11 +6571,22 @@ def _render_screen_an_option(options: list[dict], idx: int) -> None:
                   help="Puts the request in CONDUCTOR's box — you send it with **Run**.")
 
 
+# A verdict field the engines state, as the operator says it ("system_secure is false" is the engine's).
+_FALSE_IN_WORDS = {"secure": "the grid is not secure", "system_secure": "the grid is not secure",
+                   "system_n1_secure": "the grid is not N-1 secure", "feasible": "no feasible solution was found",
+                   "converged": "the power flow did not converge", "usable": "the result is not usable"}
+
+
 def _attention_hint(attention: list[str]) -> str:
     # A proposal's gap and an answer check keep their subject; other reasons
     # drop the tool prefix.
     first = attention[0]
-    return first if first.startswith(("proposal ", "answer check:")) else first.split(": ", 1)[-1]
+    if first.startswith(("proposal ", "answer check:")):
+        return first
+    hint = first.split(": ", 1)[-1]
+    field = hint[:-len(" is false")] if hint.endswith(" is false") else None
+    hint = _FALSE_IN_WORDS.get(field, hint)
+    return hint[:1].upper() + hint[1:]
 
 
 def _turn_of(idx: int) -> int:
@@ -6538,17 +6840,203 @@ def _render_data_quality(signature: str) -> None:
                               on_click=_follow_measured, args=(tuple(f.get("substations") or ()),))
 
 
+# ---------------------------------------------------------------------------
+# Synthetic data — how the data are generated, and generating them again
+# (logic in agent/synthetic_view.py; data from /api/data/synthetic)
+# ---------------------------------------------------------------------------
+
+_SYN_KEYS = {"n_days": "syn_days", "resolution_min": "syn_res", "load_profile": "syn_load",
+             "peak_load_factor": "syn_peak", "stress_events": "syn_stress", "generation_profile": "syn_gen",
+             "load_error": "syn_lerr", "generation_error": "syn_gerr", "seed": "syn_seed"}
+_SYN_PERCENT = {"peak_load_factor", "load_error", "generation_error"}   # edited in %
+_SYN_STRESS_HELP = ("On about one day in three, a 2-hour window with 15 % more load and 3 % less generation: "
+                    "a stressed hour is likely, a violation is not guaranteed.")
+_SYN_SEED_HELP = "The same settings and seed give the same data; another seed, another week of the same kind."
+
+
+def _seed_synthetic_widgets(settings: dict) -> None:
+    """Set the dialog's fields to `settings` (before its widgets are drawn, or from a callback)."""
+    for name, key in _SYN_KEYS.items():
+        value = settings[name]
+        st.session_state[key] = int(round(value * 100)) if name in _SYN_PERCENT else value
+
+
+def _synthetic_from_widgets() -> dict:
+    return {name: (st.session_state.get(key) / 100 if name in _SYN_PERCENT else st.session_state.get(key))
+            for name, key in _SYN_KEYS.items()}
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_synthetic_preview(settings_json: str, signature: str) -> dict:
+    """The totals the settings would give, beside the data in use. `signature` changes with the data."""
+    try:
+        r = httpx.post(f"{BASE_URL}/api/data/synthetic/preview", timeout=HTTP_TIMEOUT,
+                       json={"settings": json.loads(settings_json)})
+        if r.status_code >= 400:
+            return {"error": r.json().get("detail", r.text)}
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+def _generate_synthetic_data(body: dict) -> bool:
+    """POST /api/data/synthetic; a note for the panel, or the reason under `_syn_error`."""
+    out = _api_request("post", "/api/data/synthetic", body, error_key="_syn_error")
+    if out is None:
+        return False
+    if out.get("status") == "confirm_required":
+        st.session_state._syn_error = out.get("message")
+        return False
+    st.session_state._syn_note = (f"Generated {out['n_timestamps']:,} ticks, {out['first_timestamp'][:16]} → "
+                                  f"{out['last_timestamp'][:16]}, and the forecast. The clock is at "
+                                  f"{out['clock'][:16]}.")
+    _fetch_series.clear()
+    _fetch_quality.clear()
+    _fetch_synthetic_preview.clear()
+    return True
+
+
+def _syn_head(text: str) -> None:
+    st.markdown(f"<span class='gen-head'>{html.escape(text)}</span>", unsafe_allow_html=True)
+
+
+@st.dialog("Synthetic data", width="large")
+def _synthetic_dialog(data: dict, signature: str) -> None:
+    """The generator's settings on the left; the week they give, and Generate, on the right."""
+    opts, base = data["options"], data["base"]
+    limits = opts.get("limits") or {}
+    st.caption("CONDUCTOR generates the measurements and the forecast from the network's own loads and units. "
+               "Change how, and look at the week before you generate it.")
+    left, right = st.columns([2, 3], gap="large")
+    with left:
+        _syn_head("Length")
+        c_days, c_step = st.columns(2)
+        c_days.number_input("Days", min_value=1, max_value=int((limits.get("n_days") or [1, 31])[1]), step=1,
+                            key="syn_days")
+        c_step.selectbox("Step", opts["resolution_min"], format_func=lambda m: f"{m} min", key="syn_res")
+        _syn_head("Load")
+        loads = opts["load_profile"]
+        st.selectbox("Daily shape", list(loads), format_func=lambda k: _syn_view.title(loads[k]), key="syn_load",
+                     help=_syn_view.detail(loads[st.session_state.syn_load]))
+        if _syn_view.loads_line(data):
+            st.caption(_syn_view.loads_line(data))
+        lo, hi = (limits.get("peak_load_factor") or [0.3, 2.0])
+        st.slider("Usual daily peak, % of the network's own load", int(lo * 100), int(hi * 100), step=5,
+                  key="syn_peak")
+        _syn_head("Generation")
+        gens = opts["generation_profile"]
+        st.selectbox("Units the network does not describe", list(gens), format_func=lambda k: _syn_view.title(gens[k]),
+                     key="syn_gen", help=_syn_view.detail(gens[st.session_state.syn_gen]))
+        st.caption(_syn_view.units_line(data, st.session_state.syn_gen))
+        _syn_head("Forecast error")
+        c_load, c_gen = st.columns(2)
+        c_load.number_input("Load, %", min_value=0, max_value=int((limits.get("load_error") or [0, 0.5])[1] * 100),
+                            step=1, key="syn_lerr")
+        c_gen.number_input("Generation, %", min_value=0,
+                           max_value=int((limits.get("generation_error") or [0, 1.0])[1] * 100), step=1,
+                           key="syn_gerr")
+        _syn_head("Variation")
+        c_stress, c_seed = st.columns(2, vertical_alignment="bottom")
+        c_seed.number_input("Seed", min_value=0, max_value=2**31 - 1, step=1, key="syn_seed", help=_SYN_SEED_HELP)
+        c_stress.toggle("Stress windows", key="syn_stress", help=_SYN_STRESS_HELP)
+    settings = _synthetic_from_widgets()
+    preview = _fetch_synthetic_preview(json.dumps(settings, sort_keys=True), signature)
+    with right:
+        _syn_head("The measured period, system total")
+        if preview.get("error"):
+            st.warning(preview["error"])
+        else:
+            st.plotly_chart(_polish(_syn_view.preview_figure(preview)), width="stretch", theme=None,
+                            key="syn_chart", config={"displayModeBar": False})
+            peaks = preview.get("peaks") or {}
+            diffs = _syn_view.differences(preview["settings"], base)
+            st.caption(f"{preview['n_ticks']:,} ticks · peak consumption {peaks.get('consumption', 0):.1f} MW · "
+                       f"peak production {peaks.get('production', 0):.1f} MW. "
+                       + ("Solid: with these settings; dotted: the data in use." if _syn_view.comparable(preview)
+                          else _syn_view.other_period(preview))
+                       + "  \n"
+                       + (("Differs from what the network loads with: " + "; ".join(diffs) + ".") if diffs
+                          else "These are the settings the network loads with."))
+        replacing = not data.get("in_use")
+        confirmed = st.checkbox("Replace the data in use with these", key="syn_replace") if replacing else True
+        st.caption("Generating replaces the measurements and the forecast. The clock keeps its moment when the "
+                   "new data have it. Earlier answers are marked as computed on other data, with a Rerun. Kept for "
+                   "this network across restarts.")
+        error = st.session_state.pop("_syn_error", None)
+        if error:
+            st.warning(error)
+        c_go, c_back, c_cancel = st.columns([1.1, 1.5, 0.8])
+        if c_go.button("Generate", type="primary", icon=":material/autorenew:", width="stretch", key="syn_go",
+                       disabled=bool(preview.get("error")) or not confirmed):
+            with st.spinner("Generating the measurements and the forecast…"):
+                done = _generate_synthetic_data({"settings": settings, "replace": replacing})
+            if done:
+                st.rerun()
+            st.rerun(scope="fragment")              # keep the dialog open to show why
+        c_back.button("Network's defaults", width="stretch", key="syn_back",
+                      disabled=all(settings[k] == base.get(k) for k in settings),
+                      on_click=_seed_synthetic_widgets, args=(base,),
+                      help="Sets the fields to what the network loads with; Generate applies them.")
+        if c_cancel.button("Cancel", width="stretch", key="syn_cancel"):
+            st.rerun()
+
+
+def _render_synthetic_panel(signature: str) -> None:
+    """One line on how the data in use were made, with the way to change it."""
+    data = _api_request("get", "/api/data/synthetic", error_key="_syn_panel_error")
+    st.session_state.pop("_syn_panel_error", None)
+    if not data or not data.get("available"):
+        return
+    note = st.session_state.pop("_syn_note", None)
+    in_use = data.get("in_use")
+    with st.container(border=True, key="syn_panel"):
+        c_text, c_button = st.columns([5, 1.2], vertical_alignment="center")
+        with c_text:
+            if in_use:
+                st.markdown("**Synthetic data** · " + ("your settings" if data.get("custom")
+                                                       else "the network's defaults"))
+                st.caption(_syn_view.sentence(data.get("summary")))
+            else:
+                demo = data.get("measurements_source") == "demo"
+                st.markdown("**Measured data in use** · " + ("the demo's own" if demo else "uploaded"))
+                st.caption("You can generate synthetic data from the network's own loads and units instead.")
+        c_button.button("Change…" if in_use else "Generate…", icon=":material/tune:", width="stretch",
+                        key="syn_open", disabled=_ui_busy(),
+                        on_click=lambda: st.session_state.update(_syn_open=True))
+        stale = _syn_view.stale_line(data.get("stale") or [])
+        if stale:
+            c_warn, c_again = st.columns([5, 1.2], vertical_alignment="center")
+            c_warn.warning(stale, icon=":material/sync_problem:")
+            if c_again.button("Generate again", key="syn_again", width="stretch", disabled=_ui_busy()):
+                with st.spinner("Generating the data again…"):
+                    _generate_synthetic_data({"settings": {}})
+                st.rerun()
+        error = st.session_state.pop("_syn_error", None)
+        if error:
+            st.warning(error)
+        if note:
+            st.success(note, icon=":material/check_circle:")
+    if st.session_state.pop("_syn_open", False):
+        _seed_synthetic_widgets(data["settings"])
+        st.session_state.pop("syn_replace", None)
+        _synthetic_dialog(data, signature)
+
+
 def _render_data_view() -> None:
     timeline = _tl.Timeline.from_payload(_fetch_timeline())
     if not timeline.modes():
         st.warning("No data to show — the backend is not responding.")
         return
     # The names key: a rename relabels the series (the network's identity stays).
+    assumptions = _fetch_assumptions() or {}
     signature = "|".join(str(x) for x in (
-        st.session_state.get("_network_fingerprint"), (_fetch_assumptions() or {}).get("names_key"),
+        st.session_state.get("_network_fingerprint"), assumptions.get("names_key"),
+        # The data's own key: data generated again keep their length and range.
+        assumptions.get("data_key"),
         timeline.measured_source, timeline.forecast_source,
         len(timeline.measured), timeline.measured[:1], timeline.measured[-1:],
         len(timeline.forecast), timeline.forecast[:1], timeline.forecast[-1:]))
+    _render_synthetic_panel(signature)
 
     datasets = [d for d, ticks in (("Measured", timeline.measured), ("Forecast", timeline.forecast)) if ticks]
     if len(datasets) == 2:

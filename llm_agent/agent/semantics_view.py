@@ -91,6 +91,8 @@ def unit_rows(semantics: dict) -> list[dict]:
     for u in semantics.get("units") or []:
         src = u["source"]
         rows.append({"unit": u["name"], "declared": _declared(src), "value": src["value"], "basis": src["basis"],
+                     # Storage is stated as such by its table, and a declaration names a generating unit.
+                     "editable": u.get("element_type") != "storage",
                      "cells": [u["name"], u.get("bus") or "", label(src["value"]), _basis_cell(src), _from_cell(src)]})
     rows.sort(key=lambda r: (r["value"] != "unknown", r["value"], r["unit"].casefold()))
     return rows
@@ -167,7 +169,9 @@ def headline(semantics: dict) -> list[tuple[str, str, str]]:
          ", ".join(f"{len(v)} {label(k)}" for k, v in sorted((semantics.get("loads_by_category") or {}).items()))
          or "no loads"),
         ("External grid", ", ".join(e["bus"] for e in ext) or "none",
-         (f"its power comes in over {sum(len(e['branches']) for e in ext)} branch(es)" if ext else "")),
+         ((f"its power comes in over {n} branch{'es' if n != 1 else ''}"
+           if (n := sum(len(e["branches"]) for e in ext)) else "no line or transformer leaves its substation")
+          if ext else "")),
     ]
 
 
@@ -226,17 +230,34 @@ def legend(semantics: dict, kind: str = "units") -> list[tuple[str, str]]:
 
 
 def around_choices(semantics: dict) -> list[tuple[str, str]]:
-    """(label shown, name sent) for every element one can look around:
-    substations first, then buses, lines, transformers, units, loads."""
-    subs = sorted({b["substation"]["value"] for b in semantics.get("buses") or [] if b["substation"]["value"]})
-    out = [(f"Substation · {s}", s) for s in subs if s.startswith("Substation ")]
-    out += [(f"Bus · {b['name']}", b["name"]) for b in semantics.get("buses") or []]
+    """(label shown, element sent) for every element one can look around:
+    substations first, then buses, lines, transformers, units, loads. The
+    element is sent by its mRID, so a bus named "1" is never taken for the bus
+    at index 1; the label is the short name, made unique where two share it."""
+    import re
+    uuid_ = re.compile(r"_?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+    def sent(e: dict) -> str:
+        """The mRID when the backend can look it up (UUID-shaped), else the name."""
+        m = str(e.get("mrid") or "")
+        return m if uuid_.fullmatch(m) else e["name"]
+
+    bus_names = {b["name"] for b in semantics.get("buses") or []}
+    out = [(f"Substation · {s['name']}", sent(s))
+           for s in sorted((semantics.get("containers") or {}).get("substations") or [], key=lambda s: s["name"])
+           if s["name"] not in bus_names]                      # a one-bus substation is its bus
+    out += [(f"Bus · {b['name']}", sent(b)) for b in semantics.get("buses") or []]
     for kind, word in (("line", "Line"), ("trafo", "Transformer")):
-        out += [(f"{word} · {b['name']}", b["name"]) for b in semantics.get("branches") or []
+        out += [(f"{word} · {_short(b['name'])}", sent(b)) for b in semantics.get("branches") or []
                 if b["element_type"] == kind]
-    out += [(f"Unit · {u['name']}", u["name"]) for u in semantics.get("units") or []]
-    out += [(f"Load · {d['name']}", d["name"]) for d in semantics.get("loads") or []]
-    return out
+    out += [(f"Unit · {u['name']}", sent(u)) for u in semantics.get("units") or []]
+    out += [(f"Load · {d['name']}", sent(d)) for d in semantics.get("loads") or []]
+    seen: dict[str, int] = {}
+    unique = []
+    for label_, value in out:
+        seen[label_] = seen.get(label_, 0) + 1
+        unique.append((label_ if seen[label_] == 1 else f"{label_} ({seen[label_]})", value))
+    return unique
 
 
 def around_cards(result: dict) -> list[tuple[str, list[str]]]:
@@ -261,7 +282,7 @@ def around_cards(result: dict) -> list[tuple[str, list[str]]]:
     sup = result.get("supply") or {}
     supply = []
     if sup.get("route_from_external_grid"):
-        supply.append(" → ".join(r.split(" | ")[-1] for r in sup["route_from_external_grid"]))
+        supply.append(" → ".join(_short(r) for r in sup["route_from_external_grid"]))
         if sup.get("feeder"):
             supply.append(f"Feeder: **{sup['feeder'].split(' | ')[0]}**")
         elif sup.get("feeder") is None and not sup.get("radial_at_its_voltage_level", True):
@@ -280,12 +301,42 @@ def around_cards(result: dict) -> list[tuple[str, list[str]]]:
             lines.append("Units cut off: " + ", ".join(out["units_cut_off"]))
         if out["loads_cut_off"]:
             lines.append("Loads cut off: " + ", ".join(out["loads_cut_off"]))
-        if out.get("open_ties_that_could_restore"):
+        checked = out.get("ties_checked") or []
+        if checked:
+            lines += [tie_line(t) for t in checked]
+        elif out.get("open_ties_that_could_restore"):
             lines.append("Could be restored by closing: "
                          + "; ".join(t.split(" | ")[0] + " (" + t.split("(")[-1] for t in out["open_ties_that_could_restore"]))
-        lines.append("Topology only — no power flow run.")
+        lines.append("What is cut off: topology. " + (f"Each tie: a power flow at {str(result['operating_point'])[:16]}, with "
+                                                       "the element out and the tie closed."
+                                                       if checked and result.get("operating_point") else
+                                                       "No power flow run."))
         cards.append(("Without it", lines))
     return cards
+
+
+def tie_line(t: dict) -> str:
+    """One checked tie in words: what closing it restores, and whether the network stays within its limits."""
+    tie = _short(t.get("tie", "")) if " | " in str(t.get("tie", "")) else str(t.get("tie", ""))
+    if not t.get("converged"):
+        return f"Closing **{tie}**: the power flow does not converge — it may not restore supply."
+    back, cut = t.get("buses_restored", 0), t.get("buses_cut_off", 0)
+    restores = "restores all " + str(cut) + " bus(es)" if back >= cut else f"restores {back} of {cut} bus(es)"
+    parts = []
+    low = t.get("lowest_voltage")
+    if low:
+        parts.append(f"lowest voltage {low['pu']:.3f} p.u. at {low['at']}")
+    high = t.get("highest_loading")
+    if high:
+        parts.append(f"highest loading {high['pct']:.0f} % on {_short(high['on'])}")
+    verdict = ("within limits" if t.get("within_limits")
+               else "outside limits: " + ", ".join(t.get("violations") or []))
+    return f"Closing **{tie}** {restores}: " + ", ".join(parts) + f" — {verdict}."
+
+
+def short_label(text) -> str:
+    """A branch's label as people say it ("Line 1-2"), without the ends and the internal key."""
+    return _short(text)
 
 
 def _short(text) -> str:

@@ -425,7 +425,7 @@ def _study_verdicts_with_results(record: dict, earlier: bool = False) -> list[tu
 # A favourable sentence about another state than the study's: another time ("at 15:00, with the same line out, it
 # remains within limits"), the base or the intact grid beside a proposal's or an outage's insecure study, a
 # corrective option, a counterfactual, or what changed rather than what is ("no violations are resolved or newly
-# introduced"). Judging the whole answer, the check read all 24 of its findings in the GM 2027 runs from such
+# introduced"). Judging the whole answer, the check read all 24 of its findings in the CIM layer paper's runs from such
 # sentences, in answers that reported the study's violations correctly.
 # Always another state: a counterfactual or replay, what changed rather than what is, a reference moment.
 _OTHER_STATE_RE = re.compile(

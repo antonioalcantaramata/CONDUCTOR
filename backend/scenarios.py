@@ -28,6 +28,7 @@ Pure functions: no app state, no HTTP.
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 
@@ -116,8 +117,15 @@ def resume_detail(network_sentinel: dict | None, timeseries_sentinel: dict | Non
     import os
 
     def name(rec, key):
+        """The file as the operator named it: stored copies carry a prefix ("uploaded_system__grid.m"), and
+        data generated for an upload are a synthetic week, not a file of theirs."""
         path = (rec or {}).get(key) or ""
-        return os.path.basename(path) if path else None
+        if not path:
+            return None
+        base = os.path.basename(path)
+        if key == "csv_path" and re.fullmatch(r"(measurements|forecasts?)_synthetic[^/]*\.csv", base):
+            return "a synthetic week"
+        return base.split("__", 1)[1] if "__" in base else base
 
     return {"network": name(network_sentinel, "network_path"),
             "data": name(timeseries_sentinel, "csv_path"),
