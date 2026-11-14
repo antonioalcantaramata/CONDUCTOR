@@ -1,9 +1,9 @@
 """
-The CIM layer on a CGMES model (GM 2027 paper): what the layer takes as stated from the model itself, what it has to
+The CIM layer on a CGMES model (CIM layer paper): what the layer takes as stated from the model itself, what it has to
 infer, and what stays unknown, and how long it takes. The model is read with CONDUCTOR's own importer
 (backend/network_loader.read_cgmes), exactly as an operator's upload is. No AI model is called.
 
-    python papers/cimcontext/scale/cgmes_layer.py MODEL.zip [MODEL.zip ...] [--out papers/cimcontext/scale/cgmes_layer.json]
+    python papers/cim_layer/scale/cgmes_layer.py MODEL.zip [MODEL.zip ...] [--out papers/cim_layer/scale/cgmes_layer.json]
 
 MODEL.zip is a zip of the CGMES profiles, or a zip of zips (model and boundary set, as ENTSO-E publishes them).
 
@@ -101,7 +101,7 @@ def measure(path: str) -> dict:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("models", nargs="+")
-    p.add_argument("--out", default=str(ROOT / "papers" / "cimcontext" / "scale" / "cgmes_layer.json"))
+    p.add_argument("--out", default=str(ROOT / "papers" / "cim_layer" / "scale" / "cgmes_layer.json"))
     args = p.parse_args(argv)
     rows = [measure(m) for m in args.models]
     for r in rows:

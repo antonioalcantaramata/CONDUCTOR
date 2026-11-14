@@ -1,9 +1,9 @@
 """
-How large the raw-tables baseline grows with the network (GM 2027 paper, Section V-B). No model is called: the
+How large the raw-tables baseline grows with the network (CIM layer paper, Section V-A). No model is called: the
 network's standard pandapower tables, as `read_network_tables` returns them but with every row, are written out as
 JSON and measured; tokens are estimated as characters / 4.
 
-    python papers/cimcontext/scale/raw_tables_size.py [--out papers/cimcontext/scale/raw_tables_size.json]
+    python papers/cim_layer/scale/raw_tables_size.py [--out papers/cim_layer/scale/raw_tables_size.json]
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def measure(name: str, make) -> dict:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default=str(ROOT / "papers" / "cimcontext" / "scale" / "raw_tables_size.json"))
+    p.add_argument("--out", default=str(ROOT / "papers" / "cim_layer" / "scale" / "raw_tables_size.json"))
     args = p.parse_args(argv)
     rt.MAX_ROWS = 10**9                      # every row: the size the whole tables would take
     rows = []

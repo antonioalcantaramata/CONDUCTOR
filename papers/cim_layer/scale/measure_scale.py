@@ -1,10 +1,10 @@
 """
-How the semantic layer and the answer checks scale with the network (GM 2027 paper, Section IV-E). No model is
+How the semantic layer and the answer checks scale with the network (CIM layer paper, Section V-D). No model is
 called: the layer is built as the backend builds it, one outage is looked up in it, and one answer naming the
 network's elements is checked as the live loop checks it (facts kept for the named elements only, every name
 searched for elements the network does not have). Median of five timings each, on this machine.
 
-    python papers/cimcontext/scale/measure_scale.py [--out papers/cimcontext/scale/scale.json]
+    python papers/cim_layer/scale/measure_scale.py [--out papers/cim_layer/scale/scale.json]
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def measure(name: str, make) -> dict:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--out", default=str(ROOT / "papers" / "cimcontext" / "scale" / "scale.json"))
+    p.add_argument("--out", default=str(ROOT / "papers" / "cim_layer" / "scale" / "scale.json"))
     args = p.parse_args(argv)
     rows = []
     for name, make in CASES.items():

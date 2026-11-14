@@ -1,12 +1,12 @@
 """
-The case study of the GM 2027 paper (Section III): one session with the full system on the CIGRE MV demo.
+The case study of the CIM layer paper (Section IV): one session with the full system on the CIGRE MV demo.
 
 The questions are put in order in one conversation, as an operator would, to the same configuration as the full
 system of run B (default settings), on an isolated backend so nothing touches the operator's `systems/`,
 `data_files/` or caches. Each turn's record is kept, and a transcript lists every answer with what the checks found
 (figures traced, entity findings, the reading check), for the authors to read and quote. Spends model credit.
 
-    python papers/cimcontext/case_study/run_case_study.py [--out papers/cimcontext/runs/D-case-study] [--port 8795]
+    python papers/cim_layer/case_study/run_case_study.py [--out papers/cim_layer/runs/D-case-study] [--port 8795]
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-DEFAULT_OUT = ROOT / "papers" / "cimcontext" / "runs" / "D-case-study"
+DEFAULT_OUT = ROOT / "papers" / "cim_layer" / "runs" / "D-case-study"
 SCENARIO = "cigre_mv"
 
 # The session, in order. The operator's own messages only; the agent's questions back are answered by the next one.

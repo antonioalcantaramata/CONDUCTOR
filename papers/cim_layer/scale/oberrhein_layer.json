@@ -1,0 +1,57 @@
+{
+ "network": "MV Oberrhein (pandapower)",
+ "buses": 179,
+ "lines": 181,
+ "transformers": 2,
+ "switches": 322,
+ "units": 153,
+ "loads": 147,
+ "voltage_levels_kv": [
+  110.0,
+  20.0
+ ],
+ "build_s_median": 0.031,
+ "feeders": 4,
+ "normally_open_switches": 6,
+ "switch_roles": {
+  "sectionalising switch": 312,
+  "normally open point closing a loop": 1,
+  "tie between feeders": 5,
+  "line switch": 4
+ },
+ "unit_sources": {
+  "solar (stated)": 153
+ },
+ "load_categories": {
+  "unknown (unknown)": 147
+ },
+ "feeder_outages": [
+  {
+   "feeder_first_line": "Line 162 | Bus 50 -> Bus 19 [L162]",
+   "buses_cut_off": 36,
+   "load_cut_off_mw": 14.61,
+   "open_ties_that_could_restore": 2
+  },
+  {
+   "feeder_first_line": "Line 165 | Bus 19 -> Bus 56 [L165]",
+   "buses_cut_off": 32,
+   "load_cut_off_mw": 13.46,
+   "open_ties_that_could_restore": 3
+  },
+  {
+   "feeder_first_line": "Line 193 | Bus 6 -> Bus 178 [L193]",
+   "buses_cut_off": 41,
+   "load_cut_off_mw": 21.02,
+   "open_ties_that_could_restore": 1
+  },
+  {
+   "feeder_first_line": "Line 62 | Bus 178 -> Bus 76 [L62]",
+   "buses_cut_off": 41,
+   "load_cut_off_mw": 12.77,
+   "open_ties_that_could_restore": 4
+  }
+ ],
+ "machine": "macOS-27.2-arm64-arm-64bit",
+ "python": "3.12.16",
+ "repeats": 5
+}

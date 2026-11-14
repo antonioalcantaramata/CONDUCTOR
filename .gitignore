@@ -64,9 +64,16 @@ evaluation_runs/
 # until the paper is public; un-ignore its folder below to publish it. The runs' server logs and scratch caches stay
 # out: they hold repeated library warnings and local paths, and nothing in a paper is computed from them.
 papers/*
-!papers/cimcontext/
+!papers/README.md
+!papers/cim_layer/
 papers/*/runs/*/backends/
 papers/*/runs/*/cache/
+# CIM layer paper: earlier error-injection runs and per-item injection results, kept locally only (no number in
+# the paper comes from them; evaluation.injection re-creates them from the recorded runs).
+papers/cim_layer/runs/C-injection-A/
+papers/cim_layer/runs/C-injection-AB-before-scorer-fix/
+papers/cim_layer/runs/C-injection-AB/injection.json
+papers/cim_layer/runs/C-injection-AB/injection.csv
 
 # Local LLM state: usage counts, discovery caches, tool-calling test results.
 llm_agent/.cache/
