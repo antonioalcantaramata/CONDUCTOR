@@ -593,3 +593,22 @@ name:
 - the scenario or data;
 - the model, its provider and its reasoning setting;
 - whether answer review was on.
+
+If you use the CIM layer, or the answer checks that read it, please also cite
+[arXiv:2611.20026](https://arxiv.org/abs/2611.20026):
+
+```bibtex
+@misc{alcantara2026gridlanguage,
+  title         = {The Grid's Own Language: A Common Information Model Layer for {LLM} Grid Assistants},
+  author        = {Alc{\'a}ntara, Antonio and Karampinis, Ioannis and Chatzivasileiadis, Spyros},
+  year          = {2026},
+  eprint        = {2611.20026},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.SY},
+  doi           = {10.48550/arXiv.2611.20026},
+  url           = {https://arxiv.org/abs/2611.20026}
+}
+```
+
+Its runs, analyses and scripts are in the repository's
+[`papers/cim_layer`](https://github.com/antonioalcantaramata/CONDUCTOR/tree/main/papers/cim_layer) folder.

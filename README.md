@@ -460,8 +460,25 @@ costs, renaming and more — so
 please also name the version you used (the git
 commit) and its settings, as described in
 [Using CONDUCTOR in research](docs/research/using-conductor-in-research.md#citing).
-The runs, analyses and scripts behind the CIM layer paper (under review) are in
-[`papers/cim_layer`](papers/cim_layer).
+
+If you use the CIM layer, or the answer checks that read it, please also cite
+[The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants](https://arxiv.org/abs/2611.20026)
+(arXiv:2611.20026, November 2026):
+
+```bibtex
+@misc{alcantara2026gridlanguage,
+  title         = {The Grid's Own Language: A Common Information Model Layer for {LLM} Grid Assistants},
+  author        = {Alc{\'a}ntara, Antonio and Karampinis, Ioannis and Chatzivasileiadis, Spyros},
+  year          = {2026},
+  eprint        = {2611.20026},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.SY},
+  doi           = {10.48550/arXiv.2611.20026},
+  url           = {https://arxiv.org/abs/2611.20026}
+}
+```
+
+The runs, analyses and scripts behind it are in [`papers/cim_layer`](papers/cim_layer).
 
 ## License
 

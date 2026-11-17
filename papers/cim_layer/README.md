@@ -1,7 +1,8 @@
 # Evidence for "The Grid's Own Language"
 
 Everything behind the numbers in *The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants*
-(A. Alcántara, I. Karampinis, S. Chatzivasileiadis; under review): the record of every run, the analyses, and the scripts that made the paper's figure, case study and
+(A. Alcántara, I. Karampinis, S. Chatzivasileiadis; under review; preprint
+[arXiv:2611.20026](https://arxiv.org/abs/2611.20026)): the record of every run, the analyses, and the scripts that made the paper's figure, case study and
 measurements. Every run records the code commit it ran on (`manifest.json`).
 
 | Folder | In the paper | What is in it |

@@ -6,7 +6,7 @@ table it supports.
 
 | Folder | Paper | Status |
 |---|---|---|
-| [`cim_layer/`](cim_layer/README.md) | *The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants* (A. Alcántara, I. Karampinis, S. Chatzivasileiadis) | Under review |
+| [`cim_layer/`](cim_layer/README.md) | *The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants* (A. Alcántara, I. Karampinis, S. Chatzivasileiadis) | Under review; preprint [arXiv:2611.20026](https://arxiv.org/abs/2611.20026) |
 
 ## What a paper folder holds
 
