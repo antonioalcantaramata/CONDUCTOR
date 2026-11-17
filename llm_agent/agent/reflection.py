@@ -78,6 +78,7 @@ from .characterisation import check_answer as check_characterisation
 from .characterisation import check_study_claims
 from .evidence import as_conflicts as overstated_claims
 from .investigation_record import as_conflicts as _investigation_issues
+from .entities import as_conflicts as _entity_issues
 from .completeness import Gap, format_gaps
 from .completeness import check_answer as check_completeness
 from .provenance import (
@@ -245,7 +246,8 @@ def check_all(draft: str, record: dict) -> tuple[tuple[ClaimVerdict, ...],
     conflicts = tuple(check_characterisation(draft or "", record)) \
         + tuple(check_study_claims(draft or "", record)) \
         + tuple(overstated_claims(draft or "", record)) \
-        + tuple(_investigation_issues(draft or "", record))
+        + tuple(_investigation_issues(draft or "", record)) \
+        + tuple(_entity_issues(draft or "", record))
     gaps = () if is_clarifying_question(draft or "", record.get("tool_calls") or ()) else \
         tuple(check_completeness(record.get("user") or "", draft or ""))
     return findings, report, conflicts, gaps
@@ -327,6 +329,11 @@ def format_conflicts(conflicts: tuple[Conflict, ...]) -> str:
         if conflict.path == "investigation":
             # The answer departing from the turn's investigation record.
             lines.append(f'- "{conflict.context}" — this {conflict.detail}.')
+            continue
+        if conflict.path == "entities":
+            # An element called something the network does not say it is.
+            lines.append(f'- "{conflict.context}" — the draft {conflict.detail}. Say what the network '
+                         "states (describe_network), or that it does not say.")
             continue
         if conflict.path == "evidence":
             # A sentence claiming more certainty than the results give.

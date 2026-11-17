@@ -14,6 +14,23 @@ without touching the loaded network, every figure in an answer is traced to the
 solver that produced it, and an advisor — a second agent that runs no studies —
 suggests next steps and discusses results with the operator.
 
+CONDUCTOR reads the network in the grid's own language, the **Common
+Information Model (CIM)** in which system operators exchange their models. Its
+**CIM layer** says what each element is — a unit's energy source, a switch's
+normal state, the feeder that supplies a load, what an outage cuts off and
+which tie could restore it — and how that is known: stated in the data,
+suggested only by a name, inferred from the topology, or declared by the
+operator. The agent answers from it — a study's result comes linked to the
+layer, so a violation arrives with its feeder, voltage and what is connected
+there — and every statement an answer makes about an element is checked
+against it. The studies read it too: a solar scenario
+changes exactly the units the layer says are solar; the optimisations can
+curtail wind and solar but never raise them beyond what the resource gives; an
+outage study checks each tie that could restore supply with a power flow; an
+N-1 screen can be limited to one feeder, substation or voltage level; and the
+synthetic data follow each unit's source and each load's category. CGMES models
+load directly, and the layer can be exported as CIM.
+
 Corrective actions come as **options to choose from**, not one answer: the
 least disturbance, the cheapest, the fewest units, the most headroom,
 near-optimal alternatives that use other units, branches held below a chosen
@@ -41,6 +58,12 @@ whether that holds if the forecast errs. **Deep Research** asks for all of it
 on one question, and a downloadable report holds the whole investigation. A session can be exported as
 a raw record or as a report written by the model, and saved as context to
 continue from later.
+
+A network loaded without data of its own gets **synthetic data**: a week of
+measurements and a forecast built from its own loads and units. Their length,
+time step, load shape, peak, forecast errors and seed can be changed in the Data
+tab, with a preview of the period before it is generated, and are kept for the
+network.
 
 The agent runs on a **hosted model** or a **local model via Ollama**, picked
 on a launch screen grouped into tiers:
@@ -82,8 +105,8 @@ do once it is running: [getting started](docs/guide/getting-started.md),
 - **`llm_agent/`** — Streamlit chat app and the LLM agent that orchestrates the
   backend tools.
 - **`systems/`**, **`data_files/`** — networks and time-series data (the bundled
-  demos — PGLib's IEEE 30-bus case, the default, and IEEE 14 — and an example
-  CSV are included; everything else is generated or user-supplied at runtime).
+  demos — PGLib's IEEE 30-bus case, the default, and the CIGRE MV distribution
+  benchmark, built by pandapower — and an example CSV are included; everything else is generated or user-supplied at runtime).
 
 ## Requirements
 
@@ -428,12 +451,34 @@ If you use CONDUCTOR in your work, please cite the paper
 ```
 
 The paper describes an earlier version of CONDUCTOR. It has changed a great deal
-since — network proposals and their comparison, the advisor, corrective options
-and N-1 secure dispatches, free, paid and local model options, measured reactive
-power and data quality, generator models, unit costs, renaming and more — so
+since — the CIM layer with CGMES import and export, the studies that read it (curtailment-only wind and
+solar, restoring ties checked by power flow, N-1 by feeder or voltage level) and study results linked to it,
+network proposals and their
+comparison, the advisor, corrective options and N-1 secure dispatches, free, paid and local model options,
+measured reactive power and data quality, synthetic data whose settings you choose, generator models, unit
+costs, renaming and more — so
 please also name the version you used (the git
 commit) and its settings, as described in
 [Using CONDUCTOR in research](docs/research/using-conductor-in-research.md#citing).
+
+If you use the CIM layer, or the answer checks that read it, please also cite
+[The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants](https://arxiv.org/abs/2611.20026)
+(arXiv:2611.20026, November 2026):
+
+```bibtex
+@misc{alcantara2026gridlanguage,
+  title         = {The Grid's Own Language: A Common Information Model Layer for {LLM} Grid Assistants},
+  author        = {Alc{\'a}ntara, Antonio and Karampinis, Ioannis and Chatzivasileiadis, Spyros},
+  year          = {2026},
+  eprint        = {2611.20026},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.SY},
+  doi           = {10.48550/arXiv.2611.20026},
+  url           = {https://arxiv.org/abs/2611.20026}
+}
+```
+
+The runs, analyses and scripts behind it are in [`papers/cim_layer`](papers/cim_layer).
 
 ## License
 

@@ -5,6 +5,10 @@ Public API
 ----------
 generate(net, n_days, resolution_min, load_profile, generation_profile, seed, stress_events)
     -> (timestamps: list[str], measurements: dict[str, pd.DataFrame])
+forecast(net, timestamps, measurements, ...) -> the same, for the forecast
+basis(net) -> what the generator reads from a network, kept to generate again later
+normalise_settings(changes, base) / describe(settings) / preview(basis, settings) — the
+    settings an operator can change, checked, in words, and their system totals
 
 The output format is identical to the historical measurement_database.pkl schema so
 all existing main_backend.py endpoints work unchanged:
@@ -16,7 +20,7 @@ all existing main_backend.py endpoints work unchanged:
 
 Profile options
 ---------------
-load_profile  : "residential" | "twin_peak" | "industrial" | "flat"
+load_profile  : "residential" | "twin_peak" | "industrial" | "flat" (LOAD_PROFILES)
 generation_profile : "wind" | "solar" | "flat"
 
 Stress events
@@ -28,6 +32,7 @@ stressed hour likely; it does not guarantee a violation.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -86,10 +91,15 @@ def _load_shape(hours: np.ndarray, dow: np.ndarray, profile: str) -> np.ndarray:
         alpha = np.full(n, 0.85)
         alpha[(hours < 6) | (hours >= 22)] *= 0.70
         return alpha
+    if profile == "commercial":
+        # Offices and shops: on from ~8 h to ~18 h on weekdays, a little at weekends, low at night.
+        on = 1.0 / (1.0 + np.exp(-2.0 * (hours - 7.5))) / (1.0 + np.exp(2.0 * (hours - 18.5)))
+        weekend = (dow >= 5).astype(float)
+        return 0.4 + on * (0.6 * (1.0 - weekend) + 0.15 * weekend)
     return np.ones(n)  # "flat"
 
 
-_NOISE = {"residential": 0.05, "twin_peak": 0.05, "industrial": 0.03}
+_NOISE = {"residential": 0.05, "twin_peak": 0.05, "industrial": 0.03, "commercial": 0.04}
 
 
 def _load_scale(hours: np.ndarray, dow: np.ndarray,
@@ -130,11 +140,219 @@ def _gen_scale(profile: str, n_steps: int,
 
 
 # ---------------------------------------------------------------------------
+# Settings — what the operator can change (the Data tab's synthetic-data panel)
+# ---------------------------------------------------------------------------
+
+LOAD_PROFILES = {
+    "residential": "Residential: a morning peak and a higher evening peak, 15 % lower at weekends",
+    "twin_peak": "Twin peak: peaks around 2–3 h and 14–15 h, 15 % lower at weekends",
+    "industrial": "Industrial: steady by day, 30 % lower from 22 h to 6 h, every day",
+    "commercial": "Commercial: office hours on weekdays, low at night and at weekends",
+    "flat": "Flat: the same all day, with small noise",
+}
+# The shape a load follows when the CIM layer says what kind of demand it is (`semantics.LOAD_CATEGORIES`).
+# A category not here (a downstream network, other, unknown) follows the shape chosen for the rest.
+CATEGORY_SHAPES = {"residential": "residential", "rural": "residential", "heat_pump": "residential",
+                   "ev_charging": "residential", "commercial": "commercial", "commercial_industrial": "commercial",
+                   "agricultural": "commercial", "industrial": "industrial", "data_centre": "flat"}
+GENERATION_PROFILES = {
+    "wind": "Wind: wanders slowly, day and night",
+    "solar": "Solar: follows the sun, nothing at night",
+    "flat": "Flat: steady at 60 % of capacity",
+}
+RESOLUTIONS = (5, 10, 15, 30, 60)
+MAX_DAYS = 31
+MAX_TICKS = 2976            # 31 days at 15 minutes, 10 days at 5
+PEAK_RANGE = (0.3, 2.0)
+LOAD_ERROR_MAX = 0.5
+GENERATION_ERROR_MAX = 1.0
+# The forecast's seed is the measurements' plus this: 42 gives 137, the
+# forecast's seed before the settings could be changed.
+FORECAST_SEED_OFFSET = 95
+
+DEFAULTS = {
+    "n_days": 7,
+    "resolution_min": 15,
+    "load_profile": "residential",
+    "generation_profile": "wind",
+    "peak_load_factor": 1.0,
+    "stress_events": True,
+    "seed": 42,
+    "load_error": 0.04,
+    "generation_error": 0.20,
+    "forecast_overlap_days": 2.0,
+}
+
+
+class SettingsError(ValueError):
+    """Settings the generator cannot use; the message says which and why."""
+
+
+def normalise_settings(changes: dict | None, base: dict | None = None) -> dict:
+    """`base` (default `DEFAULTS`) with `changes` applied, checked: a full
+    settings dict. Raises SettingsError naming the first setting that is wrong."""
+    out = {**DEFAULTS, **(base or {})}
+    for key, value in (changes or {}).items():
+        if key not in DEFAULTS:
+            raise SettingsError(f"Unknown setting {key!r}. Known: {', '.join(DEFAULTS)}.")
+        out[key] = value
+
+    def number(key, kind, lo, hi):
+        value = out[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SettingsError(f"{key} must be a number, not {value!r}.")
+        if kind is int and float(value) != int(value):
+            raise SettingsError(f"{key} must be a whole number, not {value!r}.")
+        value = kind(value)
+        if not lo <= value <= hi:
+            raise SettingsError(f"{key} must be between {lo:g} and {hi:g}, not {value:g}.")
+        out[key] = value
+
+    number("n_days", int, 1, MAX_DAYS)
+    number("resolution_min", int, 1, 60)
+    if out["resolution_min"] not in RESOLUTIONS:
+        raise SettingsError(f"resolution_min must be one of {', '.join(map(str, RESOLUTIONS))} minutes.")
+    ticks = out["n_days"] * 24 * 60 // out["resolution_min"]
+    if ticks > MAX_TICKS:
+        raise SettingsError(f"{out['n_days']} days at {out['resolution_min']} minutes is {ticks:,} ticks; at most "
+                            f"{MAX_TICKS:,} (31 days at 15 minutes, 10 days at 5).")
+    for key, known in (("load_profile", LOAD_PROFILES), ("generation_profile", GENERATION_PROFILES)):
+        if out[key] not in known:
+            raise SettingsError(f"{key} must be one of {', '.join(known)}, not {out[key]!r}.")
+    number("peak_load_factor", float, *PEAK_RANGE)
+    if not isinstance(out["stress_events"], bool):
+        raise SettingsError(f"stress_events must be true or false, not {out['stress_events']!r}.")
+    number("seed", int, 0, 2**31 - 1)
+    number("load_error", float, 0.0, LOAD_ERROR_MAX)
+    number("generation_error", float, 0.0, GENERATION_ERROR_MAX)
+    number("forecast_overlap_days", float, 0.0, float(MAX_DAYS))
+    out["forecast_overlap_days"] = min(out["forecast_overlap_days"], float(out["n_days"]))
+    return out
+
+
+def describe(settings: dict) -> str:
+    """The settings in one sentence, for the operator and the agent."""
+    s = settings
+    shape = s["load_profile"].replace("_", " ")
+    return (f"{s['n_days']} day{'s' if s['n_days'] != 1 else ''} at {s['resolution_min']}-minute steps; "
+            f"{shape} load, its usual daily peak at {s['peak_load_factor'] * 100:.0f} % of the network's own; "
+            f"units the network does not describe follow a {s['generation_profile']} shape; "
+            f"stress windows {'on' if s['stress_events'] else 'off'}; forecast errors about "
+            f"{s['load_error'] * 100:.0f} % (load) and {s['generation_error'] * 100:.0f} % (generation); "
+            f"seed {s['seed']}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Basis:
+    """What the generator reads from a network: each unit's bus and capacity,
+    each load's bus and demand, and the buses' names. Taken when the network is
+    loaded, before a tick overwrites the loads, so data can be generated again
+    later from the network's own values."""
+    units: tuple          # ((table, index, bus, capacity MW), ...)
+    loads: tuple          # ((bus, MW, index), ...)
+    names: dict           # {bus: the name its data are filed under}
+
+
+def basis(net: pp.pandapowerNet) -> Basis:
+    """The network's `Basis` (see the class)."""
+    units = tuple((table, int(idx), int(row["bus"]), _get_max_ref(row))
+                  for table in ("gen", "sgen") for idx, row in net[table].iterrows())
+    loads = tuple((int(row["bus"]), max(float(row["p_mw"]), 0.0), int(idx)) for idx, row in net.load.iterrows())
+    buses = {u[2] for u in units} | {entry[0] for entry in loads}
+    return Basis(units=units, loads=loads, names={b: _bus_name(net, b) for b in buses})
+
+
+def _draw(b: Basis, n_days, resolution_min, load_profile, generation_profile, seed, stress_events,
+          start_dt, peak_load_factor, unit_shapes, load_shapes=None):
+    """The series behind `generate`: (timestamps, {load shape: scale per
+    tick}, {unit shape: capacity factor per tick}, {unit shape: {bus: MW}},
+    {load shape: {bus: MW of load}}, buses). None as the buses when the
+    network has no load and no unit."""
+    rng = np.random.default_rng(seed)
+    n_steps = int(n_days * 24 * 60 / resolution_min)
+
+    # --- Timestamps and calendar arrays ---
+    dts = [start_dt + timedelta(minutes=t * resolution_min) for t in range(n_steps)]
+    timestamps = [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in dts]
+    hours = np.array([dt.hour + dt.minute / 60.0 for dt in dts])
+    dow   = np.array([dt.weekday() for dt in dts])
+
+    # --- Base values per bus (use max_p_mw as capacity reference for gen) ---
+    # Capacity per bus and per shape: {shape: {bus: MW}}.
+    unit_shapes = unit_shapes or {}
+    cap_by_shape: dict[str, dict[int, float]] = {}
+    bus_max_gen: dict[int, float] = {}
+    for table, idx, bus_id, ref in b.units:
+        shape = unit_shapes.get((table, idx), generation_profile)
+        cap_by_shape.setdefault(shape, {})
+        cap_by_shape[shape][bus_id] = cap_by_shape[shape].get(bus_id, 0.0) + ref
+        bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + ref
+
+    bus_base_load: dict[int, float] = {}
+    load_by_shape: dict[str, dict[int, float]] = {}
+    load_shapes = load_shapes or {}
+    for bus_id, p_mw, *rest in b.loads:
+        bus_base_load[bus_id] = bus_base_load.get(bus_id, 0.0) + p_mw
+        shape = load_shapes.get(rest[0], load_profile) if rest else load_profile
+        load_by_shape.setdefault(shape, {})
+        load_by_shape[shape][bus_id] = load_by_shape[shape].get(bus_id, 0.0) + p_mw
+
+    all_buses = sorted(set(bus_max_gen.keys()) | set(bus_base_load.keys()))
+    if not all_buses:
+        return timestamps, None, None, cap_by_shape, load_by_shape, None
+
+    # --- Generate profile timeseries ---
+    load_alpha = _load_scale(hours, dow, load_profile, rng)
+    gen_alpha  = _gen_scale(generation_profile, n_steps, hours, rng)
+    # Other shapes only when a unit needs one (drawn after the default's, so a
+    # network whose units all follow the default gets the same week as before).
+    alphas = {generation_profile: gen_alpha}
+    for shape in sorted(set(cap_by_shape) - {generation_profile}):
+        alphas[shape] = _gen_scale(shape, n_steps, hours, rng)
+    if peak_load_factor is not None:
+        load_alpha = load_alpha * (float(peak_load_factor) / _shape_peak(load_profile))
+    load_alphas = {load_profile: load_alpha}
+
+    # --- Stress events: occasional, mild 2-hour high-load / low-gen windows ---
+    # The twin should read as *mostly secure*, with the odd stressed window —
+    # not a guaranteed daily violation. So events fire on a minority of days
+    # (~1 in 3) with a gentle load bump, rather than a hard ×1.3 every day.
+    windows = []
+    if stress_events:
+        steps_per_day = max(1, int(24 * 60 / resolution_min))
+        width = max(1, int(2 * 60 / resolution_min))  # 2 hours worth of steps
+        for d in range(n_days):
+            if rng.random() > 0.35:          # only ~35% of days see a stress window
+                continue
+            lo = d * steps_per_day + steps_per_day // 6
+            hi = (d + 1) * steps_per_day - width - 2
+            if lo < hi:
+                peak = int(rng.integers(lo, hi))
+                windows.append((peak, width))
+                load_alpha[peak:peak + width] = np.clip(
+                    load_alpha[peak:peak + width] * 1.15, 0.0, 1.6
+                )
+                for alpha in alphas.values():
+                    alpha[peak:peak + width] = np.clip(alpha[peak:peak + width] * 0.97, 0.0, 1.0)
+    # Loads of another shape (their category says so), drawn last of all — after the stress windows, which then
+    # fall on them too — so a network whose loads all follow the chosen shape gets the same week as before, and
+    # one load's category leaves every other bus as it was.
+    for shape in sorted(set(load_by_shape) - {load_profile}):
+        alpha = _load_scale(hours, dow, shape, rng)
+        if peak_load_factor is not None:
+            alpha = alpha * (float(peak_load_factor) / _shape_peak(shape))
+        for peak, width in windows:
+            alpha[peak:peak + width] = np.clip(alpha[peak:peak + width] * 1.15, 0.0, 1.6)
+        load_alphas[shape] = alpha
+    return timestamps, load_alphas, alphas, cap_by_shape, load_by_shape, all_buses
+
+
 def generate(
-    net: pp.pandapowerNet,
+    net: pp.pandapowerNet | Basis,
     n_days: int = 7,
     resolution_min: int = 15,
     load_profile: str = "residential",
@@ -143,19 +361,21 @@ def generate(
     stress_events: bool = True,
     start_dt: datetime = _ORIGIN,
     peak_load_factor: float | None = 1.0,
+    unit_shapes: dict | None = None,
+    load_shapes: dict | None = None,
 ) -> tuple[list[str], dict[str, pd.DataFrame]]:
     """Generate a synthetic measurement timeseries from a static pandapower network.
 
     Parameters
     ----------
-    net : pp.pandapowerNet
-        The base network.  Not modified.
+    net : pp.pandapowerNet or Basis
+        The base network (not modified), or its `basis` taken earlier.
     n_days : int
         Number of simulated days.
     resolution_min : int
         Timestep in minutes (e.g. 15).
     load_profile : str
-        Shape of load scaling: ``"residential"``, ``"industrial"``, or ``"flat"``.
+        Shape of load scaling: one of `LOAD_PROFILES`.
     generation_profile : str
         Shape of generation scaling: ``"wind"``, ``"solar"``, or ``"flat"``.
     seed : int
@@ -174,6 +394,15 @@ def generate(
         windows go above it. The profile shapes alone peak higher (residential
         at ~1.22×), which pushed a test case past its reactive capability every
         afternoon. ``None`` keeps the raw shape.
+    unit_shapes : dict or None
+        {(table, index): "wind" | "solar" | "flat"} — the shape a unit follows
+        when the network says what drives it (a PV unit follows the sun, not
+        the wind). Units not in it follow ``generation_profile``; ``None``
+        (the default) gives every unit that shape, as before.
+    load_shapes : dict or None
+        {load index: one of `LOAD_PROFILES`} — the shape a load follows when
+        the network says what kind of demand it is (`CATEGORY_SHAPES`). Loads
+        not in it follow ``load_profile``.
 
     Returns
     -------
@@ -184,77 +413,52 @@ def generate(
         ``substation_name``, ``production`` (MW), ``consumption`` (MW).
         One row per bus that has load or generation.
     """
-    rng = np.random.default_rng(seed)
-    n_steps = int(n_days * 24 * 60 / resolution_min)
-
-    # --- Timestamps and calendar arrays ---
-    dts = [start_dt + timedelta(minutes=t * resolution_min) for t in range(n_steps)]
-    timestamps = [dt.strftime("%Y-%m-%d %H:%M:%S") for dt in dts]
-    hours = np.array([dt.hour + dt.minute / 60.0 for dt in dts])
-    dow   = np.array([dt.weekday() for dt in dts])
-
-    # --- Base values per bus (use max_p_mw as capacity reference for gen) ---
-    bus_max_gen: dict[int, float] = {}
-    for _, row in net.gen.iterrows():
-        bus_id = int(row["bus"])
-        bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + _get_max_ref(row)
-    for _, row in net.sgen.iterrows():
-        bus_id = int(row["bus"])
-        bus_max_gen[bus_id] = bus_max_gen.get(bus_id, 0.0) + _get_max_ref(row)
-
-    bus_base_load: dict[int, float] = {}
-    for _, row in net.load.iterrows():
-        bus_id = int(row["bus"])
-        bus_base_load[bus_id] = bus_base_load.get(bus_id, 0.0) + max(float(row["p_mw"]), 0.0)
-
-    all_buses = sorted(set(bus_max_gen.keys()) | set(bus_base_load.keys()))
-    if not all_buses:
+    b = net if isinstance(net, Basis) else basis(net)
+    timestamps, load_alphas, alphas, cap_by_shape, load_by_shape, all_buses = _draw(
+        b, n_days, resolution_min, load_profile, generation_profile, seed, stress_events, start_dt,
+        peak_load_factor, unit_shapes, load_shapes)
+    if all_buses is None:
         # Degenerate case: no loads or generators — return single flat timestamp
         return [timestamps[0]], {timestamps[0]: pd.DataFrame(
             [{"substation_name": "EXT_GRID", "production": 0.0, "consumption": 0.0}]
         )}
-
-    # --- Generate profile timeseries ---
-    load_alpha = _load_scale(hours, dow, load_profile, rng)
-    gen_alpha  = _gen_scale(generation_profile, n_steps, hours, rng)
-    if peak_load_factor is not None:
-        load_alpha = load_alpha * (float(peak_load_factor) / _shape_peak(load_profile))
-
-    # --- Stress events: occasional, mild 2-hour high-load / low-gen windows ---
-    # The twin should read as *mostly secure*, with the odd stressed window —
-    # not a guaranteed daily violation. So events fire on a minority of days
-    # (~1 in 3) with a gentle load bump, rather than a hard ×1.3 every day.
-    if stress_events:
-        steps_per_day = max(1, int(24 * 60 / resolution_min))
-        width = max(1, int(2 * 60 / resolution_min))  # 2 hours worth of steps
-        for d in range(n_days):
-            if rng.random() > 0.35:          # only ~35% of days see a stress window
-                continue
-            lo = d * steps_per_day + steps_per_day // 6
-            hi = (d + 1) * steps_per_day - width - 2
-            if lo < hi:
-                peak = int(rng.integers(lo, hi))
-                load_alpha[peak:peak + width] = np.clip(
-                    load_alpha[peak:peak + width] * 1.15, 0.0, 1.6
-                )
-                gen_alpha[peak:peak + width] = np.clip(
-                    gen_alpha[peak:peak + width] * 0.97, 0.0, 1.0
-                )
 
     # --- Assemble measurement DataFrames ---
     measurements: dict[str, pd.DataFrame] = {}
     for t, ts_str in enumerate(timestamps):
         rows = [
             {
-                "substation_name": _bus_name(net, bus_id),
-                "production":  float(bus_max_gen.get(bus_id, 0.0) * gen_alpha[t]),
-                "consumption": float(bus_base_load.get(bus_id, 0.0) * load_alpha[t]),
+                "substation_name": b.names[bus_id],
+                "production":  float(sum(cap.get(bus_id, 0.0) * alphas[shape][t]
+                                         for shape, cap in cap_by_shape.items())),
+                "consumption": float(sum(base.get(bus_id, 0.0) * load_alphas[shape][t]
+                                         for shape, base in load_by_shape.items())),
             }
             for bus_id in all_buses
         ]
         measurements[ts_str] = pd.DataFrame(rows)
 
     return timestamps, measurements
+
+
+def preview(b: Basis, settings: dict, unit_shapes: dict | None = None, load_shapes: dict | None = None) -> dict:
+    """The system totals `generate` would give with `settings` (normalised),
+    without building the per-bus tables: fast enough to redraw on every change.
+    {"timestamps", "consumption", "production": MW per tick, "production_by_shape":
+    {shape: MW per tick}}."""
+    s = settings
+    timestamps, load_alphas, alphas, cap_by_shape, load_by_shape, all_buses = _draw(
+        b, s["n_days"], s["resolution_min"], s["load_profile"], s["generation_profile"], s["seed"],
+        s["stress_events"], _ORIGIN, s["peak_load_factor"], unit_shapes, load_shapes)
+    if all_buses is None:
+        return {"timestamps": timestamps[:1], "consumption": [0.0], "production": [0.0], "production_by_shape": {}}
+    by_shape = {shape: alphas[shape] * sum(cap.values()) for shape, cap in cap_by_shape.items()}
+    production = sum(by_shape.values()) if by_shape else np.zeros(len(timestamps))
+    consumption = sum(load_alphas[shape] * sum(base.values()) for shape, base in load_by_shape.items())
+    return {"timestamps": timestamps,
+            "consumption": [round(float(v), 4) for v in consumption],
+            "production": [round(float(v), 4) for v in production],
+            "production_by_shape": {shape: [round(float(v), 4) for v in series] for shape, series in by_shape.items()}}
 
 
 def _ar1(n: int, sigma: float, rng: np.random.Generator, phi: float = 0.97) -> np.ndarray:
@@ -280,6 +484,9 @@ def forecast(
     peak_load_factor: float | None = 1.0,
     load_error: float = 0.04,
     generation_error: float = 0.20,
+    unit_shapes: dict | None = None,
+    stress_events: bool = True,
+    load_shapes: dict | None = None,
 ) -> tuple[list[str], dict[str, pd.DataFrame]]:
     """A synthetic forecast that overlaps the end of the measurements.
 
@@ -316,7 +523,8 @@ def forecast(
         ahead_ts, ahead = generate(
             net, n_days=n_days, resolution_min=resolution_min, load_profile=load_profile,
             generation_profile=generation_profile, seed=seed, start_dt=start,
-            peak_load_factor=peak_load_factor,
+            peak_load_factor=peak_load_factor, unit_shapes=unit_shapes, stress_events=stress_events,
+            load_shapes=load_shapes,
         )
         out.update(ahead)
     return list(overlap) + ahead_ts, out

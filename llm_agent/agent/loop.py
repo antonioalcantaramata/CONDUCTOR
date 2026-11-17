@@ -21,6 +21,7 @@ import time
 from typing import Callable
 
 from . import tools as _tools_module
+from . import grid_context as _grid_context
 from .reporting_notes import with_note as with_reporting_note
 from .config import (
     DEEP_EXTRA_TURNS,
@@ -52,6 +53,7 @@ from .validators import (
     compares_datasets,
     compares_networks,
     compares_power_factors,
+    power_factor_in_play,
     proposal_note,
     requested_limits,
     requested_timestamps,
@@ -68,7 +70,7 @@ from .providers import (
 )
 from .system_prompt import DEEP_RESEARCH_NOTE, get_system_prompt
 from .tool_registry import LONG_SERIES, changes_state, label
-from .tool_schemas import TOOL_DISPATCH, TOOLS
+from .tool_schemas import TOOL_DISPATCH, TOOLS, hidden_tool_names, tools_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,11 @@ _TOOL_ARGS = _tool_argument_names()
 
 # Attempt tracking — per-conversation attempt counter
 _attempt_counter: dict[str, int] = {}
+# The tool results of each conversation's last turns. A follow-up ("The one around 18:30.") is answered from the
+# studies the turn before ran, which the model still has in its history; the checks read them too, or every figure
+# quoted from them reads as invented.
+_earlier_results: dict[str, list[list[dict]]] = {}
+EARLIER_TURNS = 2
 
 # ---------------------------------------------------------------------------
 # Session logging — one append-only file per run
@@ -180,6 +187,61 @@ def _grid_facts() -> dict:
     """Constants the prompt stated this turn, or empty if none were known."""
     status = last_grid_constants_status()
     return dict(status.values) if status is not None else {}
+
+
+def _network_facts(results: list[dict], answer: str) -> dict:
+    """What the elements of the networks this turn studied are — the base and
+    every proposal its results came from — as far as the answer needs to be
+    checked (entities.py): the elements it names, the units by source, the
+    voltage levels, the external grid. Kept in the record, so the check can be
+    run again on old logs. {} when the backend cannot say."""
+    import re as _re
+    from urllib.parse import urlencode
+    from .entities import names_not_in_network
+    from .tools import _get
+    from .validators import proposals_used
+    out = {}
+    tags = set(_re.findall(r"\b[LT]\d+\b", answer or ""))
+    for name in ["base", *proposals_used(results)]:
+        facts = _get("/api/network/semantics?" + urlencode({"about": "facts",
+                                                             **({"network": name} if name != "base" else {})}))
+        if not isinstance(facts, dict) or "error" in facts or "units" not in facts:
+            continue
+
+        def named(label: str) -> bool:
+            return label in (answer or "") or any(f"[{t}]" in label for t in tags)
+        units = facts["units"]
+        out[name] = {
+            "per_unit_case": facts["per_unit_case"], "voltage_levels_kv": facts["voltage_levels_kv"],
+            "external_grids": facts["external_grids"],
+            # The feeders the layer infers, by their head line's short name (an answer says "feeder Line 1-2").
+            "feeders": sorted({str(f).split(" | ")[0] for f in facts.get("feeders") or []}),
+            "units_by_source": {src: sorted(u for u, f in units.items() if f["source"] == src and f["basis"] != "unknown")
+                                for src in {f["source"] for f in units.values()} if src != "unknown"},
+            "units_unknown": sum(f["basis"] == "unknown" for f in units.values()),
+            "buses": {k: v for k, v in facts["buses"].items() if named(k)},
+            "branches": {k: v for k, v in facts["branches"].items() if named(k)},
+            "units": {k: v for k, v in units.items() if named(k)},
+            "loads": {k: v for k, v in (facts.get("loads") or {}).items() if named(k)},
+            # Names shaped like the network's own that it does not have ("Load R9").
+            "names_not_in_network": names_not_in_network(answer, [
+                *facts["buses"], *(facts.get("loads") or {}), *units,
+                *facts["branches"], *(k.split(" | ")[0] for k in facts["branches"]),
+                # After a rename, the names the data are still filed under are real elements too.
+                *(facts.get("names_as_loaded") or [])]),
+        }
+    return out
+
+
+def _cim_context(results: list[dict]) -> dict:
+    """{"cim_context": ...} — the turn's links to the CIM layer resolved (`grid_context.turn_context`), for the
+    answer checks; {} when no result was linked, so records without links keep their shape."""
+    try:
+        resolved = _grid_context.turn_context(results)
+    except Exception:  # noqa: BLE001 — the checks run without it
+        logger.debug("Could not resolve the turn's links to the CIM layer.", exc_info=True)
+        return {}
+    return {"cim_context": resolved} if resolved else {}
 
 
 def _append_to_log(record: dict) -> None:
@@ -309,6 +371,8 @@ def run_agent_turn(
     turn_start = len(history) - 1
     model_calls = 0
     prompt_tokens: list[int] = []
+    output_tokens: list[int] = []
+    cached_tokens: list[int] = []
 
     # Per-turn log accumulators.
     turn_tool_calls: list[dict] = []
@@ -347,6 +411,7 @@ def run_agent_turn(
         networks_compared=compares_networks(user_message),
         datasets_compared=compares_datasets(user_message),
         power_factors_compared=compares_power_factors(user_message),
+        power_factor_asked=power_factor_in_play(user_message, history[:turn_start]),
     )
 
     # 3. Resolve the backend. The system prompt is read per turn so edits to it
@@ -366,6 +431,8 @@ def run_agent_turn(
     # Reflection state. `reflected` guards the one-pass rule: the draft is
     # graded once, and whatever comes back is the answer.
     reflection_mode = normalise_mode(reflection if reflection is not None else REFLECTION_MODE)
+    # Tools withheld from the model (an ablation): a call to one by name is refused like an unknown tool.
+    hidden = hidden_tool_names()
     reflected = False
     reflection_record: Reflection | None = None
     # Where the draft the findings were about sits in `history`, when they
@@ -396,7 +463,7 @@ def run_agent_turn(
             started = time.perf_counter()
             response = provider.chat(
                 messages=_messages_for_model(history, turn_start),
-                tools=TOOLS,
+                tools=tools_for_model(),
                 system=system_prompt,
                 on_event=_watch,
             )
@@ -406,6 +473,12 @@ def run_agent_turn(
             reported = _usage.prompt_tokens_from(response.raw)
             if reported:
                 prompt_tokens.append(reported)
+            produced = _usage.output_tokens_from(response.raw)
+            if produced:
+                output_tokens.append(produced)
+            cached = _usage.cached_tokens_from(response.raw)
+            if cached is not None:
+                cached_tokens.append(cached)
             if not waited:      # a latency measured across retries means nothing
                 _usage.record_latency(getattr(provider, "name", "unknown"), getattr(provider, "model", ""),
                                       time.perf_counter() - started)
@@ -442,6 +515,8 @@ def run_agent_turn(
                         "grid": _grid_facts(),
                         "tool_calls": turn_tool_calls,
                         "tool_results": turn_tool_results,
+                        "network_facts": _network_facts(turn_tool_results, final_text),
+                        **_cim_context(turn_tool_results),
                     }
                     checked = time.perf_counter()
                     findings, prov_report, conflicts, gaps = check_all(final_text, draft_record)
@@ -519,11 +594,12 @@ def run_agent_turn(
                     history.append(tool_message(tool_name, result, call_id=call.id))
                     continue
 
-                tool_fn = TOOL_DISPATCH.get(tool_name)
+                tool_fn = None if tool_name in hidden else TOOL_DISPATCH.get(tool_name)
                 checked = time.perf_counter()
                 verdict = validate_call(tool_name, kwargs)
                 timing["checks_s"] += time.perf_counter() - checked
                 ran_s = None
+                grid_context = None          # what the CIM layer says about the elements the result names
                 if tool_fn is None:
                     result = {"error": f"Unknown tool: {tool_name}"}
                     tool_error_count += 1
@@ -557,7 +633,7 @@ def run_agent_turn(
                             ran_s = time.perf_counter() - ran
                             timing["studies_s"] += ran_s
                             _tools_module.progress_hook = None
-                        _attach_call_args(tool_name, result, kwargs)
+                        chart_copy = _attach_call_args(tool_name, result, kwargs)
                         if isinstance(result, dict) and "error" in result:
                             # Values that produced no result are not the turn's.
                             turn_operating_point.rollback()
@@ -585,6 +661,16 @@ def run_agent_turn(
                                 "name": tool_name,
                                 "problems": [i.message for i in findings],
                             })
+                        # The elements the result names as a problem, linked to the CIM layer: the logged
+                        # result keeps the links, the model's copy what the layer says each one is.
+                        linked = time.perf_counter()
+                        links, grid_context = _grid_context.link(tool_name, result, kwargs)
+                        timing["checks_s"] += time.perf_counter() - linked
+                        if links:
+                            result = {**result, _grid_context.LINKS_KEY: links}
+                            # The answer card reads its own copy (`_attach_call_args`): it carries the links too.
+                            if chart_copy is not None:
+                                chart_copy[_grid_context.LINKS_KEY] = links
                         if on_event:
                             on_event("tool_done", {"name": tool_name, "result": result,
                                                    "duration_s": round(ran_s, 3)})
@@ -604,8 +690,10 @@ def run_agent_turn(
                 if ran_s is not None:
                     call_record["duration_s"] = round(ran_s, 3)
                 compact = _compact_for_model(tool_name, result)
-                # How to report the study goes to the model only: guidance, not a figure to log.
-                model_result = with_reporting_note(tool_name, compact)
+                # How to report the study goes to the model only: guidance, not a figure to log. So does what
+                # the CIM layer says about the elements it names: the logged result keeps only the links.
+                model_result = _grid_context.with_context(
+                    with_reporting_note(tool_name, _grid_context.without_links(compact)), grid_context)
                 turn_tool_calls.append(call_record)
                 turn_tool_results.append({"name": tool_name,
                                           "result": _with_model_summary(tool_name, result, compact)})
@@ -640,7 +728,7 @@ def run_agent_turn(
                     messages=_messages_for_model(history, turn_start) + [make_user_message(
                         f"{why} Do not call any more tools. Answer now from the tool results above: what "
                         "was found, and plainly what could not be done and why.")],
-                    tools=TOOLS, system=system_prompt, on_event=on_event)
+                    tools=tools_for_model(), system=system_prompt, on_event=on_event)
                 model_calls += 1
                 timing["model_s"] += time.perf_counter() - started
                 summary_text = (response.text or "").strip()
@@ -781,12 +869,22 @@ def run_agent_turn(
         # counts from here, and a grounding check that only looked at tool
         # results called them fabricated.
         "grid": _grid_facts(),
+        # What the elements the answer names are (semantics), for the entity checks.
+        "network_facts": _network_facts(turn_tool_results, final_text),
+        # The studies' links to the CIM layer, resolved: what the layer says about the elements they name.
+        **_cim_context(turn_tool_results),
         "tool_calls": turn_tool_calls,
         "tool_call_count": len(turn_tool_calls),
         "tool_results": turn_tool_results,
+        # The previous turns' results in this conversation (see `_earlier_results`), when there were any.
+        **({"earlier_results": earlier_turns} if (earlier_turns := [r for turn in _earlier_results.get(conversation_id, [])
+                                                         for r in turn]) else {}),
         "tool_error_count": tool_error_count,
         "model_calls": model_calls,
         "prompt_tokens": prompt_tokens,
+        "output_tokens": output_tokens,
+        # Of the prompt tokens, those the provider served from its prompt cache (billed far lower).
+        "cached_tokens": cached_tokens,
         "assistant": final_text,
         # Absent when reflection is off, so existing logs and the graders that
         # read them are unaffected.
@@ -800,6 +898,9 @@ def run_agent_turn(
             c.get("name") in ("investigate", "test_prevention") for c in turn_tool_calls)}} if deep else {}),
     })
 
+    if turn_tool_results:
+        _earlier_results[conversation_id] = (_earlier_results.get(conversation_id, []) + [turn_tool_results])[
+            -EARLIER_TURNS:]
     return final_text, history
 
 
@@ -931,19 +1032,22 @@ def _reuse(same_as: int, earlier) -> dict:
 _SERIES_TOOLS = LONG_SERIES
 
 
-def _attach_call_args(tool_name: str, result, kwargs: dict) -> None:
+def _attach_call_args(tool_name: str, result, kwargs: dict) -> dict | None:
     """Give the chart copy of this result the arguments it ran with, so the
     app can say on each chart what differs between runs of the same study in
     one answer (load scaling, limits, the outage, …). Only the entry kept for
-    the charts changes; the model and the session record see the result as is."""
+    the charts changes; the model and the session record see the result as is.
+    Returns that chart copy (None when the result was not recorded), for what
+    else the answer card shows (the result's links to the CIM layer)."""
     if not isinstance(result, dict):
-        return
+        return None
     entries = _tools_module._last_tool_results
     for i in range(len(entries) - 1, -1, -1):
         name, recorded = entries[i]
         if recorded is result:
-            entries[i] = (name, {**result, "_call_args": dict(kwargs)})
-            return
+            copy = {**result, "_call_args": dict(kwargs)}
+            entries[i] = (name, copy)
+            return copy
 
 
 _COMPACT_CHARS = 1500

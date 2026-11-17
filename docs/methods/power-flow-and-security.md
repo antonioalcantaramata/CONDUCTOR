@@ -67,8 +67,8 @@ stated once with the result (`thresholds_used`).
 
 **The limits** are the network's own unless the question gives others: one
 voltage band for every bus and one loading limit for every branch — on the
-bundled networks 100 % of each rating, and 0.95–1.05 p.u. (IEEE 30) or
-0.94–1.06 p.u. (IEEE 14). A limit given explicitly always wins, even if it equals
+bundled networks 100 % of each rating, and 0.95–1.05 p.u. (IEEE 30 and
+CIGRE MV). A limit given explicitly always wins, even if it equals
 a default.
 
 **Not checked:** unit reactive limits and the external grid's limits in the

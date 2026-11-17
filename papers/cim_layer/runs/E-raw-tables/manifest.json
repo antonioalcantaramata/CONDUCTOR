@@ -1,0 +1,85 @@
+{
+ "kind": "ablation",
+ "study": "raw_tables",
+ "question": "What the layer adds over the data it is built from: the agent given the network's raw data tables instead of the layer (the studies read the layer in every arm).",
+ "status": "finished",
+ "started": "2026-11-04T15:29:50",
+ "updated": "2026-11-04T16:41:18",
+ "commit": "5bf4d3047403033e8b27dfd21c826a9711172401",
+ "uncommitted_changes": true,
+ "arms": [
+  {
+   "name": "tables",
+   "spec": "tables: ontology=tables",
+   "settings": {
+    "ontology": "tables"
+   },
+   "hash": "9f3bbf90bc90",
+   "describe": "ontology=tables",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {},
+   "tools_hidden": [
+    "declare_network_facts",
+    "describe_network"
+   ],
+   "tools_added": [
+    "read_network_tables"
+   ],
+   "prompt_parts_replaced": [
+    "element_identity"
+   ]
+  }
+ ],
+ "baseline": "tables",
+ "suites": [
+  "semantics-cigre",
+  "semantics-ieee30",
+  "reasoning"
+ ],
+ "tasks": [
+  "semantics-cigre/cigre_renewables",
+  "semantics-cigre/cigre_levels",
+  "semantics-cigre/cigre_storage",
+  "semantics-cigre/cigre_outage",
+  "semantics-cigre/cigre_feeder",
+  "semantics-ieee30/ieee30_renewables",
+  "semantics-ieee30/ieee30_customers",
+  "semantics-ieee30/ieee30_level",
+  "semantics-ieee30/ieee30_radial",
+  "semantics-ieee30/ieee30_external",
+  "reasoning/names_cigre",
+  "reasoning/names_ieee30",
+  "reasoning/names_cigre_wind",
+  "reasoning/names_cigre_storage",
+  "reasoning/names_ieee30_wind",
+  "reasoning/drop_ieee30_none",
+  "reasoning/drop_ieee30_declared",
+  "reasoning/drop_cigre_stated",
+  "reasoning/drop_cigre_declared",
+  "reasoning/compose_t0",
+  "reasoning/compose_battery",
+  "reasoning/compose_l33",
+  "reasoning/compose_tie",
+  "reasoning/switches_open",
+  "reasoning/switches_loops",
+  "reasoning/switches_breakers",
+  "reasoning/switches_line148",
+  "reasoning/data_cigre",
+  "reasoning/data_ieee30",
+  "reasoning/data_cigre_wind",
+  "reasoning/data_cigre_battery",
+  "reasoning/data_cigre_load_split",
+  "reasoning/data_ieee30_solved",
+  "reasoning/para_weather",
+  "reasoning/para_vary",
+  "reasoning/para_variable",
+  "reasoning/persist_ieee30"
+ ],
+ "repeats": 5,
+ "order": "interleaved",
+ "command": "python -m evaluation.ablation run raw_tables --only tables --repeats 5 --out papers/cimcontext/runs/E-raw-tables",
+ "python": "3.12.16",
+ "seconds": 4288,
+ "changes": []
+}

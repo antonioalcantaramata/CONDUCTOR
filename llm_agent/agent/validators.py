@@ -502,6 +502,27 @@ _PF_WORD_RE = re.compile(r"power[ -]?factor|\bpf\b|\bcos\s?(?:φ|phi)", re.IGNOR
 _WHAT_IF_RE = re.compile(r"\bwhat if\b", re.IGNORECASE)
 
 
+# The value a model copies from "default 0.95" into every call — CONDUCTOR's
+# generic default, not necessarily this network's (a profile states its loads'
+# own, CIGRE MV's 0.97).
+GENERIC_LOAD_PF = 0.95
+
+
+def mentions_power_factor(text: str) -> bool:
+    """Whether the question speaks of the load power factor at all."""
+    return bool(_PF_WORD_RE.search(text or ""))
+
+
+def power_factor_in_play(text: str, earlier: list[dict] | None = None) -> bool:
+    """Whether the load power factor is the operator's to set in this turn: the question speaks of it, or
+    the question before did, so that a follow-up ("and at 19:00?") keeps the 0.95 asked for a turn ago."""
+    if mentions_power_factor(text):
+        return True
+    previous = next((m["content"] for m in reversed(earlier or [])
+                     if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+    return mentions_power_factor(previous)
+
+
 def compares_power_factors(text: str) -> bool:
     """Whether the question sets one load power factor against another.
 
@@ -793,8 +814,15 @@ class TurnOperatingPoint:
     """
 
     def __init__(self, requested: dict | None = None, *, networks_compared: bool = False,
-                 datasets_compared: bool = False, power_factors_compared: bool = False) -> None:
+                 datasets_compared: bool = False, power_factors_compared: bool = False,
+                 power_factor_asked: bool = True) -> None:
         self._established: dict[str, tuple[Any, str]] = {}
+        # A question that says nothing of the power factor leaves it to the
+        # session: the generic 0.95 a model fills into every call is dropped
+        # (observed live: on CIGRE MV, whose loads are at 0.97, every study ran
+        # at 0.95 "for this study"). Any other value is deliberate and kept.
+        self._pf_asked = power_factor_asked
+        self.dropped: dict[str, Any] = {}
         # Fields the question compares: established as usual, never inherited.
         self._not_inherited = {
             field for field, compared in (("network", networks_compared),
@@ -824,6 +852,8 @@ class TurnOperatingPoint:
         resolved = dict(kwargs)
         inherited: dict[str, Any] = {}
         self._last_established = []
+        if not self._pf_asked and _numeric(resolved.get("load_power_factor")) == GENERIC_LOAD_PF:
+            self.dropped["load_power_factor"] = resolved.pop("load_power_factor")
 
         def establish(field: str, value: Any) -> None:
             if field not in self._established:

@@ -143,6 +143,10 @@ class TestOpenRouterCache:
 
     def test_free_and_paid_lists_are_cached_apart(self, or_payload, monkeypatch):
         monkeypatch.setattr(openrouter, "fetch", lambda timeout=20.0: copy.deepcopy(or_payload))
+        # On the recorded day: the recorded free models expire, and from 30 October
+        # the paid list had shrunk to the free one's size (the test aged, not the code).
+        qualifying = openrouter.qualifying
+        monkeypatch.setattr(openrouter, "qualifying", lambda payload, **kw: qualifying(payload, today=TODAY, **kw))
         free = openrouter.discover(free_only=True)["models"]
         paid = openrouter.discover(free_only=False)["models"]
         assert len(paid) > len(free)

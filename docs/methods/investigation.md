@@ -491,9 +491,10 @@ not a fact. The chart is a timeline with one row per episode, the warning in
 amber before the episode in red, and a label saying whether an action was
 found and whether it holds if the forecast errs.
 
-The result says which errors were checked (`forecast_errors_checked`). The
-demo's five units are all conventional, so on the demo only the error in
-demand is checked. On a proposal that adds a 3 MW PV unit at Bus_29, the
+The result says which errors were checked (`forecast_errors_checked`). No
+unit of the IEEE 30 demo is stated to be wind or solar (see
+[What the network is](what-the-network-is.md)), so on it only the error in
+demand is checked; on CIGRE MV the PV units and the wind turbine are. On a proposal that adds a 3 MW PV unit at Bus_29, the
 morning action also holds with that unit's output 5 % lower.
 
 On the demo's first forecast day, four episodes are expected:

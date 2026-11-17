@@ -25,10 +25,14 @@ BACKEND = pathlib.Path(__file__).resolve().parents[1] / "backend"
 
 @pytest.fixture
 def loaded():
-    """The bundled network as the backend loads it."""
-    profile = nl.load_profile("pglib_case14", backend_dir=str(BACKEND))
+    """The IEEE 30 demo network as the backend converts it (before the
+    profile's unit model) — with its Bus_10 unit made a synchronous condenser
+    (no active power, as PGLib's case14 has them), which the case lacks."""
+    profile = nl.load_profile("pglib_case30", backend_dir=str(BACKEND))
     net = nl.load_network(profile, backend_dir=str(BACKEND))
-    net, _, _ = nl.gen_to_sgen(net)
+    net.gen.loc[net.gen.bus == 10, ["max_p_mw", "p_mw", "min_p_mw"]] = 0.0
+    net, _, kept = nl.gen_to_sgen(net)
+    assert kept == ["Gen_bus10"]
     return net
 
 
@@ -37,15 +41,15 @@ class TestTheModel:
         units = {u["unit"]: u for u in gm.describe(loaded)}
         g1 = units["Gen_bus1"]
         assert (g1["control"], g1["pf"], g1["dispatchable"], g1["condenser"]) == ("power_factor", 1.0, True, False)
-        assert (g1["vm_pu"], g1["q_min_mvar"], g1["q_max_mvar"]) == (1.0, -30.0, 30.0)   # kept on conversion
-        cond = units["Gen_bus2"]
+        assert (g1["vm_pu"], g1["q_min_mvar"], g1["q_max_mvar"]) == (1.025, -20.0, 100.0)  # kept on conversion
+        cond = units["Gen_bus10"]
         assert (cond["control"], cond["dispatchable"], cond["condenser"]) == ("voltage", False, True)
 
     def test_voltage_control_and_back_from_the_network_as_loaded(self, loaded):
         model = gm.merge({}, gm.normalise(loaded, [{"unit": "Gen_bus1", "control": "voltage", "vm_pu": 1.02}]))
         net = gm.apply(loaded, model)
         row = net.gen[net.gen.name == "Gen_bus1"].iloc[0]
-        assert (row.vm_pu, row.min_q_mvar, row.max_q_mvar, int(row.bus)) == (1.02, -30.0, 30.0, 1)
+        assert (row.vm_pu, row.min_q_mvar, row.max_q_mvar, int(row.bus)) == (1.02, -20.0, 100.0, 1)
         assert "Gen_bus1" not in set(net.sgen.name)
         pp.runpp(net)
         assert net.res_bus.vm_pu[1] == pytest.approx(1.02)                  # it holds its bus
@@ -82,8 +86,8 @@ class TestTheModel:
         assert gm.merge(model, gm.normalise(loaded, [{"unit": "Gen_bus1", "dispatchable": True}], model)) == {}
 
     @pytest.mark.parametrize("change, fragment", [
-        ({"unit": "Gen_bus2", "control": "power_factor"}, "synchronous condenser"),
-        ({"unit": "Gen_bus2", "dispatchable": True}, "no active power to dispatch"),
+        ({"unit": "Gen_bus10", "control": "power_factor"}, "synchronous condenser"),
+        ({"unit": "Gen_bus10", "dispatchable": True}, "no active power to dispatch"),
         ({"unit": "Nope"}, "there is no unit"),
         ({"unit": "Gen_bus1", "pf": 0.3}, "pf must be between"),
         ({"unit": "Gen_bus1", "vm_pu": 1.5}, "vm_pu must be between"),
@@ -124,39 +128,54 @@ def client(backend_client):
 
 class TestThroughTheBackend:
     def test_the_model_changes_every_later_study(self, client):
+        # The IEEE 30 demo loads Gen_bus1 on voltage control at 1.025 p.u. (its profile).
         units = {u["unit"]: u for u in client.get("/api/generators").json()["units"]}
-        assert units["Gen_bus1"]["control"] == "power_factor"
+        assert units["Gen_bus1"]["control"] == "voltage"
+        assert units["Gen_bus1"]["vm_pu"] == pytest.approx(1.025)
         out = client.post("/api/generators", json={"changes": [
             {"unit": "Gen_bus1", "control": "voltage", "vm_pu": 1.02}]}).json()
-        assert out["changed"] == {"Gen_bus1": {"control": "voltage", "vm_pu": 1.02}}
+        assert out["changed"] == {"Gen_bus1": {"vm_pu": 1.02}}
         rsa = client.post("/api/grid/rsa", json={}).json()
         held = {v["unit"]: v for v in rsa["voltage_controlled_buses"]}
         assert held["Gen_bus1"]["setpoint_pu"] == pytest.approx(1.02)
         out = client.post("/api/generators", json={"changes": [
             {"unit": "Gen_bus1", "control": "power_factor", "pf": 0.9}]}).json()
+        rsa = client.post("/api/grid/rsa", json={}).json()
+        assert "Gen_bus1" not in {v["unit"] for v in rsa["voltage_controlled_buses"]}
         snap = client.post("/api/network/snapshot", json={}).json()
         g1 = next(g for g in snap["generators"] if g["name"] == "Gen_bus1")
         assert g1["Qg_mvar"] == pytest.approx(g1["Pg_mw"] * 0.484322, abs=1e-3)
         nominal = client.post("/api/network/snapshot", json={"data_source": "nominal"}).json()
-        assert nominal["totals"]["total_generation_mw"] == pytest.approx(29.5, abs=1e-3)   # by name, any table
+        assert nominal["totals"]["total_generation_mw"] == pytest.approx(151.0, abs=1e-3)  # by name, any table
 
     def test_voltage_control_at_1_02_through_the_tool(self, client, monkeypatch):
         """Through the tool to the backend, with every slot filled in: only the
         mode and the set-point change, not the limits or dispatchability."""
         from llm_agent.agent import tools
         monkeypatch.setattr(tools, "_post", lambda path, body: client.post(path, json=body).json())
+        # The demo loads it on voltage control: put it at a fixed power factor
+        # first, so the tool's call changes the mode back as well as the set-point.
+        client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "power_factor"}]})
         before = {u["unit"]: u for u in client.get("/api/generators").json()["units"]}["Gen_bus1"]
+        assert before["control"] == "power_factor"
         filled = {"control": "voltage", "value": 0, "on": False}
         out = tools.set_generator_model(changes=[
             {"unit": "Gen_bus1", "setting": "control", **filled},
             {"unit": "Gen_bus1", "setting": "vm_pu", **filled, "value": 1.02}])
-        assert out["changed"] == {"Gen_bus1": {"control": "voltage", "vm_pu": 1.02}}
+        assert out["changed"] == {"Gen_bus1": {"vm_pu": 1.02}}        # voltage control is how it was loaded
         after = {u["unit"]: u for u in client.get("/api/generators").json()["units"]}["Gen_bus1"]
+        assert (after["control"], after["vm_pu"]) == ("voltage", pytest.approx(1.02))
         assert {k: after[k] for k in ("q_min_mvar", "q_max_mvar", "dispatchable")} == \
                {k: before[k] for k in ("q_min_mvar", "q_max_mvar", "dispatchable")}
 
-    def test_refusals_say_why(self, client):
-        r = client.post("/api/generators", json={"changes": [{"unit": "Gen_bus2", "control": "power_factor"}]})
+    def test_refusals_say_why(self, client, monkeypatch):
+        # The IEEE 30 demo has no synchronous condenser: make Gen_bus10 one
+        # (no active power, on voltage control) in the network as loaded.
+        import main_backend as mb
+        loaded = copy.deepcopy(mb.app_data["net_loaded"])
+        loaded.gen.loc[loaded.gen.name == "Gen_bus10", ["max_p_mw", "p_mw"]] = 0.0
+        monkeypatch.setitem(mb.app_data, "net_loaded", loaded)
+        r = client.post("/api/generators", json={"changes": [{"unit": "Gen_bus10", "control": "power_factor"}]})
         assert r.status_code == 400 and "synchronous condenser" in r.json()["detail"]
         assert client.post("/api/generators", json={}).status_code == 400
 
@@ -164,9 +183,10 @@ class TestThroughTheBackend:
         client.post("/api/proposals/edit", json={"proposal": "dc", "edits": [
             {"op": "add_load", "name": "DC", "bus": "Bus 9", "p_mw": 10}]})
         client.post("/api/proposals/edit", json={"proposal": "off", "edits": [
-            {"op": "set_in_service", "element_type": "sgen", "element": "Gen_bus1", "in_service": False}]})
-        out = client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]}).json()
-        assert [d.split(":")[0] for d in out["proposals_dropped"]] == ["off"]      # its sgen is now a gen
+            {"op": "set_in_service", "element_type": "gen", "element": "Gen_bus1", "in_service": False}]})
+        out = client.post("/api/generators", json={"changes": [
+            {"unit": "Gen_bus1", "control": "power_factor"}]}).json()
+        assert [d.split(":")[0] for d in out["proposals_dropped"]] == ["off"]      # its gen is now an sgen
         ids = [p["id"] for p in client.get("/api/proposals").json()["proposals"]]
         assert ids == ["dc"]
         assert client.post("/api/proposals/compare", json={"proposal": "dc"}).status_code == 200
@@ -177,7 +197,9 @@ class TestThroughTheBackend:
             out = client.post("/api/flexibility/optimize", json={"timestamp": "2000-01-03 14:15"}).json()
             assert out["feasible"], out
             return next(a for a in out["activated_resources"] if a.get("element") == "Gen_bus1")
-        assert gen1()["Qg_new"] < 5.0 - 0.1          # as loaded: its power-factor cone binds below 5 Mvar
+        # At a fixed power factor its cone binds below 5 Mvar (the demo loads it on voltage control).
+        client.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "power_factor"}]})
+        assert gen1()["Qg_new"] < 5.0 - 0.1
         client.post("/api/generators", json={"changes": [
             {"unit": "Gen_bus1", "control": "voltage", "q_min_mvar": -5, "q_max_mvar": 5}]})
         g1 = gen1()
@@ -200,7 +222,7 @@ def test_the_model_survives_a_restart_and_the_proposals_after_it(tmp_path, monke
     pytest.importorskip("fastapi.testclient")
     import main_backend as mb
     from fastapi.testclient import TestClient
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(tmp_path / "systems"))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(tmp_path / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL"):
@@ -212,14 +234,14 @@ def test_the_model_survives_a_restart_and_the_proposals_after_it(tmp_path, monke
     saved = dict(mb.app_data)
     try:
         with TestClient(mb.app) as c:
-            c.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]})
+            c.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "power_factor"}]})
             c.post("/api/proposals/edit", json={"proposal": "dc", "edits": [
                 {"op": "add_load", "name": "DC", "bus": "Bus 9", "p_mw": 10}]})
         (entry,) = json.loads(store.read_text())["by_fingerprint"].values()
-        assert entry["generator_model"] == {"Gen_bus1": {"control": "voltage"}}
+        assert entry["generator_model"] == {"Gen_bus1": {"control": "power_factor"}}
         mb.app_data["proposals"] = {}
         with TestClient(mb.app) as c:
-            assert c.get("/api/generators").json()["changed"] == {"Gen_bus1": {"control": "voltage"}}
+            assert c.get("/api/generators").json()["changed"] == {"Gen_bus1": {"control": "power_factor"}}
             assert [p["id"] for p in c.get("/api/proposals").json()["proposals"]] == ["dc"]
             c.post("/api/generators", json={"reset": True})
         assert not store.exists()
@@ -330,5 +352,5 @@ def test_fixed_q_holds_its_reactive_output_whatever_its_power(loaded):
         gm.normalise(loaded, [{"unit": "Gen_bus1", "control": "fixed_q"}])
     from llm_agent.agent import generator_table as gt
     tables = gt.rows([{**unit, "bus_name": "Bus_1"}], model)
-    assert tables["fixed_q"][0]["cells"] == ["Gen_bus1", "Bus_1", "59 MW", "8 Mvar absorbed", "yes"]
+    assert tables["fixed_q"][0]["cells"] == ["Gen_bus1", "Bus_1", "80 MW", "8 Mvar absorbed", "yes"]
     assert gt.form_fields(unit, "fixed_q") == ["control", "q_mvar", "dispatchable"]

@@ -215,7 +215,7 @@ def test_an_upload_of_static_generators_keeps_them(tmp_path, monkeypatch):
     systems, data = tmp_path / "systems", tmp_path / "data_files"
     systems.mkdir()
     data.mkdir()
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(systems))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(data))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",

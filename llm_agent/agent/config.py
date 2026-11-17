@@ -288,20 +288,60 @@ SESSION_LOG_DIR: str = os.environ.get(
 # every turn it runs in one place.
 SESSION_LOG_PATH: str = os.environ.get("CONDUCTOR_SESSION_LOG", "")
 
+
+def ontology_enabled() -> bool:
+    """Whether the agent is given the semantic layer (`describe_network`,
+    `declare_network_facts`, the facts `locate_network_element` adds, and the
+    prompt's rule on what an element is). Off only to measure what it is worth
+    (`python -m evaluation.ablation run ontology`): `off` hides it from the agent,
+    `none` also from the studies (the backend's `studies_use_semantic_layer`),
+    `tables` hides it from the agent and gives it the raw data tables instead
+    (`raw_tables_enabled`). Read per turn, so one process can run several arms.
+    Answers are checked against the layer either way."""
+    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() not in ("off", "none", "tables", "0", "false")
+
+
+def raw_tables_enabled() -> bool:
+    """Whether the agent is given the network's raw data tables
+    (`read_network_tables`: pandapower's standard element tables, uninterpreted)
+    in place of the semantic layer — the baseline that asks what the layer adds
+    over the data it is built from (`CONDUCTOR_ONTOLOGY=tables`, evaluation
+    only). The studies still read the layer, as with `off`."""
+    return os.environ.get("CONDUCTOR_ONTOLOGY", "on").strip().lower() == "tables"
+
+
+def _env_list(name: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in os.environ.get(name, "").split(",") if x.strip())
+
+
+def hidden_tools() -> tuple[str, ...]:
+    """Tools the model is not given (evaluation only: `python -m evaluation.ablation`).
+    Tool names, or `group:<name>` for a group of `tool_registry.ABLATION_GROUPS`.
+    Empty in normal use. Read per turn, like `ontology_enabled`."""
+    return _env_list("CONDUCTOR_HIDE_TOOLS")
+
+
+def dropped_prompt_rules() -> tuple[str, ...]:
+    """Parts of the system prompt left out (evaluation only), by the ids of
+    `system_prompt.PROMPT_PARTS`. Empty in normal use. Read per turn."""
+    return _env_list("CONDUCTOR_DROP_RULES")
+
 # ---------------------------------------------------------------------------
 # Default grid constants — fallback only.
 # Callers should use get_grid_constants() for the live, network-aware values.
 # ---------------------------------------------------------------------------
 DEFAULT_GRID_CONSTANTS: dict = {
-    "name": "PGLib IEEE 14-Bus System",
-    "n_buses": 14,
-    "n_lines": 17,
-    "n_trafos": 3,
-    "n_substations": 14,
-    "substation_names": [f"Bus_{i}" for i in range(1, 15)],
-    "unit_names": ["Gen_bus1", "Gen_bus2", "Gen_bus5", "Gen_bus7"],
-    "vm_lower": 0.94,
-    "vm_upper": 1.06,
+    "name": "PGLib IEEE 30-Bus System (Alsac–Stott)",
+    "n_buses": 30,
+    "n_lines": 41,
+    "n_trafos": 0,
+    "n_substations": 23,
+    "substation_names": ["Bus_1", "Bus_2", "Bus_3", "Bus_4", "Bus_6", "Bus_7", "Bus_9", "Bus_10", "Bus_11",
+                         "Bus_12", "Bus_13", "Bus_14", "Bus_15", "Bus_16", "Bus_17", "Bus_18", "Bus_19",
+                         "Bus_20", "Bus_22", "Bus_23", "Bus_25", "Bus_28", "Bus_29"],
+    "unit_names": ["Gen_bus1", "Gen_bus12", "Gen_bus4", "Gen_bus7", "Gen_bus10"],
+    "vm_lower": 0.95,
+    "vm_upper": 1.05,
     "max_loading_pct": 100.0,
     "load_scaling_min": 0.0,
     "load_scaling_max": 4.0,
@@ -310,8 +350,9 @@ DEFAULT_GRID_CONSTANTS: dict = {
     "slack_max_mw_max": 999.0,
     "slack_name": "External Grid",
     "grid_type": "transmission",
-    "description": "Synthetic operating data generated from the bundled PGLib IEEE 14-bus MATPOWER case.",
-    "voltage_level_kv": 0.0,
+    "description": "Synthetic operating data generated from the bundled PGLib IEEE 30-bus (Alsac–Stott) "
+                   "MATPOWER case: five dispatchable units with their own costs, line ratings from PGLib.",
+    "voltage_level_kv": 135.0,
 }
 
 

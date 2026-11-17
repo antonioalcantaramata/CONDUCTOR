@@ -169,11 +169,15 @@ def name_rows(kind: str, elements: list[dict]) -> list[dict]:
 _KEPT_WORDS = {"renames": ("rename", "renames"), "costs": ("cost change", "cost changes"),
                "generators": ("generator model", "generator models"),
                "load_power_factor": ("load power factor", "load power factor"),
+               "declarations": ("declared fact", "declared facts"),
+               "synthetic_data": ("synthetic-data settings", "synthetic-data settings"),
                "proposals": ("proposal", "proposals")}
+# Kept or not, without a count.
+_KEPT_FLAGS = {"load_power_factor", "synthetic_data"}
 
 
 def kept_line(kept: dict | None) -> str:
     """"Your changes are kept: 1 rename · 2 proposals" — or "" when none."""
-    parts = [f"{n} {_KEPT_WORDS[k][n != 1]}" if k != "load_power_factor" else _KEPT_WORDS[k][0]
+    parts = [f"{n} {_KEPT_WORDS[k][n != 1]}" if k not in _KEPT_FLAGS else _KEPT_WORDS[k][0]
              for k, n in (kept or {}).items() if n and k in _KEPT_WORDS]
     return ("Your changes are kept: " + " · ".join(parts)) if parts else ""

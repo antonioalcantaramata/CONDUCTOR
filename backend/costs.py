@@ -83,8 +83,9 @@ SYNTHETIC_Q, SYNTHETIC_TAN_PHI, SYNTHETIC_Q_PENALTY = 3.0, 0.4, 10.0
 SYNTHETIC_DR_SHARE, SYNTHETIC_DR, SYNTHETIC_RELIEF = 10.0, 150.0, 3000.0
 RENEWABLE_KINDS = ("pv", "wind")
 RULE = ("Synthetic where the case gives no cost: a unit 50 €/MWh, the import 60 €/MWh, condensers 0; "
-        "up = 1.2 × marginal cost at full output, down = 0.5 × it; added pv/wind units 0 to produce and "
-        "40 €/MWh to curtail; condensers and the external grid are not redispatched; reactive power 3 €/Mvarh "
+        "up = 1.2 × marginal cost at full output, down = 0.5 × it; wind and solar units (stated, named or "
+        "declared in the CIM layer, or added by a proposal) 0 to produce and 40 €/MWh to curtail, never above "
+        "what the resource gives at the moment studied; condensers and the external grid are not redispatched; reactive power 3 €/Mvarh "
         "per unit; at the external grid, reactive exchange free within tan φ 0.4 (pf ≈ 0.93), 10 €/Mvarh beyond. "
         "Loads: 10 % of each can be reduced as demand response at 150 €/MWh; load relief beyond it at 3,000 €/MWh.")
 LOAD_RULE = ("Synthetic until changed: 10 % of each load available as demand response at 150 €/MWh; "
@@ -134,9 +135,12 @@ def _redispatch(production: dict, p_max: float, *, renewable: bool, condenser: b
     return {"up_eur_per_mwh": round(UP_PREMIUM * marginal, 4), "down_eur_per_mwh": round(DOWN_SHARE * marginal, 4)}
 
 
-def defaults(net) -> list[dict]:
+def defaults(net, variable: dict | None = None) -> list[dict]:
     """Every unit and external grid with its default costs and where each
-    figure comes from ("case" or "synthetic")."""
+    figure comes from ("case" or "synthetic"). `variable`: {(table, index):
+    "wind" | "solar"} — the units the CIM layer says are wind or solar, costed
+    as a proposal's wind and pv units are."""
+    variable = variable or {}
     out = []
     for idx in net.ext_grid.index:
         case = _case_cost(net, "ext_grid", idx)
@@ -155,6 +159,8 @@ def defaults(net) -> list[dict]:
             p_max = gm._capacity(row)
             condenser = gm.is_condenser(table, row)
             kind = str(row.get("kind") or "") if proposed and "kind" in tbl.columns else ""
+            if not kind and (table, int(idx)) in variable:
+                kind = "pv" if variable[(table, int(idx))] == "solar" else "wind"
             renewable = kind in RENEWABLE_KINDS
             case = None if proposed else _case_cost(net, table, idx)
             synth = 0.0 if (condenser or renewable) else SYNTHETIC_UNIT
@@ -213,11 +219,11 @@ def load_table(net, changes: dict | None = None) -> list[dict]:
     return out
 
 
-def table(net, changes: dict | None = None) -> list[dict]:
-    """The costs in force: the defaults with the operator's changes."""
+def table(net, changes: dict | None = None, variable: dict | None = None) -> list[dict]:
+    """The costs in force: the defaults (`defaults`) with the operator's changes."""
     changes = changes or {}
     out = []
-    for row in defaults(net):
+    for row in defaults(net, variable):
         diff = changes.get(row["unit"]) or {}
         row = {**row, **diff, "source": {**row["source"], **{k: "operator" for k in diff}},
                "changed": bool(diff)}
@@ -225,14 +231,15 @@ def table(net, changes: dict | None = None) -> list[dict]:
     return out
 
 
-def normalise(net, raw_changes: list[dict], current: dict | None = None) -> dict:
+def normalise(net, raw_changes: list[dict], current: dict | None = None,
+              variable: dict | None = None) -> dict:
     """Check the operator's changes and return, per unit named, its full
     difference from the defaults ({} when it is back to them). A field set to
     null goes back to its default."""
     if not isinstance(raw_changes, list) or not raw_changes:
         raise CostError("Give a list of cost changes, each with a 'unit'.")
     current = current or {}
-    rows = {r["unit"]: r for r in defaults(net) + load_defaults(net) if not r.get("proposed")}
+    rows = {r["unit"]: r for r in defaults(net, variable) + load_defaults(net) if not r.get("proposed")}
     out: dict[str, dict] = {}
     for n, raw in enumerate(raw_changes, start=1):
         if not isinstance(raw, dict):

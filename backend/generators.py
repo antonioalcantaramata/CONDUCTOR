@@ -71,7 +71,16 @@ def unit_name(net, table: str, idx) -> str:
         raw = raw if isinstance(raw, str) and raw.strip() else row.get("name")
         return raw.strip() if isinstance(raw, str) and raw.strip() else f"sgen_{idx}"
     raw = row.get("name")
-    return raw.strip() if isinstance(raw, str) and raw.strip() else f"Gen_bus{int(row['bus'])}"
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    # Unnamed: after its bus. Two unnamed units on one bus would share that name (and so one key for
+    # their model, costs and declarations): the second and later are numbered, by index.
+    bus = int(row["bus"])
+    names = net[table]["name"] if "name" in net[table].columns else None
+    unnamed_here = [int(i) for i in net[table].index[net[table]["bus"].astype(int) == bus]
+                    if names is None or not (isinstance(names.at[i], str) and names.at[i].strip())]
+    k = unnamed_here.index(int(idx)) if int(idx) in unnamed_here else 0
+    return f"Gen_bus{bus}" if k == 0 else f"Gen_bus{bus}_{k + 1}"
 
 
 def unit_key(net, table: str, idx) -> str:

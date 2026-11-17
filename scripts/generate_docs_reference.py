@@ -49,7 +49,9 @@ def _type(schema: dict) -> str:
 
 
 def tools_page() -> str:
-    tools = {t["function"]["name"]: t["function"] for t in to_json_schema_tools(TOOLS)}
+    # Evaluation-only tools are not the operator's: they are offered only in an evaluation arm.
+    tools = {t["function"]["name"]: t["function"] for t in to_json_schema_tools(TOOLS)
+             if t["function"]["name"] not in tool_registry.EVALUATION_ONLY}
     placed = {name for names in TOOL_GROUPS.values() for name in names}
     groups = dict(TOOL_GROUPS)
     rest = sorted(set(tools) - placed)

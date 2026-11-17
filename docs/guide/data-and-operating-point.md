@@ -34,7 +34,13 @@ and moment it used.
 | `.m` | MATPOWER case file: IEEE cases, pglib-opf, or any compatible model |
 | `.json` | pandapower JSON, exported with `pp.to_json(net, "file.json")` |
 | `.xlsx` | pandapower Excel, exported with `pp.to_excel(net, "file.xlsx")` |
-| `.uct` | UCTE exchange format (ENTSO-E) |
+| `.uct` | UCTE-DEF exchange format (ENTSO-E's older format) |
+| `.zip` | CGMES (CIM 2.4.15 or 3.0): the profiles (EQ, SSH, TP, SV) in a zip, or a zip of zips with the boundary set. Each element keeps its CIM identifier and the model's substations; synchronous machines keep the control the model states. A model whose lines end outside it is refused with what to add (usually the boundary set), and so is one without the SSH profile, which gives what the loads draw and the units produce. |
+
+To try a CGMES upload without a model of your own, upload `tests/fixtures/cgmes/pandapower_example_multivoltage.zip`
+from the repository: pandapower's multi-voltage example network as CGMES 2.4.15. ENTSO-E's conformity test models
+(MicroGrid, MiniGrid, SmallGrid) also load. They are distributed with
+[PowSyBl](https://github.com/powsybl/powsybl-core), under `cgmes/cgmes-conformity`.
 
 Two choices in the upload dialog:
 
@@ -95,6 +101,35 @@ substation, gaps, implausible power factors, values that look like kvar instead
 of Mvar, missing-value markers such as `-9999`. CONDUCTOR can read the same
 report: *"What does the data-quality report say, and does any of it affect the
 studies?"*
+
+## Synthetic data
+
+A network you load without data of your own gets a synthetic week: its own
+loads and units, shaped over time. The panel at the top of the **Data** tab
+says how it was made; **Change…** opens the settings beside a preview of the
+period they give, so you can see the effect before anything changes.
+
+| Setting | What it does |
+| --- | --- |
+| **Days**, **Step** | Length (1–31 days) and time step (5–60 minutes) |
+| **Daily shape** | Residential, twin peak, industrial, commercial or flat load |
+| **Usual daily peak** | The weekday peak, as a % of the network's own load |
+| **Daily shape** of a load whose category is known | A load the network (or you) says is residential, commercial, industrial, a data centre… follows that kind of demand; the shape chosen applies to the rest |
+| **Units the network does not describe** | Wind, solar or flat. A unit whose source the network states or names, or you declared, follows its own: PV the sun, wind the wind, the others a steady output |
+| **Forecast error** | How far the forecast strays from the measurements, for load and for generation |
+| **Stress windows** | On about one day in three, two hours with more load and less generation |
+| **Seed** | The same settings and seed give the same data; another seed, another week of the same kind |
+
+**Generate** replaces the measurements and the forecast. The clock keeps its
+moment when the new data have it, and earlier answers are marked as computed on
+other data, with a **Rerun**. The settings are kept for the network across
+restarts; **Network's defaults**, or *Start fresh* on the launcher, goes back to
+the ones it loads with. CONDUCTOR states them when it says where a value comes
+from.
+
+If you declare what a unit is after the data were made (a unit is a solar farm,
+say), the panel names it and offers **Generate again**, so the unit follows its
+source. Uploaded measurements are replaced only after you confirm.
 
 ## The Data tab
 

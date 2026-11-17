@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 from .graders.characterisation import grade_characterisation
 from .graders.completeness import grade_completeness
+from .graders.entities import grade_entities
 from .graders.evidence import grade_evidence
 from .graders.investigation import grade_investigation
 from .graders.integrity import grade_composition
@@ -47,7 +48,7 @@ def grade_record(record: dict) -> TurnGrade:
     findings = (grade_composition(record) + provenance_findings
                 + characterisation_findings + grade_refusal(record)
                 + completeness_findings + grade_sandbox(record) + evidence_findings
-                + grade_investigation(record))
+                + grade_investigation(record) + grade_entities(record))
     reading = record.get("reading_check") or {}
 
     return TurnGrade(

@@ -40,7 +40,7 @@ def backend_url(tmp_path_factory):
 
     store = tmp_path_factory.mktemp("app_flows")
     patch = pytest.MonkeyPatch()
-    patch.setenv("GRID_PROFILE", "pglib_case14")
+    patch.setenv("GRID_PROFILE", "pglib_case30")
     patch.setattr(mb, "SYSTEMS_DIR", str(store / "systems"))
     patch.setattr(mb, "DATA_FILES_DIR", str(store / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -409,15 +409,19 @@ def test_the_system_tab_lists_the_generators_to_edit(agent, monkeypatch, backend
     _script(agent, monkeypatch)
     at = _app(extra={"system_pane": "assumptions"})
     assert any(m.value.startswith("##### Generators — how each unit is modelled") for m in at.markdown)
-    assert any("Synchronous condensers" in m.value for m in at.markdown)
+    # The IEEE 30 demo: five units, all loaded on voltage control, no condenser.
+    assert any("Generators on voltage control" in m.value for m in at.markdown)
+    assert not any("Synchronous condensers" in m.value for m in at.markdown)
     assert {b.key for b in at.button if str(b.key).startswith("gen_edit_")} == {
-        "gen_edit_Gen_bus1", "gen_edit_Gen_bus2", "gen_edit_Gen_bus5", "gen_edit_Gen_bus7"}
+        "gen_edit_Gen_bus1", "gen_edit_Gen_bus4", "gen_edit_Gen_bus7", "gen_edit_Gen_bus10", "gen_edit_Gen_bus12"}
     assert [b.disabled for b in at.button if b.key == "gen_reset"] == [True]
     assert "Generators · as loaded" in [b.label for b in at.button]
-    httpx.post(f"{backend_url}/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]})
+    assert not any("Generators at a fixed power factor" in m.value for m in at.markdown)
+    httpx.post(f"{backend_url}/api/generators", json={"changes": [
+        {"unit": "Gen_bus1", "control": "power_factor"}]})
     at.run()
     assert "Generators · 1 changed" in [b.label for b in at.button]
-    assert any("Generators on voltage control" in m.value for m in at.markdown)
+    assert any("Generators at a fixed power factor" in m.value for m in at.markdown)
     assert any("gen-changed" in m.value and "Gen_bus1" in m.value for m in at.markdown)
     [b for b in at.button if b.key == "gen_reset"][0].click().run()
     assert httpx.get(f"{backend_url}/api/generators").json()["changed"] == {}
@@ -427,8 +431,8 @@ def test_the_system_tab_lists_the_generators_to_edit(agent, monkeypatch, backend
 def test_the_header_and_the_nominal_chip(agent, monkeypatch):
     _script(agent, monkeypatch)
     at = _app()
-    assert any("14 buses · 17 lines · 3 transformers" in m.value for m in at.markdown)
-    assert any(c.value == "per-unit case (every bus at 1 kV)" for c in at.caption)
+    assert any("30 buses · 41 lines · 0 transformers" in m.value for m in at.markdown)
+    assert any(c.value == "every bus at 135 kV" for c in at.caption)
     assert "Nominal point · off" in [b.label for b in at.button]
     _button(at, key_prefix="chip_nominal").click().run()
     assert at.session_state["op_nominal"] is True and at.session_state["op_view"]["mode"] == "nominal"
@@ -443,15 +447,16 @@ def test_the_launch_screen_chooses_what_to_load(agent, monkeypatch, backend_url)
     at.run()
     assert any(m.value == "### 1 · Choose what to load" for m in at.markdown)
     picker = at.radio(key="scenario_launch")
-    assert picker.value == "ieee14"
+    assert picker.value == "ieee30"
     assert picker.options == ["Resume", "Demo: IEEE 30 · active only",
-                              "Demo: IEEE 30 · with reactive measurements", "Demo: IEEE 14 · smaller"]
+                              "Demo: IEEE 30 · with reactive measurements",
+                              "Demo: CIGRE MV · distribution with DER"]
     picker.set_value("ieee30_reactive").run()                   # loads at once
     assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee30_reactive"
     at.radio(key="scenario_launch").set_value("resume").run()   # nothing to resume: refused, kept
     assert at.radio(key="scenario_launch").value == "ieee30_reactive"
     assert any("Nothing uploaded yet" in w.value for w in at.warning)
-    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception
 
 
@@ -459,7 +464,7 @@ def test_the_sidebar_switches_the_scenario_and_starts_afresh(agent, monkeypatch,
     import httpx
     _script(agent, monkeypatch)
     at = _app()
-    assert "Scenario · Demo: IEEE 14 · smaller" in [e.label for e in at.expander]
+    assert "Scenario · Demo: IEEE 30 · active only" in [e.label for e in at.expander]
     load = _button(at, key_prefix="scenario_sidebar_load")
     assert load.disabled                                        # already loaded
     at.radio(key="scenario_sidebar").set_value("ieee30_reactive").run()
@@ -468,7 +473,7 @@ def test_the_sidebar_switches_the_scenario_and_starts_afresh(agent, monkeypatch,
     assert at.session_state["messages"] == []                    # a new conversation
     assert any("a new conversation has started" in s.value for s in at.success)
     assert "Scenario · Demo: IEEE 30 · with reactive measurements" in [e.label for e in at.expander]
-    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception
 
 
@@ -514,7 +519,7 @@ def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
     _script(agent, monkeypatch)
     at = _app()
     assert any("conductor-eq-group'>For this scenario" in m.value for m in at.markdown)
-    assert "load power factor" in _button(at, key_prefix="eq_s0").label
+    assert "line from the external grid" in _button(at, key_prefix="eq_s0").label
     httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30_reactive"})
     try:
         at = _app()
@@ -523,7 +528,7 @@ def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
         _button(at, key_prefix="eq_s0").click().run()
         assert "reactive measurements" in at.session_state["_box_value"]
     finally:
-        httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee14"})
+        httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception
 
 

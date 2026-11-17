@@ -92,7 +92,8 @@ def test_render_charts_survives_empty_and_failing_renderers(monkeypatch):
         end = src.index("# Chart injection helper")
         namespace = {"st": st, "RENDERER_MAP": renderers.RENDERER_MAP,
                      "logging": __import__("logging"), "_tools_reg": tool_registry,
-                     "re": __import__("re"), "pd": __import__("pandas")}
+                     "re": __import__("re"), "pd": __import__("pandas"),
+                     "json": __import__("json"), "_grid_context": __import__("agent.grid_context").grid_context}
         exec(src[start:end].rsplit("# ----", 1)[0], namespace)
         namespace["render_charts"]([
             ("compute_violation_attribution", {"violations": []}),
@@ -158,7 +159,8 @@ class TestN1Table:
             end = src.index("# Chart injection helper")
             namespace = {"st": st, "RENDERER_MAP": renderers.RENDERER_MAP,
                          "logging": __import__("logging"), "_tools_reg": tool_registry,
-                         "re": __import__("re"), "pd": __import__("pandas")}
+                         "re": __import__("re"), "pd": __import__("pandas"),
+                     "json": __import__("json"), "_grid_context": __import__("agent.grid_context").grid_context}
             exec(src[start:end].rsplit("# ----", 1)[0], namespace)
             namespace["render_charts"]([("simulate_all_contingencies", {
                 "timestamp": "2000-01-03 02:15:00", "total_outages_tested": 20,

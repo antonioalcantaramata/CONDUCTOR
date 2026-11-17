@@ -1,0 +1,56 @@
+{
+ "machine": "macOS-27.2-arm64-arm-64bit",
+ "processor": "arm",
+ "python": "3.12.16",
+ "repeats": 5,
+ "rows": [
+  {
+   "network": "CIGRE MV",
+   "buses": 15,
+   "lines": 15,
+   "transformers": 2,
+   "units": 13,
+   "loads": 18,
+   "build_s": 0.003,
+   "compact_s": 0.0,
+   "outage_lookup_s": 0.001,
+   "check_answer_s": 0.0004
+  },
+  {
+   "network": "IEEE 30",
+   "buses": 30,
+   "lines": 41,
+   "transformers": 0,
+   "units": 5,
+   "loads": 20,
+   "build_s": 0.002,
+   "compact_s": 0.0,
+   "outage_lookup_s": 0.001,
+   "check_answer_s": 0.0005
+  },
+  {
+   "network": "PEGASE 2869",
+   "buses": 2869,
+   "lines": 4051,
+   "transformers": 531,
+   "units": 689,
+   "loads": 1311,
+   "build_s": 0.289,
+   "compact_s": 0.001,
+   "outage_lookup_s": 0.049,
+   "check_answer_s": 0.0099
+  },
+  {
+   "network": "PEGASE 9241",
+   "buses": 9241,
+   "lines": 13797,
+   "transformers": 2252,
+   "units": 1878,
+   "loads": 4461,
+   "build_s": 0.984,
+   "compact_s": 0.004,
+   "outage_lookup_s": 0.224,
+   "check_answer_s": 0.0331
+  }
+ ]
+}

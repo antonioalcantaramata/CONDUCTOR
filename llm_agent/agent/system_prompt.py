@@ -16,12 +16,22 @@ probabilistic RSA, robust dispatch, flexibility envelope, hosting capacity,
 historical risk) keep every field name, default and caveat.
 """
 
+import re
+
 from .config import DEFAULT_GRID_CONSTANTS, fetch_grid_constants
 
 # Limits stated when the constants lack them: the fallback grid's own, so the
 # prompt and the fallback agree.
 _FALLBACK_VM_LOWER = DEFAULT_GRID_CONSTANTS["vm_lower"]
 _FALLBACK_VM_UPPER = DEFAULT_GRID_CONSTANTS["vm_upper"]
+
+
+def _index_range(n) -> str:
+    """" (indices 0–n-1)", nothing for none ("0 transformers (indices 0–-1)" read
+    as an index), "?" when the count is unknown."""
+    if not isinstance(n, int):
+        return " (indices 0–?)"
+    return f" (indices 0–{n - 1})" if n > 0 else ""
 
 
 def build_system_prompt(gc: dict) -> str:
@@ -97,8 +107,8 @@ flexibility activation, and interpreting KPI metrics.
 ## Grid domain knowledge — hard facts (never contradict these)
 
 - **Grid topology:** {_n_bus} buses, \
-{_n_lines} power lines (indices 0–{_n_lines - 1 if isinstance(_n_lines, int) else "?"}), \
-{_n_trafos} transformers (indices 0–{_n_trafos - 1 if isinstance(_n_trafos, int) else "?"}).
+{_n_lines} power lines{_index_range(_n_lines)}, \
+{_n_trafos} transformers{_index_range(_n_trafos)}.
 - **Substations:** {_n_sub} of the {_n_bus} buses are substations — the buses with at least one load (plus \
 the bus of any named generator): the measurement points the data and most tools are keyed by. Buses and \
 substations are not the same count: the other buses have no load — e.g. the slack (external grid) bus, pure \
@@ -156,14 +166,15 @@ or using measurements — do not fabricate forecast results.
 ## Reactive power — the load power factor
 
 The measurements and forecasts carry **active power only**. Every study gives each measured load \
-its reactive power from a **load power factor**: Q = P·tan(acos pf), lagging, **default 0.95** — \
-the session setting, shown to the operator in the System tab. Results that assigned a tick carry a \
-`load_power_factor` block (value and source: default, session setting or this study).
+its reactive power from a **load power factor**: Q = P·tan(acos pf), lagging — the session \
+setting, shown to the operator in the System tab: 0.95 by default, or the loads' own when the \
+network's profile states it. Leave `load_power_factor` out unless the operator asks for another. \
+Results that assigned a tick carry a `load_power_factor` block (value and source).
 - To rerun **one study** under another assumption ("what if the loads were at pf 0.90?"), pass \
 `load_power_factor` to that study; compare it with the same study without it. The session \
 setting is unchanged.
 - To change the **assumption itself** for the session ("use pf 0.92 from now on"), call \
-`set_load_power_factor`; `reset=true` goes back to 0.95. Only when the operator asks for it.
+`set_load_power_factor`; `reset=true` goes back to the default. Only when the operator asks for it.
 - When a result used anything but the default, say so ("with loads at pf 0.90"). The nominal \
 point keeps the case's own reactive power and uses no power factor.
 - **When the data carry measured reactive power** (optional upload columns; the result's \
@@ -286,6 +297,17 @@ placeholder: build the transformer with the voltage asked for — do not ask abo
 presents a proposal's figure as the base's. Results on a proposal \
 carry a `network` block: its edits and what each added element injects at that tick — quote \
 that injection rather than the element's size when they differ.
+- **What an element is** — a unit's energy source (wind, solar, conventional…), a load's category \
+(residential, industrial…), a bus's voltage level, its substation, its feeder, a switch's normal state (a \
+normally open tie), whether a value is measured or estimated, what an element supplies, what carries the \
+external grid's power — comes from `describe_network` or `locate_network_element`, each fact with its basis: say a `named` one is read from the name and an \
+`inferred` one by its rule; an `unknown` one, that the network does not state it — never guess it from a \
+table or the data. When the operator states one ("Gen_bus1 is a wind farm"), record it with \
+`declare_network_facts` before a study that depends on it (renewable scaling applies to wind and solar units). \
+A study's result that names a problem element carries `grid_context`: what the layer says each one is (voltage, \
+feeder and where on it, what is connected, what a branch cuts off) — say where from it, as the CIM layer's. \
+No tool exports the network: to save it as CIM (RDF/XML or JSON-LD), point the operator to the System tab, \
+"CIM layer", "Export as CIM…".
 - **Study a proposal over time.** What it does depends on the hour — demand, generation and flows \
 move — so one moment (least of all the clock's, often a quiet night) says little. Unless the \
 question names one moment, run `compare_networks` with `study="scan"` over the period it names \
@@ -619,10 +641,111 @@ tool does succeed, trust its result over anything in this description.
 """.strip()
 
 
+# ---------------------------------------------------------------------------
+# Parts of the prompt an ablation can leave out (`CONDUCTOR_DROP_RULES`, evaluation only)
+# ---------------------------------------------------------------------------
+# Each is found by the words it starts with, not by its number, so renumbering the rules does not move an
+# ablation onto another rule; a part that is not found exactly once raises (tests/test_ablation_switches.py
+# checks every id against the real prompt).
+#   section — from "## <words>" to the next heading;
+#   rule    — a numbered rule "N. **<words>…" with the paragraphs under it, to the next numbered rule;
+#   bullet  — "- **<words>…" to the next bullet, rule or heading.
+PROMPT_PARTS: dict[str, tuple[str, str]] = {
+    "domain_facts": ("section", "Grid domain knowledge"),
+    "data_sources": ("section", "Data sources"),
+    "reactive_power": ("section", "Reactive power"),
+    "proposals": ("section", "Network proposals"),
+    "kpis": ("section", "Key performance indicators"),
+    "scope": ("rule", "Strict scope enforcement"),
+    "timestamp_first": ("rule", "Always call `get_current_timestamp` first"),
+    "no_invention": ("rule", "Never invent simulation results"),
+    "say_no_tool": ("rule", "If no tool can answer"),
+    "pass_through": ("rule", "Parameter pass-through"),
+    "investigation": ("rule", '"Why is X outside its limits?"'),
+    "name_elements": ("rule", "Always name affected elements by name"),
+    "number_format": ("rule", "Number formatting"),
+    "tool_errors": ("rule", "If a tool returns"),
+    "data_source_check": ("rule", "Confirm the data source matches"),
+    "ask_first": ("rule", "Ask first only when it changes the answer"),
+    "evidence_wording": ("rule", "Word each claim by what backs it"),
+    "element_identity": ("bullet", "What an element is"),
+    "name_proposals": ("bullet", "Every answer about a proposal names it"),
+    "proposal_over_time": ("bullet", "Study a proposal over time"),
+    # Every numbered rule that routes a kind of question to a tool ("N. **"…"** → `tool`").
+    "routing": ("group", "→"),
+}
+
+_RULE_START = r"(?m)^\d+\. \*\*"
+_BLOCK_END = r"(?=\n\d+\. \*\*|\n#+ |\Z)"
+
+
+def _part_spans(prompt: str, part: str) -> list[tuple[int, int]]:
+    kind, words = PROMPT_PARTS[part]
+    w = re.escape(words)
+    if kind == "section":
+        return [m.span() for m in re.finditer(rf"(?ms)^## {w}.*?(?=\n#+ |\Z)", prompt)]
+    if kind == "rule":
+        return [m.span() for m in re.finditer(rf"(?ms)^\d+\. \*\*{w}.*?{_BLOCK_END}", prompt)]
+    if kind == "bullet":
+        return [m.span() for m in re.finditer(rf"(?ms)^- \*\*{w}.*?(?=\n- \*\*|\n\d+\. \*\*|\n#+ |\Z)", prompt)]
+    # group: every numbered rule whose bold head is followed by the words ("N. **"…"** → `tool`")
+    return [m.span() for m in re.finditer(rf"(?ms){_RULE_START[4:]}[^\n]*?\*\*\s*{w}.*?{_BLOCK_END}", prompt)]
+
+
+def drop_parts(prompt: str, parts) -> tuple[str, dict[str, int]]:
+    """The prompt without the given parts, and how many characters each removed.
+    An unknown id, or a section/rule/bullet not found exactly once, raises: an
+    ablation that silently removed nothing would read as a null result."""
+    spans: list[tuple[int, int]] = []
+    removed: dict[str, int] = {}
+    for part in parts:
+        if part not in PROMPT_PARTS:
+            raise ValueError(f"Unknown prompt part {part!r}; known: {sorted(PROMPT_PARTS)}")
+        found = _part_spans(prompt, part)
+        if not found or (PROMPT_PARTS[part][0] != "group" and len(found) != 1):
+            raise ValueError(f"Prompt part {part!r} found {len(found)} times, expected once: the prompt changed; "
+                             "update PROMPT_PARTS.")
+        spans += found
+        removed[part] = sum(b - a for a, b in found)
+    for a, b in sorted(set(spans), reverse=True):
+        prompt = prompt[:a] + prompt[b:]
+    return re.sub(r"\n{3,}", "\n\n", prompt), removed
+
+
+# The rule on what an element is, for the evaluation's `tables` arm (`config.raw_tables_enabled`): the same
+# question answered from the raw data tables instead of the semantic layer, with the same care about names.
+RAW_TABLES_RULE = """\
+- **What an element is** — a unit's energy source (wind, solar, conventional…), a load's category \
+(residential, industrial…), a bus's voltage level, a switch's state, what an element supplies — read it from \
+the network's own data tables (`read_network_tables`): a unit's `type`, a load's `type`, a bus's `vn_kv`, a \
+switch's `closed`, and how elements connect. A name is only a hint: say what the tables state, and when they \
+do not state it, say so — never guess it."""
+
+
+def replace_part(prompt: str, part: str, text: str) -> str:
+    """The prompt with one part (found exactly once) replaced by `text`."""
+    found = _part_spans(prompt, part)
+    if len(found) != 1:
+        raise ValueError(f"Prompt part {part!r} found {len(found)} times, expected once: the prompt changed; "
+                         "update PROMPT_PARTS.")
+    a, b = found[0]
+    return prompt[:a] + text + prompt[b:]
+
+
 def get_system_prompt() -> str:
     """Return the compacted system prompt built from live grid constants."""
     status = fetch_grid_constants()
     prompt = build_system_prompt(status.values)
+    from .config import dropped_prompt_rules, ontology_enabled, raw_tables_enabled
+    drop = list(dropped_prompt_rules())
+    if raw_tables_enabled() and "element_identity" not in drop:
+        # The raw-tables baseline (evaluation only): the rule points to the tables instead of the layer.
+        prompt = replace_part(prompt, "element_identity", RAW_TABLES_RULE)
+    elif not ontology_enabled() and "element_identity" not in drop:
+        # The semantic layer switched off (evaluation only): its rule goes with its tools.
+        drop.append("element_identity")
+    if drop:
+        prompt, _ = drop_parts(prompt, drop)
     if not status.live:
         prompt = f"{prompt}\n\n{STALE_CONSTANTS_WARNING}"
     return prompt

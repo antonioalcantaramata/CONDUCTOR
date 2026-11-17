@@ -7,10 +7,14 @@ networks and data are, and how proposals change a network without touching it.
 ## From a file to a network
 
 **Formats.** MATPOWER (`.m`, converted by pandapower; PGLib cases included),
-pandapower JSON or Excel, and UCTE. A MATPOWER generator at a load bus is turned
-back into a voltage-controlled unit at 1.0 p.u.
+pandapower JSON or Excel, UCTE, and CGMES (`.zip`, CIM 2.4.15 or 3.0, read by
+pandapower's CIM converter: `network_loader.read_cgmes`). A MATPOWER generator
+at a load bus is turned back into a voltage-controlled unit at 1.0 p.u. A CGMES
+model keeps its identifiers (mRID), its substations and the control each
+synchronous machine states; a model whose reference is a generator gets it as
+the external grid, as the MATPOWER converter does, and the upload says so.
 
-**Units.** On loading, each generator not at the external grid becomes a
+**Units.** On loading (except from CGMES, see above), each generator not at the external grid becomes a
 controllable **static generator** at unity power factor, keeping what it needs to
 return to voltage control (its set-point and reactive limits). A unit below 1 MW
 is a **synchronous condenser** and stays voltage-controlled. A bundled profile may
@@ -34,18 +38,25 @@ from pandapower's internal model (see
 
 ## The bundled networks
 
-| | IEEE 30 (default) | IEEE 14 |
+| | IEEE 30 (default) | CIGRE MV |
 | --- | --- | --- |
-| Source | PGLib-OPF `pglib_opf_case30_as` (Alsac–Stott) | PGLib-OPF `pglib_opf_case14_ieee` |
-| Buses / lines / transformers / loads | 30 / 41 / 0 / 21 | 14 / 17 / 3 / 11 |
-| Units | five, all voltage-controlled (Gen_bus1 and Gen_bus12 at 1.025 p.u., the others at 1.0) | Gen_bus1 at unity power factor; three synchronous condensers |
-| External grid | Bus_0 at 1.0 p.u. | Bus_0 at 1.02 p.u. |
-| Case load | 283.4 MW, 126.2 Mvar | 259.0 MW, 73.5 Mvar |
-| Limits | 0.95–1.05 p.u., 100 % | 0.94–1.06 p.u., 100 % |
-| Synthetic week | residential load, flat generation | two-peak load, wind |
+| Source | PGLib-OPF `pglib_opf_case30_as` (Alsac–Stott) | pandapower `create_cigre_network_mv(with_der="all")` |
+| Buses / lines / transformers / loads | 30 / 41 / 0 / 21 | 15 / 15 / 2 / 18 |
+| Units | five, all voltage-controlled (Gen_bus1 and Gen_bus12 at 1.025 p.u., the others at 1.0) | 13 static generators at a fixed power factor — eight PV, one wind turbine, a CHP unit, three fuel cells — and two batteries, each typed by the network |
+| Topology | meshed, one voltage level (135 kV) | 110/20 kV substation, two radial 20 kV feeders, three normally open ties |
+| External grid | Bus_0 at 1.0 p.u. | Bus 0 (110 kV) at 1.03 p.u. |
+| Case load | 283.4 MW, 126.2 Mvar | 44.7 MW, 11.0 Mvar (the benchmark's peak) |
+| Load power factor | 0.95 (CONDUCTOR's default) | 0.97 (the profile's, the benchmark's own) |
+| Limits | 0.95–1.05 p.u., 100 % | 0.95–1.05 p.u., 100 % |
+| Synthetic week | residential load, flat generation | residential load at 0.9 of the peak; each unit shaped by its stated source (PV the sun, wind the wind, the others flat) |
 
-Ratings are the cases' own (PGLib `rateA`). Element names use 0-based bus
-indices: `Gen_bus1` sits at MATPOWER bus 2.
+Ratings are the cases' own (PGLib `rateA`; CIGRE's line currents). IEEE 30's
+element names use 0-based bus indices: `Gen_bus1` sits at MATPOWER bus 2.
+
+The data are per bus, so a bus's production is split across its units by
+capacity. On CIGRE MV three buses hold PV beside a fuel cell or the CHP unit
+(Bus 5, 9 and 10): their PV units carry a share of that bus's night output, though
+each bus's total is right.
 
 ### Naming an element
 
@@ -81,7 +92,13 @@ substation (a bus with load or generation), at a regular interval.
 
 Seven days at 15 minutes (672 moments from Saturday 1 January 2000), generated
 with fixed seeds (42 for measurements, 137 for the forecast), so every run
-sees the same week.
+sees the same week. These are the defaults: the length, step, load shape, peak,
+default generation shape, forecast errors, stress windows and seed can be changed
+in the Data tab ([Synthetic data](../guide/data-and-operating-point.md#synthetic-data)),
+and are then kept for the network (the forecast's seed is the measurements' plus
+95). The generator reads the network once, as it loads (`basis`): each unit's
+bus and capacity, each load's bus and demand. Data generated later start from
+those values, not from a tick's.
 
 **Load.** Every load follows one shape $s(h, d)$ of the hour $h$ and day $d$,
 with noise $u_t \sim \mathcal U(1 - \nu, 1 + \nu)$:
@@ -225,6 +242,7 @@ proposal (see [Risk, uncertainty and capacity](risk-and-capacity.md#comparing-a-
 | Finding an element by its name | `find`, `find_unit` in `backend/resolve.py`; `GET /api/network/resolve` |
 | Data to loads and units | `assign_load_values_from_measurements`, `assign_generators_values_from_measurements` in `backend/load_gen_assignment.py` |
 | Synthetic measurements and forecast | `generate`, `forecast` in `backend/synthetic_timeseries.py` |
+| The settings an operator can change, and their preview | `normalise_settings`, `preview` in `backend/synthetic_timeseries.py`; `/api/data/synthetic` in `backend/main_backend.py` |
 | Data quality, the nominal point | `backend/data_quality.py`, `backend/nominal.py` |
 | One moment | `_assign_tick`, `_prepared_net`, `_resolve_tick` in `backend/main_backend.py` |
 | Proposals | `backend/sandbox.py`, `POST /api/proposals/edit`, `POST /api/proposals/compare` |

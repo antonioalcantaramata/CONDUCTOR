@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./start.sh                            # bundled PGLib IEEE 30-bus profile (default)
-#   GRID_PROFILE=pglib_case14 ./start.sh  # the smaller PGLib IEEE 14-bus profile
+#   GRID_PROFILE=cigre_mv ./start.sh  # the CIGRE MV distribution benchmark
 #   BACKEND_PORT=8010 ./start.sh          # override ports if the defaults are taken
 #
 # All logic lives in start.py so macOS, Linux, and Windows share one launcher.

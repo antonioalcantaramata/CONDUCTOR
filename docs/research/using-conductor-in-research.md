@@ -10,12 +10,12 @@ its answers were.
 
 - **The demos are deterministic.** The IEEE 30-bus demos (PGLib's Alsac–Stott
   case with a synthetic week; the second adds measured reactive power with
-  deliberate gaps) and the smaller IEEE 14-bus demo are generated with fixed
+  deliberate gaps) and the CIGRE MV distribution demo are generated with fixed
   seeds, so the same scenario gives the same data on every machine. Name the
   scenario in your method section. The 30-bus demo is the one for flexibility
   studies: five dispatchable units with the case's own costs, and congestion at
   the evening peaks.
-- **Your own data.** Upload a network (MATPOWER, pandapower, UCTE) and a CSV of
+- **Your own data.** Upload a network (MATPOWER, pandapower, UCTE, CGMES) and a CSV of
   measurements and forecasts; see
   [Data and the operating point](../guide/data-and-operating-point.md).
   A *Start fresh* on the launch screen returns a network to its as-loaded state
@@ -76,9 +76,11 @@ Per turn it reports the figures in the answer and how each was grounded:
 
 ## The what-if evaluation
 
-A fixed set of proposal questions for the bundled IEEE 14-bus network (load the
-**Demo: IEEE 14 · smaller** scenario first; its week is unchanged since the tasks
-were written), run repeatedly against the real agent and graded from the records:
+A fixed set of proposal questions for the CIGRE MV distribution demo (load the
+**Demo: CIGRE MV · distribution with DER** scenario first), run repeatedly against
+the real agent and graded from the records. The sizes are distribution sizes, and
+two tasks check what only a radial network asks: that a site on one line, or a
+feeder with a line opened, is said to lose supply.
 
 ```bash
 python -m evaluation.whatif list
@@ -243,6 +245,284 @@ python -m evaluation.narration run --repeats 2 [--tasks hosting,robust]
 python -m evaluation.narration grade <run folder>
 ```
 
+## Ablations
+
+An ablation runs the same tasks with a part of CONDUCTOR taken away, and
+grades every arm the same way. One command per study:
+
+```bash
+python -m evaluation.ablation list                         # the studies, suites, knobs, tool groups
+python -m evaluation.ablation plan components --repeats 5  # what it would run and roughly cost (free)
+python -m evaluation.ablation run components --repeats 5   # run it (spends model credit; asks first)
+python -m evaluation.ablation status <run folder>          # how far a run is
+python -m evaluation.ablation run --resume <run folder>    # continue an interrupted run
+python -m evaluation.ablation analyse <run folder> [<run folder> …] [--baseline full]   # free
+```
+
+### Studies that come ready
+
+Every task these studies run, with its question, set-up and checks, is written
+out by `python -m evaluation.catalogue`, from the same definitions the runner
+uses.
+
+The first arm of each is its baseline.
+
+| Study | Question | Arms | Suites |
+| --- | --- | --- | --- |
+| `components` | What each part adds over the rest (leave one out), and against an agent with solvers only | full; without the CIM layer, the reading check, the routing rules, the evidence wording, the ask-first rule, the investigation tools; solver-only (no CIM layer for the agent or the studies, no reading check) | all |
+| `ontology` | What the CIM layer is worth (below) | on, off, none | semantics, reasoning |
+| `raw_tables` | What the layer adds over the data it is built from: the agent reads the network's raw data tables instead (below) | on, off, tables | semantics, reasoning |
+| `answer_review` | Do the answer checks, shown to the agent, ground its answers better? | off, inform | narration, options, what-if |
+| `reading_check` | What re-running the decisive studies under the question's other readings changes | on, off | clarify, narration, options |
+| `prompt_rules` | What each behavioural rule of the prompt is worth | full; without each of six rules | clarify, narration, options, investigation, what-if |
+| `tools` | What each capability adds, on the tasks that need it | all; without investigation, proposals, element lookup, studies over time | investigation, what-if, semantics, options |
+| `deep_research` | Deep Research as each task asks, and never | task, off | investigation |
+| `advisor` | Following the AI Agent Suggestion after a what-if | alone, with the suggestion | what-if |
+| `step_budget` | Model calls per question: quality against cost | 16, 8, 4 | investigation, options, what-if |
+| `effort` | The configured model's reasoning effort | medium, low, high | all |
+
+### Arms of your own
+
+`--arm` adds an arm to a study, or makes one with `--suites`:
+
+```bash
+python -m evaluation.ablation run --suites options,narration --repeats 3 \
+    --arm "full:" \
+    --arm "lean: drop_rules=routing,evidence_wording hide_tools=group:kpis" \
+    --arm "small: model=<another model> effort=low"
+```
+
+| Knob | Values | What it changes |
+| --- | --- | --- |
+| `ontology` | `on`, `off`, `none`, `tables` | the CIM layer, for the agent (`off`) and also for the studies (`none`); `tables` gives the agent the raw data tables instead (`none` gets its own backend) |
+| `review` | `off`, `warn`, `inform` | the answer checks shown to the agent before its answer goes out |
+| `reading_check` | `on`, `off` | the reading check |
+| `deep` | `task`, `on`, `off` | Deep Research on the first question |
+| `follow_suggestion` | `off`, `on` | one more turn, following the AI Agent Suggestion |
+| `drop_rules` | parts of the system prompt | rules and sections left out; `python -m evaluation.ablation prompt` lists them with their size, `prompt --drop <ids> --show` prints what goes |
+| `hide_tools` | tool names, `group:<name>` | tools the model is not given (groups: investigation, proposals, optimisation, over_time, kpis, semantic_layer, lookup); a call to one by name is refused |
+| `max_steps` | an integer | model calls per question before it must answer |
+| `provider`, `model`, `effort` | the provider's values | the model, for comparing models in one study |
+| `env.<NAME>` | any | any other environment variable |
+
+A setting that names nothing (a prompt part that is not in today's prompt, a
+tool that does not exist, a misspelt knob) stops the run before it starts:
+an ablation that silently removed nothing would read as a null result.
+Prompt parts are found by the words they begin with, not by their number, and
+`tests/test_ablation_framework.py` checks each against the real prompt.
+
+### How a run is made
+
+- Each arm runs in its own process with its settings in the environment, so
+  even the settings read once at start (the model, the provider) differ
+  between arms. Every arm uses an isolated backend
+  (`evaluation.isolated_backend`; one per kind an arm needs), never the
+  operator's. Session logs, the cache and the saved state go to the run
+  folder.
+- `--order interleaved` (the default) runs repeat 1 of every arm, then repeat
+  2, and so on. A model or an API that drifts during a long run then affects
+  every arm alike. `blocked` runs one arm after the other.
+- The scenario is loaded afresh before each task, and what a task set up is
+  undone after it.
+- Each run's record names its arm and a hash of the arm's settings.
+  `--resume` keeps the runs made under the same settings and runs the rest.
+- **When something fails.** A run fails when the infrastructure fails, not
+  the agent: the harness itself, or the model's API (quota, rate limit,
+  timeout, server error, an answer the model could not write). A failed run
+  is left out of the grading, counted, and run again on resume. Stopping at
+  the step limit is the agent's own outcome, and is graded. After three
+  failed runs in a row, an arm's process stops. If its backend has died, the
+  backend is restarted and the arm retried once; otherwise the run stops,
+  with the manifest saying why. An exhausted quota stops it at once.
+- **Progress.** In a terminal, one line is redrawn as the run goes: a bar,
+  the share done, the turns, the time so far and the time left (estimated
+  from the turns run in this session), what is running, and how many runs
+  failed. Written to a log, it prints one line per run. `status <folder>`
+  shows the same line from another terminal while the run goes on.
+- **Running a part, again or later:**
+
+  ```bash
+  python -m evaluation.ablation status <folder> --detail          # every run a resume would run, and why
+  python -m evaluation.ablation run --resume <folder>             # the rest of the plan
+  python -m evaluation.ablation run --resume <folder> --only full --suites reasoning   # part of it now
+  python -m evaluation.ablation run --resume <folder> --repeats 5 --reason "…"         # extend the plan
+  python -m evaluation.ablation run --resume <folder> \
+      --rerun "arm=full task=names_cigre repeat=2" --reason "…"   # these runs again
+  ```
+
+  A re-run moves the selected records aside to `runs/_replaced/<time>/`,
+  never deleting them, and runs those runs again. The manifest's change log
+  keeps each re-run, extension, backend restart and stop, with its reason.
+  The analysis, the error injection and the catalogue are separate commands
+  that call no model, and can be run again at any time.
+- `plan` (and `run`, before it asks) shows the agent turns per arm and an
+  estimate of tokens and time. The estimate comes from CONDUCTOR's usage
+  record for the configured model or, more closely, from earlier runs
+  (`--estimate-from <folder>`). Only the records of earlier runs say how much
+  of the input came from the provider's prompt cache. The share is large
+  (97 % on OpenAI: the system prompt and the tools go out unchanged with every
+  call), and cached input is billed at a fraction of the price.
+- CONDUCTOR knows no prices, so `plan` shows no cost unless you give your
+  model's prices in USD per million tokens: `--price-in` (uncached input),
+  `--price-cached` and `--price-out`, from the provider's price list or your
+  bill. A cost without the cached price, or from records that do not say what
+  was cached, is labelled an upper bound.
+- `--max-turns` refuses a larger plan, and `--per-suite N --seed S` draws a
+  pilot of N tasks from each suite. A pilot run first gives the records a
+  close estimate needs.
+
+### What it writes
+
+The run folder holds the records (`runs/<arm>/<suite>/<task>-<repeat>.jsonl`)
+and `manifest.json`. The manifest records:
+
+- the date, the commit, and whether the tree had uncommitted changes;
+- each arm's settings and hash, with the prompt characters each dropped part
+  removed and the tools it hid;
+- the suites, the tasks, the repeats and the order;
+- any pilot sample, and the command.
+
+The analysis grades every arm with the suites' own checks and every grader of
+`python -m evaluation`. It reports:
+
+- **checks passed** and **tasks with every check passed**, each with a 95 %
+  Wilson interval;
+- the **difference from the baseline**, averaged over the tasks both arms
+  ran, with a 95 % bootstrap interval over tasks (runs of one task are not
+  independent, so the task is the unit) and a two-sided sign test over tasks;
+- the **cost per run**: tool calls, model calls, input tokens (and how many
+  of them were cached), output tokens, seconds;
+- **the reading check**: how many turns it re-checked, and how often another
+  reading moved the figure by more than 10 % (shifts) or changed the
+  conclusion (changes);
+- **ungrounded figures** and **entity errors** per run;
+- a table **by suite** (and by family), and every **check where the arms
+  differ**.
+
+It writes `analysis.md`, `summary.csv`, `runs.csv`, `checks.csv` (one row per
+run and check, the long form for a plot), `summary.tex` (a booktabs table)
+and `results.json`. `analyse` can merge folders, for example an arm added
+later. It grades with today's checks, so a grader fix applies to old records
+too; say so when you report it.
+
+### The CIM layer
+
+The `ontology` study measures the CIM layer
+([What the network is](../methods/what-the-network-is.md)), in three arms
+(`CONDUCTOR_ONTOLOGY`):
+
+| Arm | The agent sees the layer | The studies use it |
+| --- | --- | --- |
+| `on` | yes | yes — CONDUCTOR as it is |
+| `off` | no (`describe_network`, `declare_network_facts`, the facts `locate_network_element` adds and the prompt's rule are hidden) | yes |
+| `none` | no | no — as before the layer: every static generator is renewable in scaling, the probabilistic and robust studies and the look-ahead; declarations change nothing |
+
+and three comparisons: `on` vs `off` (what the agent gains), `off` vs `none`
+(what grounding the studies gains), `on` vs `none` (the whole). Answers are
+checked against the layer in every arm.
+
+```bash
+python -m evaluation.ablation run ontology --repeats 3 [--only on,off]
+```
+
+The `raw_tables` study adds a fourth arm, `tables`: the agent is given the
+network's raw pandapower tables (`read_network_tables`) instead of the layer,
+with the same rule on names, while the studies still read the layer. It
+separates what the layer adds from simply showing the agent the data:
+
+```bash
+python -m evaluation.ablation run raw_tables --only tables --repeats 5 --out <folder>
+```
+
+The runs, analyses and scripts behind the CIM layer paper are in
+[`papers/cim_layer`](https://github.com/antonioalcantaramata/CONDUCTOR/tree/main/papers/cim_layer).
+
+`none` gets its own backend, started with `CONDUCTOR_ONTOLOGY=none`, and an
+arm refuses a backend in the wrong mode. Besides the general tables, its
+analysis adds one per network and per reasoning family for each comparison.
+It runs two suites:
+
+- **`evaluation.semantics`** — looking up what elements are, on CIGRE MV (the
+  network states nearly everything) and IEEE 30 (it states almost nothing, so
+  the right answer is often that it does not say): storage, voltage levels,
+  renewables, feeders, what an outage cuts off, what carries the external
+  grid's power;
+- **`evaluation.reasoning`** — reasoning from the facts:
+  - *misleading names* (a CHP unit renamed "Solar Farm North": the stated type
+    must win over the name);
+  - *intervention* (the same question before and after a unit is declared
+    wind: the answer, and the study's own scaling, must change with the fact);
+  - *composition* (what a transformer outage cuts off, how much of it is solar,
+    which tie restores it, and whether that switch is normally open);
+  - *switches* (which switches are normally open, and which one ties two
+    feeders);
+  - *data* (is a value measured, a share of its bus's measurement, or derived
+    from the power-factor assumption?);
+  - *consistency* (one question in three wordings; a fact stated in one turn
+    used in the next).
+
+Every check is a fact of the network or of the study's own record, computed
+rather than judged, and `tests/test_ablation_ground_truth.py` checks those
+facts against the networks, so a change to a network or its data cannot leave
+the ablation grading against a stale answer. Each suite also runs on its own
+(`python -m evaluation.semantics run --network cigre --arm off`,
+`python -m evaluation.reasoning run --arm on --out <folder>`).
+
+## Error injection: what the checks catch
+
+Labelling the checks' findings by hand measures how often a flag is right. It
+cannot measure how many errors the checks miss: an error nobody flagged is
+invisible in the records. Error injection measures that. It takes real
+answers from any run folder, puts one known error into a copy of each, runs
+the same checks the live system runs, and counts an error as caught only when
+the check flags *that* error (its figure or its sentence):
+
+```bash
+python -m evaluation.injection <run folder> [<run folder> …] [--seed 0] [--out <folder>]
+```
+
+| Level | Error put into the answer | Check |
+| --- | --- | --- |
+| Figures | a figure changed by a few per cent | provenance |
+| Figures | a violated element's figure replaced by another violated element's | provenance (misattribution) |
+| Figures | an insecure assessment called secure | characterisation |
+| Figures | a dispatch "proved" optimal with no certificate; "secure" with no study | evidence |
+| Entities | a unit called the wrong source; one whose source is unknown given one | entities |
+| Entities | a bus at a voltage the network does not have | entities |
+| Entities | a line called a transformer, before and after its name | entities |
+| Entities | a value called measured that was derived from an assumption | entities |
+| Entities | a real element's name replaced by one the network does not have | entities |
+
+- **True statements are injected too, as controls.** These use the same
+  wording, but are true ("PV 3 is a solar PV unit", where it is). A check
+  that flags them raises false alarms, and their rate is reported beside the
+  recall.
+- **Some errors are undetectable by construction**, and are counted apart:
+  - a changed figure that another result of the question holds anyway;
+  - a swapped figure that the sentence's own element also holds.
+- **The unmodified answers are checked as well,** so a change to a check that
+  raises new flags on real answers is seen.
+- **Each injected error follows what its check reads,** so the table reports
+  the reach of each check on real answers.
+- **The facts are rebuilt as the live system builds them** for the edited
+  answer. That includes the network's full list of names, needed to tell an
+  invented name from a real one.
+
+It costs nothing (no model is called), is deterministic for a seed, and writes
+`injection.md`, `injection.csv` and `injection.json`.
+
+Run on the pilot runs' records, it found four gaps in the checks, all fixed
+and pinned by tests in `tests/test_injection.py`:
+
+1. Names with underscores (`Gen_bus12`, `Bus_25`) were never matched.
+2. A sentence closed by markdown after its full stop ran on into the next one.
+3. A branch named by its short name ("Line 1-2") was not recognised.
+4. Element names written with a space were hidden from the misattribution
+   check.
+
+When it is used for a paper, report it on records other than those it was
+developed on.
+
 ## Comparing models
 
 The launch screen offers free, paid and local models (see
@@ -250,7 +530,25 @@ The launch screen offers free, paid and local models (see
 model answered, the same questions can be graded across models and providers.
 For a fair comparison, keep the scenario, the operating point and the settings
 fixed, and report the model, its reasoning setting and the date (providers
-change models without notice).
+change models without notice). An ablation with one arm per model
+(`--arm "a: model=…" --arm "b: provider=… model=…"`) does all of that, on the
+same tasks, interleaved.
+
+## A test set from any network
+
+`evaluation.generated` builds questions whose answers the loaded network's CIM
+layer already knows — what kind of unit X is (or that the network does not say),
+which units are of a source, a bus's voltage, the feeder that supplies a load,
+the loads an outage cuts off — with deterministic checks, for whatever network is
+loaded. It measures a model on *your* network before you rely on it, and can be
+re-run across models or with and without the layer:
+
+    python -m evaluation.generated generate --out tasks.json [--per-kind 3] [--seed 0]
+    python -m evaluation.generated run --tasks tasks.json --out <folder> [--repeats 1]
+    python -m evaluation.generated grade <folder> --tasks tasks.json
+
+The task file records the network it was built from (name, fingerprint, commit,
+seed). `run` spends model credit (it asks first); `generate` and `grade` do not.
 
 ## What the checks can and cannot see
 
@@ -295,3 +593,22 @@ name:
 - the scenario or data;
 - the model, its provider and its reasoning setting;
 - whether answer review was on.
+
+If you use the CIM layer, or the answer checks that read it, please also cite
+[arXiv:2611.20026](https://arxiv.org/abs/2611.20026):
+
+```bibtex
+@misc{alcantara2026gridlanguage,
+  title         = {The Grid's Own Language: A Common Information Model Layer for {LLM} Grid Assistants},
+  author        = {Alc{\'a}ntara, Antonio and Karampinis, Ioannis and Chatzivasileiadis, Spyros},
+  year          = {2026},
+  eprint        = {2611.20026},
+  archivePrefix = {arXiv},
+  primaryClass  = {eess.SY},
+  doi           = {10.48550/arXiv.2611.20026},
+  url           = {https://arxiv.org/abs/2611.20026}
+}
+```
+
+Its runs, analyses and scripts are in the repository's
+[`papers/cim_layer`](https://github.com/antonioalcantaramata/CONDUCTOR/tree/main/papers/cim_layer) folder.

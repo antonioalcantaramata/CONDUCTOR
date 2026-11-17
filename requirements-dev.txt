@@ -34,6 +34,10 @@ requests>=2.33
 python-dotenv>=1.0
 pyyaml>=6.0
 openpyxl>=3.1.0
+# pandapower's CIM converter (CGMES upload) needs lxml; rdflib is only for the
+# tests, which read the CIM export back as RDF and query it with SPARQL.
+lxml>=5.0
+rdflib>=7.0
 
 plotly>=5.20.0
 

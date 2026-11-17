@@ -15,7 +15,9 @@ Suggestion to measure what the suggestion changes.
 `run` drives the real agent against the running backend and SPENDS MODEL
 CREDIT (it asks for confirmation unless --yes). Its records go to their own
 folder, never to the session logs. `grade` reads a folder of runs and costs
-nothing. The tasks are written for the bundled PGLib IEEE 14-bus profile.
+nothing. The tasks are written for the CIGRE MV demo (`cigre_mv`): a radial
+20 kV distribution network, so the sizes are distribution sizes and opening a
+line cuts customers off.
 
 Grading is deterministic, from the records — the same rule as the rest of
 `evaluation`: no LLM judge, nothing hand-labelled.
@@ -53,74 +55,80 @@ class Task(NamedTuple):
 # Every task also gets the generic checks in `_ALWAYS`.
 TASKS: tuple[Task, ...] = (
     Task("dc_flat",
-         ("What if we connect a 50 MW data centre at Bus 9? Compare with today.",),
-         ({"kind": "edit", "label": "edit: 50 MW load at Bus_9",
-           "match": {"op": "add_load", "bus": 9, "p_mw": 50}},
+         ("What if we connect a 2 MW data centre at Bus 9? Compare with today.",),
+         ({"kind": "edit", "label": "edit: 2 MW load at Bus 9",
+           "match": {"op": "add_load", "bus": 9, "p_mw": 2}},
           {"kind": "over_time", "label": "looked beyond one moment"})),
     Task("dc_follow_worst",
-         ("Add a 30 MW load at Bus 4 that follows the bus's own demand. When in the week is it "
+         ("Add a 1.5 MW load at Bus 4 that follows the bus's own demand. When in the week is it "
           "worst compared with today?",),
-         ({"kind": "edit", "label": "edit: 30 MW follow_bus load at Bus_4",
-           "match": {"op": "add_load", "bus": 4, "p_mw": 30, "profile": "follow_bus"}},
+         ({"kind": "edit", "label": "edit: 1.5 MW follow_bus load at Bus 4",
+           "match": {"op": "add_load", "bus": 4, "p_mw": 1.5, "profile": "follow_bus"}},
           {"kind": "over_time", "label": "studied the week"})),
     Task("factory_shift",
-         ("A 40 MW factory would run from 08:00 to 18:00 at Bus 13. Would it cause violations "
+         ("A 3 MW factory would run from 08:00 to 18:00 at Bus 11. Would it cause violations "
           "during the week?",),
-         ({"kind": "edit", "label": "edit: 40 MW shift 08–18 at Bus_13",
-           "match": {"op": "add_load", "bus": 13, "p_mw": 40, "profile": "shift",
+         ({"kind": "edit", "label": "edit: 3 MW shift 08–18 at Bus 11",
+           "match": {"op": "add_load", "bus": 11, "p_mw": 3, "profile": "shift",
                      "start_hour": 8, "end_hour": 18}},
           {"kind": "over_time", "label": "studied the week"})),
     Task("reinforce_after_load",
-         ("Create a proposal with a 60 MW load at Bus 9 and compare it with today at "
-          "2000-01-03 14:45.",
-          "Would doubling the line Bus_8 -> Bus_9 help?"),
-         ({"kind": "edit", "label": "edit: 60 MW load at Bus_9",
-           "match": {"op": "add_load", "bus": 9, "p_mw": 60}},
-          {"kind": "edit", "label": "edit: line L12 ×2", "match": {"op": "reinforce_line", "line": 12,
-                                                                   "factor": 2}},
+         ("Create a proposal with a 4 MW load at Bus 9 and compare it with today at "
+          "2000-01-03 19:00.",
+          "Would doubling the line Bus 8 -> Bus 9 help?"),
+         ({"kind": "edit", "label": "edit: 4 MW load at Bus 9",
+           "match": {"op": "add_load", "bus": 9, "p_mw": 4}},
+          {"kind": "edit", "label": "edit: line L6 ×2", "match": {"op": "reinforce_line", "line": 6,
+                                                                  "factor": 2}},
           {"kind": "tool", "label": "compared at the same moment",
-           "name": "compare_networks", "args": {"timestamp": "2000-01-03 14:45"}})),
+           "name": "compare_networks", "args": {"timestamp": "2000-01-03 19:00"}})),
     Task("new_site_n1",
-         ("Build a new substation 5 km from Bus 9 with the same conductor as the line Bus_8 -> Bus_9 "
-          "and put a 15 MW data centre there. Is it N-1 secure?",),
-         ({"kind": "edit", "label": "edit: new bus 5 km from Bus_9 like L12",
-           "match": {"op": "add_bus_with_connection", "connect_to": 9, "length_km": 5, "line_like": 12}},
-          {"kind": "edit", "label": "edit: 15 MW load at the new bus",
-           "match": {"op": "add_load", "bus": 14, "p_mw": 15}},
+         ("Build a new substation 5 km from Bus 9 with the same conductor as the line Bus 8 -> Bus 9 "
+          "and put a 1 MW data centre there. Is it N-1 secure?",),
+         ({"kind": "edit", "label": "edit: new bus 5 km from Bus 9 like L6",
+           "match": {"op": "add_bus_with_connection", "connect_to": 9, "length_km": 5, "line_like": 6}},
+          {"kind": "edit", "label": "edit: 1 MW load at the new bus",
+           "match": {"op": "add_load", "bus": 15, "p_mw": 1}},
           {"kind": "n1_on_proposal", "label": "N-1 on the proposal"},
-          {"kind": "mentions", "label": "reported the line-length note",
-           "any": ["1 km", "placeholder", "impedance"]})),
+          # One line to the new site: its outage cuts the site off, whatever the flows.
+          {"kind": "mentions", "label": "said a single-line site loses supply",
+           "any": ["radial", "single line", "one line", "only connection", "lose supply", "loses supply",
+                   "loses its supply", "cut off", "islanded", "disconnected"]})),
     Task("open_line_n1",
-         ("What happens if we permanently open the line Bus_0 -> Bus_4 [L1]? Check N-1 too.",),
-         ({"kind": "edit", "label": "edit: open L1",
-           "match": {"op": "set_in_service", "element_type": "line", "element": 1, "in_service": False}},
-          {"kind": "n1_on_proposal", "label": "N-1 on the proposal"})),
+         ("What happens if we permanently open the line Bus 3 -> Bus 4 [L2]? Check N-1 too.",),
+         ({"kind": "edit", "label": "edit: open L2",
+           "match": {"op": "set_in_service", "element_type": "line", "element": 2, "in_service": False}},
+          {"kind": "n1_on_proposal", "label": "N-1 on the proposal"},
+          # The feeder is radial: opening L2 leaves Bus 4–6 without supply until a tie is closed.
+          {"kind": "mentions", "label": "said what loses supply",
+           "any": ["lose supply", "loses supply", "lost supply", "without supply", "no supply", "cut off",
+                   "islanded", "disconnected", "de-energised", "de-energized"]})),
     Task("wind_week",
-         ("Add a 20 MW wind farm at Bus 13 and compare the external grid import with today over "
+         ("Add a 2 MW wind farm at Bus 11 and compare the external grid import with today over "
           "the week.",),
-         ({"kind": "edit", "label": "edit: 20 MW wind at Bus_13",
-           "match": {"op": "add_generator", "bus": 13, "p_max_mw": 20, "kind": "wind"}},
+         ({"kind": "edit", "label": "edit: 2 MW wind at Bus 11",
+           "match": {"op": "add_generator", "bus": 11, "p_max_mw": 2, "kind": "wind"}},
           {"kind": "over_time", "label": "studied the week"})),
     Task("trafo_upgrade",
-         ("Would upgrading the transformer Bus_3 -> Bus_8 [T1] to 80 MVA change anything at the "
+         ("Would upgrading the transformer Bus 0 -> Bus 1 [T0] to 40 MVA change anything at the "
           "worst hour of the week?",),
-         ({"kind": "edit", "label": "edit: T1 to 80 MVA",
-           "match": {"op": "upgrade_trafo", "trafo": 1, "new_sn_mva": 80}},
+         ({"kind": "edit", "label": "edit: T0 to 40 MVA",
+           "match": {"op": "upgrade_trafo", "trafo": 0, "new_sn_mva": 40}},
           {"kind": "over_time", "label": "found the worst hour"})),
     Task("classical_generator",
-         ("Add a 30 MW generator at Bus 4 and tell me whether the grid stays secure.",
+         ("Add a 2 MW generator at Bus 4 and tell me whether the grid stays secure.",
           "A classical one that holds its bus voltage — use 1.0 p.u."),
          ({"kind": "asked", "label": "asked how the unit is modelled before building it"},
-          {"kind": "edit", "label": "edit: 30 MW unit on voltage control at Bus_4",
-           "match": {"op": "add_generator", "bus": 4, "p_max_mw": 30, "control": "voltage", "vm_pu": 1.0}})),
+          {"kind": "edit", "label": "edit: 2 MW unit on voltage control at Bus 4",
+           "match": {"op": "add_generator", "bus": 4, "p_max_mw": 2, "control": "voltage", "vm_pu": 1.0}})),
     Task("new_substation_trafo",
-         ("Build a new 20 kV substation at Bus 9 with two 40 MVA transformers (vk 12 %, vkr 0.4 %) "
-          "and connect a 30 MW data centre to it. Is it N-1 secure?",),
-         ({"kind": "edit", "label": "edit: 2 × 40 MVA transformer to a 20 kV bus at Bus_9",
-           "match": {"op": "add_bus_with_transformer", "connect_to": 9, "vn_kv": 20, "sn_mva": 40,
-                     "parallel": 2, "vk_percent": 12}},
-          {"kind": "edit", "label": "edit: 30 MW load at the new bus",
-           "match": {"op": "add_load", "bus": 14, "p_mw": 30}},
+         ("Build a new 0.4 kV substation at Bus 9 with two 0.63 MVA transformers (vk 6 %, vkr 1 %) "
+          "and connect a 0.8 MW data centre to it. Is it N-1 secure?",),
+         ({"kind": "edit", "label": "edit: 2 × 0.63 MVA transformer to a 0.4 kV bus at Bus 9",
+           "match": {"op": "add_bus_with_transformer", "connect_to": 9, "vn_kv": 0.4, "sn_mva": 0.63,
+                     "parallel": 2, "vk_percent": 6}},
+          {"kind": "edit", "label": "edit: 0.8 MW load at the new bus",
+           "match": {"op": "add_load", "bus": 15, "p_mw": 0.8}},
           {"kind": "n1_on_proposal", "label": "N-1 on the proposal"},
           {"kind": "mentions", "label": "reported how the units are modelled",
            "any": ["together", "one branch", "label", "per unit"]})),
@@ -185,6 +193,15 @@ def check(spec: dict, records: list[dict]) -> bool:
     if kind == "named":
         used = any(_on_proposal(r) for _, r in _successful(records))
         return used and not any(PROPOSAL_NOTE_PREFIX in (rec.get("assistant") or "") for rec in records)
+    if kind == "mentions_all":
+        # Every item (a string, or a list of alternatives), read as "mentions" reads.
+        text = re.sub(r"[*`]+", "", " ".join(rec.get("assistant") or "" for rec in records)).casefold()
+        text = text.replace("\u2019", "'")                  # "can’t" as "can't"
+        # `unless_any`: words that take it back ("I can't present it as a tie").
+        if any(w.casefold() in text for w in spec.get("unless_any", ())):
+            return False
+        return all(any(alt.casefold() in text for alt in ([item] if isinstance(item, str) else item))
+                   for item in spec["all"])
     if kind == "mentions":
         # Without bold or code marks: "does **not** establish" is "does not establish" (underscores stay: Bus_29).
         text = re.sub(r"[*`]+", "", " ".join(rec.get("assistant") or "" for rec in records)).casefold()
@@ -345,7 +362,7 @@ class Suite(NamedTuple):
     scenario: str            # the scenario that loads it
 
 
-WHATIF = Suite("whatif", TASKS, _ALWAYS, "14", "Demo: IEEE 14 · smaller")
+WHATIF = Suite("whatif", TASKS, _ALWAYS, "CIGRE", "Demo: CIGRE MV · distribution with DER")
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +393,13 @@ def _clear_proposals() -> None:
         _backend("delete", f"/api/proposals/{prop['id']}")
 
 
-def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[dict]:
-    """One run of one task through the real agent. Returns its turn records."""
+def run_task(task: Task, repeat: int, follow_suggestion: bool = False, *, reflection: str = "off",
+             reading_check: bool | None = None, deep: bool | None = None) -> list[dict]:
+    """One run of one task through the real agent. Returns its turn records.
+
+    The defaults are the configuration every reported suite result was produced
+    under (answer review off, the reading check as configured, Deep Research as
+    the task says); an ablation arm sets them (`evaluation.ablation`)."""
     from llm_agent.agent import loop, recommender
 
     _clear_proposals()
@@ -392,7 +414,8 @@ def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[d
         visible = []
         for i, question in enumerate(task.turns):
             text, history = loop.run_agent_turn(question, history, conversation_id=conversation,
-                                                reflection="off", deep=task.deep and i == 0)
+                                                reflection=reflection, reading_check=reading_check,
+                                                deep=(task.deep if deep is None else deep) and i == 0)
             visible += [{"role": "user", "text": question}, {"role": "assistant", "text": text}]
         if follow_suggestion and records:
             proposals = _backend("get", "/api/proposals").get("proposals") or []
@@ -401,7 +424,8 @@ def run_task(task: Task, repeat: int, follow_suggestion: bool = False) -> list[d
             picks = [s for s in result.suggestions if s.angle == "stress"] or list(result.suggestions)
             if picks:
                 records[-1] = {**records[-1], "followed_suggestion": picks[0].as_record()}
-                loop.run_agent_turn(picks[0].prompt, history, conversation_id=conversation, reflection="off")
+                loop.run_agent_turn(picks[0].prompt, history, conversation_id=conversation, reflection=reflection,
+                                    reading_check=reading_check)
     finally:
         loop._append_to_log = original
     return records

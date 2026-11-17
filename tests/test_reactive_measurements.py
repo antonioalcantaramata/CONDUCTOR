@@ -138,7 +138,7 @@ class TestThroughTheBackend:
         pytest.importorskip("fastapi.testclient")
         import main_backend as mb
         from fastapi.testclient import TestClient
-        monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+        monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
         monkeypatch.setattr(mb, "SYSTEMS_DIR", str(tmp_path / "systems"))
         monkeypatch.setattr(mb, "DATA_FILES_DIR", str(tmp_path / "data_files"))
         for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -161,6 +161,9 @@ class TestThroughTheBackend:
     def test_studies_use_the_measured_reactive_power(self, upload):
         c, out = upload
         assert out["quality"]["reactive"] == {"consumption": True, "production": True}
+        # The demo loads Gen_bus1 on voltage control; at a fixed power factor it takes the measured Q.
+        assert c.post("/api/generators", json={"changes": [
+            {"unit": "Gen_bus1", "control": "power_factor"}]}).status_code == 200
         snap = c.post("/api/network/snapshot", json={"timestamp": "2001-01-01 00:00"}).json()
         assert {round(l["Q_mvar"], 4) for l in snap["loads"]} == {4.0}
         assert snap["load_power_factor"]["measured_reactive_power"]["share_of_load"] == 1.0
@@ -199,7 +202,7 @@ def test_voltage_units_can_be_switched_to_follow_the_measured_reactive_power(tmp
     pytest.importorskip("fastapi.testclient")
     import main_backend as mb
     from fastapi.testclient import TestClient
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(tmp_path / "systems"))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(tmp_path / "data_files"))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -208,7 +211,7 @@ def test_voltage_units_can_be_switched_to_follow_the_measured_reactive_power(tmp
     saved = dict(mb.app_data)
     try:
         with TestClient(mb.app) as c:
-            c.post("/api/generators", json={"changes": [{"unit": "Gen_bus1", "control": "voltage"}]})
+            # The demo loads Gen_bus1 on voltage control already (its profile's unit model).
             names = sorted({f"Bus_{b}" for b in mb.app_data["net"].load.bus} | {"Bus_1"})
             rows = [f"2001-01-01 00:{m:02d}:00,{n},10,{20 if n == 'Bus_1' else 0},,{(5 + m / 15) if n == 'Bus_1' else ''}"
                     for m in (0, 15, 30) for n in names]
@@ -226,7 +229,12 @@ def test_voltage_units_can_be_switched_to_follow_the_measured_reactive_power(tmp
             assert g1["Qg_mvar"] == pytest.approx(7.0)                               # the measurement
             q = c.get("/api/data/quality").json()["measurements"]
             assert not any(f["code"] == "reactive_at_voltage_units" for f in q["findings"])
-            bad = c.post("/api/generators/follow_measured", json={"substations": ["Bus_2"]})
+            bad = c.post("/api/generators/follow_measured", json={"substations": ["Bus_2"]})   # no unit
+            assert bad.status_code == 400 and "No voltage-controlled generator" in bad.json()["detail"]
+            # IEEE 30 has no condenser: make the Bus_10 unit one (no active power capacity).
+            net = mb.app_data["net"]
+            net.gen.loc[net.gen.bus == 10, ["max_p_mw", "p_mw"]] = 0.0
+            bad = c.post("/api/generators/follow_measured", json={"substations": ["Bus_10"]})
             assert bad.status_code == 400 and "condenser" in bad.json()["detail"]
     finally:
         mb.app_data.clear()

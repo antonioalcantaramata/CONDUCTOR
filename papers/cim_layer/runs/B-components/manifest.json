@@ -1,0 +1,252 @@
+{
+ "kind": "ablation",
+ "study": "components",
+ "question": "Leave one out: what each part of CONDUCTOR adds over the rest (the paper's main table).",
+ "status": "finished",
+ "started": "2026-11-03T18:52:22",
+ "updated": "2026-11-04T08:15:37",
+ "commit": "3aa1afce42bdac12ecb6929d592cef9bda22dd6e",
+ "uncommitted_changes": false,
+ "arms": [
+  {
+   "name": "full",
+   "spec": "full:",
+   "settings": {},
+   "hash": "44136fa355b3",
+   "describe": "as it is",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {},
+   "tools_hidden": []
+  },
+  {
+   "name": "no-semantic-layer",
+   "spec": "no-semantic-layer: ontology=off",
+   "settings": {
+    "ontology": "off"
+   },
+   "hash": "6cb0859ccf49",
+   "describe": "ontology=off",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "element_identity": 772
+   },
+   "tools_hidden": [
+    "declare_network_facts",
+    "describe_network"
+   ]
+  },
+  {
+   "name": "no-reading-check",
+   "spec": "no-reading-check: reading_check=off",
+   "settings": {
+    "reading_check": "off"
+   },
+   "hash": "374e921219f8",
+   "describe": "reading_check=off",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {},
+   "tools_hidden": []
+  },
+  {
+   "name": "no-routing-rules",
+   "spec": "no-routing-rules: drop_rules=routing",
+   "settings": {
+    "drop_rules": [
+     "routing"
+    ]
+   },
+   "hash": "b789e3530391",
+   "describe": "drop_rules=routing",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "routing": 12663
+   },
+   "tools_hidden": []
+  },
+  {
+   "name": "no-evidence-wording",
+   "spec": "no-evidence-wording: drop_rules=evidence_wording",
+   "settings": {
+    "drop_rules": [
+     "evidence_wording"
+    ]
+   },
+   "hash": "81c63bdb7f12",
+   "describe": "drop_rules=evidence_wording",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "evidence_wording": 441
+   },
+   "tools_hidden": []
+  },
+  {
+   "name": "no-ask-first",
+   "spec": "no-ask-first: drop_rules=ask_first",
+   "settings": {
+    "drop_rules": [
+     "ask_first"
+    ]
+   },
+   "hash": "0a12b07c05fc",
+   "describe": "drop_rules=ask_first",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "ask_first": 861
+   },
+   "tools_hidden": []
+  },
+  {
+   "name": "no-investigation-tools",
+   "spec": "no-investigation-tools: hide_tools=group:investigation",
+   "settings": {
+    "hide_tools": [
+     "group:investigation"
+    ]
+   },
+   "hash": "4d1fc48724ca",
+   "describe": "hide_tools=group:investigation",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {},
+   "tools_hidden": [
+    "compute_violation_attribution",
+    "investigate",
+    "look_ahead",
+    "record_investigation",
+    "test_prevention"
+   ]
+  },
+  {
+   "name": "solver-only",
+   "spec": "solver-only: ontology=none reading_check=off",
+   "settings": {
+    "ontology": "none",
+    "reading_check": "off"
+   },
+   "hash": "3d414d8e49d4",
+   "describe": "ontology=none reading_check=off",
+   "backend": "none",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "element_identity": 772
+   },
+   "tools_hidden": [
+    "declare_network_facts",
+    "describe_network"
+   ]
+  }
+ ],
+ "baseline": "full",
+ "suites": [
+  "whatif",
+  "investigation",
+  "options",
+  "clarify",
+  "narration",
+  "semantics-cigre",
+  "semantics-ieee30",
+  "reasoning"
+ ],
+ "tasks": [
+  "whatif/dc_flat",
+  "whatif/dc_follow_worst",
+  "whatif/factory_shift",
+  "whatif/reinforce_after_load",
+  "whatif/new_site_n1",
+  "whatif/open_line_n1",
+  "whatif/wind_week",
+  "whatif/trafo_upgrade",
+  "whatif/classical_generator",
+  "whatif/new_substation_trafo",
+  "investigation/why_bus29",
+  "investigation/what_caused_overload",
+  "investigation/why_insecure",
+  "investigation/no_symptom",
+  "investigation/why_physics",
+  "investigation/what_if",
+  "investigation/why_method",
+  "investigation/own_hypotheses",
+  "investigation/untestable",
+  "investigation/why_outage",
+  "investigation/why_window",
+  "investigation/why_so_close",
+  "investigation/classical_views",
+  "investigation/recurring",
+  "investigation/prevention",
+  "investigation/look_ahead",
+  "investigation/deep_why",
+  "investigation/deep_analysis",
+  "investigation/injected_setpoint",
+  "options/options_peak",
+  "options/rule_out_unit",
+  "options/near_optimal",
+  "options/near_optimal_margin",
+  "options/branch_cap",
+  "options/n1_secure",
+  "options/n1_corrective",
+  "options/last_resort",
+  "options/hold_option",
+  "options/plan_peak",
+  "options/no_action",
+  "clarify/which_line",
+  "clarify/unstated_margin",
+  "clarify/secure_now",
+  "clarify/n1_unspecified",
+  "clarify/worst_outage",
+  "narration/hosting",
+  "narration/probabilistic",
+  "narration/robust",
+  "narration/envelope",
+  "narration/historical_risk",
+  "narration/renewables",
+  "semantics-cigre/cigre_renewables",
+  "semantics-cigre/cigre_levels",
+  "semantics-cigre/cigre_storage",
+  "semantics-cigre/cigre_outage",
+  "semantics-cigre/cigre_feeder",
+  "semantics-ieee30/ieee30_renewables",
+  "semantics-ieee30/ieee30_customers",
+  "semantics-ieee30/ieee30_level",
+  "semantics-ieee30/ieee30_radial",
+  "semantics-ieee30/ieee30_external",
+  "reasoning/names_cigre",
+  "reasoning/names_ieee30",
+  "reasoning/names_cigre_wind",
+  "reasoning/names_cigre_storage",
+  "reasoning/names_ieee30_wind",
+  "reasoning/drop_ieee30_none",
+  "reasoning/drop_ieee30_declared",
+  "reasoning/drop_cigre_stated",
+  "reasoning/drop_cigre_declared",
+  "reasoning/compose_t0",
+  "reasoning/compose_battery",
+  "reasoning/compose_l33",
+  "reasoning/compose_tie",
+  "reasoning/switches_open",
+  "reasoning/switches_loops",
+  "reasoning/switches_breakers",
+  "reasoning/switches_line148",
+  "reasoning/data_cigre",
+  "reasoning/data_ieee30",
+  "reasoning/data_cigre_wind",
+  "reasoning/data_cigre_battery",
+  "reasoning/data_cigre_load_split",
+  "reasoning/data_ieee30_solved",
+  "reasoning/para_weather",
+  "reasoning/para_vary",
+  "reasoning/para_variable",
+  "reasoning/persist_ieee30"
+ ],
+ "repeats": 3,
+ "order": "interleaved",
+ "command": "python -m evaluation.ablation run components --repeats 3 --out papers/gm2027/runs/B-components",
+ "python": "3.12.16",
+ "seconds": 48195,
+ "changes": []
+}

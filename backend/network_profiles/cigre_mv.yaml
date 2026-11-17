@@ -1,0 +1,37 @@
+name: "CIGRE MV Benchmark (with DER)"
+# pandapower's CIGRE medium-voltage benchmark (CIGRE Task Force C6.04.02):
+# a 110/20 kV substation feeding two 20 kV feeders, with every distributed
+# resource of the benchmark — eight PV units, a wind turbine, a CHP unit, fuel
+# cells and two batteries, each stated as such by its type. Three normally
+# open switches make the feeders radial; closing one meshes them.
+source: pandapower
+case: create_cigre_network_mv
+case_args:
+  with_der: all
+measurement_source: synthetic
+synthetic_n_days: 7
+synthetic_resolution_min: 15
+synthetic_load_profile: "residential"
+# Each unit follows the shape of the source the network states for it (the PV
+# units the sun, the wind turbine the wind, the CHP and fuel cells a flat
+# output); this one is for a unit whose source the network does not state.
+synthetic_generation_profile: "flat"
+# The benchmark's loads are peak demands (at them its feeder ends sit at
+# 0.944 p.u.); the usual daily peak here is 0.9 of them. Over the synthetic
+# week: undervoltage at the feeder ends in ~9 of 168 hours, all at the evening
+# peak (lowest ~0.94 p.u.); transformers up to ~92 % (October 2026 calibration).
+synthetic_peak_load_factor: 0.9
+synthetic_forecast_overlap_days: 2
+precomputed_ybus_path: null
+slack_max_mw: 999.0
+# Medium-voltage planning band.
+vm_lower: 0.95
+vm_upper: 1.05
+max_loading_pct: 100.0
+voltage_level_kv: 20
+grid_type: "distribution"
+slack_name: "External Grid"
+description: "Synthetic 7-day profile generated from pandapower's CIGRE MV benchmark with all its distributed resources: PV, wind, CHP, fuel cells and batteries, each typed by the network."
+# The loads' own power factor (the benchmark's loads draw Q/P ≈ 0.25): each
+# measured load's reactive power uses it until the operator sets another.
+load_power_factor: 0.97

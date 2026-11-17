@@ -74,7 +74,7 @@ def client(tmp_path, monkeypatch):
     systems, data = tmp_path / "systems", tmp_path / "data_files"
     systems.mkdir()
     data.mkdir()
-    monkeypatch.setenv("GRID_PROFILE", "pglib_case14")
+    monkeypatch.setenv("GRID_PROFILE", "pglib_case30")
     monkeypatch.setattr(mb, "SYSTEMS_DIR", str(systems))
     monkeypatch.setattr(mb, "DATA_FILES_DIR", str(data))
     for name in ("_LAST_UPLOAD_SENTINEL", "_LAST_TIMESERIES_SENTINEL", "_LAST_FORECAST_SENTINEL",
@@ -95,7 +95,7 @@ def test_the_session_request_works_end_to_end(client):
     prop = client.post("/api/grid/rsa", json={"timestamp": "2000-01-05 15:30:00", "network": "grid_1050"}).json()
     v_base = {v["bus_name"]: v["vm_pu"] for v in base["all_voltages"]}
     v_prop = {v["bus_name"]: v["vm_pu"] for v in prop["all_voltages"]}
-    assert abs(v_prop["Bus_0"] - 1.05) < 1e-6 and abs(v_base["Bus_0"] - 1.02) < 1e-6
+    assert abs(v_prop["Bus_0"] - 1.05) < 1e-6 and abs(v_base["Bus_0"] - 1.0) < 1e-6      # the demo: 1.0 p.u.
     assert v_prop["Bus_3"] > v_base["Bus_3"]                     # the raised grid voltage lifts the weak bus
     assert prop["network"]["id"] == "grid_1050" and "Set external grid" in prop["network"]["edits"][0]
 

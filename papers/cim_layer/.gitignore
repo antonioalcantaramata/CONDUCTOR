@@ -1,0 +1,5 @@
+# Not published: backend server logs (repeated library warnings, local paths) and scratch caches.
+runs/*/backends/
+runs/*/cache/
+runs/*/logs/
+runs/*/context/

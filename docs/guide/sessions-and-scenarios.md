@@ -4,7 +4,7 @@
 
 A **scenario** is what CONDUCTOR loads: **Resume** (your last uploaded network
 and data) or one of the **demos** (IEEE 30-bus, with or without reactive
-measurements, and the smaller IEEE 14-bus). Choose it on the launch screen
+measurements, and the CIGRE MV distribution benchmark). Choose it on the launch screen
 (it loads at once), or later in the sidebar under **Settings → Scenario** with
 **Load**, which starts a new conversation (the old one was about another grid).
 

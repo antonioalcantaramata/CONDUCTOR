@@ -47,7 +47,9 @@ MAX_SUGGESTIONS = 4
 # Clock control is left out of what the agent is told it can suggest: a
 # suggestion names its timestamp explicitly, so the operator's view of the
 # simulation clock is never moved by following one.
-_EXCLUDED_CAPABILITIES = frozenset({"get_current_timestamp", "advance_timestamp"})
+# Not studies to suggest: the clock, and recording what the operator states
+# about the network (only they can say it).
+_EXCLUDED_CAPABILITIES = frozenset({"get_current_timestamp", "advance_timestamp", "declare_network_facts"})
 
 # How much of the conversation the agent sees. Older turns matter less than
 # the cost of sending them on every request.
@@ -72,6 +74,10 @@ class Suggestion(NamedTuple):
     # Figures in `why` that appear nowhere in this conversation's evidence,
     # rendered for display ("1.07 p.u."). Empty when everything traced.
     unverified: tuple[str, ...] = ()
+    # What the CIM layer contradicts or does not support in it (advisor_layer.Review.flags).
+    layer: tuple[str, ...] = ()
+    # The groups its prompt names by meaning, resolved against the layer (advisor_layer.group_phrases).
+    groups: tuple[dict, ...] = ()
 
     def as_record(self) -> dict:
         return {
@@ -80,6 +86,8 @@ class Suggestion(NamedTuple):
             "prompt": self.prompt,
             "why": self.why,
             "unverified": list(self.unverified),
+            "layer": list(self.layer),
+            "groups": list(self.groups),
         }
 
 
@@ -89,6 +97,7 @@ class SuggestionResult(NamedTuple):
     # suggestions. Opinion, labelled as such; its figures are checked like `why`.
     comment: str = ""
     comment_unverified: tuple[str, ...] = ()
+    comment_layer: tuple[str, ...] = ()
     # The agent's own explanation when it has nothing useful to suggest.
     note: str = ""
     # Set when the call or the parse failed; the UI shows a short message,
@@ -338,11 +347,13 @@ def capability_list() -> list[tuple[str, str]]:
     agents cannot disagree about what CONDUCTOR can do.
     """
     from .providers.schema import function_declarations
+    from .tool_registry import EVALUATION_ONLY
     from .tool_schemas import TOOLS
 
     out = []
     for fd in function_declarations(TOOLS):
-        if fd.name in _EXCLUDED_CAPABILITIES:
+        # Evaluation-only tools are withheld from the orchestrator in normal use, so from here too.
+        if fd.name in _EXCLUDED_CAPABILITIES or fd.name in EVALUATION_ONLY:
             continue
         out.append((fd.name, _first_sentence(fd.description or "")))
     return out
@@ -423,11 +434,12 @@ def _compact(value: Any, depth: int = 0) -> Any:
 
 def compact_turn(record: dict, max_chars_per_tool: int = 3000) -> dict:
     """The latest turn, reduced to what the suggestion agent needs."""
+    from .grid_context import without_links
     from .loop import _compact_for_model
 
     tools = []
     for call, result in zip(record.get("tool_calls") or [], record.get("tool_results") or []):
-        payload = _compact_for_model(result.get("name", ""), result.get("result"))
+        payload = without_links(_compact_for_model(result.get("name", ""), result.get("result")))
         view = _compact(payload)
         text = json.dumps(view, ensure_ascii=False, default=str)
         if len(text) > max_chars_per_tool:
@@ -512,7 +524,9 @@ def answer_concerns(record: dict | None) -> list[str]:
             out.append(f"answer check: {shown(v.claim.value, v.claim.unit)} appears in no tool result "
                        "(the agent may have computed or estimated it)")
     for c in conflicts:
-        if c.path in ("evidence", "investigation"):
+        if c.path == "entities":
+            out.append(f"answer check: against the CIM layer, \"{c.context[:120]}\" {c.detail}")
+        elif c.path in ("evidence", "investigation"):
             out.append(f"answer check: \"{c.context[:120]}\" {c.detail}")
         elif c.study:
             out.append(f"answer check: the answer reads as reassuring, but {c.detail} ({c.path})")
@@ -732,6 +746,12 @@ def _session_parts(messages: list[dict], record: dict | None, context: dict,
     attention = needs_attention(record)
     if attention:
         parts.append("## Concerns raised by the system\n" + "\n".join(f"- {r}" for r in attention))
+    # The CIM layer: what it says about the elements the latest results name, and what the conclusion depends on
+    # that it does not say — each with how to use it, sent only when there is something to say.
+    from . import advisor_layer
+    for block in (advisor_layer.context_block(record), advisor_layer.gap_block(advisor_layer.fact_gaps(record))):
+        if block:
+            parts.append(block)
     sets = option_sets(records or ([record] if record else []))
     if sets:
         parts.append("## Corrective options (solver results; name them as listed, e.g. "
@@ -883,6 +903,7 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
         return SuggestionResult((), error=f"The suggestion agent could not be reached: {exc}")
 
     result = parse_response(response.text or "", shown)
+    result = _with_fact_question(result, latest)
     if result.suggestions or result.comment:
         # Grounding is a check: if it fails, the comment and suggestions are
         # still shown, unmarked, rather than lost.
@@ -893,7 +914,41 @@ def suggest(messages: list[dict], latest: dict | None, records: list[dict],
             )
         except Exception:  # noqa: BLE001
             logger.warning("Could not ground suggestion figures.", exc_info=True)
+        result = _reviewed(result, latest)
     return result
+
+
+def _with_fact_question(result: SuggestionResult, latest: dict | None) -> SuggestionResult:
+    """When the conclusion moved with what units the network does not say are (the reading check), at least one
+    suggestion asks the operator about them; the advisor was told so, and if it did not, one is added — in place
+    of the last when the list is full."""
+    from . import advisor_layer
+    try:
+        gaps = advisor_layer.fact_gaps(latest)
+        if not gaps or not result.ok or any(advisor_layer.asks_about(f"{s.title} {s.prompt} {s.why}", gaps)
+                                            for s in result.suggestions):
+            return result
+        added = advisor_layer.gap_suggestion(gaps, latest)
+        kept = list(result.suggestions)[:MAX_SUGGESTIONS - 1]
+        return result._replace(suggestions=tuple([*kept, added]))
+    except Exception:  # noqa: BLE001 — a question not added, never a reply lost
+        logger.warning("Could not add the question on unknown facts.", exc_info=True)
+        return result
+
+
+def _reviewed(result: SuggestionResult, latest: dict | None) -> SuggestionResult:
+    """The comment and each suggestion checked against the CIM layer; each suggestion's group phrases resolved."""
+    from . import advisor_layer
+    try:
+        texts = [result.comment] + [t for s in result.suggestions for t in (s.title, s.why, s.prompt)]
+        review = advisor_layer.Review(texts, latest)
+        return result._replace(
+            comment_layer=review.flags(result.comment),
+            suggestions=tuple(s._replace(layer=review.flags(s.title, s.why, s.prompt), groups=review.groups(s.prompt))
+                              for s in result.suggestions))
+    except Exception:  # noqa: BLE001 — shown unreviewed rather than lost
+        logger.warning("Could not review the suggestions against the CIM layer.", exc_info=True)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -911,10 +966,12 @@ class Study(NamedTuple):
     prompt: str
     why: str = ""
     unverified: tuple[str, ...] = ()
+    layer: tuple[str, ...] = ()
+    groups: tuple[dict, ...] = ()
 
     def as_record(self) -> dict:
         return {"title": self.title, "prompt": self.prompt, "why": self.why,
-                "unverified": list(self.unverified)}
+                "unverified": list(self.unverified), "layer": list(self.layer), "groups": list(self.groups)}
 
 
 class AdvisorReply(NamedTuple):
@@ -926,6 +983,8 @@ class AdvisorReply(NamedTuple):
     raw: str = ""
     # What the operator has said matters for the decision, so far.
     criteria: tuple[str, ...] = ()
+    # What the CIM layer contradicts or does not support in `text`.
+    layer: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -945,6 +1004,7 @@ class DecisionNote(NamedTuple):
     # (`resolve_option`); `chosen_unresolved` is a name the session has no option for.
     chosen_option: dict | None = None
     chosen_unresolved: str = ""
+    layer: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -954,7 +1014,8 @@ class DecisionNote(NamedTuple):
         return {"decision": self.decision, "evidence": list(self.evidence),
                 "open_risks": list(self.open_risks), "studies_run": list(self.studies_run),
                 "unverified": list(self.unverified), "criteria": list(self.criteria),
-                "chosen_option": self.chosen_option, "chosen_unresolved": self.chosen_unresolved}
+                "chosen_option": self.chosen_option, "chosen_unresolved": self.chosen_unresolved,
+                "layer": list(self.layer)}
 
 
 def _thread_text(thread: list[dict]) -> str:
@@ -1086,6 +1147,16 @@ def discuss(question: str, thread: list[dict], messages: list[dict], latest: dic
                                    studies=tuple(st._replace(unverified=check(st.why)) for st in reply.studies))
         except Exception:  # noqa: BLE001 — shown unmarked rather than lost
             logger.warning("Could not ground the advisor's figures.", exc_info=True)
+        try:
+            from . import advisor_layer
+            review = advisor_layer.Review([reply.text] + [t for st in reply.studies for t in (st.title, st.why,
+                                                                                             st.prompt)], latest)
+            reply = reply._replace(layer=review.flags(reply.text),
+                                   studies=tuple(st._replace(layer=review.flags(st.title, st.why, st.prompt),
+                                                             groups=review.groups(st.prompt))
+                                                 for st in reply.studies))
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not review the advisor's reply against the CIM layer.", exc_info=True)
     return reply
 
 
@@ -1112,4 +1183,10 @@ def decision_note(thread: list[dict], messages: list[dict], latest: dict | None,
             note = note._replace(unverified=check(text))
         except Exception:  # noqa: BLE001
             logger.warning("Could not ground the decision note's figures.", exc_info=True)
+        try:
+            from . import advisor_layer
+            texts = [note.decision, *note.evidence, *note.open_risks]
+            note = note._replace(layer=advisor_layer.Review(texts, latest).flags(*texts))
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not review the decision note against the CIM layer.", exc_info=True)
     return note

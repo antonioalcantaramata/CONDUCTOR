@@ -69,12 +69,35 @@ to answer without part of its depth, CONDUCTOR reminds it once. It then either
 does that part or says why it does not apply. The icon turns itself off after
 each question.
 
+## What the network is
+
+Questions about the network itself are answered from its
+[CIM layer](what-the-network-is.md), with how each fact is known: stated by
+the network, read from a name, inferred from the topology, or not stated.
+
+| Question | Ask, for example |
+| --- | --- |
+| **What an element is** — a unit's energy source, a load's category, a bus's voltage level | *Which units are solar?* · *Where is the storage?* · *What voltage levels does the network have?* |
+| **Switches and feeders** — normal states, ties, what each feeder supplies | *Which switches are normally open, and which one ties two feeders?* · *Which feeder supplies Bus 9?* |
+| **What an outage cuts off** — the buses and loads that lose supply, and the ties that could restore them | *If Line 2-3 trips, which loads lose supply, and which switch could restore them?* |
+| **Where a value comes from** — measured, a share of its bus's measurement, or derived from an assumption | *Is Load R5's reactive demand measured?* |
+| **Where the grid's power comes in** | *Which lines carry the power from the external grid?* |
+
+When the network does not say something, CONDUCTOR says so instead of
+guessing from a name. Tell it what you know and it records it for every later
+study: *"Gen_bus12 is a wind farm."* · *"Fuel cell 1 has been replaced by a
+wind turbine."* A study that scales wind and solar output then includes that
+unit. A tie that could restore supply is checked with a power flow at the
+current operating point (what it restores, voltages, loadings); it is one
+moment's check, not a switching plan.
+
 ## Contingencies (N-1)
 
 | Study | Ask, for example |
 | --- | --- |
 | **One outage** | *What happens if the line Bus_0 – Bus_1 trips?* |
 | **Every single outage** — each line and transformer out in turn; an outage that breaks a limit, or cuts load off, makes the grid not N-1 secure | *Which single N-1 outage is the most critical right now?* · *Is the grid N-1 secure at the worst moment of the week?* |
+| **The outages of one feeder, substation or voltage level** | *Run N-1 on the 20 kV level.* · *Is feeder Line 1-2 N-1 secure?* |
 | **Corrective dispatch after an outage** | *If that line trips, can redispatch restore security, and how?* |
 
 ## Over time, scenarios and risk
@@ -454,6 +477,7 @@ See [What-if proposals](what-if-proposals.md).
 - *Put Gen_bus1 on voltage control at 1.02 p.u.*
 - *Set the up-regulation cost of Gen_bus1 to 80 €/MWh.*
 - *Rename Bus 3 to North.*
+- *Gen_bus12 is a wind farm.*
 
 These change every later study; CONDUCTOR says so. The same settings are in the
 [System tab](system-tab.md).

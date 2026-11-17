@@ -4,7 +4,7 @@ Limits, datasets and time windows travel intact (code review batch A).
 Each test reproduces a defect found in the October 2026 review — a valid
 solver given the wrong limits, dataset or moment, returning a confident answer
 — and pins the fix. The endpoint tests run the real backend in-process on the
-bundled IEEE 14-bus profile (about 1.5 s to start, no IPOPT needed), isolated
+bundled IEEE 30-bus demo profile (about 1.5 s to start, no IPOPT needed), isolated
 from any network or data uploaded on this machine.
 """
 
@@ -23,7 +23,8 @@ from llm_agent.agent.validators import (  # noqa: E402
     validate_call,
 )
 
-NETWORK_LIMITS = {"vm_upper_pu": 1.06, "vm_lower_pu": 0.94,
+# The IEEE 30 demo's own limits (backend/network_profiles/pglib_case30.yaml).
+NETWORK_LIMITS = {"vm_upper_pu": 1.05, "vm_lower_pu": 0.95,
                   "max_line_loading_pct": 100.0, "max_trafo_loading_pct": 100.0}
 
 
@@ -41,8 +42,12 @@ class TestLimits:
     def test_unset_limits_are_the_networks_own(self, client):
         assert client.post("/api/grid/rsa", json={}).json()["thresholds_used"] == NETWORK_LIMITS
 
-    def test_explicit_generic_values_are_honoured(self, client):
+    def test_explicit_generic_values_are_honoured(self, client, monkeypatch):
         """0.95 / 1.05 / 90 used to mean "not specified" and were replaced."""
+        # A network band other than the generic one, so an explicit 0.95 / 1.05
+        # replaced by the network's would show (the demo's own band is 0.95–1.05).
+        monkeypatch.setitem(mb.app_data, "default_vm_lower", 0.94)
+        monkeypatch.setitem(mb.app_data, "default_vm_upper", 1.06)
         used = client.post("/api/grid/rsa", json={
             "vm_lower_pu": 0.95, "vm_upper_pu": 1.05, "max_line_loading_pct": 90,
         }).json()["thresholds_used"]

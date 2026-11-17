@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: >-
+  If you use CONDUCTOR, please cite the paper describing it. If you use the CIM layer, or the answer checks that
+  read it, please also cite the CIM layer paper listed under references.
+title: CONDUCTOR
+abstract: >-
+  An LLM-orchestrated digital twin for distribution grid operations, which reads the network through a Common
+  Information Model (CIM) layer.
+type: software
+authors:
+  - family-names: Alcántara
+    given-names: Antonio
+  - family-names: Kahraman
+    given-names: Aysegül
+  - family-names: Sundhu
+    given-names: Anosh Arshad
+  - family-names: Chatzivasileiadis
+    given-names: Spyros
+repository-code: https://github.com/antonioalcantaramata/CONDUCTOR
+url: https://antonioalcantaramata.github.io/CONDUCTOR/
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "CONDUCTOR: An LLM-Orchestrated Digital Twin for Uncertainty-Aware Distribution Grid Operations"
+  authors:
+    - family-names: Alcántara
+      given-names: Antonio
+    - family-names: Kahraman
+      given-names: Aysegül
+    - family-names: Sundhu
+      given-names: Anosh Arshad
+    - family-names: Chatzivasileiadis
+      given-names: Spyros
+  year: 2026
+  journal: arXiv preprint
+  identifiers:
+    - type: doi
+      value: 10.48550/arXiv.2606.24609
+  url: https://arxiv.org/abs/2606.24609
+references:
+  - type: article
+    title: "The Grid's Own Language: A Common Information Model Layer for LLM Grid Assistants"
+    authors:
+      - family-names: Alcántara
+        given-names: Antonio
+      - family-names: Karampinis
+        given-names: Ioannis
+      - family-names: Chatzivasileiadis
+        given-names: Spyros
+    year: 2026
+    journal: arXiv preprint
+    identifiers:
+      - type: doi
+        value: 10.48550/arXiv.2611.20026
+    url: https://arxiv.org/abs/2611.20026

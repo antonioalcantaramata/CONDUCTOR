@@ -29,6 +29,13 @@ alternatives are the ones an operator would plausibly have meant:
   voltage band        the common ±5 % band, when the network's own differs
   data                the forecast for a measured moment that also has one
                       (and the measurements for a forecast one)
+  what units are      when the study depends on which units are wind or
+                      solar (a renewable scaling, an optimisation, which may
+                      only curtail them) and the CIM layer does not know some:
+                      the units whose source is unknown counted as wind or
+                      solar, and the units known only by their name not
+                      counted (`fact_readings`; the backend's
+                      `assume_unit_sources`, nothing kept)
 
 The studies re-run are those with one clear verdict and no side effects: the
 security assessment, single and full N-1 screens, and the two optimisations
@@ -56,7 +63,11 @@ from .validators import _ACTUALS_WORD_RE, _FORECAST_WORD_RE, _PF_WORD_RE, reques
 HOLDS, SHIFTS, CHANGES, FAILED = "holds", "shifts", "changes", "failed"
 
 STUDIES = ("run_rsa", "simulate_contingency", "simulate_all_contingencies", "optimize_flexibility",
-           "optimize_contingency", "investigate")
+           "optimize_contingency", "investigate", "scan_scenarios")
+# A renewable scenario scan is re-run only on what the units are (`fact_readings`), and only when short: its
+# other readings would cost a scan each.
+_FACTS_ONLY = ("scan_scenarios",)
+MAX_SCAN_TICKS = 200
 _ASSESSMENTS = ("run_rsa", "simulate_contingency", "simulate_all_contingencies", "investigate")
 MAX_RERUNS = 8
 MAX_STUDIES = 2
@@ -221,6 +232,15 @@ def verdict(tool: str, result: Any) -> Verdict | None:
                 "no_reference": "no moment without the problem", "no_change": "no change to explain",
                 "not_decomposed": "the change could not be divided"}
         return Verdict(status, None, said[status]) if status in said else None
+    if tool == "scan_scenarios":
+        # Its conclusion: under which scenarios something breaks a limit.
+        rows = [(s.get("label") or f"×{s.get('sgen_scale')}", int((s.get("summary") or {}).get("total_violations") or 0))
+                for s in result.get("scenarios") or []]
+        if not rows:
+            return None
+        key = tuple((label, n > 0) for label, n in rows)
+        return Verdict(key, float(sum(n for _l, n in rows)),
+                       "; ".join(f"{label}: {n} violation{'s' if n != 1 else ''}" for label, n in rows))
     if tool in ("optimize_flexibility", "optimize_contingency"):
         status = result.get("status")
         if status == "options":
@@ -289,6 +309,8 @@ def readings(tool: str, args: dict, result: dict, prompt: str, grid: dict | None
     being present settles nothing; a value other than the default does (it
     came from earlier in the conversation, or from a setting the operator
     chose), and is left alone."""
+    if tool in _FACTS_ONLY:
+        return []
     grid, settings = grid or {}, settings or {}
     stated = _stated(prompt or "")
     out: list[Reading] = []
@@ -337,6 +359,45 @@ def readings(tool: str, args: dict, result: dict, prompt: str, grid: dict | None
 # The check
 # ---------------------------------------------------------------------------
 
+# Studies whose result depends on which units are wind or solar even unscaled: the optimisations, which may
+# only curtail those units and do not price them as conventional ones.
+_SOURCE_DEPENDENT = ("optimize_flexibility", "optimize_contingency")
+_SHOWN = 3
+
+
+def _names(units: list[str]) -> str:
+    shown = ", ".join(units[:_SHOWN])
+    return shown + (f" and {len(units) - _SHOWN} more" if len(units) > _SHOWN else "")
+
+
+def depends_on_sources(tool: str, args: dict, result: dict) -> bool:
+    """Whether a study's result depends on which units are wind or solar."""
+    factor = (args or {}).get("sgen_scaling_factor")
+    return (tool in _SOURCE_DEPENDENT or (factor is not None and abs(float(factor) - 1.0) > 1e-9)
+            or bool((result or {}).get("renewables_scaled")))
+
+
+def fact_readings(tool: str, args: dict, result: dict, units: dict | None) -> list[Reading]:
+    """The other readings of what the units are, for a study that depends on it (`depends_on_sources`):
+    the units whose source the CIM layer does not know counted as wind or solar, and those it knows only by
+    their name not counted. `units`: describe_network(about='units')'s `by_source`."""
+    if not units or not depends_on_sources(tool, args, result):
+        return []
+    unknown = [u["name"] for u in (units.get("unknown") or {}).get("units") or []]
+    named = [u["name"] for src in ("wind", "solar") for u in (units.get(src) or {}).get("units") or []
+             if u.get("basis") == "named"]
+    out = []
+    if unknown:
+        out.append(Reading("unit_sources", {"assume_unit_sources": {n: "wind" for n in unknown}},
+                           f"{_names(unknown)} counted as wind or solar",
+                           "not wind or solar (the network does not say what they are)"))
+    if named:
+        out.append(Reading("unit_sources", {"assume_unit_sources": {n: "conventional" for n in named}},
+                           f"{_names(named)} not counted as wind or solar",
+                           "wind or solar (read only from their names)"))
+    return out
+
+
 def _decisive(record: dict) -> list[tuple[str, dict, dict]]:
     """The studies to re-run: the last call of each kind, at most two, the
     later ones first (the answer's conclusion is usually the last study's)."""
@@ -356,6 +417,9 @@ def _decisive(record: dict) -> list[tuple[str, dict, dict]]:
         if name == "investigate" and (args.get("start_timestamp") or args.get("end_timestamp")
                                       or args.get("recurring")):
             continue                                     # a window or every episode: too slow to re-run
+        if name == "scan_scenarios" and int(result.get("n_scanned") or 0) * max(
+                len(result.get("scenarios") or []), 1) > MAX_SCAN_TICKS:
+            continue                                     # a long scan: too slow to re-run
         seen.add(name)
         out.append((name, args, result))
         if len(out) == MAX_STUDIES:
@@ -380,9 +444,15 @@ def check(record: dict, grid: dict | None = None, dispatch: dict | None = None,
         from .tools import _get
         settings = _get("/api/settings")
         settings = settings if isinstance(settings, dict) and "error" not in settings else {}
+    units = None
+    if any(depends_on_sources(tool, args, result) for tool, args, result in studies):
+        from .tools import _get
+        described = _get("/api/network/semantics?about=units")
+        units = described.get("by_source") if isinstance(described, dict) and "error" not in described else None
     plan = []
     for tool, args, result in studies:
-        for reading in readings(tool, args, result, record.get("user") or "", grid, settings):
+        for reading in (*readings(tool, args, result, record.get("user") or "", grid, settings),
+                        *fact_readings(tool, args, result, units)):
             plan.append((tool, args, result, reading))
     if not plan:
         return Report((), ("the question settled every reading these studies take",))
@@ -419,14 +489,16 @@ def check(record: dict, grid: dict | None = None, dispatch: dict | None = None,
 
 # The studies as a sentence names them.
 NOUNS = {"run_rsa": "security assessment", "simulate_contingency": "single-outage study",
+         "scan_scenarios": "scenario scan",
          "simulate_all_contingencies": "N-1 screen", "optimize_flexibility": "flexibility study",
          "optimize_contingency": "post-outage optimisation", "investigate": "investigation"}
 
 
 # What the reading check cannot tell, for the card's limits.
-BLIND_SPOT = ("The reading check varies only the load power factor, the loading limit, the voltage band and "
-              "measured or forecast data, for the assessment, the N-1 screens and the two optimisations; a "
-              "question open in another way is not re-checked.")
+BLIND_SPOT = ("The reading check varies only the load power factor, the loading limit, the voltage band, "
+              "measured or forecast data, and what the CIM layer does not know about which units are wind or "
+              "solar, for the assessment, the N-1 screens and the two optimisations (and, on what the units are "
+              "only, a short renewable scenario scan); a question open in another way is not re-checked.")
 
 # How CONDUCTOR's note under an answer begins (the app sets it apart).
 NOTE_PREFIX = "**Reading check.** CONDUCTOR re-ran"

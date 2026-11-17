@@ -9,7 +9,7 @@ Usage:
     py start.py                # Windows
 
 Environment overrides:
-    GRID_PROFILE=pglib_case14  # bundled network profile (default: pglib_case30)
+    GRID_PROFILE=cigre_mv      # bundled network profile (default: pglib_case30)
     BACKEND_PORT=8010          # FastAPI port   (default: 8000)
     STREAMLIT_PORT=8502        # Streamlit port (default: 8501)
     BACKEND_HOST=0.0.0.0       # bind address   (default: 127.0.0.1 — keep it

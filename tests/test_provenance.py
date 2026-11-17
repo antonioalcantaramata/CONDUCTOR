@@ -495,6 +495,8 @@ class TestClarifyingQuestions:
     ("an N-1-1 screen", []),
     ("line 95 % loaded", [95.0]),                  # a unit after it: a figure again
     ("3 lines are out", [3.0]),
+    ("With Line 2-3 out, Bus 4–11 lose supply", []),           # a branch by its ends; a range
+    ("Trafo 0-1 carries 21.5 MVA", [21.5]),
 ])
 def test_a_name_is_not_a_figure(text, values):
     # Observed live: the "0" of "N-0" and the "1" of "N-1" graded as figures.

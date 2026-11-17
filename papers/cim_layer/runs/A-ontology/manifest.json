@@ -1,0 +1,112 @@
+{
+ "kind": "ablation",
+ "study": "ontology",
+ "question": "What the semantic layer is worth \u2014 to the agent, and to the studies.",
+ "status": "finished",
+ "started": "2026-11-03T14:58:28",
+ "updated": "2026-11-03T17:04:19",
+ "commit": "5bdfb2eb1b0d20ac48669ad20f44367da71f2df7",
+ "uncommitted_changes": false,
+ "arms": [
+  {
+   "name": "on",
+   "spec": "on: ontology=on",
+   "settings": {
+    "ontology": "on"
+   },
+   "hash": "e94242b2fcc2",
+   "describe": "ontology=on",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {},
+   "tools_hidden": []
+  },
+  {
+   "name": "off",
+   "spec": "off: ontology=off",
+   "settings": {
+    "ontology": "off"
+   },
+   "hash": "6cb0859ccf49",
+   "describe": "ontology=off",
+   "backend": "on",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "element_identity": 772
+   },
+   "tools_hidden": [
+    "declare_network_facts",
+    "describe_network"
+   ]
+  },
+  {
+   "name": "none",
+   "spec": "none: ontology=none",
+   "settings": {
+    "ontology": "none"
+   },
+   "hash": "ccc56312855d",
+   "describe": "ontology=none",
+   "backend": "none",
+   "prompt_chars": 40766,
+   "prompt_chars_removed": {
+    "element_identity": 772
+   },
+   "tools_hidden": [
+    "declare_network_facts",
+    "describe_network"
+   ]
+  }
+ ],
+ "baseline": "on",
+ "suites": [
+  "semantics-cigre",
+  "semantics-ieee30",
+  "reasoning"
+ ],
+ "tasks": [
+  "semantics-cigre/cigre_renewables",
+  "semantics-cigre/cigre_levels",
+  "semantics-cigre/cigre_storage",
+  "semantics-cigre/cigre_outage",
+  "semantics-cigre/cigre_feeder",
+  "semantics-ieee30/ieee30_renewables",
+  "semantics-ieee30/ieee30_customers",
+  "semantics-ieee30/ieee30_level",
+  "semantics-ieee30/ieee30_radial",
+  "semantics-ieee30/ieee30_external",
+  "reasoning/names_cigre",
+  "reasoning/names_ieee30",
+  "reasoning/names_cigre_wind",
+  "reasoning/names_cigre_storage",
+  "reasoning/names_ieee30_wind",
+  "reasoning/drop_ieee30_none",
+  "reasoning/drop_ieee30_declared",
+  "reasoning/drop_cigre_stated",
+  "reasoning/drop_cigre_declared",
+  "reasoning/compose_t0",
+  "reasoning/compose_battery",
+  "reasoning/compose_l33",
+  "reasoning/compose_tie",
+  "reasoning/switches_open",
+  "reasoning/switches_loops",
+  "reasoning/switches_breakers",
+  "reasoning/switches_line148",
+  "reasoning/data_cigre",
+  "reasoning/data_ieee30",
+  "reasoning/data_cigre_wind",
+  "reasoning/data_cigre_battery",
+  "reasoning/data_cigre_load_split",
+  "reasoning/data_ieee30_solved",
+  "reasoning/para_weather",
+  "reasoning/para_vary",
+  "reasoning/para_variable",
+  "reasoning/persist_ieee30"
+ ],
+ "repeats": 5,
+ "order": "interleaved",
+ "command": "python -m evaluation.ablation run ontology --repeats 5 --out papers/gm2027/runs/A-ontology",
+ "python": "3.12.16",
+ "seconds": 7551,
+ "changes": []
+}

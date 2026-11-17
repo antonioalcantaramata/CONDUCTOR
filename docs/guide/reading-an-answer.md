@@ -122,12 +122,43 @@ forecast errs (more demand, less renewable output). Hover over an episode for it
 Hover over a chart for values; use the toolbar to zoom or download it as an
 image.
 
+Under a study that named problem elements — buses out of limits, outages that
+cut supply, a binding line — **📍 Where these elements are · CIM layer** opens a
+table of what the [CIM layer](what-the-network-is.md) says about each: its
+voltage, its feeder and where on it (*bus 2 of 2, far end*), the units and loads
+there (and how their values come from the data: measured, a share of a
+measurement, or derived), the element the study was about marked *studied*, the
+feeder's normally open points, and for a line or transformer what loses supply
+without it — with the
+MW at the moment the study ran, when it ran at one moment on the network's own
+demand (no load scaling, no proposal). It is read
+from the layer when you open it, through the study's links; if the layer has
+changed since the study ran (you declared a fact, say), it says so. The agent
+was given the same facts with the result, so it can say where a problem is
+without guessing. The exported session report carries the same table under each
+study.
+
 ## Answer checks
 
 Every answer is checked by fixed rules (no second model involved): each figure
 is traced to a result, compared with the fields beside it, and the answer is
 checked for the kind of quantity the question asked for. What they find is
 always shown in the card.
+
+What the answer says about an element is checked against the network's
+[CIM layer](what-the-network-is.md): a unit's energy source, a load's
+category, a bus's voltage, the feeder an element is on, a line or a
+transformer, which branches carry the external grid's power, whether a value
+was measured. A statement the layer
+contradicts is a **failure** (*"Solar Farm North, a solar unit"*, when the
+network states a diesel unit); one it does not support is a **warning**
+(*"Gen_bus7, a wind farm"*, when the network does not say what drives it).
+An element the network does not have (*"Load R9"* on CIGRE MV) is a failure
+too. A fact that only an element's name gives is a warning when the answer
+states it as fact (*"Solar Plant A is the solar unit"*): the answer should say
+it is read from the name, or you can declare it. A figure computed in one step
+from figures the answer quotes (a margin, a total, a duration from a count of
+intervals) is marked **Derived**, not unsupported.
 
 In the sidebar, **Answer checks** has two switches. **Let the agent review its
 answer**: off (the default), findings are shown to you only; on, CONDUCTOR sees
