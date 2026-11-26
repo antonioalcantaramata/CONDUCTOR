@@ -108,14 +108,20 @@ def apply(net, snap: dict):
     # Units by name, in whichever table their model puts them now. Reactive
     # power only where the case fixed it (a static generator as loaded); a
     # voltage-controlled unit's is solved, a power-factor unit's set after.
-    by_name = {name: row for etype in _UNITS for name, row in snap["tables"].get(etype, pd.DataFrame()).iterrows()}
+    # Two units may share a name (an imported model can name two machines alike): each name keeps all its rows,
+    # handed out in the order they were snapshotted, so the second unit does not take the first one's value.
+    by_name: dict[str, list] = {}
+    for etype in _UNITS:
+        for name, row in snap["tables"].get(etype, pd.DataFrame()).iterrows():
+            by_name.setdefault(name, []).append(row)
     for etype in _UNITS:
         if etype not in net or not len(net[etype]):
             continue
         for idx in net[etype].index:
-            row = by_name.get(unit_key(net, etype, idx))   # its name as loaded
-            if row is None:
+            rows = by_name.get(unit_key(net, etype, idx))   # its name as loaded
+            if not rows:
                 continue
+            row = rows.pop(0)
             net[etype].at[idx, "p_mw"] = float(row["p_mw"])
             if etype == "sgen" and "q_mvar" in row.index and math.isfinite(row["q_mvar"]):
                 net.sgen.at[idx, "q_mvar"] = float(row["q_mvar"])
@@ -146,9 +152,9 @@ def as_measurements(net, snap: dict, key_for_bus) -> pd.DataFrame:
         buses = _unit_buses(net) if etype in _UNITS else None
         for idx, p in frame["p_mw"].items():
             if etype in _UNITS:
-                if idx not in buses:
+                if not buses.get(idx):
                     continue
-                bus = buses[idx]
+                bus = buses[idx].pop(0)
             elif idx not in net[etype].index:
                 continue
             else:
@@ -160,6 +166,11 @@ def as_measurements(net, snap: dict, key_for_bus) -> pd.DataFrame:
 
 
 def _unit_buses(net) -> dict:
-    """{unit name: bus} over both unit tables."""
-    return {unit_key(net, etype, idx): int(net[etype].at[idx, "bus"])
-            for etype in _UNITS if etype in net for idx in net[etype].index}
+    """{unit name: [bus, …]} over both unit tables: a name two units share lists both buses, in table order (the
+    order `snapshot` keeps them in)."""
+    out: dict[str, list[int]] = {}
+    for etype in _UNITS:
+        if etype in net:
+            for idx in net[etype].index:
+                out.setdefault(unit_key(net, etype, idx), []).append(int(net[etype].at[idx, "bus"]))
+    return out

@@ -133,6 +133,8 @@ def loop_stub(monkeypatch):
         monkeypatch.setattr(loop_module, "TOOL_DISPATCH", {"run_rsa": lambda **kw: result})
         monkeypatch.setattr(loop_module, "_append_to_log", written.append)
         monkeypatch.setattr(loop_module, "_grid_facts", lambda: {})
+        # The network's facts come from the backend: none here, whatever backend may be running on this machine.
+        monkeypatch.setattr(loop_module, "_network_facts", lambda *a, **k: {})
         return provider
 
     install.written = written

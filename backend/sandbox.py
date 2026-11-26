@@ -64,7 +64,7 @@ ASSUMED_RATED_PF = 0.85
 SWITCHABLE = ("line", "trafo", "load", "sgen", "gen", "shunt", "storage", "trafo3w")
 OPS = ("add_load", "add_generator", "add_shunt", "reinforce_line", "upgrade_trafo",
        "add_bus_with_connection", "add_bus_with_transformer", "set_in_service", "set_parameter",
-       "add_line", "add_trafo", "move_element", "scale")
+       "add_line", "add_trafo", "move_element", "scale", "set_switch")
 MOVABLE = ("load", "sgen", "gen", "shunt", "storage", "ext_grid", "line")
 SCALABLE = ("load", "sgen", "gen")
 MAX_SCALE = 10.0
@@ -224,6 +224,10 @@ def resolve_element(net, etype: str, element, allowed: tuple = SWITCHABLE) -> in
         except rv.ResolveError as exc:
             raise EditError(str(exc)) from None
     tbl = net[etype]
+    if isinstance(element, str):
+        by_mrid = rv._by_mrid(net, (etype,), element.strip())      # its mRID (the model's own, or the layer's)
+        if by_mrid:
+            return by_mrid.idx
     if isinstance(element, str) and element.strip().isdigit() and int(element) in tbl.index:
         return int(element)
     if isinstance(element, (int, np.integer)) and not isinstance(element, bool):
@@ -800,6 +804,8 @@ def normalise_edit(net, raw: dict) -> dict:
         return _normalise_move(net, edit)
     if op == "scale":
         return _normalise_scale(net, edit)
+    if op == "set_switch":
+        return _normalise_switch(net, edit)
 
     # set_in_service
     etype = str(edit.get("element_type") or "").strip()
@@ -808,6 +814,33 @@ def normalise_edit(net, raw: dict) -> dict:
     if not isinstance(state, bool):
         raise EditError("set_in_service: in_service must be true or false.")
     return {"op": op, "element_type": etype, "element": idx, "in_service": state}
+
+
+def _normalise_switch(net, edit: dict) -> dict:
+    """Open or close a switch (a breaker, a disconnector, a coupler between busbars): by its name, index or
+    mRID; `closed` true or false (or `open`)."""
+    if not len(getattr(net, "switch", [])):
+        raise EditError("set_switch: this network has no switches; take a line or transformer out with "
+                        "set_in_service instead.")
+    idx = resolve_element(net, "switch", edit.get("switch", edit.get("element")), allowed=("switch",))
+    closed = edit.get("closed")
+    if closed is None and isinstance(edit.get("open"), bool):
+        closed = not edit["open"]
+    if not isinstance(closed, bool):
+        raise EditError("set_switch: closed must be true or false (or give open).")
+    return {"op": "set_switch", "switch": idx, "closed": closed}
+
+
+def _switch_label(net, idx: int) -> str:
+    """A switch as results show it, with what it switches."""
+    sw = net.switch
+    name = sw.at[idx, "name"] if "name" in sw.columns and isinstance(sw.at[idx, "name"], str) and \
+        sw.at[idx, "name"].strip() else f"switch {idx}"
+    et, element, bus = str(sw.at[idx, "et"]), int(sw.at[idx, "element"]), int(sw.at[idx, "bus"])
+    what = (f"on line {line_display_name(net, element)}" if et == "l" else
+            f"on transformer {_element_labels(net, 'trafo', element)[-1]}" if et == "t" else
+            f"between {_bus_label(net, bus)} and {_bus_label(net, element)}")
+    return f"{name} ({what})"
 
 
 def _normalise_add_line(net, edit: dict) -> dict:
@@ -1174,6 +1207,9 @@ def _apply(net, edit: dict) -> None:
             merged = {**(json.loads(old) if isinstance(old, str) and old else {}), **measured}
             tbl.at[idx, "override"] = json.dumps(merged, sort_keys=True)
         return
+    if op == "set_switch":
+        net.switch.at[edit["switch"], "closed"] = bool(edit["closed"])
+        return
     if op == "add_load":
         q = edit["p_mw"] * math.tan(math.acos(edit["pf"])) * (-1 if edit.get("leading") else 1)
         idx = pp.create_load(net, bus=edit["bus"], p_mw=edit["p_mw"], q_mvar=q, name=edit["name"])
@@ -1405,6 +1441,8 @@ def describe(net, edit: dict) -> str:
             where = f"the end of a {edit['length_km']:g} km line from {where} ({conductor})"
         return (f"New bus {edit['name']!r} ({edit['vn_kv']:g} kV) behind a new {units}{d['sn_mva']:g} MVA "
                 f"{d['vn_hv_kv']:g}/{d['vn_lv_kv']:g} kV transformer ({spec}) at {where}")
+    if op == "set_switch":
+        return f"{'Close' if edit['closed'] else 'Open'} {_switch_label(net, edit['switch'])}"
     # set_in_service
     etype = edit["element_type"]
     labels = _element_labels(net, etype, edit["element"])
@@ -1434,6 +1472,7 @@ def summary(net, edits: list[dict]) -> dict:
         "new_shunts_mvar": {k: round(sum(e["q_mvar"] for e in edits if e["op"] == "add_shunt"
                                          and e["kind"] == k), 4) for k in SHUNT_KINDS},
         "switched_elements": sum(e["op"] == "set_in_service" for e in edits),
+        "operated_switches": sum(e["op"] == "set_switch" for e in edits),
         "changed_settings": sum(e["op"] == "set_parameter" for e in edits),
         "new_lines": sum(e["op"] == "add_line" for e in edits),
         "moved_elements": sum(e["op"] == "move_element" for e in edits),

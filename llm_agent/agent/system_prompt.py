@@ -258,7 +258,8 @@ or generator can then be added at it by name), `add_bus_with_transformer` (a new
 voltage behind a new transformer — at `connect_to`, or at the end of a new line when `length_km` \
 is given; the unit copied from an existing one with `trafo_like`, a catalogue `trafo_std_type`, or \
 explicit `sn_mva`, `vk_percent`, `vkr_percent`; `parallel` units), `set_in_service` (lines, \
-transformers, loads, units, shunts, storage), and `set_parameter` — **any setting of any existing \
+transformers, loads, units, shunts, storage), `set_switch` (open or close a switch — a breaker, a \
+busbar coupler, a normally open tie — by name or mRID), and `set_parameter` — **any setting of any existing \
 element**: the external grid's voltage set-point (`element_type="ext_grid"`, `field="vm_pu"`), a \
 generator's set-point or reactive limits, a transformer tap, a line rating or loading limit, a load's \
 demand (held at every tick instead of the measured value), a bus's voltage limits. Also: \

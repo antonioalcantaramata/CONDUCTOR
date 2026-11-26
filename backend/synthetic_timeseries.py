@@ -21,7 +21,7 @@ all existing main_backend.py endpoints work unchanged:
 Profile options
 ---------------
 load_profile  : "residential" | "twin_peak" | "industrial" | "flat" (LOAD_PROFILES)
-generation_profile : "wind" | "solar" | "flat"
+generation_profile : "wind" | "solar" | "flat" | "dispatched"
 
 Stress events
 -------------
@@ -133,10 +133,17 @@ def _gen_scale(profile: str, n_steps: int,
         alpha[(hours < 5.0) | (hours > 20.0)] = 0.0
         alpha *= np.clip(rng.uniform(0.90, 1.10, n_steps), 0.0, 1.0)
         alpha = np.clip(alpha, 0.0, 1.0)
+    elif profile == "dispatched":
+        alpha = np.full(n_steps, 0.60)       # set from the demand once it is drawn (_draw); no random draw here
     else:  # "flat"
         alpha = np.full(n_steps, 0.60)
         alpha *= rng.uniform(0.98, 1.02, n_steps)
     return alpha
+
+
+# The share of the demand the dispatched units cover at every moment; the external grid (or the reference unit)
+# takes the rest.
+DISPATCH_SHARE = 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +166,7 @@ GENERATION_PROFILES = {
     "wind": "Wind: wanders slowly, day and night",
     "solar": "Solar: follows the sun, nothing at night",
     "flat": "Flat: steady at 60 % of capacity",
+    "dispatched": "Dispatched: follows the demand, covering 95 % of it (a transmission system's units)",
 }
 RESOLUTIONS = (5, 10, 15, 30, 60)
 MAX_DAYS = 31
@@ -316,6 +324,11 @@ def _draw(b: Basis, n_days, resolution_min, load_profile, generation_profile, se
     if peak_load_factor is not None:
         load_alpha = load_alpha * (float(peak_load_factor) / _shape_peak(load_profile))
     load_alphas = {load_profile: load_alpha}
+    if "dispatched" in alphas:
+        # Units dispatched to the demand: together they follow it, each in proportion to its capacity.
+        capacity = sum(cap_by_shape.get("dispatched", {}).values())
+        demand = sum(bus_base_load.values())
+        alphas["dispatched"][:] = np.clip(load_alpha * demand * DISPATCH_SHARE / max(capacity, 1e-9), 0.0, 1.0)
 
     # --- Stress events: occasional, mild 2-hour high-load / low-gen windows ---
     # The twin should read as *mostly secure*, with the odd stressed window —

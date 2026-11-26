@@ -449,12 +449,12 @@ def test_the_launch_screen_chooses_what_to_load(agent, monkeypatch, backend_url)
     picker = at.radio(key="scenario_launch")
     assert picker.value == "ieee30"
     assert picker.options == ["Resume", "Demo: IEEE 30 · active only",
-                              "Demo: IEEE 30 · with reactive measurements",
+                              "Demo: ENTSO-E SmallGrid · a CIM model",
                               "Demo: CIGRE MV · distribution with DER"]
-    picker.set_value("ieee30_reactive").run()                   # loads at once
-    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee30_reactive"
+    picker.set_value("smallgrid").run()                   # loads at once
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "smallgrid"
     at.radio(key="scenario_launch").set_value("resume").run()   # nothing to resume: refused, kept
-    assert at.radio(key="scenario_launch").value == "ieee30_reactive"
+    assert at.radio(key="scenario_launch").value == "smallgrid"
     assert any("Nothing uploaded yet" in w.value for w in at.warning)
     httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception
@@ -467,12 +467,12 @@ def test_the_sidebar_switches_the_scenario_and_starts_afresh(agent, monkeypatch,
     assert "Scenario · Demo: IEEE 30 · active only" in [e.label for e in at.expander]
     load = _button(at, key_prefix="scenario_sidebar_load")
     assert load.disabled                                        # already loaded
-    at.radio(key="scenario_sidebar").set_value("ieee30_reactive").run()
+    at.radio(key="scenario_sidebar").set_value("smallgrid").run()
     _button(at, key_prefix="scenario_sidebar_load").click().run()
-    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "ieee30_reactive"
+    assert httpx.get(f"{backend_url}/api/scenario").json()["current"] == "smallgrid"
     assert at.session_state["messages"] == []                    # a new conversation
     assert any("a new conversation has started" in s.value for s in at.success)
-    assert "Scenario · Demo: IEEE 30 · with reactive measurements" in [e.label for e in at.expander]
+    assert "Scenario · Demo: ENTSO-E SmallGrid · a CIM model" in [e.label for e in at.expander]
     httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception
 
@@ -520,13 +520,13 @@ def test_the_example_queries_fit_the_scenario(agent, monkeypatch, backend_url):
     at = _app()
     assert any("conductor-eq-group'>For this scenario" in m.value for m in at.markdown)
     assert "line from the external grid" in _button(at, key_prefix="eq_s0").label
-    httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30_reactive"})
+    httpx.post(f"{backend_url}/api/scenario", json={"name": "smallgrid"})
     try:
         at = _app()
         labels = [b.label for b in at.button if str(b.key).startswith("eq_s")]
-        assert any("reactive measurements" in x for x in labels)
+        assert any("reactive measurements" in x for x in labels) and any("CIM model" in x for x in labels)
         _button(at, key_prefix="eq_s0").click().run()
-        assert "reactive measurements" in at.session_state["_box_value"]
+        assert "CIM model" in at.session_state["_box_value"]
     finally:
         httpx.post(f"{backend_url}/api/scenario", json={"name": "ieee30"})
     assert not at.exception

@@ -81,6 +81,31 @@ def bus_groups(layer: dict, by: str) -> tuple[dict[int, tuple[str, str]], list[s
     raise ValueError(f"Unknown view {by!r}; one of {', '.join(MODES)}.")
 
 
+_KNOWN_RANK = {"stated": 0, "named": 1, "unknown": 2}
+
+
+def fold_merged(network: NetworkMap, buses: dict[int, tuple[str, str]], by: str) -> dict[int, tuple[str, str]]:
+    """The groups of buses drawn as one node (a node-breaker model's nodes joined by closed switches) on that node:
+    sources that differ make it "mixed"; what is known, the least known of its buses; a feeder, the first."""
+    if not network.alias:
+        return buses
+    out: dict[int, tuple[str, str]] = {}
+    for bus, (group, detail) in buses.items():
+        node = network.alias.get(bus, bus)
+        if node not in out:
+            out[node] = (group, detail)
+            continue
+        old, old_detail = out[node]
+        if by == "source" and old != group:
+            group = "mixed"
+        elif by == "known":
+            group = max(old, group, key=lambda g: _KNOWN_RANK.get(g, 3))
+        else:
+            group = old
+        out[node] = (group, "<br>".join(x for x in (old_detail, detail) if x))
+    return out
+
+
 def edge_groups(network: NetworkMap, buses: dict[int, tuple[str, str]], by: str) -> dict[int, str]:
     """{edge position: group} — in the feeder view, a branch whose ends share a feeder takes its colour."""
     if by != "feeder":
@@ -112,6 +137,7 @@ def render_layer_map(network: NetworkMap, positions: dict, layer: dict, by: str,
     if not drawn:
         return _empty_figure("No network to draw")
     buses, order, colours = bus_groups(layer, by)
+    buses = fold_merged(network, buses, by)
     edges = edge_groups(network, buses, by)
     xs = [positions[n.index][0] for n in drawn]
     ys = [positions[n.index][1] for n in drawn]
@@ -180,7 +206,7 @@ def render_layer_map(network: NetworkMap, positions: dict, layer: dict, by: str,
                    range=[min(xs) - 0.08 * span, max(xs) + 0.14 * span]),
         yaxis=dict(visible=False, showgrid=False, zeroline=False, scaleanchor="x", scaleratio=1,
                    range=[min(ys) - 0.06 * span, max(ys) + 0.06 * span]),
-        annotations=[dict(text="from the CIM layer · schematic connectivity, not geography", xref="paper",
+        annotations=[dict(text=f"from the CIM layer · {network.what_is_drawn}", xref="paper",
                           yref="paper", x=0.0, y=-0.045, showarrow=False, font=dict(size=10, color="#888"),
                           xanchor="left")])
     return fig

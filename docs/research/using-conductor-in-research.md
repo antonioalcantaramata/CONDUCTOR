@@ -95,6 +95,26 @@ suggestions, to measure what they change. **`run` uses model credit** and asks
 for confirmation; `grade` costs nothing. Runs are written to their own folder,
 never to the session logs.
 
+## The CIM model as the network's state
+
+A deterministic check (no model credit, no agent) that the network CONDUCTOR
+studies is the same whether it is built the way it was before or projected
+from the CIM model and its differences: proposals (every kind of edit), the
+operator's generator models and names, the clock's moments, and differences
+read back from their IEC 61970-552 files — every column of every table, the
+costs, the row indices and the power flow, element by element through the mRIDs.
+
+```bash
+python -m evaluation.cim_central run                  # IEEE 14 and 30, CIGRE MV, multi-voltage, MV Oberrhein
+python -m evaluation.cim_central run --large          # also PEGASE 1354 and 9241, with timings
+python -m evaluation.cim_central run --networks case14 --parts proposals,moments
+```
+
+It writes `results.json`, `results.csv` (one row per network and case: the same
+or not, the time each way) and `manifest.json` (date, commit, uncommitted
+changes, command) to `evaluation_runs/cim-central-<time>/`, and exits non-zero
+if any case differs.
+
 ## The options evaluation
 
 A fixed set of questions about corrective options for the IEEE 30-bus demo

@@ -76,6 +76,36 @@ substations, unit types and switch states are then *stated* by the model, not
 inferred. What CIM itself does not store, such as feeders and what an outage
 cuts off, the layer still works out from the topology.
 
+The whole model is kept, not only what the studies use. The layer reads from it
+the names of substations, voltage levels and busbars, every limit on a line
+(also the ones that may be exceeded for a while), the controls of machines,
+shunts and tap changers, and how each load follows the voltage. Ask *"what does
+the model have that the studies do not use?"*: the agent says, for example,
+that the studies check only permanent limits, or that a shunt regulating a
+voltage in the model is held fixed. When the model carries its own power-flow
+solution, CONDUCTOR's power flow is compared with it on loading; a difference is
+listed among the data issues.
+
+In **System → CIM layer**, the picture *The CIM model* shows what the layer does
+with each kind of object in your model, and the *CIM model* tab gives the
+details. The network map draws a node-breaker model as its electrical nodes,
+named after their busbars, and uses your model's own diagram when it has one, so
+the network looks as it does in the tool it came from. **Export as CIM** then
+also offers *your model + CONDUCTOR's additions*: your files exactly as uploaded,
+plus one file with what CONDUCTOR adds, by your model's own identifiers.
+
+A network that did not come as CIM gets a CIM model too: CONDUCTOR writes it as
+CGMES from its data, and **Export as CIM** offers it as *The network as CGMES*,
+for other CIM tools. Under **As CGMES**, *Check that it reads back the same*
+reads it back and compares the power flow element by element.
+
+What you change is kept as changes to that model: your generator models and
+renames, and each proposal, as CIM difference files against it. The studies run
+on the model with them applied. Both downloads of **Export as CIM** carry them
+(the operator's changes, `proposals/<id>.xml`, and a manifest saying what each
+file is), so another CIM tool can take the network with your changes as one
+package.
+
 **Export as CIM** writes the layer back out in the distribution namespace of
 CIM (CIM100). How each fact is known goes in a namespace of its own beside the
 standard properties, so a tool that knows only CIM still reads a valid model.

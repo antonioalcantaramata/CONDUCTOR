@@ -761,12 +761,50 @@ def _restore_option_sets() -> None:
     app_data["option_set_counter"] = max(int(entry.get("counter") or 0), app_data.get("option_set_counter", 0))
 
 
-def _remember_loaded(net) -> None:
+def _remember_loaded(net, cim_source: str | None = None) -> None:
     """The network as loaded: the reference every generator model is applied
-    to (generators.py), and the identity the saved assumptions are keyed to."""
+    to (generators.py), and the identity the saved assumptions are keyed to.
+    `cim_source`: the CGMES zip it came from — its whole model is kept
+    (cim_model.CimModel), tied to this network, for the CIM layer to read what
+    pandapower's converter did not keep."""
     app_data["net_loaded"] = copy.deepcopy(net)
     app_data["loaded_fingerprint"] = sb.network_fingerprint(net)
+    import resolve as _resolve
+    _resolve.NETWORK_ID = str(app_data["loaded_fingerprint"])      # elements can be named by their mRID too
+    app_data["cim_model"] = None
+    if cim_source:
+        try:
+            import cim_model
+            model = cim_model.CimModel.read(cim_source)
+            app_data["cim_model"] = {"fingerprint": app_data["loaded_fingerprint"], "model": model,
+                                     "source": cim_source, "solved": _solved_state_check(net, model)}
+            # Its differences name the model's own parts (cim_changes.own_ids).
+            import cim_changes as cc
+            cc.use_model(str(app_data["loaded_fingerprint"]), model)
+            print(f"[cim] Model kept: {model.summary()}")
+        except Exception as exc:  # noqa: BLE001 — the layer then reads pandapower's copy, as before
+            print(f"[cim] The CGMES model could not be kept ({exc}); the layer reads pandapower's copy.")
+    else:
+        # Any other network gets a CIM model too, written as CGMES from its data (cgmes_writer): derived, so the
+        # layer never takes it for a model's own statement; it is what the network is exported and given to other
+        # tools as. Whether it reads back the same (cim_adapter.round_trip) is checked on demand.
+        try:
+            import io as _io
+            from datetime import datetime, timezone
+
+            import cgmes_writer
+            import cim_model
+            created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            package = cgmes_writer.package(net, str(app_data["loaded_fingerprint"]),
+                                           name=str(getattr(net, "name", "") or "network"), created=created)
+            model = cim_model.CimModel.read(_io.BytesIO(package))
+            app_data["cim_model"] = {"fingerprint": app_data["loaded_fingerprint"], "model": model, "derived": True,
+                                     "package": package, "round_trip": None}
+            print(f"[cim] Written as CGMES from its data: {model.summary()['objects']} objects.")
+        except Exception as exc:  # noqa: BLE001 — the network works as before, without a CIM model of its own
+            print(f"[cim] The network could not be written as CGMES ({exc}).")
     app_data["generator_model"] = {}
+    app_data["_saved_operator"] = None
     app_data["unit_costs"] = {}
     app_data["element_names"] = {}
     app_data["unit_sources"] = {}
@@ -784,7 +822,7 @@ def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
     if loaded is None:
         raise gm.ModelError("No network is loaded.")
     names = (app_data.get("element_names") or {}) if names is None else names
-    new = naming.apply(gm.apply(loaded, model), names)
+    new = _operated_network(loaded, model, names)
     app_data["net"] = new
     app_data["generator_model"] = model
     app_data["element_names"] = names
@@ -803,8 +841,9 @@ def _apply_generator_model(model: dict, names: dict | None = None) -> list[str]:
             dropped.append(f"{pid}: {exc}")
             _proposals().pop(pid)
             continue
-        _proposals()[pid] = {**prop, "edits": canonical, "hash": sb.edits_hash(canonical),
-                             "summary": sb.summary(net, canonical)}
+        _proposals()[pid] = {**{k: v for k, v in prop.items() if not k.startswith("cim_")}, "edits": canonical,
+                             "hash": sb.edits_hash(canonical), "summary": sb.summary(net, canonical),
+                             **_cim_record(pid, new, net, canonical)}
     if _proposals() or dropped:
         _save_proposals()
     return dropped
@@ -847,7 +886,11 @@ def _save_assumptions() -> None:
             and not synthetic):
         store.pop(fp, None)
     else:
+        kept = app_data.get("_operator_difference")
+        diff = kept[1] if kept and kept[0] == _operator_key(model, names) else None
         store[fp] = {"load_power_factor": None if value is None else float(value), "generator_model": model,
+                     **({"cim_operator": {"basis": _cim_basis(model, names), "difference": diff}}
+                        if diff and (diff["added"] or diff["changed"] or diff["removed"]) else {}),
                      "unit_costs": unit_costs, "element_names": names, "unit_sources": sources,
                      "load_categories": load_categories,
                      **({"synthetic_data": synthetic} if synthetic else {})}
@@ -871,6 +914,7 @@ def _restore_assumptions() -> None:
     saved = _read_store(_ASSUMPTIONS_FILE).get(app_data.get("loaded_fingerprint"))
     if saved is None:
         return
+    app_data["_saved_operator"] = saved.get("cim_operator")      # the operator's difference as saved, if any
     value = saved.get("load_power_factor")
     if isinstance(value, (int, float)) and LOAD_PF_MIN <= value <= 1.0:
         app_data["load_power_factor"] = float(value)
@@ -966,8 +1010,13 @@ def _restore_proposals() -> list[str]:
         except (sb.EditError, KeyError, TypeError) as exc:
             print(f"[proposals] {pid!r} no longer applies ({exc}) — dropped.")
             continue
-        _proposals()[pid] = {**prop, "edits": canonical, "hash": sb.edits_hash(canonical),
-                             "summary": sb.summary(net, canonical)}
+        same = (prop.get("cim_difference") and prop.get("cim_basis") == _cim_basis()
+                and sb.edits_hash(canonical) == prop.get("hash"))
+        # The proposal as saved: its difference, when it was made against this same model; else made again.
+        cim = ({k: v for k, v in prop.items() if k.startswith("cim_")} if same
+               else _cim_record(pid, base, net, canonical))
+        _proposals()[pid] = {**{k: v for k, v in prop.items() if not k.startswith("cim_")}, "edits": canonical,
+                             "hash": sb.edits_hash(canonical), "summary": sb.summary(net, canonical), **cim}
         restored.append(pid)
     if restored:
         print(f"[proposals] Restored {len(restored)}: {', '.join(restored)}")
@@ -1003,13 +1052,148 @@ def _materialised(name: str) -> dict:
     key = (id(base), proposal["hash"])
     entry = cache.get(name)
     if entry is None or entry["key"] != key:
-        try:
-            net, _ = sb.materialise(base, sb.upgrade_stored(proposal["edits"]))
-        except sb.EditError as exc:
-            raise HTTPException(status_code=409, detail=f"Proposal {name!r} no longer applies: {exc}")
-        entry = {"key": key, "net": net, "db_full": None, "db_error": None}
+        net, via = _proposal_network(name, base, proposal), "edits"
+        if isinstance(net, tuple):
+            net, via = net
+        entry = {"key": key, "net": net, "db_full": None, "db_error": None, "via": via}
         cache[name] = entry
     return entry
+
+
+def _proposal_network(name: str, base, proposal: dict):
+    """The proposal's network: the base network with the proposal's CIM difference applied element by element, by
+    mRID (cim_changes.project_onto: the base's layout, every other row unchanged). Built by its edits only when no
+    difference could be made or the projection fails, said in the log. Returns (network, "cim"), or the network."""
+    import cim_changes as cc
+    if proposal.get("cim_difference"):
+        try:
+            nid = str(app_data.get("loaded_fingerprint") or "local")
+            projected, _notes = cc.project_onto(base, _cim_base_statements(base), proposal["cim_difference"], nid,
+                                                name)
+            return projected, "cim"
+        except Exception as exc:  # noqa: BLE001 — the edits still build it
+            print(f"[cim] Proposal {name!r}: the model's projection failed ({exc}); built by its edits.")
+    try:
+        net, _ = sb.materialise(base, sb.upgrade_stored(proposal["edits"]))
+    except sb.EditError as exc:
+        raise HTTPException(status_code=409, detail=f"Proposal {name!r} no longer applies: {exc}")
+    return net
+
+
+def _loaded_statements() -> dict:
+    """The model as loaded, as statements (cim_changes.statements of the network as loaded), kept per network."""
+    import cim_changes as cc
+    loaded = app_data.get("net_loaded")
+    key = (app_data.get("loaded_fingerprint"), id(loaded))
+    kept = app_data.get("_loaded_statements")
+    if not kept or kept[0] != key:
+        kept = (key, cc.statements(loaded, str(app_data.get("loaded_fingerprint") or "local")))
+        app_data["_loaded_statements"] = kept
+    return kept[1]
+
+
+def _cim_basis(model: dict | None = None, names: dict | None = None) -> str:
+    """What a saved CIM difference was made against: the network as loaded, the operator's changes on it, the
+    writer's version and the CGMES version. A saved difference with another basis is made again from its source."""
+    import json as _json
+
+    import cgmes_writer as cw
+    model = (app_data.get("generator_model") or {}) if model is None else model
+    names = (app_data.get("element_names") or {}) if names is None else names
+    return hashlib.sha1(_json.dumps([app_data.get("loaded_fingerprint"), model, names, cw.WRITER_VERSION,
+                                     cw.DEFAULT_VERSION], sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _operator_key(model: dict, names: dict) -> tuple:
+    import json as _json
+    return (app_data.get("loaded_fingerprint"), _json.dumps(model, sort_keys=True, default=str),
+            _json.dumps(names, sort_keys=True, default=str))
+
+
+def _operated_network(loaded, model: dict, names: dict):
+    """The base network: the model as loaded with the operator's standing changes — generator models and names —
+    applied as a CIM difference (cim_changes.difference_of: the rows they change, written again), projected onto the
+    network as loaded by mRID (cim_changes.project_onto). The changes are read as before (generators.apply,
+    naming.apply: a change that does not apply is refused there); what the base network is, is the model and its
+    difference. If the projection fails, the network they build directly (said in the log)."""
+    import cim_changes as cc
+    saved = app_data.get("_saved_operator") or {}
+    if (model or names) and saved.get("basis") == _cim_basis(model, names) and saved.get("difference"):
+        # The state as saved: the model as loaded and the operator's difference — projected, not made again.
+        try:
+            nid = str(app_data.get("loaded_fingerprint") or "local")
+            projected, _notes = cc.project_onto(loaded, _loaded_statements(), saved["difference"], nid, "operator")
+            app_data["_operator_difference"] = (_operator_key(model, names), saved["difference"])
+            print("[cim] The operator's changes: projected from the saved difference.")
+            return projected
+        except Exception as exc:  # noqa: BLE001 — made again below; said
+            print(f"[cim] The saved operator difference does not apply ({exc}); made again from the changes.")
+    operated = naming.apply(gm.apply(loaded, model), names)
+    if not model and not names:
+        app_data["_operator_difference"] = (_operator_key(model, names), {
+            "added": [], "removed": [], "changed": [], "general": {}, "in_service": {}, "version": None})
+        return operated if operated is not loaded else copy.deepcopy(loaded)
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    try:
+        base = _loaded_statements()
+        diff = cc.difference_of(loaded, base, operated, nid)
+        projected, _notes = cc.project_onto(loaded, base, diff, nid, "operator")
+        app_data["_operator_difference"] = (_operator_key(model, names), diff)
+        return projected
+    except Exception as exc:  # noqa: BLE001 — the changes still apply; said
+        print(f"[cim] The operator's changes could not be projected from the model ({type(exc).__name__}: {exc}); "
+              "applied directly.")
+        app_data["_operator_difference"] = None
+        return operated
+
+
+def _operator_difference() -> dict | None:
+    """The operator's standing changes to the model as loaded — the generator models (a unit's control, its
+    set-points and limits) and the names given — as a CIM difference: what the base network is projected from.
+    None with no network."""
+    import cim_changes as cc
+    loaded = app_data.get("net_loaded")
+    if loaded is None:
+        return None
+    model, names = app_data.get("generator_model") or {}, app_data.get("element_names") or {}
+    kept = app_data.get("_operator_difference")
+    if kept and kept[0] == _operator_key(model, names):
+        return kept[1]
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    if not model and not names:
+        diff = {"added": [], "removed": [], "changed": [], "general": {}, "in_service": {}, "version": None}
+    else:
+        diff = cc.difference_of(loaded, _loaded_statements(), naming.apply(gm.apply(loaded, model), names), nid)
+    app_data["_operator_difference"] = (_operator_key(model, names), diff)
+    return diff
+
+
+def _cim_base_statements(base) -> dict:
+    """The base network's CIM model as statements (cim_changes.statements), kept per network: a new base (another
+    network, the operator's changes) is a new object. A difference touches only the elements it changes, so the
+    clock's moment at which the statements were written does not enter it."""
+    import cim_changes as cc
+    key = (app_data.get("loaded_fingerprint"), id(base))
+    kept = app_data.get("_cim_base_statements")
+    if not kept or kept[0] != key:
+        kept = (key, cc.statements(base, str(app_data.get("loaded_fingerprint") or "local")))
+        app_data["_cim_base_statements"] = kept
+    return kept[1]
+
+
+def _cim_record(name: str, base, net, edits: list | None = None) -> dict:
+    """The proposal as a CIM difference against the base's model (cim_changes.translate), stored with it: what the
+    proposal is, and what its network is projected from. If none can be made, the proposal is studied by its edits
+    (`cim_error`, said in the log)."""
+    import cim_changes as cc
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    try:
+        diff = cc.translate(base, _cim_base_statements(base), edits or [], nid)
+        return {"cim_difference": diff, "cim_summary": cc.summary(diff), "cim_translation": diff.get("translation"),
+                "cim_basis": _cim_basis()}
+    except Exception as exc:  # noqa: BLE001 — the proposal is studied by its edits; said
+        print(f"[cim] Proposal {name!r}: no CIM difference ({type(exc).__name__}: {exc}); studied by its edits.")
+        return {"cim_error": f"{type(exc).__name__}: {exc}"}
 
 
 def _net_for(request=None):
@@ -1151,7 +1335,7 @@ def _variable_units(net) -> dict:
         for i in net[table].index:
             if gm._proposed(net[table], i):
                 continue
-            f = sem.unit_source(net, table, i, declared, profile)
+            f = sem.unit_source(net, table, i, declared, profile, cim=_cim_model())
             if f["value"] in sem.VARIABLE and f["basis"] in (sem.STATED, sem.NAMED):
                 out[(table, int(i))] = f["value"]
     app_data["_variable_units"] = (key, out)
@@ -1183,6 +1367,36 @@ def _cap_to_resource(net) -> None:
             tbl.at[i, "min_p_mw"] = 0.0
 
 
+_MOMENTS_KEPT = 512
+
+
+def _moment_onto(net, meas, ts: str, subs: list, pf: float):
+    """The tick's measurements on `net` (in place): the moment of the networks that share its measured elements
+    (operating_point.py: computed once — the base and its proposals take the same — and applied by mRID); a network
+    the allocation rebuilds is allocated on its own, as before."""
+    import collections
+
+    import operating_point as op
+    sig = op.signature(net)
+    if sig is None:
+        return op.allocate(net, meas, subs, pf)[0]
+    content = hashlib.sha1(pd.util.hash_pandas_object(meas.astype(str), index=True).values.tobytes()).hexdigest()
+    key = (sig, content, ts, round(float(pf), 6), hashlib.sha1(repr(list(subs)).encode()).hexdigest())
+    cache = app_data.get("_moments")
+    if not isinstance(cache, collections.OrderedDict):
+        cache = app_data["_moments"] = collections.OrderedDict()
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    moment = cache.get(key)
+    if moment is None:
+        moment = cache[key] = op.compute(net, meas, subs, pf, nid)
+        while len(cache) > _MOMENTS_KEPT:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(key)
+    op.apply(net, moment, meas, subs, nid)
+    return net
+
+
 def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | None = None,
                  resource_caps: bool = True):
     """Give `net` the values of one tick: measured loads and generation, then
@@ -1207,8 +1421,7 @@ def _assign_tick(net, meas, ts: str, dataset: dict | None = None, subs: list | N
     else:
         own = getattr(_study, "load_pf", None)
         pf = own if own is not None else _load_pf_setting()[0]
-        net, _ = lg.assign_load_values_from_measurements(net, meas, subs, power_factor=pf)
-        net, _ = lg.assign_generators_values_from_measurements(net, meas, subs)
+        net = _moment_onto(net, meas, ts, subs, pf)
         _study.pf_used = True
         share = net.get("_q_measured_share", 0.0) if hasattr(net, "get") else 0.0
         if share:
@@ -2733,6 +2946,9 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
 
     # The case's own operating point, before the first tick is written over it.
     app_data["nominal"] = nom.snapshot(net)
+    # The network as loaded is recorded now, before the tick: as an upload records it (it is what every generator
+    # model is applied to, and what the model's own solution is checked against).
+    _remember_loaded(net, network_path if ext == ".zip" else None)
     initial_meas = measurements[timestamps[0]]
     subs = get_substation_names(net)
     substations.extend(subs)
@@ -2761,7 +2977,6 @@ def _lifespan_from_uploaded(sentinel: dict) -> bool:
     print(f"[lifespan] PG_MAX_DATA: {len(PG_MAX_DATA)} generators.")
 
     _build_and_store_ybus(net)
-    _remember_loaded(net)
     _restore_timeseries_from_sentinel()
     _restore_forecast_from_sentinel()
     print("\n !API IS READY TO RECEIVE REQUESTS! \n")
@@ -2836,6 +3051,10 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
 
     # The case's own operating point, before the first tick is written over it.
     app_data["nominal"] = nom.snapshot(net)
+    # The network as loaded, recorded before the tick (as an upload and a restart record it).
+    # A profile that loads a CIM model keeps it whole, as an upload does.
+    _remember_loaded(net, os.path.join(os.path.dirname(os.path.abspath(backend_dir)), profile["cgmes_path"])
+                     if str(profile.get("source", "")).lower() == "cgmes" else None)
     # Assign first-tick measurements to initialise operating point.
     initial_meas = measurements[timestamps[0]]
     subs = get_substation_names(net)
@@ -2881,7 +3100,6 @@ def _lifespan_generic(profile_name: str, backend_dir: str, restore_uploads: bool
 
     # Build Ybus on-the-fly (generic profiles never use pre-computed pickles).
     _build_and_store_ybus(net)
-    _remember_loaded(net)
     if restore_uploads:
         # Not for a demo: it must load the same data every time, and leave the
         # operator's uploaded data for Resume.
@@ -3279,7 +3497,97 @@ def _semantics(network: str | None = None) -> dict:
     return sem.build(net, app_data.get("unit_sources") or {}, profile.get("unit_sources") or {},
                      app_data.get("load_categories") or {}, profile.get("load_categories") or {},
                      normal_open=normal_open, provenance=_value_provenance(net),
-                     network_id=str(app_data.get("loaded_fingerprint") or "local"))
+                     network_id=str(app_data.get("loaded_fingerprint") or "local"), cim=_cim_model())
+
+
+def _solved_state_check(net, model) -> dict | None:
+    """CONDUCTOR's power flow on the network as loaded against the model's own solution (its SV profile):
+    `semantics.solved_state_check`, once per load."""
+    try:
+        solved = copy.deepcopy(net)
+        # The model's own operating point (its SSH profile), as snapshotted before the first tick: on a restart
+        # the network is recorded after the first synthetic tick was written over it.
+        snap = app_data.get("nominal")
+        if snap:
+            try:
+                solved = nom.apply(solved, snap)
+            except nom.NominalError:
+                pass
+        pp.runpp(solved)
+        result = sem.solved_state_check(solved, model)
+    except Exception as exc:  # noqa: BLE001 — a model that does not solve says so, the load goes on
+        return {"matches": None, "note": f"The network as loaded did not solve, so it was not compared with the "
+                                         f"model's own solution ({exc})."}
+    if result:
+        print(f"[cim] Solved state: {'matches' if result['matches'] else 'differs'} "
+              f"(max {result['max_vm_diff_pu']} pu, {result['max_injection_diff_mw_mvar']} MW/Mvar)")
+    return result
+
+
+def _cim_kept() -> dict | None:
+    """The loaded network's CIM model entry — the model it came from, or one written from its data (`derived`) —
+    while that network is the one loaded (its fingerprint as loaded)."""
+    kept = app_data.get("cim_model")
+    if kept and kept.get("fingerprint") == app_data.get("loaded_fingerprint"):
+        return kept
+    return None
+
+
+def _cim_solved() -> dict | None:
+    kept = _cim_kept()
+    return kept.get("solved") if kept and not kept.get("derived") else None
+
+
+def _cim_round_trip() -> dict | None:
+    """For a network written as CGMES from its data: pandapower → CGMES → pandapower, the same power flow? Run once
+    per network, on demand (it solves the network twice), and kept."""
+    kept = _cim_kept()
+    if not kept or not kept.get("derived"):
+        return None
+    if kept.get("round_trip") is None:
+        import cim_adapter
+        loaded = app_data.get("net_loaded")
+        try:
+            kept["round_trip"] = cim_adapter.round_trip(copy.deepcopy(loaded), str(app_data["loaded_fingerprint"]))
+        except Exception as exc:  # noqa: BLE001 — said, not raised
+            kept["round_trip"] = {"matches": None, "note": f"The round trip could not be run ({exc})."}
+    return kept["round_trip"]
+
+
+def _node_breaker_drawing(net) -> dict:
+    """What the map needs to draw a node-breaker CIM model: its bus–bus switches (`couplers`, so the nodes they
+    join can be drawn as one electrical node), each node's name in the model (`labels`: its busbar or bus name),
+    and each bus's position in the model's own diagram (`positions`, from its DL profile, when the model is kept).
+    Empty for any other network, whose map is unchanged."""
+    if "origin_class" not in net.bus.columns or not (net.bus["origin_class"] == "ConnectivityNode").any():
+        out = {}
+    else:
+        couplers = []
+        if len(getattr(net, "switch", [])):
+            bb = net.switch[net.switch.et == "b"]
+            couplers = [{"from_bus": int(r.bus), "to_bus": int(r.element), "closed": bool(r.closed)}
+                        for r in bb.itertuples() if pd.notna(r.bus) and pd.notna(r.element)]
+        cim = _cim_model()
+        labels = {}
+        for source in (sem._busbars(net, cim), sem._bus_name_markers(net, cim)):
+            labels.update({str(b): v["name"] for b, v in source.items()})
+        out = {"node_breaker": True, "couplers": couplers, **({"labels": labels} if labels else {})}
+    cim = _cim_model()
+    if cim is not None and "origin_id" in net.bus.columns:
+        node_of = {int(i): sem.cm_norm(v) for i, v in net.bus["origin_id"].items() if isinstance(v, str)}
+        placed = cim.diagram_positions(node_of.values())
+        positions = {str(b): [round(placed[n][0], 3), round(placed[n][1], 3)] for b, n in node_of.items()
+                     if n in placed}
+        if positions:
+            out["positions"] = positions
+    return out
+
+
+def _cim_model():
+    """The CIM model the loaded network came from (cim_model.CimModel), or None: only while that network is the
+    one loaded, and never one CONDUCTOR wrote from the network's data (that states nothing a model said)."""
+    kept = _cim_kept()
+    return kept["model"] if kept and not kept.get("derived") else None
 
 
 _MRID_RE = re.compile(r"_?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -3447,7 +3755,7 @@ def _unit_shapes(net, profile: dict, declared: dict | None = None) -> dict:
     shapes = {}
     for table in ("gen", "sgen"):
         for i in net[table].index:
-            f = sem.unit_source(net, table, i, declared, profile.get("unit_sources") or {})
+            f = sem.unit_source(net, table, i, declared, profile.get("unit_sources") or {}, cim=_cim_model())
             if f["basis"] not in (sem.STATED, sem.NAMED):
                 continue
             shape = {"solar": "solar", "wind": "wind"}.get(f["value"], "flat")
@@ -3666,7 +3974,7 @@ def _renewable_rows(net) -> tuple[list[tuple[str, int]], dict]:
     rows, names = [], []
     for table in ("gen", "sgen"):
         for i in net[table].index:
-            f = sem.unit_source(net, table, i, declared, profile)
+            f = sem.unit_source(net, table, i, declared, profile, cim=_cim_model())
             if f["value"] in sem.VARIABLE and f["basis"] in (sem.STATED, sem.NAMED):
                 rows.append((table, int(i)))
                 names.append(gm.unit_name(net, table, i))
@@ -3728,16 +4036,42 @@ async def network_semantics(network: str | None = None, about: str | None = None
             out["names_as_loaded"] = renamed
         return out
     if about == "changes":
+        import cim_changes as cc
         import cim_export as ce
         base, proposal, network_id, name = _proposal_difference(network)
+        prop = _proposals().get(name) or {}
+        model = None
+        if prop.get("cim_difference"):
+            # The model's own account first: what the proposal's CIM difference adds, removes and changes.
+            names = {}
+            for layer in (base, proposal):
+                for key in ("buses", "branches", "units", "loads"):
+                    for e in layer.get(key) or []:
+                        if e.get("mrid"):
+                            names[e["mrid"]] = e.get("name")
+            model = cc.by_element(_cim_base_statements(_net_for(None)), prop["cim_difference"])
+            for e in model:
+                e.setdefault("name", names.get(e["mrid"]))
         return {"about": "changes", "proposal": name,
+                **({"model": model, "model_summary": prop.get("cim_summary")} if model is not None else {}),
                 **ce.difference_summary(ce.difference(base, proposal, network_id)),
-                "note": "What the proposal changes in the CIM layer, element by element: added, removed, or the "
-                        "facts that change (a feeder's members, a unit's source, a bus's level). Exported as a "
-                        "CIM difference model by GET /api/network/cim/difference."}
+                "note": "What the proposal changes: in the CIM model (`model`: each element its difference touches, "
+                        "with the statements that change — exported as an IEC 61970-552 difference by GET "
+                        "/api/network/cim/proposal), and in the CIM layer's facts (a feeder's members, a unit's "
+                        "source, a bus's level — GET /api/network/cim/difference)."}
     if about == "issues":
         import types
         issues = sem.data_issues(_net_for(types.SimpleNamespace(network=network)), facts)
+        solved = _cim_solved()
+        if solved and solved.get("matches") is False:
+            worst = (solved.get("largest_injection_differences") or [{}])[0]
+            issues.append({"kind": "solved_state_differs", "level": "check",
+                           "element": worst.get("element") or "the network",
+                           "note": f"CONDUCTOR's power flow on the network as loaded differs from the model's own "
+                                   f"solution: up to {solved['max_vm_diff_pu']} pu in voltage and "
+                                   f"{solved['max_injection_diff_mw_mvar']} MW/Mvar at an injection (largest at "
+                                   f"{', '.join(d['element'] for d in solved.get('largest_injection_differences') or [])})"
+                                   ": something the studies use differs from the model"})
         return {"about": "issues", "issues": issues,
                 "note": ("What in the network's own data looks inconsistent, found from the facts (no study run). "
                          "'check': likely an error in the data — say so before relying on it; 'note': worth "
@@ -3771,12 +4105,53 @@ async def network_semantics(network: str | None = None, about: str | None = None
         if station and not any(b["name"].casefold() == said for b in facts["buses"]):
             return {**sem.around(net, facts, "substation", station, check_tie=_tie_checker(net)),
                     "operating_point": _clock_moment()}
+        # A name the CIM model gives: a busbar section or a bus name marker (its node), a voltage level (its
+        # substation).
+        if not any(b["name"].casefold() == said for b in facts["buses"]):
+            node = next((b["index"] for b in facts["buses"] for key in ("busbar", "name_in_model")
+                         if ((b.get(key) or {}).get("value") or {}).get("name", "").casefold() == said), None)
+            if node is not None:
+                return {**sem.around(net, facts, "bus", node, check_tie=_tie_checker(net)),
+                        "operating_point": _clock_moment()}
+            level_of = next((s["name"] for s in (facts.get("containers") or {}).get("substations") or []
+                             for vl in s["voltage_levels"] if str(vl.get("name") or "").casefold() == said), None)
+            if level_of:
+                return {**sem.around(net, facts, "substation", level_of, check_tie=_tie_checker(net)),
+                        "operating_point": _clock_moment()}
+        # Any object of the CIM model by its mRID, even one the layer does not describe (a limit set, a fuse
+        # pandapower did not keep, a diagram object): as the model states it.
+        cim = _cim_model()
+        described = cim.describe(str(element).strip()) if cim is not None else None
+        if described:
+            listed = next((o for o in facts.get("other_equipment") or []
+                           if o["mrid"] == described["mrid"]), None)
+            return {"about": "around", "in_model": described,
+                    **({"in_layer": listed} if listed else {}),
+                    "note": "An object of the CIM model the network came from, as the model states it. "
+                            + ("It is not in the computation: the studies do not see it." if listed
+                               and not listed["in_computation"] else
+                               "Not an element the layer looks around (no bus, branch, unit, load or substation).")}
         found = _find_element(net, element, ("bus", "line", "trafo", "gen", "sgen", "storage", "load"))
         return {**sem.around(net, facts, found.etype, found.idx, check_tie=_tie_checker(net)),
                 "operating_point": _clock_moment()}
     if about not in sem.ABOUT:
         raise HTTPException(status_code=400, detail=f"about must be one of {list(sem.ABOUT) + ['facts']}.")
     out = sem.view(facts, about)
+    if about == "model" and facts.get("cim_model"):
+        out["solved_state"] = _cim_solved() or {"note": "The model has no solved state (SV profile) to compare."}
+    elif about == "model" and (_cim_kept() or {}).get("derived"):
+        kept = _cim_kept()
+        trip = _cim_round_trip() or {}
+        out = {"about": "model", "derived": True, "version": kept["model"].version,
+               "objects": kept["model"].summary()["objects"],
+               "round_trip": {k: trip.get(k) for k in ("matches", "compared", "max_diff", "worst", "n_missing",
+                                                       "tolerance", "note") if k in trip},
+               "losses": trip.get("losses") or [],
+               "note": "The network did not come as CIM: CONDUCTOR wrote it as CGMES (EQ, SSH, TP) from its data, "
+                       "each element by the CIM layer's mRID. round_trip: read back by pandapower's CIM converter "
+                       "(with what CGMES has no place for put back by mRID), the same power flow element by element? "
+                       "losses: what the CGMES cannot carry. The layer's facts stay the network's own (stated, named, "
+                       "inferred), not the written model's. Export: GET /api/network/cim/package."}
     if about == "summary":
         out["studies_use_semantic_layer"] = studies_use_semantic_layer()
     # Demands are the current moment's: say which moment.
@@ -3811,6 +4186,212 @@ def _proposal_difference(network: str | None):
         raise HTTPException(status_code=400, detail="Name a proposal (network=<proposal id>): the difference is a "
                                                     "proposal's against the base.")
     return _semantics(None), _semantics(name), str(app_data.get("loaded_fingerprint") or "local"), name
+
+
+@app.get("/api/network/cim/package")
+@_off_event_loop
+async def network_cim_package():
+    """The CIM model the network came from, losslessly: its profiles exactly as uploaded (the zip, untouched),
+    and CONDUCTOR's additions as one more profile (`cim_export.additions_rdf_xml`: the facts the layer adds about
+    the model's objects, by their own identifiers, with how each is known, and the feeders it infers). 404 for a
+    network not loaded as CIM."""
+    import io
+    import zipfile
+    from datetime import datetime, timezone
+
+    import cim_export as ce
+    kept = _cim_kept() or {}
+    cim = kept.get("model")
+    source = kept.get("source")
+    derived = bool(kept.get("derived"))
+    if cim is None or (not derived and (not source or not os.path.isfile(source))):
+        raise HTTPException(status_code=404, detail="No CIM model is kept for this network: export the layer as CIM "
+                                                    "instead (/api/network/cim).")
+    layer = _semantics(None)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if derived:
+        # Written from the network's data: the CGMES profiles, what the adapter puts back, and the additions.
+        stem = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                       for ch in str(getattr(app_data.get("net_loaded"), "name", "") or "network"))[:40] or "network"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            with zipfile.ZipFile(io.BytesIO(kept["package"])) as written:
+                for n in written.namelist():
+                    z.writestr(f"model/{n}", written.read(n))
+            z.writestr("conductor_additions.xml", ce.additions_rdf_xml(layer, cim, created=created))
+            _write_operator_changes(z)
+            _write_state_files(z)
+            z.writestr("README.txt", (
+                "This network did not come as CIM: CONDUCTOR wrote it as CGMES 2.4.15 from its data.\n"
+                "model/ holds its EQ (equipment), SSH (operating point as loaded) and TP (topology) profiles, and "
+                "conductor_extras.json: what CGMES has no place for but CONDUCTOR's computation needs (costs, OPF "
+                "limits, voltage-dependent loads, scaling, storage, frequency), by mRID, with any losses listed.\n"
+                "conductor_additions.xml: the facts CONDUCTOR's CIM layer adds about the model's objects, with how "
+                "each is known. Namespace: urn:conductor:semantics#.\n"))
+        return Response(content=buf.getvalue(), media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{stem}-cgmes.zip"',
+                                 "X-Conductor-Model": "written"})
+    original = os.path.basename(source)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(source, f"model/{original}")
+        z.writestr("conductor_additions.xml", ce.additions_rdf_xml(layer, cim, created=created))
+        _write_operator_changes(z)
+        _write_state_files(z)
+        z.writestr("README.txt", (
+            "model/ holds the CIM model exactly as it was uploaded to CONDUCTOR (untouched).\n"
+            "conductor_additions.xml is one more profile beside it: the facts CONDUCTOR's CIM layer adds about the "
+            "model's objects (a unit's energy source, a load's category, a node's feeder, a switch's role), each "
+            "with how it is known (stated, named, inferred, declared by the operator), referring to the objects by "
+            "the model's own identifiers, and the feeders the layer infers. Namespace: urn:conductor:semantics#.\n"))
+    name = os.path.splitext(original)[0].removeprefix("uploaded_system__") or "model"
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{name}-with-conductor.zip"',
+                             "X-Conductor-Model": "original"})
+
+
+def _write_state_files(z) -> None:
+    """Into a package: each proposal's difference (IEC 61970-552, `proposals/<id>.xml`) and a manifest of the state —
+    the model, the operator's changes, the proposals — and what each was made against."""
+    import json as _json
+
+    import cgmes_writer as cw
+    import cim_changes as cc
+    written = []
+    for pid, prop in _proposals().items():
+        diff = prop.get("cim_difference")
+        if diff:
+            z.writestr(f"proposals/{pid}.xml", cc.to_xml(diff, description=f"Proposal {pid}",
+                                                         created=prop.get("updated", "")))
+            written.append({"id": pid, "file": f"proposals/{pid}.xml", "edits": len(prop.get("edits") or []),
+                            "summary": prop.get("cim_summary")})
+    op = _operator_difference()
+    z.writestr("manifest.json", _json.dumps({
+        "network": app_data.get("loaded_fingerprint"), "basis": _cim_basis(), "writer": cw.WRITER_VERSION,
+        "cgmes": cw.DEFAULT_VERSION,
+        "operator_changes": "operator_changes.xml" if op and (op["added"] or op["changed"] or op["removed"])
+        else None,
+        "proposals": written,
+        "note": "The network's state: its model (model/), the operator's standing changes to it and each proposal, "
+                "as IEC 61970-552 differences against it. CONDUCTOR studies the model with these applied."},
+        indent=1, default=str))
+
+
+def _write_operator_changes(z) -> None:
+    """Into a package: the operator's standing changes (generator models, names) as a difference model, if any."""
+    import cim_changes as cc
+    diff = _operator_difference()
+    if diff and (diff["added"] or diff["removed"] or diff["changed"]):
+        z.writestr("operator_changes.xml", cc.to_xml(diff, description="The operator's changes to the model as "
+                                                                       "loaded"))
+
+
+@app.get("/api/network/cim/operator")
+@_off_event_loop
+async def network_cim_operator(format: str = "xml"):
+    """The operator's standing changes to the model as loaded (generator models, names) as a CIM difference: an IEC
+    61970-552 difference model (`xml`), or its summary (`json`). Empty when nothing has been changed."""
+    import cim_changes as cc
+    diff = _operator_difference()
+    if diff is None:
+        raise HTTPException(status_code=503, detail="No network loaded yet.")
+    if format == "json":
+        return {"summary": cc.summary(diff), "empty": not (diff["added"] or diff["removed"] or diff["changed"]),
+                "note": "What the operator has changed in the model as loaded: each unit's control (its generator "
+                        "model) and the names given. Declarations of what the data do not say are in the "
+                        "additions profile (GET /api/network/cim/package)."}
+    return Response(cc.to_xml(diff, description="The operator's changes to the model as loaded"),
+                    media_type="application/rdf+xml",
+                    headers={"Content-Disposition": 'attachment; filename="operator-changes.xml"'})
+
+
+@app.get("/api/network/cim/moment")
+@_off_event_loop
+async def network_cim_moment(network: str | None = None, timestamp: str | None = None, source: str = "measurements",
+                             format: str = "xml"):
+    """A moment of the clock as the CIM model states it: the network's operating point at that tick (the
+    measurements allocated as every study does) as a CGMES SSH profile against its model (`xml`, the same mRIDs as
+    GET /api/network/cim/package), or each element's values by mRID (`json`). Default: the base, the clock's
+    tick."""
+    import operating_point as op
+    req = type("R", (), {"network": network})()
+    net = copy.deepcopy(_net_for(req))
+    ts = _resolve_tick(source, timestamp)
+    meas = prepare_measurement_df(_lookup_measurement_df(ts, source))
+    net, _report = _assign_tick(net, meas, ts, _resolve_dataset(source)[1])
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    if format == "json":
+        import semantics as sm
+        out = {}
+        for table, cols in (("load", ("p_mw", "q_mvar")), ("gen", ("p_mw", "vm_pu")), ("sgen", ("p_mw", "q_mvar")),
+                            ("storage", ("p_mw", "q_mvar"))):
+            if table in net and len(net[table]):
+                ids = sm.row_mrids(net, table, nid)
+                for i in net[table].index:
+                    row = {c: float(net[table].at[i, c]) for c in cols if c in net[table].columns
+                           and pd.notna(net[table].at[i, c])}
+                    row["in_service"] = bool(net[table].at[i, "in_service"])
+                    if table == "load" and "substation_name" in net.load.columns:
+                        row["measurement"] = net.load.at[i, "substation_name"]
+                    out[ids[int(i)]] = {"table": table, "name": net[table].at[i, "name"]
+                                        if "name" in net[table].columns else None, **row}
+        return {"network": network or BASE_NETWORK, "timestamp": ts, "elements": out}
+    xml = op.ssh_profile(net, nid, description=f"{network or BASE_NETWORK} at {ts}", created=ts)
+    return Response(xml, media_type="application/rdf+xml",
+                    headers={"Content-Disposition": f'attachment; filename="moment-{ts.replace(":", "")}_SSH.xml"'})
+
+
+@app.get("/api/network/cim/solved")
+@_off_event_loop
+async def network_cim_solved(network: str | None = None, timestamp: str | None = None, source: str = "measurements",
+                             format: str = "xml"):
+    """The network solved at a moment, as CGMES state variables (an SV profile against its model: each node's
+    voltage and angle, the power at every terminal, the tap positions — the model's own identifiers for a network
+    loaded as CIM), so another tool can read CONDUCTOR's solution or compare it with its own. `json`: what was
+    solved. Default: the base, the clock's tick."""
+    import operating_point as op
+    req = type("R", (), {"network": network})()
+    net = copy.deepcopy(_net_for(req))
+    ts = _resolve_tick(source, timestamp)
+    meas = prepare_measurement_df(_lookup_measurement_df(ts, source)) if ts != nom.NOMINAL else None
+    net, _report = _assign_tick(net, meas, ts, _resolve_dataset(source)[1])
+    try:
+        pp.runpp(net)
+    except Exception as exc:  # noqa: BLE001 — said
+        raise HTTPException(status_code=422, detail=f"The power flow does not solve at {ts} ({exc}).")
+    nid = str(app_data.get("loaded_fingerprint") or "local")
+    if format == "json":
+        return {"network": network or BASE_NETWORK, "timestamp": ts, "converged": True,
+                "nodes": int(net.res_bus["vm_pu"].notna().sum()),
+                "lowest_vm_pu": round(float(net.res_bus["vm_pu"].min()), 5),
+                "highest_vm_pu": round(float(net.res_bus["vm_pu"].max()), 5),
+                "identifiers": "the model's own" if _cim_model() is not None else "the written model's"}
+    xml = op.sv_profile(net, nid, description=f"{network or BASE_NETWORK} solved at {ts}", created=ts)
+    return Response(xml, media_type="application/rdf+xml",
+                    headers={"Content-Disposition": f'attachment; filename="solved-{ts.replace(":", "")}_SV.xml"'})
+
+
+@app.get("/api/network/cim/proposal")
+@_off_event_loop
+async def network_cim_proposal(network: str, format: str = "xml"):
+    """A proposal as the change it makes to the CIM model: an IEC 61970-552 difference model (`xml`), or its summary
+    and how its edits were translated (`json`). 404 when none could be made (the proposal is then studied by its
+    edits)."""
+    import cim_changes as cc
+    proposal = _proposals().get(network)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail=f"No proposal {network!r}.")
+    diff = proposal.get("cim_difference")
+    if not diff:
+        raise HTTPException(status_code=404, detail="No CIM difference could be made for this proposal ("
+                                                    f"{proposal.get('cim_error') or 'unknown'}); it is studied by "
+                                                    "its edits.")
+    if format == "json":
+        return {"proposal": network, "summary": proposal.get("cim_summary"),
+                "translation": proposal.get("cim_translation")}
+    return Response(cc.to_xml(diff, description=f"Proposal {network}", created=proposal.get("updated", "")),
+                    media_type="application/rdf+xml",
+                    headers={"Content-Disposition": f'attachment; filename="{network}-cim-difference.xml"'})
 
 
 @app.get("/api/network/cim/difference")
@@ -4158,6 +4739,7 @@ async def network_topology(network: str | None = None):
         "buses": buses,
         "branches": branches,
         "external_grids": external_grids,
+        **_node_breaker_drawing(net),
         "counts": {
             "buses": len(buses),
             "lines": int(len(net.line)),
@@ -4545,7 +5127,7 @@ def _cim_layer_summary() -> dict:
         return cached[1]
     profile = (app_data.get("grid_profile") or {}).get("unit_sources") or {}
     unknown = sum(1 for table in ("gen", "sgen") for i in loaded[table].index
-                  if sem.unit_source(loaded, table, i, declared, profile)["basis"] == sem.UNKNOWN)
+                  if sem.unit_source(loaded, table, i, declared, profile, cim=_cim_model())["basis"] == sem.UNKNOWN)
     out = {"declared": len(declared) + len(categories), "units_unknown": unknown}
     app_data["_cim_summary"] = (key, out)
     return out
@@ -5511,7 +6093,7 @@ async def upload_network(
     PG_MAX_DATA.clear()
     PG_MAX_DATA.update(get_pg_max_data(net))
     print(f"[upload] PG_MAX_DATA populated ({len(PG_MAX_DATA)} generators): {PG_MAX_DATA}")
-    _remember_loaded(net)
+    _remember_loaded(net, stored_path if ext == ".zip" else None)
 
     # Build admittance databases on-the-fly (required for OPF / RSA / N-1)
     print(f"[upload] Building admittance databases ({len(net.line)} lines, {len(net.trafo)} trafos)...")
@@ -7992,14 +8574,89 @@ async def simulate_contingency(request: ContingencyRequest):
 
     # Placeholder: publish_ca_results(df_results_ca, current_ts, topic="topic6913"...)
 
+    rows = df_results_ca.to_dict(orient="records")
+    temporary = _with_temporary_limits(rows, net_copy)
     return echoed({"timestamp": current_ts, "system_secure": False, "total_violations": len(df_results_ca),
-            "violations": df_results_ca.to_dict(orient="records"),
+            "violations": rows, **temporary,
             "data_source": _dataset_label(request),
             "thresholds_used": _thresholds_used(request),
             **supply})
 
 
 _SCREEN_VM_TOL, _SCREEN_LOADING_TOL = 1e-4, 0.01      # p.u., % — solver precision, not a violation
+
+
+def _temporary_limits(net) -> dict:
+    """{(table, index): [{"type", "held_for_s", "limit_pct"}…], longest first} — the temporary limits (TATL) a CIM
+    model states for each line and transformer, as a share of its permanent limit (PATL, the rating the loadings
+    are a percentage of). Empty for a network that did not come as CIM. Kept per network."""
+    cim = _cim_model()
+    if cim is None:
+        return {}
+    key = (app_data.get("loaded_fingerprint"), id(cim))
+    kept = app_data.get("_temporary_limits")
+    if kept and kept[0] == key:
+        return kept[1]
+    out: dict = {}
+    for table in ("line", "trafo"):
+        df = net[table] if table in net else None
+        if df is None or not len(df) or "origin_id" not in df.columns:
+            continue
+        for i in df.index:
+            own = sem._origin(net, table, i)
+            if not own:
+                continue
+            by_kind: dict = {}
+            for lim in cim.limits(own):
+                if lim.get("value") is None:
+                    continue
+                by_kind.setdefault(lim["kind"], []).append(lim)
+            ratings = []
+            for kind, lims in by_kind.items():
+                patl = next((x["value"] for x in lims if x["permanent"]), None)
+                if not patl:
+                    continue
+                for x in lims:
+                    temporary = not x["permanent"] and (x.get("limit_type") in (None, "tatl")) and x.get("duration_s")
+                    if temporary and x["value"] > patl:
+                        ratings.append({"type": x.get("type") or "TATL", "held_for_s": float(x["duration_s"]),
+                                        "limit_pct": round(100.0 * x["value"] / patl, 2)})
+            if ratings:
+                out[(table, int(i))] = sorted(ratings, key=lambda r: -r["held_for_s"])
+    app_data["_temporary_limits"] = (key, out)
+    return out
+
+
+def _with_temporary_limits(rows: list[dict], net) -> dict:
+    """Each loading violation above its permanent limit, against the model's temporary limits (in place): the
+    longest it may be held (`temporary_limit`) or `beyond_temporary_limits`; and the time left to act — the
+    shortest over the violations (0: one is beyond every temporary limit). Empty when the model states none."""
+    limits = _temporary_limits(net)
+    if not limits:
+        return {}
+    shortest = None
+    for row in rows:
+        table = {"line_loading": "line", "trafo_loading": "trafo"}.get(row.get("violation_type"))
+        ratings = limits.get((table, int(row.get("violation_element_index", -1)))) if table else None
+        value = row.get("value")
+        if not ratings or value is None or float(value) <= 100.0:
+            continue
+        fits = [r for r in ratings if float(value) <= r["limit_pct"]]
+        if fits:
+            best = max(fits, key=lambda r: r["held_for_s"])
+            row["temporary_limit"] = {**best, "basis": "stated", "from": "the model's temporary limit"}
+            held = best["held_for_s"]
+        else:
+            row["beyond_temporary_limits"] = True
+            held = 0.0
+        shortest = held if shortest is None else min(shortest, held)
+    if shortest is None:
+        return {}
+    return {"time_to_act_s": shortest,
+            "temporary_limits_note": ("Above its permanent limit, a line or transformer may be held up to the "
+                                      "model's temporary limit for as long as that limit says (TATL): "
+                                      "`time_to_act_s` is the shortest of these over the violations — 0 means one "
+                                      "is beyond every temporary limit and needs action at once.")}
 
 
 def _load_cut_off(net) -> tuple[list[str], float]:
@@ -8107,8 +8764,9 @@ def _n1_sweep(net_copy, current_ts: str, vm_lower: float, vm_upper: float,
                 df_results_ca["value"] = df_results_ca["value"].round(3)
             all_violations.extend(df_results_ca.to_dict(orient="records"))
 
+    temporary = _with_temporary_limits(all_violations, net_copy)
     return {"total_outages_tested": total_tested, "total_outages_causing_violations": outages_with_violations,
-            "total_violations": len(all_violations), "violations": all_violations,
+            "total_violations": len(all_violations), "violations": all_violations, **temporary,
             "non_converged_outages": non_converged_outages,
             "total_outages_disconnecting_load": len(disconnecting), "outages_disconnecting_load": disconnecting}
 
@@ -8209,6 +8867,7 @@ async def simulate_all_contingencies(request: ContingencySweepRequest):
         "total_outages_disconnecting_load": len(disconnecting),
         "outages_disconnecting_load": disconnecting,
         "violations": all_violations,
+        **{k: sweep[k] for k in ("time_to_act_s", "temporary_limits_note") if k in sweep},
         "data_source": _dataset_label(request),
         "thresholds_used": _thresholds_used(request),
         # The corrective option this screen ran with, applied — not the schedule.
@@ -14791,7 +15450,9 @@ _SCAN_MAX_TICKS = 700
 def _proposal_view(name: str) -> dict:
     p = _proposals()[name]
     return {"id": name, "edits": p["edits"], "edits_hash": p["hash"],
-            "summary": p["summary"], "created": p["created"], "updated": p["updated"]}
+            "summary": p["summary"], "created": p["created"], "updated": p["updated"],
+            **({"cim": {"summary": p.get("cim_summary"), "translation": p.get("cim_translation")}}
+               if p.get("cim_difference") else {"cim": {"error": p.get("cim_error")}} if p.get("cim_error") else {})}
 
 
 def _check_profiles_now(net, name: str) -> list[str]:
@@ -14854,6 +15515,7 @@ async def edit_proposal(request: ProposalEditRequest):
         "id": name, "edits": canonical, "hash": sb.edits_hash(canonical),
         "summary": sb.summary(net, canonical),
         "created": existing["created"] if existing else now, "updated": now,
+        **_cim_record(name, base, net, canonical),
     }
     app_data.setdefault("_proposal_cache", {}).pop(name, None)
     _save_proposals()

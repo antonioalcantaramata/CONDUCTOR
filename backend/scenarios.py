@@ -9,9 +9,14 @@ Starting scenarios: what CONDUCTOR loads — the operator's own work, or a demo.
   ratings; a synthetic week of active power in which the line from the
   external grid congests at the evening peaks. Loads take their reactive
   power from the load power factor. Its nominal operating point is included.
-- ``ieee30_reactive`` — the same network and week, with measured reactive
-  demand and generation (`demo_reactive_csv`), a few values left out on
-  purpose so the data-quality report shows how gaps are handled.
+- ``smallgrid`` — ENTSO-E's CGMES SmallGrid test model (CC BY-SA 4.0, ENTSO-E;
+  ``backend/network_data/entsoe_smallgrid/``), loaded as a CIM model and kept
+  whole: 118 nodes at 220, 132 and 33 kV, 18 machines holding the model's own
+  voltage set-points, three boundary equivalents. A synthetic week in which the
+  units follow the demand and the 220 kV corridor Olive–X9–Breed congests at the
+  evening peaks, with measured reactive demand and generation
+  (`demo_reactive_csv`), a few values left out on purpose so the data-quality
+  report shows how gaps are handled.
 - ``cigre_mv`` — pandapower's CIGRE medium-voltage benchmark (110/20 kV, two
   radial feeders with normally open ties) with all its distributed resources —
   PV, wind, CHP, fuel cells, batteries — each typed by the network, so its
@@ -34,6 +39,7 @@ import numpy as np
 
 DEMO_PROFILE = "pglib_case30"
 DISTRIBUTION_DEMO_PROFILE = "cigre_mv"
+CIM_DEMO_PROFILE = "entsoe_smallgrid"
 DEFAULT_DEMO = "ieee30"
 SCENARIOS = {
     "resume": {
@@ -48,11 +54,14 @@ SCENARIOS = {
                        "point is included.",
         "profile": DEMO_PROFILE, "reactive": False,
     },
-    "ieee30_reactive": {
-        "label": "Demo: IEEE 30 · with reactive measurements",
-        "description": "The same network and week, with measured reactive demand and generation — a few values "
-                       "left out on purpose, so the data-quality report shows how gaps are handled.",
-        "profile": DEMO_PROFILE, "reactive": True,
+    "smallgrid": {
+        "label": "Demo: ENTSO-E SmallGrid · a CIM model",
+        "description": "ENTSO-E's CGMES SmallGrid test model (CC BY-SA 4.0, © ENTSO-E), loaded as CIM and kept "
+                       "whole: 118 nodes at 220/132/33 kV, 18 machines, boundary equivalents. A synthetic week in "
+                       "which the 220 kV corridor Olive–X9–Breed congests at the evening peaks, with measured "
+                       "reactive power — a few values left out on purpose, so the data-quality report shows how "
+                       "gaps are handled.",
+        "profile": CIM_DEMO_PROFILE, "reactive": True,
     },
     "cigre_mv": {
         "label": "Demo: CIGRE MV · distribution with DER",
@@ -70,7 +79,8 @@ def demo_for_profile(profile: str) -> str | None:
     no demo uses (`GRID_PROFILE=<your own>`). Calling it the default demo filed
     its saved changes under that demo, and the next start loaded the demo
     instead of the profile."""
-    return next((k for k, v in SCENARIOS.items() if v.get("profile") == profile and not v.get("reactive")), None)
+    same = [k for k, v in SCENARIOS.items() if v.get("profile") == profile]
+    return next((k for k in same if not SCENARIOS[k].get("reactive")), same[0] if same else None)
 
 
 def demo_reactive_csv(measurements: dict, seed: int = 7) -> bytes:

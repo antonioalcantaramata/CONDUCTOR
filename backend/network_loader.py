@@ -69,6 +69,7 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
     - ``"pandapower"`` → pp.networks.<case>(**case_args) — any of pandapower's
                          bundled networks, e.g. ``create_cigre_network_mv``
                          with ``case_args: {with_der: all}``
+    - ``"cgmes"``     → read_cgmes(cgmes_path): a CIM model (the model is kept too)
     - ``"json"``      → pp.from_json(json_path)
     - ``"pickle"``    → pp.from_pickle(pickle_path)
     """
@@ -88,6 +89,10 @@ def load_network(profile: dict, backend_dir: Optional[str] = None) -> pp.pandapo
         if loader is None:
             raise ValueError(f"Unknown pp.networks case: {case}")
         return loader(**(profile.get("case_args") or {}))
+
+    if source == "cgmes":
+        # A CIM model (a CGMES zip, or a zip of a model's and its boundary's zips), read as an upload is.
+        return read_cgmes(str(base.parent / profile["cgmes_path"]))
 
     if source == "json":
         path = base.parent / profile["json_path"]
@@ -169,7 +174,7 @@ def _name_switch_nodes(net) -> None:
             net.bus.at[b, "Substation_id"] = net.bus.at[other, "Substation_id"]
 
 
-def read_cgmes(path: str) -> pp.pandapowerNet:
+def read_cgmes(path: str, partial: bool = False) -> pp.pandapowerNet:
     """A CGMES model (CIM 2.4.15 or 3.0) from a zip of its profiles — EQ, SSH,
     TP, SV, and the boundary set when the model has one — or a zip of such
     zips (a model and its boundary, as ENTSO-E publishes them). Converted by
@@ -207,13 +212,14 @@ def read_cgmes(path: str) -> pp.pandapowerNet:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                net = from_cim(file_list=files, cgmes_version=version)
+                net = (_from_cim_v3(files, path) if version == "3.0"
+                       else from_cim(file_list=files, cgmes_version=version))
         finally:
             logging.disable(logging.NOTSET)
-    if not len(net.bus):
+    if not len(net.bus) and not partial:
         raise CgmesError("The CGMES profiles describe no topology: include the TP (or EQ with connectivity) profile.")
     equipment = sum(len(net[t]) for t in ("line", "trafo", "trafo3w", "load", "gen", "sgen", "ext_grid") if t in net)
-    if not equipment or net.bus["vn_kv"].isna().all():
+    if (not equipment or net.bus["vn_kv"].isna().all()) and not partial:
         raise CgmesError("The CGMES profiles describe no equipment (no lines, transformers, loads, units or "
                          "voltages): include the EQ profile.")
     # The operating point — what each load draws and each unit produces — is the SSH profile's. Without
@@ -236,8 +242,8 @@ def read_cgmes(path: str) -> pp.pandapowerNet:
     # CONDUCTOR studies the network from a supply point. A model whose reference is a generator (CGMES
     # `referencePriority`, pandapower's `slack`) gets it as the external grid, as pandapower's MATPOWER
     # converter makes the reference bus's unit one; it keeps the unit's mRID.
-    net["_import_notes"] = []
-    if not len(net.ext_grid) and len(net.gen):
+    net["_import_notes"] = list(net.get("_v3_notes") or [])
+    if not len(net.ext_grid) and len(net.gen) and not partial:
         slack = net.gen[net.gen["slack"].fillna(False).astype(bool)] if "slack" in net.gen.columns else net.gen.iloc[0:0]
         biggest = (net.gen["max_p_mw"].fillna(0).idxmax() if "max_p_mw" in net.gen.columns
                    and net.gen["max_p_mw"].notna().any() else net.gen.index[0])
@@ -251,8 +257,206 @@ def read_cgmes(path: str) -> pp.pandapowerNet:
         net.gen = net.gen.drop(index=ref)
         net["_import_notes"].append(f"The model has no external grid: its reference unit {row.get('name')!r} "
                                     "is the supply point (the external grid) in CONDUCTOR.")
+    # An in-service flag pandapower's converter could not decide (CGMES 3.0 combines a motor's with its generating
+    # unit's, which a motor does not have) is in service: the model states nothing else, and the power flow needs a
+    # true or false.
+    for table in ("bus", "line", "trafo", "trafo3w", "gen", "sgen", "load", "motor", "shunt", "ward", "xward",
+                  "impedance", "ext_grid", "storage", "svc"):
+        df = net[table] if table in net else None
+        if isinstance(df, pd.DataFrame) and len(df) and "in_service" in df.columns and df["in_service"].dtype != bool:
+            net[table]["in_service"] = [True if pd.isna(v) else bool(v) for v in df["in_service"]]
+    # A boundary node can come with no nominal voltage (pandapower's converter reads none for some CGMES 3.0 boundary
+    # sets): a line or a closed bus–bus switch joins two buses at one voltage, so it takes its neighbour's.
+    if net.bus["vn_kv"].isna().any():
+        filled = 0
+        for _round in range(len(net.bus)):
+            known = net.bus["vn_kv"]
+            pairs = [(int(a), int(b)) for a, b in zip(net.line.from_bus, net.line.to_bus)]
+            if len(getattr(net, "switch", [])):
+                bb = net.switch[(net.switch.et == "b")]
+                pairs += [(int(a), int(b)) for a, b in zip(bb.bus, bb.element)]
+            step = 0
+            for a, b in pairs:
+                for x, y in ((a, b), (b, a)):
+                    if pd.isna(known.get(x)) and pd.notna(known.get(y)):
+                        net.bus.at[x, "vn_kv"] = known[y]
+                        step += 1
+            filled += step
+            if not step:
+                break
+        if filled:
+            net["_import_notes"].append(f"{filled} node(s) with no nominal voltage in the model (boundary nodes) take "
+                                        "the voltage of the node a line joins them to.")
+    # A static var compensator in reactive-power control has no voltage set point, which pandapower's converter takes
+    # as the shunt's rated voltage: left empty, the power flow cannot build the network. It takes its bus's voltage.
+    if len(net.shunt) and net.shunt["vn_kv"].isna().any():
+        missing = net.shunt["vn_kv"].isna()
+        net.shunt.loc[missing, "vn_kv"] = net.bus.loc[net.shunt.loc[missing, "bus"], "vn_kv"].to_numpy()
+        net["_import_notes"].append(f"{int(missing.sum())} shunt(s) with no rated voltage in the model (a static var "
+                                    "compensator in reactive-power control) take their bus's nominal voltage.")
+    # A transformer with a ratio tap changer on one end and a linear phase tap changer on the other: pandapower's
+    # converter gives each tap the other's step as well (the ratio tap an angle step, the phase tap a voltage step),
+    # so every ratio step also turns the angle. Each keeps its own.
+    cols = set(net.trafo.columns) if len(net.trafo) else set()
+    if {"tapchanger_class", "tapchanger2_class"} <= cols:
+        first = net.trafo["tapchanger_class"].astype(str)
+        second = net.trafo["tapchanger2_class"].astype(str)
+        fixed = 0
+        for ratio, phase, phase_tap, ratio_tap in ((first, second, "tap2", "tap"), (second, first, "tap", "tap2")):
+            both = ratio.str.startswith("RatioTapChanger") & phase.str.startswith("PhaseTapChangerLinear")
+            for col in (f"{ratio_tap}_step_degree", f"{phase_tap}_step_percent"):
+                if col in cols and (both & net.trafo[col].notna()).any():
+                    fixed += int((both & net.trafo[col].notna()).sum())
+                    net.trafo.loc[both, col] = float("nan")
+        if fixed:
+            net["_import_notes"].append("Transformer(s) with a ratio and a phase tap changer: each tap keeps only its "
+                                        "own step (pandapower's converter copies the other's to it).")
+    _plain_dtypes(net)
+    added = add_unconverted_switches(net, path)
+    if added:
+        classes = sorted({c for _, c in added})
+        net["_import_notes"].append(
+            f"{len(added)} switch(es) of a class pandapower's converter does not read ({', '.join(classes)}) "
+            "were added as switches between their nodes, so the topology is the model's.")
     net.name = net.name or os.path.splitext(os.path.basename(path))[0]
     return net
+
+
+# Equipment pandapower's CGMES 3.0 converter reads `inService` for from its EQ table, where its parser keeps no such
+# column (CGMES 3.0 states Equipment.inService in SSH, and may leave it out: then the equipment is in service).
+_V3_IN_SERVICE_FROM_EQ = ("ACLineSegment", "DCLineSegment", "EquivalentBranch", "SeriesCompensator")
+
+
+def _from_cim_v3(files: list, source: str):
+    """A CGMES 3.0 model through pandapower's converter, with what its 3.0 parser drops put back. pandapower 3.5's
+    3.0 data structure has no inService for a line (CGMES 3.0 states it in SSH, and may leave it out — then the
+    equipment is in service), which its converter then reads: without it pandapower cannot read a 3.0 model with
+    lines at all (ENTSO-E's MicroGrid included). The structure is extended for this parse only, and the state read
+    from the whole model. (A transformer's phaseAngleClock is the ShortCircuit profile's in 3.0: a model sent
+    without it reads every vector group as 0°, said in the import notes.)"""
+    import cim_model
+    from pandapower.converter.cim import cim_classes
+    from pandapower.converter.cim.cim2pp.from_cim import from_cim_dict
+
+    parser = cim_classes.CimParser(cgmes_version="3.0")
+    structure = parser.get_cim_data_structure
+
+    def extended():
+        s = {profile: dict(classes) for profile, classes in structure().items()}
+        for cls in _V3_IN_SERVICE_FROM_EQ:
+            if cls in s["eq"] and "inService" not in s["eq"][cls].columns:
+                s["eq"][cls] = pd.DataFrame(columns=list(s["eq"][cls].columns) + ["inService"])
+        return s
+    parser.get_cim_data_structure = extended
+    parser.parse_files(file_list=files, prepare_cim_net=True, set_data_types=True)
+    model = cim_model.CimModel.read(source)
+    for cls in _V3_IN_SERVICE_FROM_EQ:
+        df = parser.cim["eq"].get(cls)
+        if isinstance(df, pd.DataFrame) and len(df):
+            df["inService"] = [str((model.get(rid) or {}).get("Equipment.inService", "true")).strip().lower() != "false"
+                               for rid in df["rdfId"]]
+    net = from_cim_dict(parser, cim_version="3.0",
+                        custom_converter_classes={"energySourcesCim16": _energy_sources_and_inverters()})
+    _drop_twice_converted(net)
+    if len(net.trafo) + len(net.trafo3w) and not model.profiles.get("SC"):
+        net["_v3_notes"] = ["The model has no ShortCircuit profile, where CGMES 3.0 states each transformer's vector "
+                            "group (phaseAngleClock): every transformer is read with no phase shift."]
+    return net
+
+
+def _plain_dtypes(net) -> None:
+    """pandas' nullable types (boolean, Int64, Float64, string) that pandapower's CIM converter leaves in the
+    tables, as plain ones: pandapower's own `create_*` cannot append a row to a nullable boolean column (adding a
+    transformer to a network loaded from CGMES failed). A flag with no value is False; a number with none is NaN."""
+    for table in ("bus", "line", "trafo", "trafo3w", "load", "gen", "sgen", "shunt", "ext_grid", "switch", "ward",
+                  "xward", "impedance", "motor", "storage", "svc", "dcline"):
+        df = net[table] if table in net else None
+        if not isinstance(df, pd.DataFrame) or not len(df.columns):
+            continue
+        for c in df.columns:
+            kind = str(df[c].dtype)
+            if c in ("reactive_capability_curve", "slack", "oltc", "power_station_unit", "tap_dependency_table") \
+                    and kind in ("object", "boolean"):
+                df[c] = df[c].where(df[c].notna(), False).astype(bool)     # a flag the model leaves unset: off
+                continue
+            if kind == "boolean":
+                df[c] = df[c].fillna(False).astype(bool)
+            elif kind in ("Int64", "Int32", "UInt32", "Float64", "Float32"):
+                df[c] = df[c].astype("float64")
+            elif kind == "string":
+                df[c] = df[c].astype(object).where(df[c].notna(), None)
+
+
+def _drop_twice_converted(net) -> None:
+    """The guard on `_energy_sources_and_inverters`: should a later pandapower convert power-electronics connections
+    for CGMES 3.0 itself, each would come out twice — the rows with one mRID are kept once (the first)."""
+    if not len(net.sgen) or "origin_id" not in net.sgen.columns:
+        return
+    twice = net.sgen["origin_id"].notna() & net.sgen["origin_id"].duplicated(keep="first")
+    if twice.any():
+        net.sgen = net.sgen[~twice]
+        net["_v3_notes"] = list(net.get("_v3_notes") or []) + [
+            f"{int(twice.sum())} unit(s) converted twice by pandapower kept once."]
+
+
+def _energy_sources_and_inverters():
+    """pandapower 3.5 converts PowerElectronicsConnections (PV, wind, batteries behind an inverter) for the LTDS
+    profile only: a CGMES 3.0 model would lose every one. Its converter already reads 3.0; this runs it after the
+    energy sources, where the LTDS profile runs it."""
+    from pandapower.converter.cim.cim2pp.converter_classes.generators.energySourcesCim16 import EnergySourceCim16
+    from pandapower.converter.cim.cim2pp.converter_classes.generators.powerElectronicsConnection import (
+        PowerElectronicsConnection)
+
+    class EnergySourcesAndInverters(EnergySourceCim16):
+        def convert_energy_sources_cim16(self):
+            super().convert_energy_sources_cim16()
+            PowerElectronicsConnection(cimConverter=self.cimConverter).convert_power_electronics_connection()
+    return EnergySourcesAndInverters
+
+
+# CIM switch classes pandapower's converter does not read (it reads Breaker, Disconnector, LoadBreakSwitch and
+# Switch). Left out, a fuse in series leaves its two nodes unjoined: everything beyond it looks cut off.
+_UNREAD_SWITCHES = ("Fuse", "Jumper", "GroundDisconnector", "Recloser", "Sectionaliser", "ProtectedSwitch",
+                    "DisconnectingCircuitBreaker", "Cut")
+_SWITCH_TYPE = {"Recloser": "CB", "ProtectedSwitch": "CB", "DisconnectingCircuitBreaker": "CB",
+                "Sectionaliser": "LBS"}
+
+
+def add_unconverted_switches(net, path: str) -> list[tuple[str, str]]:
+    """Add to `net` each switch of the CGMES model at `path` whose class the converter does not read, as a
+    bus–bus switch between the buses of its two terminals, open or closed as the model has it now (SSH), with its
+    mRID and class (`origin_id`, `origin_class`). Returns [(name, class)] of those added. A switch whose terminals
+    fall on one bus (a bus-branch model merges them) changes nothing and is not added."""
+    import cim_model
+    try:
+        model = cim_model.CimModel.read(path)
+    except Exception:  # noqa: BLE001 — the converter read it; without our own read, nothing is added
+        return []
+    unread = model.of(*_UNREAD_SWITCHES)
+    if not unread or "origin_id" not in net.bus.columns:
+        return []
+    node_bus = {cim_model.norm(v): int(i) for i, v in net.bus["origin_id"].items() if isinstance(v, str)}
+    added = []
+    for sw in unread:
+        buses = []
+        for t in model.terminals(sw):
+            node = model.ref(t, "Terminal.ConnectivityNode") or model.ref(t, "Terminal.TopologicalNode")
+            if node in node_bus and node_bus[node] not in buses:
+                buses.append(node_bus[node])
+        if len(buses) != 2:
+            continue
+        o = model.get(sw) or {}
+        state = o.get("Switch.open", o.get("Switch.normalOpen"))
+        closed = str(state).strip().lower() != "true"
+        cls = o.get("class")
+        idx = pp.create_switch(net, bus=buses[0], element=buses[1], et="b", closed=closed,
+                               type=_SWITCH_TYPE.get(cls, "LS"), name=model.name(sw) or sw)
+        if "origin_id" in net.switch.columns:
+            net.switch.at[idx, "origin_id"] = sw
+        if "origin_class" in net.switch.columns:
+            net.switch.at[idx, "origin_class"] = cls
+        added.append((model.name(sw) or sw, cls))
+    return added
 
 
 def read_matpower(path: str) -> pp.pandapowerNet:
@@ -319,11 +523,15 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
         # Unique per unit: two generators on one bus both used to become
         # `Gen_bus{b}`, and every table keyed by name (capacities, OPF sets)
         # silently kept one of them.
-        name = f"Gen_bus{bus_id}"
+        # A unit the network names (a CIM model's machine) keeps its name; one it does not is named by its bus.
+        own = row.get("name") if "name" in row.index else None
+        own = own.strip() if isinstance(own, str) and own.strip() else None
+        stem = own or f"Gen_bus{bus_id}"
+        name = stem
         taken = set(created_names) | set(net.sgen["name"].astype(str)) if len(net.sgen) else set(created_names)
         suffix = 2
         while name in taken:
-            name = f"Gen_bus{bus_id}_{suffix}"
+            name = f"{stem} {suffix}" if own else f"Gen_bus{bus_id}_{suffix}"
             suffix += 1
         min_p = float(row["min_p_mw"]) if "min_p_mw" in row.index and not np.isnan(float(row["min_p_mw"])) else 0.0
         new = pp.create_sgen(
@@ -345,6 +553,14 @@ def gen_to_sgen(net: pp.pandapowerNet) -> tuple:
             if col not in net.sgen.columns:
                 net.sgen[col] = np.nan
             net.sgen.at[new, col] = float(value) if value is not None and pd.notna(value) else np.nan
+        # A CIM model's machine keeps its identity (its mRID, class and terminal).
+        for col in ("origin_id", "origin_class", "terminal"):
+            value = row.get(col) if col in row.index else None
+            if isinstance(value, str) and value:
+                if col not in net.sgen.columns:
+                    net.sgen[col] = None
+                    net.sgen[col] = net.sgen[col].astype(object)
+                net.sgen.at[new, col] = value
         rows_to_drop.append(idx)
         created_names.append(name)
         _move_cost(net, "gen", idx, "sgen", new)

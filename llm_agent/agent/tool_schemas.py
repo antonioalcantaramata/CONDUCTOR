@@ -251,7 +251,9 @@ _simulate_contingency = genai.types.FunctionDeclaration(
     name="simulate_contingency",
     description=(
         "Simulate a single N-1 contingency (one line or transformer outage). "
-        "Returns whether the system remains secure and any resulting violations."
+        "Returns whether the system remains secure and any resulting violations. On a network loaded as CIM whose "
+        "model states temporary limits, each overload says how long it may be held (temporary_limit) or that it "
+        "is beyond them, and time_to_act_s the shortest — say it: how long the operator has to act."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -302,7 +304,9 @@ _simulate_all_contingencies = genai.types.FunctionDeclaration(
         "Use this when the user asks 'which contingency is worst' or "
         "'is the grid N-1 secure'. With option, it screens a corrective option instead of the schedule. "
         "With scope, only the outages of one feeder, substation or voltage level ('N-1 on the 20 kV level', "
-        "'on feeder Line 1-2'); violations are still looked for in the whole network."
+        "'on feeder Line 1-2'); violations are still looked for in the whole network. On a network loaded as CIM "
+        "whose model states temporary limits, each overload says how long it may be held, and time_to_act_s the "
+        "shortest over the sweep."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1766,7 +1770,12 @@ _describe_network = genai.types.FunctionDeclaration(
         "phrase names by meaning ('the wind units on feeder Line 1-2'), each with its basis; studies that take "
         "units accept such a phrase too. about='issues': what in the network's own data looks inconsistent "
         "(a name its type contradicts, a line across voltage levels, loads cut off). about='changes' with "
-        "network=<proposal>: what the proposal changes in the CIM layer, element by element."
+        "network=<proposal>: what the proposal changes, element by element — in the CIM model (each element its "
+        "difference touches, with the statements that change: a line's r and x, a limit) and in the layer's facts. "
+        "about='model': for a "
+        "network loaded as CIM/CGMES, what its model holds, what reaches the studies, and what they ignore "
+        "(temporary limits, controls held fixed, equipment pandapower has no place for); for any other, the CGMES "
+        "CONDUCTOR writes from its data and whether it reads back the same power flow."
     ),
     parameters=genai.types.Schema(
         type=genai.types.Type.OBJECT,
@@ -1774,11 +1783,13 @@ _describe_network = genai.types.FunctionDeclaration(
             "about": genai.types.Schema(
                 type=genai.types.Type.STRING,
                 enum=["summary", "units", "loads", "voltage_levels", "substations", "external_grid", "switches",
-                      "feeders", "data", "around", "select", "issues", "changes"],
+                      "feeders", "data", "around", "select", "issues", "changes", "model"],
                 description="The aspect to describe (default summary)."),
             "element": genai.types.Schema(
                 type=genai.types.Type.STRING,
-                description=("For about='around': a bus, line, transformer, unit, load or substation, by name. "
+                description=("For about='around': a bus, line, transformer, unit, load or substation, by name "
+                             "(for a CIM model also a busbar, a bus name or a voltage level as the model names "
+                             "it), or any object's mRID. "
                              "For about='select': what to select, by meaning — 'solar units on feeder Line 1-2', "
                              "'industrial loads at 20 kV', 'units in substation Bus 5', 'unknown units', "
                              "'transformers'.")),
@@ -1995,7 +2006,7 @@ _edit_proposal = genai.types.FunctionDeclaration(
                             "add_load", "add_generator", "add_shunt", "reinforce_line", "upgrade_trafo",
                             "add_bus_with_connection", "add_bus_with_transformer", "set_in_service",
                             "set_parameter", "add_line", "add_trafo", "move_element", "scale",
-                            "include_proposal"]),
+                            "set_switch", "include_proposal"]),
                         "name": _S(type=_T.STRING, description=(
                             "add_load / add_generator / add_shunt: a unique name, e.g. 'Data centre'. "
                             "add_line / add_trafo: optional name of the new branch. "
@@ -2136,6 +2147,10 @@ _edit_proposal = genai.types.FunctionDeclaration(
                             "include_proposal: an existing proposal whose edits are copied in here, in order "
                             "(an independent copy).")),
                         "in_service": _S(type=_T.BOOLEAN, description="set_in_service: true or false."),
+                        "switch": _S(type=_T.STRING, description=(
+                            "set_switch: the switch to operate — its name, index or mRID (a breaker, a "
+                            "disconnector, a busbar coupler, a normally open tie).")),
+                        "closed": _S(type=_T.BOOLEAN, description="set_switch: true to close it, false to open it."),
                         "field": _S(type=_T.STRING, description=(
                             "set_parameter: a column of that element, e.g. vm_pu (ext_grid, gen), tap_pos, "
                             "max_i_ka, max_loading_percent, p_mw, max_vm_pu. An unknown one is refused with "

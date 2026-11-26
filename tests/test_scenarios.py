@@ -62,7 +62,7 @@ class TestChoosing:
     def test_a_fresh_start_offers_the_demos_and_no_resume(self, client):
         payload = client.get("/api/scenario").json()
         assert payload["current"] == "ieee30"
-        assert [o["name"] for o in payload["options"]] == ["resume", "ieee30", "ieee30_reactive", "cigre_mv"]
+        assert [o["name"] for o in payload["options"]] == ["resume", "ieee30", "smallgrid", "cigre_mv"]
         assert _option(payload, "resume")["available"] is False
         assert "Nothing uploaded yet" in _option(payload, "resume")["description"]
 
@@ -74,9 +74,9 @@ class TestChoosing:
         assert client.post("/api/scenario", json={"name": "ieee118"}).status_code == 400
 
     def test_the_reactive_demo_carries_measured_reactive_power_with_gaps(self, client):
-        r = client.post("/api/scenario", json={"name": "ieee30_reactive"})
+        r = client.post("/api/scenario", json={"name": "smallgrid"})
         assert r.status_code == 200, r.text
-        assert r.json()["current"] == "ieee30_reactive"
+        assert r.json()["current"] == "smallgrid"
         quality = client.get("/api/data/quality").json()["measurements"]
         assert quality["reactive"] == {"consumption": True, "production": True}
         codes = {f["code"]: f for f in quality["findings"]}
@@ -86,7 +86,7 @@ class TestChoosing:
         assert client.get("/api/assumptions").json()["reactive_measured"]["measurements"]["consumption"] is True
 
     def test_the_active_only_demo_has_no_reactive_measurements(self, client):
-        client.post("/api/scenario", json={"name": "ieee30_reactive"})
+        client.post("/api/scenario", json={"name": "smallgrid"})
         assert client.post("/api/scenario", json={"name": "ieee30"}).status_code == 200
         quality = client.get("/api/data/quality").json()["measurements"]
         assert quality["reactive"] == {"consumption": False, "production": False}
@@ -108,8 +108,8 @@ class TestResume:
         assert "grid9" in _option(payload, "resume")["description"]
         sentinel = (systems / "last_uploaded.json").read_bytes()
 
-        assert client.post("/api/scenario", json={"name": "ieee30_reactive"}).status_code == 200
-        assert len(mb.app_data["net"].bus) == 30
+        assert client.post("/api/scenario", json={"name": "smallgrid"}).status_code == 200
+        assert len(mb.app_data["net"].bus) == 118
         assert (systems / "last_uploaded.json").read_bytes() == sentinel   # the demo never touches it
 
         assert client.post("/api/scenario", json={"name": "resume"}).status_code == 200
@@ -129,7 +129,7 @@ class TestResume:
 
     def test_reset_forgets_the_choice(self, client, tmp_path):
         _upload_case9(client)
-        client.post("/api/scenario", json={"name": "ieee30_reactive"})
+        client.post("/api/scenario", json={"name": "smallgrid"})
         assert (tmp_path / "scenario.json").exists()
         client.post("/api/network/reset_active")
         assert not (tmp_path / "scenario.json").exists()
@@ -143,11 +143,11 @@ class TestRestart:
         try:
             with TestClient(mb.app) as c:
                 _upload_case9(c)
-                assert c.post("/api/scenario", json={"name": "ieee30_reactive"}).status_code == 200
+                assert c.post("/api/scenario", json={"name": "smallgrid"}).status_code == 200
             with TestClient(mb.app) as c:
                 payload = c.get("/api/scenario").json()
-                assert payload["current"] == "ieee30_reactive"
-                assert len(mb.app_data["net"].bus) == 30
+                assert payload["current"] == "smallgrid"
+                assert len(mb.app_data["net"].bus) == 118
                 assert c.get("/api/data/quality").json()["measurements"]["reactive"]["consumption"] is True
                 assert c.post("/api/scenario", json={"name": "resume"}).status_code == 200
             with TestClient(mb.app) as c:
@@ -174,7 +174,7 @@ class TestTemplateAndDataKey:
         assert up.status_code == 200, up.text
 
     def test_the_template_carries_reactive_values_when_loaded(self, client):
-        client.post("/api/scenario", json={"name": "ieee30_reactive"})
+        client.post("/api/scenario", json={"name": "smallgrid"})
         lines = client.get("/api/data/template?hours=2").text.splitlines()
         assert len(lines) - 1 == 8 * (len({x.split(",")[1] for x in lines[1:]}))
         assert any(not line.endswith(",,") for line in lines[1:])
@@ -183,7 +183,7 @@ class TestTemplateAndDataKey:
         key = client.get("/api/assumptions").json()["data_key"]
         client.post("/api/assumptions", json={"load_power_factor": 0.9})
         assert client.get("/api/assumptions").json()["data_key"] == key
-        client.post("/api/scenario", json={"name": "ieee30_reactive"})
+        client.post("/api/scenario", json={"name": "smallgrid"})
         reactive = client.get("/api/assumptions").json()["data_key"]
         assert reactive != key
         client.post("/api/scenario", json={"name": "ieee30"})
@@ -191,7 +191,7 @@ class TestTemplateAndDataKey:
 
 
 def test_a_window_with_reactive_gaps_says_the_power_factor_filled_them(client):
-    client.post("/api/scenario", json={"name": "ieee30_reactive"})
+    client.post("/api/scenario", json={"name": "smallgrid"})
     worst = client.post("/api/rsa/worst_case", json={}).json()
     block = worst["load_power_factor"]["measured_reactive_power"]
     assert isinstance(block["share_of_load"], list) and block["share_of_load"][0] < 0.9999

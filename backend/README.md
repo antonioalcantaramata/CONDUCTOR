@@ -111,7 +111,7 @@ stay fast:
 |---|---|
 | `resume` | The last uploaded network and data (the "last uploaded" records). Only offered once something has been uploaded. |
 | `ieee30` (default) | PGLib IEEE 30-bus (Alsac–Stott, `pglib_case30`) with its synthetic week, active power only (loads use the load power factor). Five dispatchable units with the case's own quadratic costs, loaded on voltage control (the profile's `unit_model`); the line from the external grid congests at the evening peaks (about 11 of 168 hours with a violation). The nominal operating point is included. |
-| `ieee30_reactive` | The same network and week plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
+| `smallgrid` | ENTSO-E's CGMES SmallGrid test model (`network_profiles/entsoe_smallgrid.yaml`; the model in `network_data/entsoe_smallgrid/`, © ENTSO-E, CC BY-SA 4.0 — see its NOTICE), loaded as CIM and kept whole: 118 nodes at 220/132/33 kV, 18 machines on the model's voltage set-points. A synthetic week in which the units follow the demand (`dispatched`) and the 220 kV corridor Olive–X9–Breed congests at the evening peaks, plus measured reactive demand and generation (`demo_reactive_csv`, fixed seed): per-substation pf 0.88–0.98, one leading substation, about 1 % of cells and three hours of one substation left empty so the data-quality report shows gaps. |
 | `cigre_mv` | pandapower's CIGRE MV benchmark with all its distributed resources (`cigre_mv`, built by `pp.networks.create_cigre_network_mv(with_der="all")` — profile `source: pandapower` with `case_args`): a 110/20 kV substation, two radial feeders with three normally open ties, eight PV units, a wind turbine, CHP, fuel cells and two batteries, each typed by the network. Its synthetic week shapes each unit by the source the network states (`unit_shapes`: PV the sun, wind the wind, the others flat); its loads use the profile's power factor 0.97 (`load_power_factor`, the benchmark's own). The usual daily peak is 0.9 of the benchmark's peak loads: the feeder ends sag below 0.95 p.u. in about 9 of 168 hours, all at the evening peak. The what-if evaluation is written for it. |
 
 A profile can carry `unit_model` — the starting model of named units (e.g.
@@ -476,7 +476,7 @@ measurement row it reads, not a name).
 
 | Group | Endpoints |
 |---|---|
-| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee30\|ieee30_reactive\|cigre_mv`) |
+| **Scenario** | `GET /api/scenario`, `POST /api/scenario` (`resume\|ieee30\|smallgrid\|cigre_mv`) |
 | **State / clock** | `GET /api/grid_constants`, `GET /api/time/current`, `GET /api/time/timeline`, `POST /api/time/advance` |
 | **Upload** | `POST /api/network/upload`, `POST /api/data/upload` (`kind=measurements\|forecasts`), `GET /api/data/template` (a CSV for the loaded network: substation names, the first hour as example values, the optional reactive columns), `GET /api/data/quality`, `POST /api/network/snapshot` |
 | **Security** | `POST /api/grid/rsa`, `POST /api/rsa/worst_case`, `POST /api/rsa/scan_scenarios`, `POST /api/rsa/probabilistic`, `POST /api/rsa/historical_risk`, `POST /api/grid/element_timeseries` |

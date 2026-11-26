@@ -3098,13 +3098,13 @@ SCENARIO_QUERIES: dict[str, list[tuple[str, str]]] = {
          ":material/account_tree:"),
         ("Which units are solar, and how much of the evening peak can they cover?", ":material/solar_power:"),
     ],
-    "ieee30_reactive": [
+    "smallgrid": [
+        ("What does this CIM model hold that the studies do not use, and does its own solution match "
+         "CONDUCTOR's power flow?", ":material/schema:"),
+        ("When does the 220 kV corridor to Breed congest this week, and which units could relieve it?",
+         ":material/trending_up:"),
         ("What does the data-quality report say about the reactive measurements, and how are the gaps "
          "filled?", ":material/fact_check:"),
-        ("Which loads have the lowest power factor right now, and does that matter for the voltages?",
-         ":material/bolt:"),
-        ("With the measured reactive demand, when is the worst moment of the week, and is the grid "
-         "still secure then?", ":material/trending_down:"),
     ],
 }
 
@@ -5035,6 +5035,64 @@ def _render_data_issues() -> None:
                         .replace("$", "\\$"))
 
 
+def _render_written_model() -> None:
+    """For a network that did not come as CIM: CONDUCTOR writes it as CGMES; whether that reads back the same power
+    flow is checked on demand (it solves the network twice)."""
+    with st.expander("As CGMES", icon=":material/account_tree:", key="sem_written"):
+        st.caption("This network did not come as CIM, so CONDUCTOR writes it as CGMES (EQ, SSH, TP) from its data, "
+                   "each element under the CIM layer's identifier: the format system operators exchange, and what "
+                   "other tools read. The layer's facts stay the network's own; the written model states nothing "
+                   "new.")
+        if st.button("Check that it reads back the same", key="sem_round_trip", icon=":material/sync_alt:"):
+            out = _api_request("get", "/api/network/semantics?about=model", error_key="_sem_model_error") or {}
+            st.session_state.pop("_sem_model_error", None)
+            st.session_state["_sem_round_trip"] = out
+        out = st.session_state.get("_sem_round_trip") or {}
+        trip = out.get("round_trip") or {}
+        if trip.get("matches") is True:
+            d = trip.get("max_diff") or {}
+            st.success(f"Read back from CGMES, the network gives the same power flow: {trip['compared']} elements "
+                       f"within {d.get('vm_pu', 0):.0e} pu and {d.get('mw', 0):.0e} MW.", icon=":material/verified:")
+        elif trip.get("matches") is False:
+            st.warning(f"Read back from CGMES, the power flow differs (up to {(trip.get('max_diff') or {}).get('mw', 0):.3g}"
+                       " MW): see what CGMES cannot carry below.", icon=":material/report:")
+        elif trip.get("note"):
+            st.caption(trip["note"])
+        for loss in out.get("losses") or []:
+            st.markdown(f"- {html.escape(str(loss))}".replace("$", "\\$"))
+
+
+def _render_cim_model(rows: list[dict]) -> None:
+    """The CIM model the network came from: whether CONDUCTOR's power flow reproduces the model's own solution,
+    what the studies do not use, and the loss report class by class."""
+    out = _api_request("get", "/api/network/semantics?about=model", error_key="_sem_model_error") or {}
+    st.session_state.pop("_sem_model_error", None)
+    solved = out.get("solved_state") or {}
+    if solved.get("matches") is True:
+        st.success(f"CONDUCTOR's power flow reproduces the model's own solution: {solved['buses_compared']} nodes "
+                   f"within {solved['max_vm_diff_pu']} pu and {solved['max_angle_diff_deg']}°, "
+                   f"{solved['injections_compared']} injections within {solved['max_injection_diff_mw_mvar']} MW/Mvar.",
+                   icon=":material/verified:")
+    elif solved.get("matches") is False:
+        worst = ", ".join(d["element"] for d in solved.get("largest_injection_differences") or [])
+        st.warning(f"CONDUCTOR's power flow differs from the model's own solution: up to "
+                   f"{solved.get('max_vm_diff_pu')} pu and {solved.get('max_injection_diff_mw_mvar')} MW/Mvar "
+                   f"(largest at {worst or '—'})" + (f"; {solved['buses_not_solved']} node(s) the model solves are "
+                                                     "cut off here" if solved.get("buses_not_solved") else "")
+                   + ". Something the studies use differs from the model.", icon=":material/report:")
+    elif solved.get("note"):
+        st.caption(solved["note"])
+    ignored = out.get("studies_ignore") or []
+    if ignored:
+        st.markdown("**What the model states that the studies do not use**")
+        for c in ignored:
+            st.markdown(f"- **{html.escape(str(c['element']))}** — {html.escape(str(c['note']))}".replace("$", "\\$"))
+    st.caption("Every object of the model is kept. *In the studies*: kept by pandapower's tables; *in the layer*: "
+               "described or cited by the CIM layer. Any object can be looked up by its mRID (the agent: "
+               "describe_network, about='around').")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=min(420, 38 + 35 * len(rows)))
+
+
 def _render_semantics() -> None:
     """What each element is — a unit's energy source, a load's category, a
     bus's voltage level and substation, a branch's ends and rating, where the
@@ -5057,38 +5115,45 @@ def _render_semantics() -> None:
                "CONDUCTOR in the chat is recorded here too.")
     _render_data_issues()
     with st.container(key="sem_headline"):
-        for col, (label, value, how) in zip(st.columns(5), _sem_view.headline(data)):
+        items = _sem_view.headline(data) + [h for h in [_sem_view.model_headline(data)] if h]
+        for col, (label, value, how) in zip(st.columns(len(items)), items):
             col.markdown(f"<div class='sem-label'>{html.escape(label)}</div>"
                          f"<div class='sem-value'>{html.escape(value)}</div>"
                          f"<div class='sem-how'>{html.escape(how)}</div>", unsafe_allow_html=True)
 
-    kinds = [k for k in ("units", "loads") if data.get(k)]
+    kinds = [k for k in ("units", "loads") if data.get(k)] + (["model"] if data.get("cim_model") else [])
     if kinds:
         st.session_state.setdefault("sem_picture", kinds[0])
         if st.session_state.sem_picture not in kinds:
             st.session_state.sem_picture = kinds[0]
         shown = st.segmented_control("Picture", kinds, key="sem_picture", label_visibility="collapsed",
                                      format_func={"units": "Units by energy source",
-                                                  "loads": "Loads by category"}.get) or kinds[0]
+                                                  "loads": "Loads by category",
+                                                  "model": "The CIM model"}.get) or kinds[0]
         c_fig, c_key = st.columns([3, 1], vertical_alignment="center")
         c_fig.plotly_chart(_sem_view.figure(data, shown), width="stretch", theme=None,
                            config={"displayModeBar": False})
         c_key.markdown(f"**{_sem_view.KINDS[shown]['legend']}**<br>" + "<br>".join(
             f"<span class='sem-swatch' style='background:{c}'></span>{html.escape(v)}"
             for v, c in _sem_view.legend(data, shown)), unsafe_allow_html=True)
-        c_key.caption("Voltage level › substation › element. A lighter shade: read from the name or inferred, "
+        c_key.caption("What the layer does with each class of the model the network came from: described, "
+                      "read into other entries, the source tool's solution (checked against CONDUCTOR's), or kept "
+                      "in the model only. Everything is kept. Click a ring to zoom in." if shown == "model" else
+                      "Voltage level › substation › element. A lighter shade: read from the name or inferred, "
                       "not stated. Grey: the network does not say. Click a ring to zoom in.")
 
     units, loads = _sem_view.unit_rows(data), _sem_view.load_rows(data)
     lines, trafos, buses = _sem_view.line_table(data), _sem_view.trafo_table(data), _sem_view.bus_table(data)
     switches, feeders, shunts = _sem_view.switch_table(data), _sem_view.feeder_table(data), _sem_view.shunt_table(data)
     values = _sem_view.data_table(data)
+    model_rows, other_rows = _sem_view.model_table(data), _sem_view.other_table(data)
     tabs = [(f"Units · {len(units)}", "units"), (f"Loads · {len(loads)}", "loads"),
             (f"Lines · {len(lines)}", "lines"), (f"Transformers · {len(trafos)}", "trafos"),
             (f"Buses · {len(buses)}", "buses"), (f"Switches · {len(switches)}", "switches"),
             (f"Feeders · {len(feeders)}", "feeders"), (f"Shunts · {len(shunts)}", "shunts"),
-            (f"Data · {len(values)}", "data")]
-    tabs = [t for t in tabs if not t[0].endswith(" 0")]
+            (f"Data · {len(values)}", "data"), (f"Other equipment · {len(other_rows)}", "other"),
+            (f"CIM model · {len(model_rows)} classes", "model")]
+    tabs = [t for t in tabs if not t[0].endswith(" 0") and not t[0].endswith(" 0 classes")]
     for (_title, kind), tab in zip(tabs, st.tabs([t[0] for t in tabs])):
         with tab:
             if kind in ("units", "loads"):
@@ -5103,9 +5168,11 @@ def _render_semantics() -> None:
                     lambda name, kind=kind: st.session_state.update(_sem_editing=(kind, name)),
                     mark="declared", flag="declared",
                     widths=[1.1, 1.0, 0.8, 0.8, 1.9] if kind == "units" else [1.1, 1.0, 0.9, 0.8, 1.6, 0.7])
+            elif kind == "model":
+                _render_cim_model(model_rows)
             else:
                 table = {"lines": lines, "trafos": trafos, "buses": buses, "switches": switches,
-                         "feeders": feeders, "shunts": shunts, "data": values}[kind]
+                         "feeders": feeders, "shunts": shunts, "data": values, "other": other_rows}[kind]
                 st.caption({"lines": "Each line's ends, voltage and rating, as the network states them (a "
                                      "rating in MVA needs a voltage: unknown in a per-unit case).",
                             "trafos": "Each transformer's high- and low-voltage ends and rated power.",
@@ -5118,7 +5185,11 @@ def _render_semantics() -> None:
                                        "now, only where the voltage level is radial.",
                             "shunts": "Each shunt compensator (LinearShuntCompensator): a capacitor injects "
                                       "reactive power, a reactor absorbs it; the size is at 1 p.u. voltage.",
-                            "data": _sem_view.data_caption(data)}[kind])
+                            "data": _sem_view.data_caption(data),
+                            "other": "Equipment the layer has no kind of its own for — three-winding "
+                                     "transformers, equivalents of networks outside the model, DC lines, motors — "
+                                     "and the model's equipment pandapower's converter has no place for, which "
+                                     "the studies do not see."}[kind])
                 st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch",
                              height=min(420, 38 + 35 * len(table)))
     # The export on demand: a large network's RDF is megabytes, not worth fetching on every render.
@@ -5136,16 +5207,38 @@ def _render_semantics() -> None:
                         r = client.get(f"{BASE_URL}/api/network/cim", params={"format": fmt})
                         r.raise_for_status()
                         files[fmt] = r.content
+                    # Its CIM model: the one it came as, untouched, or the CGMES written from its data — each with
+                    # CONDUCTOR's additions beside it.
+                    r = client.get(f"{BASE_URL}/api/network/cim/package")
+                    if r.status_code == 200:
+                        files["package"] = r.content
+                        files["package_kind"] = r.headers.get("x-conductor-model", "original")
+                        files["package_name"] = (r.headers.get("content-disposition", "").split('filename="')[-1]
+                                                 .rstrip('"') or "model-with-conductor.zip")
                 st.session_state._sem_export = {"key": key, **files}
                 st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.warning(f"The export could not be prepared: {exc}")
     else:
-        c_rdf, c_jl, _ = st.columns([1, 1, 2])
+        c_rdf, c_jl, c_pkg = st.columns([1, 1, 2])
         c_rdf.download_button("CIM RDF/XML", ready["xml"], file_name="conductor-network.xml",
                               mime="application/rdf+xml", key="sem_export_xml", icon=":material/download:")
         c_jl.download_button("JSON-LD", ready["jsonld"], file_name="conductor-network.jsonld",
                              mime="application/ld+json", key="sem_export_jsonld", icon=":material/download:")
+        if ready.get("package"):
+            written = ready.get("package_kind") == "written"
+            c_pkg.download_button(
+                "The network as CGMES" if written else "Your model + CONDUCTOR's additions", ready["package"],
+                file_name=ready.get("package_name") or "model-with-conductor.zip", mime="application/zip",
+                key="sem_export_package", icon=":material/download:",
+                help=("This network did not come as CIM: CONDUCTOR writes it as CGMES 2.4.15 (EQ, SSH, TP) from its "
+                      "data, readable by other CIM tools, with what CGMES has no place for kept beside it."
+                      if written else
+                      "The CIM model as you uploaded it, untouched, and one more profile with what CONDUCTOR adds "
+                      "(sources, categories, feeders, roles, and how each is known), by the model's own identifiers: "
+                      "nothing of your model is regenerated."))
+    if not data.get("cim_model"):
+        _render_written_model()
     _render_proposal_difference()
     if st.button("Forget everything I set", key="sem_reset",
                  disabled=not any(r["declared"] for r in units + loads)):

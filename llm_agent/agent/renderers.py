@@ -4556,7 +4556,7 @@ def render_network_map(network: NetworkMap, positions: dict, *,
         annotations=[dict(
             # Said on the figure: a force-directed layout looks like a map and
             # is not one.
-            text="schematic connectivity, not geography"
+            text=getattr(network, "what_is_drawn", "schematic connectivity, not geography")
                  + (f" · {dropped} name(s) hidden, hover for them" if dropped else ""),
             xref="paper", yref="paper", x=0.0, y=-0.045, showarrow=False,
             font=dict(size=10, color="#888"), xanchor="left")],

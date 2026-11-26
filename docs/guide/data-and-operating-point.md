@@ -115,7 +115,7 @@ period they give, so you can see the effect before anything changes.
 | **Daily shape** | Residential, twin peak, industrial, commercial or flat load |
 | **Usual daily peak** | The weekday peak, as a % of the network's own load |
 | **Daily shape** of a load whose category is known | A load the network (or you) says is residential, commercial, industrial, a data centre… follows that kind of demand; the shape chosen applies to the rest |
-| **Units the network does not describe** | Wind, solar or flat. A unit whose source the network states or names, or you declared, follows its own: PV the sun, wind the wind, the others a steady output |
+| **Units the network does not describe** | Wind, solar, flat, or dispatched (the units follow the demand and cover 95 % of it, as a transmission system's are run). A unit whose source the network states or names, or you declared, follows its own: PV the sun, wind the wind, the others a steady output |
 | **Forecast error** | How far the forecast strays from the measurements, for load and for generation |
 | **Stress windows** | On about one day in three, two hours with more load and less generation |
 | **Seed** | The same settings and seed give the same data; another seed, another week of the same kind |
