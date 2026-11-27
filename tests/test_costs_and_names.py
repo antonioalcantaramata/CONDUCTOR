@@ -226,10 +226,10 @@ def test_the_launcher_says_what_is_kept_and_start_fresh_clears_it(client):
     _ok(client.post("/api/costs", json={"changes": [{"unit": "Gen_bus1", "up_eur_per_mwh": 90}]}))
     _ok(client.post("/api/proposals/edit", json={"proposal": "p1", "edits": [
         {"op": "scale", "element_type": "load", "all": True, "factor": 1.1}]}))
-    _ok(client.post("/api/scenario", json={"name": "ieee30_reactive"}))
+    _ok(client.post("/api/scenario", json={"name": "cigre_mv"}))
     kept = {o["name"]: o.get("kept") for o in _ok(client.get("/api/scenario"))["options"]}
-    assert kept["ieee30"] == kept["ieee30_reactive"] == {"renames": 1, "costs": 1, "proposals": 1}  # one network
-    assert kept["cigre_mv"] is None                                                       # another network
+    assert kept["ieee30"] == {"renames": 1, "costs": 1, "proposals": 1}                   # kept with its network
+    assert kept["cigre_mv"] is None and kept["smallgrid"] is None                         # other networks
     assert kept["resume"] is None
     # Switching back restores them; Start fresh clears them, live and saved.
     _ok(client.post("/api/scenario", json={"name": "ieee30"}))

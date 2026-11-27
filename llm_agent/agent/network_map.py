@@ -41,7 +41,7 @@ import networkx as nx
 MARKER_PX = {"external": 18, "slack": 17, "substation": 15,
              "distribution": 10, "junction": 5, "isolated": 9}
 
-LAYOUTS = ("kamada", "spring", "shell")
+LAYOUTS = ("kamada", "spring", "shell", "diagram")
 
 Position = tuple[float, float]
 
@@ -61,6 +61,10 @@ class Node:
     vm_pu: float | None = None
     load_mw: float = 0.0
     gen_mw: float = 0.0
+    # A node-breaker model's nodes joined by closed switches are drawn as one electrical node: the buses it stands
+    # for, and their names (results report a bus by its own name or index).
+    members: list[int] = field(default_factory=list)
+    member_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +90,22 @@ class NetworkMap:
     # show at full size. Set by the layout, the only place that knows how
     # densely the buses ended up packed.
     marker_scale: float = 1.0
+    # {bus index: the drawn node's index} for the buses merged into another node.
+    alias: dict[int, int] = field(default_factory=dict)
+    # {node index: (x, y)}: the model's own diagram (a CIM model's DL profile), when it places the network.
+    diagram: dict[int, Position] = field(default_factory=dict)
+    drawn_from_diagram: bool = False      # set by the layout when it used the diagram
+
+    @property
+    def what_is_drawn(self) -> str:
+        """For the map's footer."""
+        return ("the model's own diagram, not geography" if self.drawn_from_diagram
+                else "schematic connectivity, not geography")
+
+    def node(self, index) -> Node | None:
+        """The drawn node a bus is, following merges."""
+        i = int(index)
+        return self.nodes.get(self.alias.get(i, i))
 
     @property
     def duplicate_names(self) -> dict[str, int]:
@@ -118,12 +138,15 @@ def from_payload(payload: dict) -> NetworkMap:
             in_service=bool(entry.get("in_service", True)),
         ))
 
+    alias = _merge_switched_nodes(nodes, edges, payload)
+    edges = [e for e in edges if e.from_bus != e.to_bus]
+
     # The external grid is an element of its own, not a property of the bus it
     # attaches to. Drawn only as a larger bus, nothing said where the system
     # connects to its neighbour, which is the first thing anyone looks for.
     # Negative indices, so they can never collide with a real bus.
     for position, entry in enumerate(payload.get("external_grids") or []):
-        bus = int(entry["bus"])
+        bus = alias.get(int(entry["bus"]), int(entry["bus"]))
         if bus not in nodes:
             continue
         index = -(position + 1)
@@ -144,8 +167,13 @@ def from_payload(payload: dict) -> NetworkMap:
         nodes=nodes, edges=edges,
         counts=dict(payload.get("counts") or {}),
         voltage_levels=[float(v) for v in payload.get("voltage_levels") or []],
+        alias=alias, diagram=_diagram(nodes, payload),
     )
     _classify(network)
+    merged = sum(len(n.members) - 1 for n in nodes.values() if n.members)
+    if merged:
+        network.notes.append(f"{merged} node(s) joined to others by closed switches are drawn as one electrical "
+                             "node each (the model is node-breaker).")
 
     shared = network.duplicate_names
     if shared:
@@ -154,6 +182,65 @@ def from_payload(payload: dict) -> NetworkMap:
             f"({', '.join(sorted(shared))}); results are matched by index, not name."
         )
     return network
+
+
+def _merge_switched_nodes(nodes: dict[int, Node], edges: list[Edge], payload: dict) -> dict[int, int]:
+    """Merge the nodes a node-breaker model joins by closed switches into one drawn node each (in place), named
+    after its busbar or bus name in the model when it has one; re-point the edges. Returns {merged bus: node}.
+    Only for a payload that says the model is node-breaker: any other network's map is drawn bus by bus."""
+    labels = {int(k): str(v) for k, v in (payload.get("labels") or {}).items()}
+    if not payload.get("node_breaker"):
+        return {}
+    parent = {i: i for i in nodes}
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for c in payload.get("couplers") or []:
+        a, b = int(c["from_bus"]), int(c["to_bus"])
+        if c.get("closed") and a in parent and b in parent:
+            ra, rb = root(a), root(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+    groups: dict[int, list[int]] = {}
+    for i in nodes:
+        groups.setdefault(root(i), []).append(i)
+    alias: dict[int, int] = {}
+    for members in groups.values():
+        # The same head in the base and in a proposal's map (they are compared node by node): never chosen by
+        # what is connected, which a proposal can change.
+        named = [m for m in members if m in labels]
+        head = min(named) if named else min(members)
+        node = nodes[head]
+        node.members = sorted(members)
+        node.member_names = [nodes[m].name for m in node.members]
+        if named:
+            node.name = labels[head]
+        node.in_service = any(nodes[m].in_service for m in members)
+        for m in members:
+            if m != head:
+                alias[m] = head
+    for m in alias:
+        nodes.pop(m, None)
+    for e in edges:
+        e.from_bus, e.to_bus = alias.get(e.from_bus, e.from_bus), alias.get(e.to_bus, e.to_bus)
+    return alias
+
+
+def _diagram(nodes: dict[int, Node], payload: dict) -> dict[int, Position]:
+    """{node: (x, y)} from the model's diagram positions of its buses (averaged over a merged node's members);
+    y flipped, since a CIM diagram's y grows downwards."""
+    placed = {int(k): (float(v[0]), float(v[1])) for k, v in (payload.get("positions") or {}).items()}
+    if not placed:
+        return {}
+    out = {}
+    for index, node in nodes.items():
+        pts = [placed[m] for m in (node.members or [index]) if m in placed]
+        if pts:
+            out[index] = (sum(p[0] for p in pts) / len(pts), -sum(p[1] for p in pts) / len(pts))
+    return out
 
 
 def _classify(network: NetworkMap) -> None:
@@ -190,6 +277,15 @@ def _classify(network: NetworkMap) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _nodes_by_name(network: NetworkMap) -> dict[str, list[Node]]:
+    """{name: [drawn nodes]}: each node by its own name and, for a merged node, by its buses' names."""
+    out: dict[str, list[Node]] = {}
+    for node in network.nodes.values():
+        for name in dict.fromkeys([node.name, *node.member_names]):
+            out.setdefault(name, []).append(node)
+    return out
+
+
 def apply_assessment(network: NetworkMap, rsa: dict) -> list[str]:
     """Colour the map with the operating point an assessment reported.
 
@@ -199,9 +295,7 @@ def apply_assessment(network: NetworkMap, rsa: dict) -> list[str]:
     """
     problems: list[str] = []
 
-    by_name: dict[str, list[Node]] = {}
-    for node in network.nodes.values():
-        by_name.setdefault(node.name, []).append(node)
+    by_name = _nodes_by_name(network)
 
     measured = 0
     for entry in rsa.get("all_voltages") or []:
@@ -215,6 +309,8 @@ def apply_assessment(network: NetworkMap, rsa: dict) -> list[str]:
                 )
             continue
         value = entry.get("vm_pu")
+        if targets[0].members and targets[0].vm_pu is not None:
+            continue                      # a merged node: its buses share one voltage, counted once
         targets[0].vm_pu = float(value) if value is not None else None
         measured += 1
 
@@ -252,14 +348,12 @@ def apply_conditions(network: NetworkMap, conditions: dict) -> list[str]:
     it — thirteen of sixteen joined that way, and every one was wrong.
     """
     problems: list[str] = []
-    by_name: dict[str, list[Node]] = {}
-    for node in network.nodes.values():
-        by_name.setdefault(node.name, []).append(node)
+    by_name = _nodes_by_name(network)
 
     def locate(entry: dict, label: str) -> Node | None:
         index = entry.get("bus_index")
         if index is not None:
-            node = network.nodes.get(int(index))
+            node = network.node(index)
             if node is None:
                 problems.append(f"{label} reported at bus {index}, absent from this network")
             return node
@@ -396,9 +490,24 @@ def _lay_out(graph: nx.Graph, kind: str, seed: int,
 def compute_layout(network: NetworkMap, kind: str = "kamada", seed: int = 7,
                    satellite: float = 0.17, include_isolated: bool = False,
                    separate: bool = True) -> dict[int, Position]:
-    """Positions keyed by bus index, and by negative index for external grids."""
+    """Positions keyed by bus index, and by negative index for external grids. A network whose model brings its
+    own diagram (a CIM model's DL profile) is drawn as that diagram unless another layout is asked for."""
     graph = _graph(network)
     connected = graph.subgraph([n for n in graph.nodes if graph.degree(n) > 0])
+    if kind in ("kamada", "diagram") and network.diagram:
+        drawn = _from_diagram(network, graph, connected)
+        if drawn is not None:
+            if include_isolated:
+                _park(network, drawn)
+            if separate and drawn:
+                remaining = _separate(network, drawn)
+                if remaining:
+                    network.notes.append(f"{remaining} pair(s) of buses still overlap — the network is denser "
+                                         "than the drawing area can show at this marker size.")
+            hidden = len(network.nodes) - len(drawn)
+            if hidden:
+                network.notes.append(f"{hidden} bus(es) connected to nothing are not drawn.")
+            return drawn
 
     positions: dict[int, Position] = {}
     for offset, component in enumerate(
@@ -424,6 +533,34 @@ def compute_layout(network: NetworkMap, kind: str = "kamada", seed: int = 7,
     if hidden:
         network.notes.append(f"{hidden} bus(es) connected to nothing are not drawn.")
     return positions
+
+
+# Below this share of the drawn buses placed by the model's diagram, the diagram is not used.
+_DIAGRAM_COVERAGE = 0.8
+
+
+def _from_diagram(network: NetworkMap, graph: nx.Graph, connected: nx.Graph) -> dict[int, Position] | None:
+    """The model's diagram as positions, or None when it places too few of the buses drawn. A bus it does not place
+    (an external grid, a node a proposal added) goes beside its placed neighbours."""
+    drawn = list(connected.nodes)
+    placed = {n: network.diagram[n] for n in drawn if n in network.diagram}
+    buses = [n for n in drawn if n >= 0]          # an external grid (negative index) is never in a diagram
+    if not buses or len(placed) < _DIAGRAM_COVERAGE * len(buses):
+        return None
+    xs, ys = [p[0] for p in placed.values()], [p[1] for p in placed.values()]
+    step = 0.03 * (max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0)
+    missing = [n for n in drawn if n not in placed]
+    for _ in range(4):
+        for n in list(missing):
+            near = [placed[m] for m in graph.neighbors(n) if m in placed]
+            if near:
+                placed[n] = (sum(p[0] for p in near) / len(near) + step, sum(p[1] for p in near) / len(near) + step)
+                missing.remove(n)
+    for k, n in enumerate(missing):          # placed neither by the diagram nor through a neighbour
+        placed[n] = (min(xs) + k * step, min(ys) - 2 * step)
+    network.notes.append("Drawn as the model's own diagram (its DL profile).")
+    network.drawn_from_diagram = True
+    return placed
 
 
 def _lay_out_component(network: NetworkMap, graph: nx.Graph, kind: str, seed: int,

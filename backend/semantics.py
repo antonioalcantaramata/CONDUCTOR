@@ -162,10 +162,18 @@ def _proposal_kind(tbl, idx) -> str | None:
         return None
 
 
-def unit_source(net, table: str, idx, declared: dict | None = None, profile: dict | None = None) -> dict:
+# A source a CIM model states by its generating unit's class.
+_MODEL_UNIT_SOURCE = {"ThermalGeneratingUnit": "thermal", "HydroGeneratingUnit": "hydro",
+                      "NuclearGeneratingUnit": "nuclear", "WindGeneratingUnit": "wind", "SolarGeneratingUnit": "solar",
+                      "PhotoVoltaicUnit": "solar", "PowerElectronicsWindUnit": "wind", "BatteryUnit": "storage"}
+
+
+def unit_source(net, table: str, idx, declared: dict | None = None, profile: dict | None = None,
+                cim=None) -> dict:
     """The energy source of one unit, as a fact (see the module's docstring).
     `declared`: the operator's statements; `profile`: the network profile's
-    (`unit_sources`), both keyed by the unit's name as loaded."""
+    (`unit_sources`), both keyed by the unit's name as loaded. `cim`: the CIM model the network came from — its
+    generating unit's class states the source (a ThermalGeneratingUnit is thermal)."""
     tbl = net[table]
     row = tbl.loc[idx]
     key = gm.unit_key(net, table, idx)
@@ -179,6 +187,14 @@ def unit_source(net, table: str, idx, declared: dict | None = None, profile: dic
         source = {"pv": "solar", "wind": "wind", "dispatchable": "conventional"}.get(str(kind).casefold())
         if source:
             return fact(source, STATED, "as the proposal that added it describes it")
+    if cim is not None:
+        gu = _model_generating_unit(cim, _origin(net, table, idx))
+        classes = ([gu.get("class")] if gu and gu.get("class") else
+                   [u.get("class") for u in (gu or {}).get("units") or []])
+        sources = {_MODEL_UNIT_SOURCE.get(str(c).split(":")[-1]) for c in classes} - {None}
+        if len(sources) == 1:
+            cls = str(classes[0]).split(":")[-1]
+            return fact(sources.pop(), STATED, f"the model's generating unit ({cls})")
     for col in ("type", "origin_class", "generating_unit_class"):
         if col in tbl.columns:
             source = _source_of_text(row.get(col), _TYPE_PATTERNS)
@@ -266,11 +282,12 @@ def _components(n: int, edges) -> list[int]:
     return [root(i) for i in range(n)]
 
 
-def substations(net) -> tuple[dict, str]:
+def substations(net, cim=None) -> tuple[dict, str]:
     """{bus index: substation name}, and the basis. Stated when the network
     names them (a 'substation' column, as a CIM import writes); otherwise the
     buses joined by transformers or bus couplers (bus–bus switches), named after
-    the highest-voltage bus among them — a single bus is a substation of its own."""
+    the highest-voltage bus among them — a single bus is a substation of its own.
+    `cim`: the CIM model as loaded, whose Substations give their own names."""
     if "substation" in net.bus.columns and net.bus["substation"].notna().any():
         named = {int(i): clean_label(v) for i, v in net.bus["substation"].items() if clean_label(v)}
         if len(named) == len(net.bus):
@@ -282,11 +299,21 @@ def substations(net) -> tuple[dict, str]:
         # Boundary nodes (an imported model's ties to neighbours) carry none: each is a substation of its own.
         groups: dict = {}
         for i, sid in net.bus["Substation_id"].items():
-            groups.setdefault(str(sid) if pd.notna(sid) else f"node:{int(i)}", []).append(int(i))
-        out = {}
-        for members in groups.values():
+            groups.setdefault(cm_norm(sid) if isinstance(sid, str) and sid.strip() else f"node:{int(i)}",
+                              []).append(int(i))
+        own = _model_substation_names(net, cim)
+        out, used = {}, set(own.values())
+        for sid, members in groups.items():
             head = max(members, key=lambda b: (float(net.bus.at[b, "vn_kv"]), -b))
-            out.update({b: f"Substation {bus_display_name(net, head)}" for b in members})
+            name = own.get(sid)
+            if not name:
+                # Named after its highest-voltage bus; two substations whose buses share a name stay two.
+                name = base = f"Substation {bus_display_name(net, head)}"
+                k = 2
+                while name in used:
+                    name, k = f"{base} ({k})", k + 1
+                used.add(name)
+            out.update({b: name for b in members})
         return out, STATED
     order = [int(i) for i in net.bus.index]
     pos = {b: k for k, b in enumerate(order)}
@@ -320,6 +347,10 @@ def substations(net) -> tuple[dict, str]:
 
 # pandapower's switch types as the CIM Switch subclasses they are.
 _SWITCH_CLASS = {"CB": "Breaker", "LBS": "LoadBreakSwitch", "LS": "LoadBreakSwitch", "DS": "Disconnector"}
+# CIM's Switch subclasses (IEC 61970-301), as a CIM import's `origin_class` names them.
+_CIM_SWITCHES = frozenset({"Switch", "Breaker", "Disconnector", "LoadBreakSwitch", "Fuse", "Jumper",
+                           "GroundDisconnector", "Recloser", "Sectionaliser", "ProtectedSwitch",
+                           "DisconnectingCircuitBreaker", "Cut"})
 _FEEDER_RULE = ("inferred from the topology as switched now: the first line after the last transformer on the "
                 "route from the external grid; only where the voltage level is radial")
 
@@ -375,8 +406,13 @@ def _switch_entries(net, names: dict, buses: dict, feeder: dict, normal_open: di
         i = int(i)
         raw_type = clean_label(row.get("type")) if "type" in sw.columns else ""
         cls = _SWITCH_CLASS.get(raw_type.upper())
-        cim = (fact(cls, STATED, f"its type in the network ({raw_type!r})") if cls else
-               fact("Switch", UNKNOWN, "the network does not say what kind of switch it is"))
+        own_class = row.get("origin_class") if "origin_class" in sw.columns else None
+        if isinstance(own_class, str) and own_class in _CIM_SWITCHES:
+            # A CIM import keeps the class the model gives (a Fuse, a Recloser…), finer than pandapower's type.
+            cim = fact(own_class, STATED, "its class in the CIM model")
+        else:
+            cim = (fact(cls, STATED, f"its type in the network ({raw_type!r})") if cls else
+                   fact("Switch", UNKNOWN, "the network does not say what kind of switch it is"))
         is_open = not bool(row["closed"])
         if normal_open is not None and i in normal_open:
             normal = fact(bool(normal_open[i]), STATED, "its state as the network was loaded")
@@ -408,7 +444,8 @@ def _switch_entries(net, names: dict, buses: dict, feeder: dict, normal_open: di
                 role = "normally open line switch"
         elif row["et"] == "b":
             other = int(row["element"])
-            where = {"kind": "coupler", "between": [buses[bus]["name"], buses.get(other, {}).get("name", other)]}
+            where = {"kind": "coupler", "between": [buses[bus]["name"], buses.get(other, {}).get("name", other)],
+                     "between_index": [bus, other]}
             role = "bus coupler"
         elif row["et"] == "t":
             where = {"kind": "transformer", "element": names.get(("trafo", int(row["element"]))),
@@ -538,6 +575,30 @@ def mrid(network_id: str, kind: str, key) -> str:
     return str(uuid.uuid5(_MRID_NS, f"{network_id}|{kind}|{key}"))
 
 
+def row_mrids(net, table: str, network_id: str) -> dict[int, str]:
+    """{index: mRID} of every row of a table — `_row_mrid` for all of them at once (the columns read once)."""
+    tbl = net[table]
+    n = len(tbl)
+    if not n:
+        return {}
+    def col(c):
+        return list(tbl[c]) if c in tbl.columns else [None] * n
+    own, proposed, names = col("origin_id"), col("proposed"), col("name")
+    loaded_t, loaded_i = col("loaded_table"), col("loaded_index")
+    out = {}
+    for k, idx in enumerate(tbl.index):
+        o = own[k]
+        if isinstance(o, str) and o.strip():
+            out[int(idx)] = o.strip().lstrip("_")
+        elif proposed[k] is True:
+            out[int(idx)] = mrid(network_id, f"{table}:proposed", clean_label(names[k]) or int(idx))
+        elif isinstance(loaded_t[k], str) and loaded_t[k]:
+            out[int(idx)] = mrid(network_id, loaded_t[k], int(loaded_i[k]))
+        else:
+            out[int(idx)] = mrid(network_id, table, int(idx))
+    return out
+
+
 def _row_mrid(net, table: str, idx, network_id: str) -> str:
     """The element's own mRID when the network brings one (a CIM/CGMES import:
     pandapower's `origin_id`), else one derived from its table and index; an
@@ -551,6 +612,9 @@ def _row_mrid(net, table: str, idx, network_id: str) -> str:
     if "proposed" in tbl.columns and tbl.at[idx, "proposed"] is True:
         name = clean_label(tbl.at[idx, "name"]) if "name" in tbl.columns else ""
         return mrid(network_id, f"{table}:proposed", name or int(idx))
+    # A unit a generator model moved to the other table keeps the identity it had as loaded (generators.py).
+    if "loaded_table" in tbl.columns and isinstance(tbl.at[idx, "loaded_table"], str) and tbl.at[idx, "loaded_table"]:
+        return mrid(network_id, tbl.at[idx, "loaded_table"], int(tbl.at[idx, "loaded_index"]))
     return mrid(network_id, table, int(idx))
 
 
@@ -568,9 +632,394 @@ def _kv(net, bus: int, per_unit: bool) -> dict:
     return fact(float(kv), STATED, "the bus's nominal voltage in the network")
 
 
+# ---------------------------------------------------------------------------
+# The CIM model as loaded (cim_model.CimModel), when the network came as CIM
+# ---------------------------------------------------------------------------
+
+# Element tables of a pandapower network the layer describes as its own kinds; any other table with elements
+# (three-winding transformers, equivalents, DC lines, motors…) is listed as other equipment.
+_DESCRIBED_TABLES = frozenset({"bus", "line", "trafo", "gen", "sgen", "storage", "load", "ext_grid", "shunt", "switch"})
+_OTHER_CLASS = {"trafo3w": "PowerTransformer", "ward": "EquivalentInjection", "xward": "EquivalentInjection",
+                "impedance": "EquivalentBranch", "dcline": "DCLineSegment", "motor": "AsynchronousMachine",
+                "svc": "StaticVarCompensator", "ssc": "StaticSynchronousCompensator", "tcsc": "SeriesCompensator"}
+_OTHER_WHAT = {"trafo3w": "three-winding transformer", "ward": "equivalent injection (a network outside the model, "
+               "seen as an injection)", "xward": "extended equivalent injection", "impedance": "equivalent branch or "
+               "series compensator", "dcline": "DC line", "motor": "motor (asynchronous machine)",
+               "svc": "static var compensator", "ssc": "static synchronous compensator", "tcsc": "series compensator"}
+_BUS_COLUMNS = {"trafo3w": ("hv_bus", "mv_bus", "lv_bus"), "impedance": ("from_bus", "to_bus"),
+                "dcline": ("from_bus", "to_bus"), "tcsc": ("from_bus", "to_bus")}
+# Equipment a node stands for: described as the node's, not as equipment of its own.
+_NODE_EQUIPMENT = frozenset({"BusbarSection", "Junction"})
+
+
+def _origin(net, table: str, idx) -> str | None:
+    if "origin_id" not in net[table].columns:
+        return None
+    v = net[table].at[idx, "origin_id"]
+    return cm_norm(v) if isinstance(v, str) and v.strip() else None
+
+
+def cm_norm(identifier) -> str:
+    """An mRID as the layer and the CIM model compare it (cim_model.norm)."""
+    s = str(identifier or "").strip()
+    if s.startswith("#"):
+        s = s[1:]
+    if s.lower().startswith("urn:uuid:"):
+        s = s[9:]
+    return s.lstrip("_")
+
+
+def _node_of_terminal(cim, terminal) -> str | None:
+    return cim.ref(terminal, "Terminal.ConnectivityNode") or cim.ref(terminal, "Terminal.TopologicalNode")
+
+
+def _model_containers(cim, node) -> dict:
+    """{"voltage_level", "bay", "substation"} (mRIDs) of a node of the model: a ConnectivityNode through its
+    container, a TopologicalNode through its own."""
+    chain = cim.container_chain(node)
+    if not chain:
+        vl = cim.ref(node, "TopologicalNode.ConnectivityNodeContainer")
+        if vl:
+            chain = {"voltage_level": vl} if cim.cls(vl) == "VoltageLevel" else {}
+            if chain:
+                sub = cim.ref(vl, "VoltageLevel.Substation")
+                if sub:
+                    chain["substation"] = sub
+    return chain
+
+
+def _named(cim, mrid: str | None) -> dict | None:
+    return {"name": cim.label(mrid) or mrid, "mrid": mrid} if mrid else None
+
+
+def _busbars(net, cim) -> dict[int, dict]:
+    """{bus index: {"name", "mrid"}} of the model's BusbarSections: from the model when it is kept, else from the
+    columns pandapower's converter writes (Busbar_id, Busbar_name)."""
+    out: dict[int, dict] = {}
+    if cim is not None:
+        node_bus = {cm_norm(v): int(i) for i, v in net.bus.get("origin_id", pd.Series(dtype=object)).items()
+                    if isinstance(v, str)}
+        for bb in cim.of("BusbarSection"):
+            for t in cim.terminals(bb):
+                bus = node_bus.get(_node_of_terminal(cim, t) or "")
+                if bus is not None:
+                    out.setdefault(bus, {"name": cim.label(bb) or bb, "mrid": bb})
+        return out
+    if "Busbar_id" in net.bus.columns:
+        for i, v in net.bus["Busbar_id"].items():
+            if isinstance(v, str) and v.strip():
+                name = net.bus.at[i, "Busbar_name"] if "Busbar_name" in net.bus.columns else None
+                out[int(i)] = {"name": clean_label(name) or cm_norm(v), "mrid": cm_norm(v)}
+    return out
+
+
+def _bus_name_markers(net, cim) -> dict[int, dict]:
+    """{bus index: {"name", "mrid"}} of the model's BusNameMarkers: the names a node-breaker model gives its
+    buses, on the terminals at each node."""
+    if cim is None or not cim.of("BusNameMarker"):
+        return {}
+    node_bus = {cm_norm(v): int(i) for i, v in net.bus.get("origin_id", pd.Series(dtype=object)).items()
+                if isinstance(v, str)}
+    out: dict[int, dict] = {}
+    for marker in cim.of("BusNameMarker"):
+        for t in cim.referring(marker, "ACDCTerminal.BusNameMarker"):
+            bus = node_bus.get(_node_of_terminal(cim, t) or "")
+            if bus is not None and cim.label(marker):
+                out.setdefault(bus, {"name": cim.label(marker), "mrid": marker})
+    return out
+
+
+def _model_substation_names(net, cim) -> dict[str, str]:
+    """{Substation mRID: its name in the model}, each name unique (a name the model gives twice takes its
+    region or its mRID's start)."""
+    if cim is None or "Substation_id" not in net.bus.columns:
+        return {}
+    ids = sorted({cm_norm(v) for v in net.bus["Substation_id"] if isinstance(v, str) and v.strip()})
+    names = {s: cim.label(s) for s in ids}
+    count: dict[str, int] = {}
+    for n in names.values():
+        if n:
+            count[n] = count.get(n, 0) + 1
+    out = {}
+    for s, n in names.items():
+        if not n:
+            continue
+        out[s] = n if count[n] == 1 else f"{n} ({s[:8]})"
+    return out
+
+
+def _model_limits(cim, mrid: str | None) -> dict | None:
+    """The model's operational limits on a branch, as a fact: each type with how long it may be held."""
+    if cim is None or not mrid:
+        return None
+    lims = cim.limits(mrid)
+    if not lims:
+        return None
+    rows = sorted(({k: v for k, v in x.items() if k not in ("set",)} for x in lims),
+                  key=lambda r: (r["terminal"] or 0, not r["permanent"], -(r["duration_s"] or 0)))
+    return {"value": rows, "basis": STATED,
+            "from": "the model's OperationalLimitSets (current limits in A unless the kind says otherwise)",
+            "in_studies": "the studies check the permanent limit only (pandapower keeps one rating per branch)"}
+
+
+def _model_control(cim, mrid: str | None) -> dict | None:
+    if cim is None or not mrid:
+        return None
+    rc = cim.regulating_control(mrid)
+    if not rc:
+        return None
+    return {"mrid": rc["mrid"], "class": rc["class"] or "RegulatingControl", "mode": rc["mode"],
+            "target": rc["target"], "deadband": rc["deadband"],
+            "enabled": rc["enabled"] if rc["enabled"] is not None else rc["control_enabled"],
+            "basis": STATED, "from": "the model's RegulatingControl"}
+
+
+def _yes(value) -> bool | None:
+    return None if value is None else str(value).strip().lower() == "true"
+
+
+def _model_transformer(cim, mrid: str | None) -> dict:
+    """A transformer's ends (rated voltage and power) and tap changers as the model states them."""
+    if cim is None or not mrid:
+        return {}
+    ends, taps = [], []
+    for end in sorted(cim.referring(mrid, "PowerTransformerEnd.PowerTransformer"),
+                      key=lambda e: num_or((cim.get(e) or {}).get("TransformerEnd.endNumber"), 0)):
+        o = cim.get(end) or {}
+        ends.append({"mrid": end, "end": num_or(o.get("TransformerEnd.endNumber"), None),
+                     "rated_kv": num_or(o.get("PowerTransformerEnd.ratedU"), None),
+                     "rated_mva": num_or(o.get("PowerTransformerEnd.ratedS"), None),
+                     "connection": str(o.get("PowerTransformerEnd.connectionKind") or "").rsplit(".", 1)[-1] or None})
+        for attr in ("RatioTapChanger.TransformerEnd", "PhaseTapChanger.TransformerEnd"):
+            for tc in cim.referring(end, attr):
+                t = cim.get(tc) or {}
+                taps.append({"mrid": tc, "class": t.get("class"), "end": ends[-1]["end"],
+                             "steps": [num_or(t.get("TapChanger.lowStep"), None),
+                                       num_or(t.get("TapChanger.highStep"), None)],
+                             "neutral": num_or(t.get("TapChanger.neutralStep"), None),
+                             "normal": num_or(t.get("TapChanger.normalStep"), None),
+                             "now": num_or(t.get("TapChanger.step"), None),
+                             "step_pct": num_or(t.get("RatioTapChanger.stepVoltageIncrement")
+                                                or t.get("PhaseTapChangerLinear.voltageStepIncrement"), None),
+                             "control_mode": str(t.get("RatioTapChanger.tculControlMode") or "").rsplit(".", 1)[-1]
+                                             or None,
+                             "control_enabled": _yes(t.get("TapChanger.controlEnabled")),
+                             "load_tap_changing": _yes(t.get("TapChanger.ltcFlag")),
+                             **({"control": c} if (c := _control_of(cim, cim.ref(tc, "TapChanger.TapChangerControl")))
+                                else {})})
+    out = {}
+    if ends:
+        # Not "ends": a branch's ends are the buses it joins (other code reads them by that key).
+        out["transformer_ends"] = fact(ends, STATED, "the model's PowerTransformerEnds")
+    if taps:
+        out["tap_changers"] = {"value": taps, "basis": STATED, "from": "the model's tap changers",
+                               "in_studies": "held at a fixed position (the tap policy chosen at upload): the "
+                                             "studies do not move a tap to follow its control"}
+    return out
+
+
+def num_or(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _control_of(cim, rc: str | None) -> dict | None:
+    """A RegulatingControl (or TapChangerControl) by its mRID: mode, target, whether it is enabled."""
+    if cim is None or not rc:
+        return None
+    o = cim.get(rc) or {}
+    return {"mrid": rc, "class": o.get("class"), "mode": str(o.get("RegulatingControl.mode") or "").rsplit(".", 1)[-1]
+            or None, "target": num_or(o.get("RegulatingControl.targetValue"), None),
+            "enabled": _yes(o.get("RegulatingControl.enabled"))}
+
+
+def _model_generating_unit(cim, mrid: str | None) -> dict | None:
+    """The GeneratingUnit behind a machine (or the units behind an inverter connection), as the model states it."""
+    if cim is None or not mrid:
+        return None
+    gu = cim.ref(mrid, "RotatingMachine.GeneratingUnit") or cim.ref(mrid, "SynchronousMachine.GeneratingUnit")
+    if gu:
+        o = cim.get(gu) or {}
+        return {"mrid": gu, "class": o.get("class"), "name": cim.name(gu),
+                "p_max_mw": num_or(o.get("GeneratingUnit.maxOperatingP"), None),
+                "p_min_mw": num_or(o.get("GeneratingUnit.minOperatingP"), None),
+                "basis": STATED, "from": "the model's generating unit"}
+    pe = cim.referring(mrid, "PowerElectronicsUnit.PowerElectronicsConnection")
+    if pe:
+        return {"units": [{"mrid": u, "class": cim.cls(u), "name": cim.name(u)} for u in pe],
+                "basis": STATED, "from": "the model's power electronics units"}
+    return None
+
+
+def _model_load_response(cim, mrid: str | None) -> dict | None:
+    """How a load's power follows the voltage, as the model states it (its LoadResponseCharacteristic)."""
+    if cim is None or not mrid:
+        return None
+    lrc = cim.ref(mrid, "EnergyConsumer.LoadResponse")
+    if not lrc:
+        return None
+    o = cim.get(lrc) or {}
+    shares = {f"{q}_{k}": num_or(o.get(f"LoadResponseCharacteristic.{q}Constant{K}"), None)
+              for q in ("p", "q") for k, K in (("power", "Power"), ("current", "Current"), ("impedance", "Impedance"))}
+    exponent = _yes(o.get("LoadResponseCharacteristic.exponentModel"))
+    constant_power = (not exponent and shares["p_power"] in (1.0, None) and shares["q_power"] in (1.0, None)
+                      and not any(shares[k] for k in ("p_current", "p_impedance", "q_current", "q_impedance")))
+    return {"mrid": lrc, "name": cim.name(lrc), "exponent_model": exponent, **shares,
+            **({"p_voltage_exponent": num_or(o.get("LoadResponseCharacteristic.pVoltageExponent"), None),
+                "q_voltage_exponent": num_or(o.get("LoadResponseCharacteristic.qVoltageExponent"), None)}
+               if exponent else {}),
+            "constant_power": constant_power, "basis": STATED, "from": "the model's LoadResponseCharacteristic",
+            "in_studies": "constant power (pandapower's converter does not read the model's load response)"}
+
+
+def _model_region(cim, substation: str | None) -> dict | None:
+    if cim is None or not substation:
+        return None
+    sub_region = cim.ref(substation, "Substation.Region")
+    if not sub_region:
+        return None
+    region = cim.ref(sub_region, "SubGeographicalRegion.Region")
+    return {"sub_region": _named(cim, sub_region), **({"region": _named(cim, region)} if region else {})}
+
+
+def _other_equipment(net, cim, names_of_bus: dict[int, str], network_id: str) -> list[dict]:
+    """What the layer has no kind of its own for: each element of the other pandapower tables (in the
+    computation), and each piece of the model's equipment pandapower's converter did not keep (not in it)."""
+    out = []
+    kept: set[str] = set()
+    for t in net.keys():
+        df = net[t]
+        if not isinstance(df, pd.DataFrame) or t.startswith("res_") or not len(df) or "origin_id" not in df.columns:
+            continue
+        kept |= {cm_norm(v) for v in df["origin_id"] if isinstance(v, str) and v.strip()}
+    for table in _OTHER_CLASS:
+        df = getattr(net, table, None) if table in net else None
+        if not isinstance(df, pd.DataFrame) or not len(df):
+            continue
+        for i in df.index:
+            cols = _BUS_COLUMNS.get(table, ("bus",))
+            buses = [int(df.at[i, c]) for c in cols if c in df.columns and pd.notna(df.at[i, c])]
+            oc = df.at[i, "origin_class"] if "origin_class" in df.columns else None
+            name = clean_label(df.at[i, "name"]) if "name" in df.columns else ""
+            out.append({"name": name or f"{_OTHER_WHAT[table].split(' (')[0].capitalize()} {int(i)}",
+                        "element_type": table, "index": int(i),
+                        "cim_class": oc if isinstance(oc, str) and oc else _OTHER_CLASS[table],
+                        "what": _OTHER_WHAT[table], "buses": [names_of_bus.get(b, str(b)) for b in buses],
+                        "buses_index": buses, "in_computation": True,
+                        "in_service": bool(df.at[i, "in_service"]) if "in_service" in df.columns else True,
+                        "mrid": _row_mrid(net, table, i, network_id)})
+            own = _origin(net, table, i) if cim is not None else None
+            if table == "trafo3w" and own:
+                out[-1].update(_model_transformer(cim, own))
+                limits = _model_limits(cim, own)
+                if limits:
+                    out[-1]["limits"] = limits
+    if cim is None:
+        return out
+    node_bus = {cm_norm(v): int(i) for i, v in net.bus.get("origin_id", pd.Series(dtype=object)).items()
+                if isinstance(v, str)}
+    # Equipment is what has terminals; what the converter kept has its mRID in a table.
+    seen = set()
+    for term in cim.of("Terminal"):
+        eq = cim.ref(term, "Terminal.ConductingEquipment")
+        if not eq or eq in seen or eq in kept:
+            continue
+        seen.add(eq)
+        cls = cim.cls(eq)
+        if not cls or cls in _NODE_EQUIPMENT:
+            continue
+        buses = []
+        for t in cim.terminals(eq):
+            b = node_bus.get(_node_of_terminal(cim, t) or "")
+            if b is not None and b not in buses:
+                buses.append(b)
+        o = cim.get(eq) or {}
+        normal_open = o.get("Switch.normalOpen")
+        open_now = o.get("Switch.open")
+        out.append({"name": cim.name(eq) or eq, "element_type": None, "index": None, "cim_class": cls,
+                    "what": f"{cls} (not in the computation: pandapower's converter has no place for it)",
+                    "buses": [names_of_bus.get(b, str(b)) for b in buses], "buses_index": buses,
+                    "in_computation": False, "mrid": eq,
+                    **({"normal_open": str(normal_open).lower() == "true"} if normal_open is not None else {}),
+                    **({"open": str(open_now).lower() == "true"} if open_now is not None else {})})
+    return out
+
+
+def _layer_mrids(obj, out: set) -> set:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "mrid" and isinstance(v, str):
+                out.add(cm_norm(v))
+            else:
+                _layer_mrids(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _layer_mrids(v, out)
+    return out
+
+
+def model_coverage(net, cim, layer: dict) -> dict:
+    """What of the CIM model reaches the computation (pandapower's tables) and the layer, class by class: the
+    loss report of an import. "in_computation": objects whose mRID a pandapower table keeps (as an element or as
+    an id column the converter writes); "in_layer": objects the layer describes or cites by mRID."""
+    in_pp: set[str] = set()
+    for t in net.keys():
+        df = net[t]
+        if not isinstance(df, pd.DataFrame) or t.startswith("res_") or not len(df):
+            continue
+        for c in df.columns:
+            cs = str(c)
+            if cs == "origin_id" or cs.endswith("_id"):
+                in_pp |= {cm_norm(v) for v in df[c].dropna() if isinstance(v, str) and v.strip()}
+    in_layer = _layer_mrids(layer, set())
+    rows = []
+    for cls, ids in sorted(cim.by_class.items()):
+        if not ids:
+            continue
+        n_pp = sum(1 for i in ids if i in in_pp)
+        n_layer = sum(1 for i in ids if i in in_layer)
+        if n_layer >= len(ids):
+            status = "described"
+        elif cls in _READ_INTO:
+            status = "read_into"
+        elif n_layer:
+            status = "partly"
+        elif cls in _SOLVED_STATE:
+            status = "solved_state"
+        else:
+            status = "model_only"
+        rows.append({"class": cls, "in_model": len(ids), "in_computation": n_pp, "in_layer": n_layer,
+                     "status": status, **({"read_into": _READ_INTO[cls]} if status == "read_into" else {}),
+                     "profiles": sorted({p for i in ids for p in cim.object_profiles.get(i, ())})})
+    return {"classes": rows,
+            "note": "in_computation: kept by pandapower (an element, or an id it records); in_layer: described or "
+                    "cited by the CIM layer. status: described (every object), partly, read_into (its content is "
+                    "read into other entries, e.g. limit sets into each branch's limits), solved_state (the source "
+                    "tool's power-flow solution), model_only (kept in the model, not in the layer: the agent can "
+                    "still look an object up by its mRID)."}
+
+
+# Classes whose objects the layer does not list but whose content it reads into other entries.
+_READ_INTO = {"Terminal": "every element's connections", "OperationalLimitSet": "each branch's limits",
+              "OperationalLimitType": "each limit's type and duration",
+              "TopologicalNode": "the buses (a node-breaker model's buses are its ConnectivityNodes; the "
+                                 "topological nodes are the source tool's grouping of them)",
+              "TopologicalIsland": "the buses' connectivity", "CoordinateSystem": "the model's locations",
+              "BusNameMarker": "the buses' names in the model",
+              "Diagram": "the network map, drawn as the model's own diagram",
+              "DiagramObject": "the network map, drawn as the model's own diagram",
+              "DiagramObjectPoint": "the network map, drawn as the model's own diagram"}
+# The source tool's power-flow solution (the SV profile).
+_SOLVED_STATE = frozenset({"SvVoltage", "SvPowerFlow", "SvInjection", "SvShuntCompensatorSections", "SvTapStep",
+                           "SvStatus", "SvSwitch"})
+
+
 def build(net, declared: dict | None = None, profile: dict | None = None,
           declared_loads: dict | None = None, profile_loads: dict | None = None,
-          normal_open: dict | None = None, provenance: dict | None = None, network_id: str = "local") -> dict:
+          normal_open: dict | None = None, provenance: dict | None = None, network_id: str = "local",
+          cim=None) -> dict:
     """What every element of `net` is, with the basis of each fact (compact:
     one entry per element, for the agent and for checking answers).
     `declared`/`profile`: units' sources; `declared_loads`/`profile_loads`:
@@ -578,20 +1027,47 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
     `normal_open`: {switch index: open as loaded} (the switches' normal
     state); `provenance`: `value_provenance`'s result, where each value of the
     present operating point comes from. `network_id`: the network's identity,
-    for derived mRIDs (the backend passes the fingerprint as loaded)."""
+    for derived mRIDs (the backend passes the fingerprint as loaded).
+    `cim`: the CIM model as loaded (cim_model.CimModel) when the network came
+    as CIM: what it states is read from it first — names, voltage levels, bays,
+    busbar sections, limits, controls, and the equipment pandapower did not keep."""
     per_unit = per_unit_case(net)
-    subs, sub_basis = substations(net)
-    sub_why = (("the model's Substation for each bus (named after its highest-voltage bus; a node with none, "
-                 "such as a boundary node, is a substation of its own)"
+    subs, sub_basis = substations(net, cim)
+    model_named = bool(_model_substation_names(net, cim))
+    sub_why = (("the model's Substation for each bus"
+                + (" (its name in the model" if model_named else " (named after its highest-voltage bus")
+                + "; a node with none, such as a boundary node, is a substation of its own)"
                 if "Substation_id" in net.bus.columns and "substation" not in net.bus.columns else "named in the network")
                if sub_basis == STATED else
                "buses joined by transformers or bus couplers; a single bus is a substation of its own")
+    busbar_of = _busbars(net, cim)
+    marker_of = _bus_name_markers(net, cim)
+    has_class = "origin_class" in net.bus.columns
     buses = []
     for i in net.bus.index:
         b = int(i)
-        buses.append({"name": bus_display_name(net, b), "index": b, "cim_class": CIM_CLASS["bus"],
-                      "kv": _kv(net, b, per_unit), "substation": fact(subs.get(b), sub_basis, sub_why),
-                      "in_service": bool(net.bus.at[b, "in_service"])})
+        oc = net.bus.at[b, "origin_class"] if has_class else None
+        entry = {"name": bus_display_name(net, b), "index": b,
+                 # A node-breaker model's buses are its ConnectivityNodes; a bus-branch model's, and any other
+                 # network's, the TopologicalNodes a power flow solves.
+                 "cim_class": oc if oc in ("ConnectivityNode", "TopologicalNode") else CIM_CLASS["bus"],
+                 "kv": _kv(net, b, per_unit), "substation": fact(subs.get(b), sub_basis, sub_why),
+                 "in_service": bool(net.bus.at[b, "in_service"])}
+        if b in busbar_of:
+            entry["busbar"] = fact(busbar_of[b], STATED, "the model's BusbarSection at this node")
+        if b in marker_of:
+            entry["name_in_model"] = fact(marker_of[b], STATED, "the model's BusNameMarker for this node (the bus "
+                                                                "name the source tool shows)")
+        node = _origin(net, "bus", b) if cim is not None else None
+        if node:
+            chain = _model_containers(cim, node)
+            if chain.get("voltage_level"):
+                vl = chain["voltage_level"]
+                entry["voltage_level"] = fact({"name": cim.label(vl) or vl, "mrid": vl}, STATED,
+                                              "the model's VoltageLevel for this node")
+            if chain.get("bay"):
+                entry["bay"] = fact(_named(cim, chain["bay"]), STATED, "the model's Bay for this node")
+        buses.append(entry)
     kv_of = {e["index"]: e["kv"]["value"] for e in buses}
     branches, unresolved = [], []
     for etype, label, a, b in (("line", line_display_name, "from_bus", "to_bus"),
@@ -619,18 +1095,32 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
             else:
                 entry["kv"] = [kv_of.get(ends[0]), kv_of.get(ends[1])]
                 entry["rating_mva"] = fact(float(tbl.at[i, "sn_mva"]), STATED, "its rated power")
+            own = _origin(net, etype, i) if cim is not None else None
+            limits = _model_limits(cim, own)
+            if limits:
+                entry["limits"] = limits
+            if etype == "trafo":
+                entry.update(_model_transformer(cim, own))
+            line = cim.container_chain(own).get("line") if own else None
+            if line:
+                # CIM's Line: the circuit a segment belongs to (a line of several segments has one Line).
+                entry["cim_line"] = _named(cim, line)
             branches.append(entry)
     units = []
     for table, i in _unit_rows(net):
-        source = unit_source(net, table, i, declared, profile)
+        source = unit_source(net, table, i, declared, profile, cim=cim)
         bus = int(net[table].at[i, "bus"])
         inverter = any(re.search(r"fuel ?cell", str(net[table].at[i, c]), re.IGNORECASE)
                        for c in ("type", "name") if c in net[table].columns)
         equipment, unit_class = cim_unit(table, source["value"], inverter)
         control = _control(net, table, i)
-        units.append({"name": gm.unit_name(net, table, i), "element_type": table, "index": int(i),
+        own_unit = _origin(net, table, i) if cim is not None else None
+        stated_control = _model_control(cim, own_unit)
+        generating_unit = _model_generating_unit(cim, own_unit)
+        units.append({**({"generating_unit": generating_unit} if generating_unit else {}),"name": gm.unit_name(net, table, i), "element_type": table, "index": int(i),
                       "cim_class": equipment, "cim_unit": unit_class,
-                      "cim_control": {"class": "RegulatingControl", "mode": _CIM_MODE[control["value"]]},
+                      "cim_control": {"class": "RegulatingControl", "mode": _CIM_MODE[control["value"]],
+                                      **({"in_model": stated_control} if stated_control else {})},
                       "source": source, "control": control,
                       "bus": bus_display_name(net, bus), "bus_index": bus,
                       "p_max_mw": (round(float(net[table].at[i, "max_p_mw"]), 3)
@@ -651,12 +1141,22 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
         step = net.shunt.at[i, "step"] if "step" in net.shunt.columns and pd.notna(net.shunt.at[i, "step"]) else 1
         kind = ("capacitor" if q < 0 else "reactor") if q else "unknown"
         name = clean_label(net.shunt.at[i, "name"]) if "name" in net.shunt.columns else ""
-        shunts.append({"name": name or f"Shunt {int(i)}", "index": int(i), "cim_class": "LinearShuntCompensator",
-                       "kind": (fact(kind, STATED, "the sign of its reactive power in the network (negative: it "
-                                                   "injects)") if q else
-                                fact("unknown", UNKNOWN, "no reactive power given")),
-                       "q_mvar_at_1pu": round(q * float(step), 4), "bus": bus_display_name(net, bus),
-                       "bus_index": bus, "in_service": bool(net.shunt.at[i, "in_service"])})
+        oc = net.shunt.at[i, "origin_class"] if "origin_class" in net.shunt.columns else None
+        entry = {"name": name or f"Shunt {int(i)}", "index": int(i),
+                 # pandapower's converter makes a static var compensator or a non-linear shunt a shunt too; the
+                 # class it came as is kept.
+                 "cim_class": oc if isinstance(oc, str) and oc else "LinearShuntCompensator",
+                 "kind": (fact(kind, STATED, "the sign of its reactive power in the network (negative: it "
+                                             "injects)") if q else
+                          fact("unknown", UNKNOWN, "no reactive power given")),
+                 "q_mvar_at_1pu": round(q * float(step), 4), "bus": bus_display_name(net, bus),
+                 "bus_index": bus, "in_service": bool(net.shunt.at[i, "in_service"])}
+        stated_control = _model_control(cim, _origin(net, "shunt", i) if cim is not None else None)
+        if stated_control:
+            entry["control"] = {**stated_control,
+                                "in_studies": "held at its present sections: the studies do not switch it to "
+                                              "follow its target"}
+        shunts.append(entry)
     loads = []
     for i in net.load.index:
         bus = int(net.load.at[i, "bus"])
@@ -666,6 +1166,9 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
                       "bus": bus_display_name(net, bus), "bus_index": bus,
                       "p_mw": round(float(net.load.at[i, "p_mw"]), 3),
                       "in_service": bool(net.load.at[i, "in_service"])})
+        response = _model_load_response(cim, _origin(net, "load", i) if cim is not None else None)
+        if response:
+            loads[-1]["load_response"] = response
     external = []
     for i in net.ext_grid.index:
         bus = int(net.ext_grid.at[i, "bus"])
@@ -678,6 +1181,14 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
                or (br["element_type"] == "trafo" and home & set(br["ends_index"]))]
         external.append({"name": "External grid", "cim_class": CIM_CLASS["ext_grid"], "bus": bus_display_name(net, bus),
                          "bus_index": bus, "substation": subs.get(bus), "branches": via})
+        # A model whose reference is a machine gets it as the external grid (network_loader.read_cgmes), keeping
+        # its mRID: the machine's control and unit stay stated.
+        own_ext = _origin(net, "ext_grid", i) if cim is not None else None
+        if own_ext:
+            external[-1]["in_model"] = {"class": cim.cls(own_ext), "name": cim.name(own_ext),
+                                        **({"control": c} if (c := _model_control(cim, own_ext)) else {}),
+                                        **({"generating_unit": g} if (g := _model_generating_unit(cim, own_ext))
+                                           else {})}
     # Feeders and switches (the topology as switched now).
     names = {(b["element_type"], b["index"]): b["name"] for b in branches}
     try:
@@ -720,33 +1231,77 @@ def build(net, declared: dict | None = None, profile: dict | None = None,
     by_category: dict[str, list[str]] = {}
     for d in loads:
         by_category.setdefault(d["category"]["value"], []).append(d["name"])
-    return {"per_unit_case": per_unit, "voltage_levels_kv": levels,
-            "substations": {"basis": sub_basis, "from": sub_why, "count": len(set(subs.values()))},
-            "units_by_source": by_source, "loads_by_category": by_category,
-            "buses": buses, "branches": branches, "units": units, "loads": loads, "external_grids": external,
-            "switches": switches, "shunts": shunts,
-            **({"unresolved_branches": unresolved} if unresolved else {}),
-            "containers": _containers(buses, units, loads, switches, sub_basis, sub_why, branches, network_id),
-            "mrid_basis": _mrid_basis(net, "bus"),
-            **({"provenance": provenance.get("context")} if provenance else {})}
+    other = _other_equipment(net, cim, {b["index"]: b["name"] for b in buses}, network_id)
+    # Each substation's identity: the model's Substation (its mRID) when the network came as CIM.
+    sub_mrid = {}
+    if "Substation_id" in net.bus.columns:
+        for b in buses:
+            sid = net.bus.at[b["index"], "Substation_id"]
+            if isinstance(sid, str) and sid.strip():
+                sub_mrid.setdefault(b["substation"]["value"], cm_norm(sid))
+    layer = {"per_unit_case": per_unit, "voltage_levels_kv": levels,
+             "substations": {"basis": sub_basis, "from": sub_why, "count": len(set(subs.values()))},
+             "units_by_source": by_source, "loads_by_category": by_category,
+             "buses": buses, "branches": branches, "units": units, "loads": loads, "external_grids": external,
+             "switches": switches, "shunts": shunts,
+             **({"other_equipment": other} if other else {}),
+             **({"unresolved_branches": unresolved} if unresolved else {}),
+             "containers": _containers(buses, units, loads, switches, sub_basis, sub_why, branches, network_id,
+                                       sub_mrid=sub_mrid, cim=cim),
+             "mrid_basis": _mrid_basis(net, "bus"),
+             **({"provenance": provenance.get("context")} if provenance else {})}
+    if cim is not None:
+        layer["cim_model"] = {**cim.summary(), "coverage": model_coverage(net, cim, layer)}
+    return layer
 
 
-def _containers(buses, units, loads, switches, sub_basis, sub_why, branches=(), network_id="local") -> dict:
+def _containers(buses, units, loads, switches, sub_basis, sub_why, branches=(), network_id="local",
+                sub_mrid: dict | None = None, cim=None) -> dict:
     """CIM's equipment containers: each Substation with its VoltageLevels, and
-    each Feeder with what it supplies and the switches that tie it to others."""
+    each Feeder with what it supplies and the switches that tie it to others.
+    A voltage level is the model's own (its name, mRID and bays) when the model
+    states the buses' VoltageLevel; otherwise the substation's buses at one
+    voltage (inferred)."""
+    sub_mrid = sub_mrid or {}
     subs: dict[str, dict] = {}
     for b in buses:
         s = subs.setdefault(b["substation"]["value"], {"levels": {}, "buses": []})
         s["buses"].append(b["name"])
-        s["levels"].setdefault(b["kv"]["value"], []).append(b["name"])
+        vl = (b.get("voltage_level") or {}).get("value")
+        key = ("model", vl["mrid"]) if vl else ("kv", b["kv"]["value"])
+        s["levels"].setdefault(key, {"buses": [], "kv": b["kv"]["value"], "stated": vl, "busbars": [], "bays": []})
+        lv = s["levels"][key]
+        lv["buses"].append(b["name"])
+        bb = (b.get("busbar") or {}).get("value")
+        if bb and bb["name"] not in lv["busbars"]:
+            lv["busbars"].append(bb["name"])
+        bay = (b.get("bay") or {}).get("value")
+        if bay and bay["name"] not in lv["bays"]:
+            lv["bays"].append(bay["name"])
     first_bus = {}
     for b in buses:
         first_bus.setdefault(b["substation"]["value"], b["index"])
+
+    def level(n, key, lv):
+        if lv["stated"]:
+            kv = (cim.base_kv(lv["stated"]["mrid"]) if cim is not None else None) or lv["kv"]
+            base = cim.ref(lv["stated"]["mrid"], "VoltageLevel.BaseVoltage") if cim is not None else None
+            return {"cim_class": "VoltageLevel", "name": lv["stated"]["name"], "kv": kv, "buses": lv["buses"],
+                    "mrid": lv["stated"]["mrid"], "basis": STATED, "from": "the model's VoltageLevel",
+                    **({"base_voltage": {"mrid": base, "kv": kv}} if base else {}),
+                    **({"busbars": lv["busbars"]} if lv["busbars"] else {}),
+                    **({"bays": lv["bays"]} if lv["bays"] else {})}
+        kv = key[1]
+        return {"cim_class": "VoltageLevel", "kv": kv, "buses": lv["buses"],
+                "mrid": mrid(network_id, "voltage_level", f"{first_bus[n]}:{kv}"), "basis": INFERRED,
+                "from": "the substation's buses at one nominal voltage",
+                **({"busbars": lv["busbars"]} if lv["busbars"] else {})}
     substation_list = [{"name": n, "cim_class": "Substation", "basis": sub_basis, "from": sub_why,
-                        "mrid": mrid(network_id, "substation", first_bus[n]),
-                        "voltage_levels": [{"cim_class": "VoltageLevel", "kv": kv, "buses": names,
-                                            "mrid": mrid(network_id, "voltage_level", f"{first_bus[n]}:{kv}")}
-                                           for kv, names in sorted(s["levels"].items(), key=lambda x: -(x[0] or 0))]}
+                        "mrid": sub_mrid.get(n) or mrid(network_id, "substation", first_bus[n]),
+                        **({"region": r} if (r := _model_region(cim, sub_mrid.get(n))) else {}),
+                        "voltage_levels": [level(n, key, lv) for key, lv in
+                                           sorted(s["levels"].items(), key=lambda x: (-(x[1]["kv"] or 0),
+                                                                                      str(x[0][1])))]}
                        for n, s in subs.items()]
     feeders: dict[str, dict] = {}
     on_feeder = {b["index"]: b["feeder"]["value"] for b in buses if b.get("feeder", {}).get("value")}
@@ -841,7 +1396,7 @@ def normalise_load_declarations(net, changes: list[dict], declared: dict | None 
 # ---------------------------------------------------------------------------
 
 ABOUT = ("summary", "units", "loads", "voltage_levels", "substations", "external_grid", "switches", "feeders",
-         "data")
+         "data", "model")
 _MAX_LISTED = 40
 
 
@@ -949,9 +1504,20 @@ def view(semantics: dict, about: str = "summary") -> dict:
         levels = {}
         for b in buses:
             levels.setdefault(b["kv"]["value"], []).append(b["name"])
-        return {"about": "voltage_levels", "basis": STATED,
-                "levels": [{"kv": kv, "buses": len(names), "e.g.": names[:5]}
-                           for kv, names in sorted(levels.items(), key=lambda kv: -(kv[0] or 0))]}
+        out = {"about": "voltage_levels", "basis": STATED,
+               "levels": [{"kv": kv, "buses": len(names), "e.g.": names[:5]}
+                          for kv, names in sorted(levels.items(), key=lambda kv: -(kv[0] or 0))]}
+        # The model's own VoltageLevels (a CIM model states them, with names, busbars and bays).
+        named = [{"name": vl["name"], "substation": s["name"], "kv": vl["kv"], "buses": len(vl["buses"]),
+                  **({"busbars": vl["busbars"]} if vl.get("busbars") else {}),
+                  **({"bays": len(vl["bays"])} if vl.get("bays") else {})}
+                 for s in (semantics.get("containers") or {}).get("substations") or []
+                 for vl in s["voltage_levels"] if vl.get("basis") == STATED and vl.get("name")]
+        if named:
+            out["in_model"] = named[:_MAX_LISTED]
+            if len(named) > _MAX_LISTED:
+                out["more_in_model"] = len(named) - _MAX_LISTED
+        return out
     if about == "substations":
         subs: dict[str, dict] = {}
         for b in buses:
@@ -969,7 +1535,11 @@ def view(semantics: dict, about: str = "summary") -> dict:
         return {"about": "external_grid", "external_grids": semantics["external_grids"],
                 "note": "The external grid is a connection, not a bus or a branch: what carries its power is the "
                         "branches listed."}
+    if about == "model":
+        return model_view(semantics)
     by_source = {k: len(v) for k, v in semantics["units_by_source"].items()}
+    other = semantics.get("other_equipment") or []
+    cimm = semantics.get("cim_model")
     return {"about": "summary", "buses": len(buses), "lines": sum(b["element_type"] == "line"
                                                                   for b in semantics["branches"]),
             "transformers": sum(b["element_type"] == "trafo" for b in semantics["branches"]),
@@ -983,7 +1553,180 @@ def view(semantics: dict, about: str = "summary") -> dict:
             "switches": {"count": len(semantics.get("switches") or []),
                          "normally_open": sum(1 for x in semantics.get("switches") or [] if x["normal_open"]["value"])},
             "feeders": [f["name"] for f in (semantics.get("containers") or {}).get("feeders") or []],
+            **({"other_equipment": {"in_computation": _class_counts(o for o in other if o["in_computation"]),
+                                    "not_in_computation": _class_counts(o for o in other if not o["in_computation"])}}
+               if other else {}),
+            **({"cim_model": {"version": cimm.get("version"), "objects": cimm.get("objects"),
+                              "note": "The network came as a CIM model, kept whole: describe_network(about='model') "
+                                      "says what the studies use of it and what they ignore."}} if cimm else {}),
             **({"note": declare_hint} if unknown_units else {})}
+
+
+def _class_counts(items) -> dict:
+    out: dict = {}
+    for o in items:
+        out[o["cim_class"]] = out.get(o["cim_class"], 0) + 1
+    return out
+
+
+def model_caveats(semantics: dict) -> list[dict]:
+    """What the CIM model states that the studies do not use: each {"kind", "element", "note"}. Only for a network
+    that came as CIM (its model kept)."""
+    if not semantics.get("cim_model"):
+        return []
+    out = []
+    temporary = [b["name"].split(" | ")[0] for b in semantics.get("branches") or []
+                 if any(not r["permanent"] and r["duration_s"] for r in (b.get("limits") or {}).get("value") or [])]
+    if temporary:
+        out.append({"kind": "temporary_limits_after_outages_only", "element": f"{len(temporary)} branch(es)",
+                    "note": "the model gives temporary limits (held for a stated time) as well as the permanent one; "
+                            "the N-1 studies say how long an overload after an outage may be held under them, the "
+                            "other studies check the permanent limit, e.g. " + ", ".join(temporary[:3])})
+    controlled = [x["name"] for x in semantics.get("shunts") or [] if (x.get("control") or {}).get("enabled")]
+    if controlled:
+        out.append({"kind": "shunt_control_not_followed", "element": ", ".join(controlled[:5])
+                    + (" …" if len(controlled) > 5 else ""),
+                    "note": f"{len(controlled)} shunt(s) regulate a voltage in the model; the studies hold them at "
+                            "their present sections"})
+    taps = [b["name"].split(" | ")[0] for b in semantics.get("branches") or []
+            for t in (b.get("tap_changers") or {}).get("value") or [] if t.get("control_enabled")]
+    if taps:
+        out.append({"kind": "tap_control_not_followed", "element": ", ".join(taps[:5]) + (" …" if len(taps) > 5 else ""),
+                    "note": f"{len(taps)} tap changer(s) regulate in the model; the studies hold each tap fixed"})
+    responsive = [d["name"] for d in semantics.get("loads") or []
+                  if (d.get("load_response") or {}).get("constant_power") is False]
+    if responsive:
+        out.append({"kind": "load_response_not_used", "element": ", ".join(responsive[:5])
+                    + (" …" if len(responsive) > 5 else ""),
+                    "note": f"{len(responsive)} load(s) follow the voltage in the model (constant current or "
+                            "impedance shares); the studies treat every load as constant power"})
+    missing = [o for o in semantics.get("other_equipment") or [] if not o["in_computation"]]
+    if missing:
+        counts = _class_counts(missing)
+        out.append({"kind": "equipment_not_in_computation",
+                    "element": ", ".join(f"{n} {c}" for c, n in sorted(counts.items())),
+                    "note": "the model holds equipment pandapower's converter has no place for; the studies do not "
+                            "see it, e.g. " + ", ".join(o["name"] for o in missing[:3])})
+    return out
+
+
+SOLVED_TOLERANCE = {"vm_pu": 0.005, "angle_deg": 0.5, "mw": 1.0}
+
+
+def solved_state_check(net_solved, cim) -> dict | None:
+    """CONDUCTOR's power flow against the source tool's own solution (the model's SV profile), on the network as
+    loaded: each node's voltage (magnitude, and angle relative to the supply point's) and each injection's power
+    (loads, units, shunts, the supply point). A close match says the conversion kept the model electrically
+    intact; a difference says where it did not. `net_solved`: the network as loaded after a power flow."""
+    if cim is None or not cim.of("SvVoltage") or "res_bus" not in net_solved or not len(net_solved.res_bus):
+        return None
+    sv_v = {}
+    for x in cim.of("SvVoltage"):
+        o = cim.get(x) or {}
+        tn = cim.ref(x, "SvVoltage.TopologicalNode")
+        if tn:
+            sv_v[tn] = (num_or(o.get("SvVoltage.v"), None), num_or(o.get("SvVoltage.angle"), None))
+    rows, unsolved = [], []
+    for i, oid in net_solved.bus.get("origin_id", pd.Series(dtype=object)).items():
+        if not isinstance(oid, str):
+            continue
+        node = cm_norm(oid)
+        tn = node if cim.cls(node) == "TopologicalNode" else cim.ref(node, "ConnectivityNode.TopologicalNode")
+        v, ang = sv_v.get(tn, (None, None))
+        kv = net_solved.bus.at[i, "vn_kv"]
+        if v is None or not kv:
+            continue
+        if pd.isna(net_solved.res_bus.at[i, "vm_pu"]):
+            # The model solved this node; CONDUCTOR's power flow did not reach it (cut off as converted).
+            if v > 0:
+                unsolved.append(bus_display_name(net_solved, int(i)))
+            continue
+        rows.append((int(i), float(net_solved.res_bus.at[i, "vm_pu"]), v / float(kv),
+                     float(net_solved.res_bus.at[i, "va_degree"]), ang, cim.label(tn) or tn))
+    if not rows:
+        return None
+    # Angles are relative: aligned at the supply point's bus (else at the median difference).
+    ref_bus = int(net_solved.ext_grid.bus.iloc[0]) if len(net_solved.ext_grid) else None
+    ref = next(((r[3] - r[4]) for r in rows if r[0] == ref_bus and r[4] is not None), None)
+    if ref is None:
+        diffs = sorted(r[3] - r[4] for r in rows if r[4] is not None)
+        ref = diffs[len(diffs) // 2] if diffs else 0.0
+    names = {int(i): bus_display_name(net_solved, int(i)) for i, *_ in rows}
+    def angle_gap(d: float) -> float:          # angles compare modulo a full turn
+        return abs((d + 180.0) % 360.0 - 180.0)
+    volt = sorted(((abs(r[1] - r[2]), angle_gap(r[3] - r[4] - ref) if r[4] is not None else 0.0, r) for r in rows),
+                  key=lambda x: -x[0])
+    worst_v = [{"bus": names[r[0]], "node_in_model": r[5], "vm_pu": round(r[1], 4), "model_vm_pu": round(r[2], 4)}
+               for _, _, r in volt[:3]]
+    # Injections: the model's flows at each injection's terminal (load sign: positive into the equipment).
+    table_of = {}
+    for table in ("load", "gen", "sgen", "ext_grid", "shunt", "ward", "xward", "motor", "storage"):
+        df = net_solved[table] if table in net_solved else None
+        if isinstance(df, pd.DataFrame) and len(df) and "origin_id" in df.columns:
+            for i, o in df["origin_id"].items():
+                if isinstance(o, str) and o.strip():
+                    table_of[cm_norm(o)] = (table, i)
+    inj = []
+    for x in cim.of("SvPowerFlow"):
+        term = cim.ref(x, "SvPowerFlow.Terminal")
+        eq = cim.ref(term, "Terminal.ConductingEquipment") if term else None
+        hit = table_of.get(eq or "")
+        res = f"res_{hit[0]}" if hit else None
+        if not hit or res not in net_solved or hit[1] not in net_solved[res].index:
+            continue
+        o = cim.get(x) or {}
+        p_model, q_model = num_or(o.get("SvPowerFlow.p"), None), num_or(o.get("SvPowerFlow.q"), None)
+        sign = 1.0 if hit[0] in ("load", "shunt", "ward", "xward", "motor", "storage") else -1.0  # pandapower's sign
+        p_ours = net_solved[res].at[hit[1], "p_mw"]
+        q_ours = net_solved[res].at[hit[1], "q_mvar"] if "q_mvar" in net_solved[res].columns else None
+        if p_model is None or pd.isna(p_ours):
+            continue
+        d_p = abs(sign * float(p_ours) - p_model)
+        d_q = abs(sign * float(q_ours) - q_model) if q_model is not None and q_ours is not None \
+            and not pd.isna(q_ours) else 0.0
+        inj.append((max(d_p, d_q), d_p, d_q, cim.label(eq) or eq, hit[0]))
+    inj.sort(key=lambda x: -x[0])
+    max_dv = volt[0][0]
+    max_da = max(x[1] for x in volt)
+    max_dpq = inj[0][0] if inj else 0.0
+    matches = (max_dv <= SOLVED_TOLERANCE["vm_pu"] and max_da <= SOLVED_TOLERANCE["angle_deg"]
+               and max_dpq <= SOLVED_TOLERANCE["mw"] and not unsolved)
+    return {"matches": matches, "buses_compared": len(rows), "injections_compared": len(inj),
+            **({"buses_not_solved": len(unsolved), "e.g. not solved": unsolved[:5]} if unsolved else {}),
+            "max_vm_diff_pu": round(max_dv, 5), "max_angle_diff_deg": round(max_da, 4),
+            "max_injection_diff_mw_mvar": round(max_dpq, 4), "tolerance": SOLVED_TOLERANCE,
+            "largest_voltage_differences": worst_v,
+            "largest_injection_differences": [{"element": e, "table": t, "dp_mw": round(dp, 4), "dq_mvar": round(dq, 4)}
+                                              for _, dp, dq, e, t in inj[:3]],
+            "note": ("CONDUCTOR's power flow on the network as loaded reproduces the source tool's solution "
+                     "(the model's SV profile) within the tolerance: the conversion kept the model electrically "
+                     "intact." if matches else
+                     "CONDUCTOR's power flow on the network as loaded differs from the source tool's solution "
+                     "(the model's SV profile) beyond the tolerance: something the studies use differs from the "
+                     "model — see the largest differences.")}
+
+
+def model_view(semantics: dict) -> dict:
+    """What the CIM model the network came from holds, what reaches the computation and the layer, and what the
+    studies ignore (for the agent: describe_network(about="model"))."""
+    cimm = semantics.get("cim_model")
+    if not cimm:
+        return {"about": "model", "note": "The network did not come as a CIM/CGMES model, or its model is not kept: "
+                                          "the CIM layer is built from the network's own data."}
+    by_status: dict[str, list] = {}
+    for r in cimm["coverage"]["classes"]:
+        by_status.setdefault(r["status"], []).append(
+            {"class": r["class"], "in_model": r["in_model"], "in_layer": r["in_layer"],
+             **({"read_into": r["read_into"]} if r.get("read_into") else {})})
+    missing = [o for o in semantics.get("other_equipment") or [] if not o["in_computation"]]
+    return {"about": "model", "version": cimm.get("version"), "objects": cimm.get("objects"),
+            "profiles": cimm.get("profiles"), "classes_by_status": by_status,
+            **({"not_in_computation": [{"name": o["name"], "class": o["cim_class"], "buses": o["buses"],
+                                        "mrid": o["mrid"]} for o in missing[:_MAX_LISTED]]} if missing else {}),
+            "studies_ignore": model_caveats(semantics),
+            "note": "described: the layer describes every object of the class; read_into: its content is in other "
+                    "entries; solved_state: the source tool's power-flow solution; model_only: kept, not in the "
+                    "layer. Any object can be looked up by its mRID: describe_network(about='around', element=<mRID>)."}
 
 
 def _value_kinds(e: dict) -> dict:
@@ -1317,6 +2060,8 @@ def data_issues(net, semantics: dict) -> list[dict]:
     if cut:
         out.append({"kind": "loads_without_supply", "element": ", ".join(cut[:5]) + (" …" if len(cut) > 5 else ""),
                     "level": "check", "note": f"{len(cut)} load(s) with no path to a source as switched now"})
+    # What the CIM model states that the studies do not use (a network that came as CIM).
+    out += [{**c, "level": "note"} for c in model_caveats(semantics)]
     loads = semantics.get("loads") or []
     known = [d for d in loads if d["category"]["basis"] != UNKNOWN]
     if known and len(known) < len(loads):

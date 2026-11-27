@@ -99,6 +99,7 @@ moment's check, not a switching plan.
 | **Every single outage** — each line and transformer out in turn; an outage that breaks a limit, or cuts load off, makes the grid not N-1 secure | *Which single N-1 outage is the most critical right now?* · *Is the grid N-1 secure at the worst moment of the week?* |
 | **The outages of one feeder, substation or voltage level** | *Run N-1 on the 20 kV level.* · *Is feeder Line 1-2 N-1 secure?* |
 | **Corrective dispatch after an outage** | *If that line trips, can redispatch restore security, and how?* |
+| **Time to act** — on a network loaded as CIM whose model states temporary limits, each overload after an outage says how long it may be held (the 15-minute limit, say) or that it is beyond them | *If Logan – Baileysv trips at the evening peak, how long do I have to act?* |
 
 ## Over time, scenarios and risk
 

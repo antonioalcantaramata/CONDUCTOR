@@ -7,8 +7,9 @@ GridAPPS-D uses), so a SPARQL query or a CIM tool can read what CONDUCTOR
 knows about the network:
 
 - containers: BaseVoltage, Substation, VoltageLevel, Feeder;
-- topology: TopologicalNode, and a Terminal joining each piece of conducting
-  equipment to its node;
+- topology: TopologicalNode (or, for a node-breaker CIM model, its
+  ConnectivityNodes), and a Terminal joining each piece of conducting
+  equipment to its node — a bus coupler to the nodes on both sides;
 - equipment: ACLineSegment, PowerTransformer (with its two ends),
   EnergyConsumer, PowerElectronicsConnection with its PhotovoltaicUnit /
   PowerElectronicsWindUnit / BatteryUnit / PowerElectronicsUnit,
@@ -117,18 +118,24 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
         for vl in sub["voltage_levels"]:
             g.add(vl["mrid"], "cim:VoltageLevel",
                   [_lit("cim:IdentifiedObject.mRID", vl["mrid"]),
-                   _lit("cim:IdentifiedObject.name", f"{sub['name']} {vl['kv']:g} kV" if vl["kv"] else sub["name"]),
+                   _lit("cim:IdentifiedObject.name", vl.get("name") or (f"{sub['name']} {vl['kv']:g} kV" if vl["kv"]
+                                                                       else sub["name"])),
                    _ref("cim:VoltageLevel.Substation", sub["mrid"]),
                    _ref("cim:VoltageLevel.BaseVoltage", base_voltage.get(vl["kv"]))])
             for name in vl["buses"]:
                 level_of_bus[name] = vl["mrid"]
 
-    # Nodes.
-    for b in buses.values():
-        g.add(b["mrid"], "cim:TopologicalNode",
+    # Nodes: TopologicalNodes (a bus-branch network), or a node-breaker model's ConnectivityNodes as it has them.
+    def node_class(bus: int) -> str:
+        return "ConnectivityNode" if buses[bus].get("cim_class") == "ConnectivityNode" else "TopologicalNode"
+
+    for i, b in buses.items():
+        cls = node_class(i)
+        g.add(b["mrid"], f"cim:{cls}",
               [_lit("cim:IdentifiedObject.mRID", b["mrid"]), _lit("cim:IdentifiedObject.name", b["name"]),
-               _ref("cim:TopologicalNode.BaseVoltage", base_voltage.get(b["kv"]["value"])),
-               _ref("cim:TopologicalNode.ConnectivityNodeContainer", level_of_bus.get(b["name"])),
+               *([_ref("cim:TopologicalNode.BaseVoltage", base_voltage.get(b["kv"]["value"]))]
+                 if cls == "TopologicalNode" else []),
+               _ref(f"cim:{cls}.ConnectivityNodeContainer", level_of_bus.get(b["name"])),
                *_fact("nominalVoltage", b["kv"]), *_fact("feeder", b.get("feeder"))])
 
     def terminals(eq_mrid: str, bus_indices: list[int]) -> list[str]:
@@ -138,7 +145,7 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
             g.add(t, "cim:Terminal",
                   [_lit("cim:IdentifiedObject.mRID", t), _lit("cim:ACDCTerminal.sequenceNumber", seq),
                    _ref("cim:Terminal.ConductingEquipment", eq_mrid),
-                   _ref("cim:Terminal.TopologicalNode", buses[bus]["mrid"])])
+                   _ref(f"cim:Terminal.{node_class(bus)}", buses[bus]["mrid"])])
             out.append(t)
         return out
 
@@ -244,7 +251,11 @@ def build_graph(semantics: dict, network_id: str = "local") -> _Graph:
                _lit("cim:Switch.normalOpen", sw["normal_open"]["value"]), _lit("cim:Switch.open", sw["open"]["value"]),
                _ref("cdr:atEquipment", names.get(where.get("element"))),
                _lit("cdr:classBasis", sw["cim_class"]["basis"]), *_fact("role", sw["role"])])
-        if at_bus is not None:
+        between = [i for i in where.get("between_index") or [] if i in buses]
+        if len(between) == 2:
+            # A bus coupler, and every switch of a node-breaker model: joined to the nodes on both sides.
+            terminals(sw["mrid"], between)
+        elif at_bus is not None:
             terminals(sw["mrid"], [at_bus])
 
     # Feeders: containers, energised from a substation through their head line.
@@ -420,3 +431,66 @@ def to_difference_rdf_xml(base: dict, proposal: dict, network_id: str = "local",
             write(reverse, sid, None, minus)
     ET.indent(root)
     return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode")
+
+
+ADDITIONS_PROFILE = "urn:conductor:profile:additions"
+
+
+def additions_rdf_xml(semantics: dict, cim, created: str = "") -> str:
+    """What CONDUCTOR adds to a CIM model it was given, as one more profile beside the model's own: each fact the
+    layer adds about the model's objects — a unit's energy source, a load's category, a node's feeder, a switch's
+    role, each with how it is known (stated, named, inferred, declared by the operator) — referring to them as the
+    model's own profiles do (`cim.about`), and the feeders the layer infers, which the model does not hold. With the
+    original profiles, nothing of the model is regenerated: the export is lossless."""
+    ET.register_namespace("rdf", RDF_NS)
+    ET.register_namespace("cdr", CDR_NS)
+    ET.register_namespace("md", MD_NS)
+    root = ET.Element(f"{{{RDF_NS}}}RDF")
+    header = ET.SubElement(root, f"{{{MD_NS}}}FullModel",
+                           {f"{{{RDF_NS}}}about": _urn(_child_id("additions", "|".join(
+                               h.get("id") or "" for h in cim.headers)))})
+    if created:
+        ET.SubElement(header, f"{{{MD_NS}}}Model.created").text = created
+    ET.SubElement(header, f"{{{MD_NS}}}Model.description").text = (
+        "CONDUCTOR's additions to this model: the facts its CIM layer adds, with how each is known.")
+    ET.SubElement(header, f"{{{MD_NS}}}Model.profile").text = ADDITIONS_PROFILE
+    for h in cim.headers:
+        if h.get("id") and h.get("profile") in ("EQ", "SSH", "TP"):
+            ET.SubElement(header, f"{{{MD_NS}}}Model.DependentOn", {f"{{{RDF_NS}}}resource": h["id"]})
+
+    def describe(mrid: str, facts: list) -> None:
+        props = [f for f in facts if f[1] is not None]
+        if not props or cim.get(mrid) is None:
+            return
+        el = ET.SubElement(root, f"{{{RDF_NS}}}Description", {f"{{{RDF_NS}}}about": cim.about(mrid)})
+        for prop, value, is_ref in props:
+            child = ET.SubElement(el, f"{{{CDR_NS}}}{prop.split(':')[1]}")
+            if is_ref:
+                child.set(f"{{{RDF_NS}}}resource", value)
+            else:
+                child.text = _value_text(value)
+
+    for u in semantics.get("units") or []:
+        describe(u["mrid"], _fact("energySource", u["source"]))
+    for d in semantics.get("loads") or []:
+        describe(d["mrid"], _fact("category", d["category"]))
+    for b in semantics.get("buses") or []:
+        describe(b["mrid"], _fact("feeder", b.get("feeder")) + _fact("substationName", b.get("substation")))
+    for s in semantics.get("switches") or []:
+        describe(s["mrid"], _fact("role", s.get("role")))
+    # The feeders the layer infers: not in the model, so whole objects of CONDUCTOR's namespace, members by reference.
+    node_of = {b["name"]: b["mrid"] for b in semantics.get("buses") or []}
+    head_of = {b["name"]: b["mrid"] for b in semantics.get("branches") or []}
+    for f in (semantics.get("containers") or {}).get("feeders") or []:
+        el = ET.SubElement(root, f"{{{CDR_NS}}}Feeder", {f"{{{RDF_NS}}}about": _urn(f["mrid"])})
+        ET.SubElement(el, f"{{{CDR_NS}}}name").text = _label(f["name"])
+        ET.SubElement(el, f"{{{CDR_NS}}}basis").text = f["basis"]
+        ET.SubElement(el, f"{{{CDR_NS}}}from").text = f["from"]
+        if f["name"] in head_of and cim.get(head_of[f["name"]]) is not None:
+            ET.SubElement(el, f"{{{CDR_NS}}}headBranch", {f"{{{RDF_NS}}}resource": cim.about(head_of[f["name"]])})
+        for name in f["buses"]:
+            if name in node_of and cim.get(node_of[name]) is not None:
+                ET.SubElement(el, f"{{{CDR_NS}}}member", {f"{{{RDF_NS}}}resource": cim.about(node_of[name])})
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode")
+

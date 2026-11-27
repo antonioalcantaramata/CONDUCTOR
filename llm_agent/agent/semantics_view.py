@@ -47,6 +47,7 @@ _FADE = 0.45            # a weaker basis than stated: the hue, lighter
 KINDS = {
     "units": {"fact": "source", "colours": SOURCE_COLOURS, "legend": "Energy source"},
     "loads": {"fact": "category", "colours": CATEGORY_COLOURS, "legend": "Demand category"},
+    "model": {"fact": None, "colours": {}, "legend": "The CIM model's classes"},
 }
 
 
@@ -119,9 +120,33 @@ def line_table(semantics: dict) -> list[dict]:
         r = b["rating_mva"]
         out.append({"Line": b["name"], "From": b["ends"][0], "To": b["ends"][1],
                     "kV": b["kv"], "Rating (MVA)": r["value"],
-                    "Rating basis": BASIS_LABELS.get(r["basis"], r["basis"]), "In service": b["in_service"],
-                    "CIM class": b["cim_class"]})
+                    "Rating basis": BASIS_LABELS.get(r["basis"], r["basis"]),
+                    **({"Limits (model)": limits_text(b["limits"])} if b.get("limits") else {}),
+                    "In service": b["in_service"], "CIM class": b["cim_class"]})
     return out
+
+
+def limits_text(limits: dict) -> str:
+    """A branch's limits as the model gives them, on one line: '1000 A permanent · 1150 A 15 min · 1400 A 1 min'
+    (the first terminal's; the studies check the permanent one)."""
+    rows = limits.get("value") or []
+    first = min((r.get("terminal") or 0 for r in rows), default=0)
+    parts = []
+    for r in rows:
+        if (r.get("terminal") or 0) != first or r.get("value") is None or r.get("limit_type") == "patlt":
+            continue
+        unit = "A" if r.get("kind") in (None, "CurrentLimit") else ("MVA" if "Apparent" in str(r.get("kind")) else
+                                                                    "MW" if "Active" in str(r.get("kind")) else "kV")
+        held = "permanent" if r.get("permanent") else _duration(r.get("duration_s"))
+        parts.append(f"{r['value']:g} {unit} {held}")
+    return " · ".join(dict.fromkeys(parts))
+
+
+def _duration(seconds) -> str:
+    if not seconds:
+        return "temporary"
+    s = float(seconds)
+    return f"{s / 3600:g} h" if s >= 3600 else f"{s / 60:g} min" if s >= 60 else f"{s:g} s"
 
 
 def trafo_table(semantics: dict) -> list[dict]:
@@ -131,19 +156,99 @@ def trafo_table(semantics: dict) -> list[dict]:
         if b["element_type"] != "trafo":
             continue
         hv, lv = (b["kv"] or [None, None])[:2]
+        taps = (b.get("tap_changers") or {}).get("value") or []
         out.append({"Transformer": b["name"], "HV bus": b["ends"][0], "LV bus": b["ends"][1],
                     "HV kV": hv, "LV kV": lv, "Rating (MVA)": b["rating_mva"]["value"],
+                    **({"Tap (model)": "; ".join(
+                        f"step {t['now']:g} of {t['steps'][0]:g}–{t['steps'][1]:g}"
+                        + (" · control on (held fixed in studies)" if t.get("control_enabled") else "")
+                        for t in taps if t.get("now") is not None and None not in (t.get("steps") or [None]))}
+                       if taps else {}),
                     "In service": b["in_service"], "CIM class": b["cim_class"]})
     return out
 
 
 def bus_table(semantics: dict) -> list[dict]:
-    """Buses, read-only: voltage and substation, each with its basis."""
-    return [{"Bus": b["name"], "kV": b["kv"]["value"], "kV basis": BASIS_LABELS.get(b["kv"]["basis"]),
+    """Buses, read-only: voltage and substation, each with its basis; the model's voltage level, busbar and bus
+    name when a CIM model states them."""
+    buses = semantics.get("buses") or []
+    model = {k: any(b.get(k) for b in buses) for k in ("voltage_level", "busbar", "name_in_model")}
+
+    def named(b, key):
+        return ((b.get(key) or {}).get("value") or {}).get("name") or "—"
+    return [{"Bus": b["name"],
+             **({"Name in model": named(b, "name_in_model")} if model["name_in_model"] else {}),
+             "kV": b["kv"]["value"], "kV basis": BASIS_LABELS.get(b["kv"]["basis"]),
              "Substation": b["substation"]["value"],
              "Substation basis": BASIS_LABELS.get(b["substation"]["basis"]),
+             **({"Voltage level": named(b, "voltage_level")} if model["voltage_level"] else {}),
+             **({"Busbar": named(b, "busbar")} if model["busbar"] else {}),
              "Feeder": ((b.get("feeder") or {}).get("value") or "—").split(" | ")[0],
-             "In service": b["in_service"], "CIM class": b["cim_class"]} for b in semantics.get("buses") or []]
+             "In service": b["in_service"], "CIM class": b["cim_class"]} for b in buses]
+
+
+# The CIM model the network came from: how much of it the layer describes.
+STATUS_LABELS = {"described": "Described by the layer", "partly": "Partly described",
+                 "read_into": "Read into other entries", "solved_state": "Source tool's solution (checked)",
+                 "model_only": "In the model only"}
+STATUS_COLOURS = {"described": _C.OK, "partly": _C.TEAL, "read_into": _C.PRIMARY, "solved_state": _C.PURPLE,
+                  "model_only": _C.NEUTRAL}
+
+
+def model_headline(semantics: dict) -> tuple[str, str, str] | None:
+    """(label, value, how we know) for the CIM model, above the picture; None for a network not loaded as CIM."""
+    cim = semantics.get("cim_model")
+    if not cim:
+        return None
+    rows = (cim.get("coverage") or {}).get("classes") or []
+    described = sum(1 for r in rows if r["status"] in ("described", "read_into"))
+    return ("CIM model", f"{cim.get('objects', 0):,} objects",
+            f"CGMES {cim.get('version')}: {described} of {len(rows)} classes in the layer, all kept")
+
+
+def model_hierarchy(semantics: dict) -> dict:
+    """Sunburst arrays for the CIM model: status › class, one sector per class (its objects in the hover)."""
+    rows = ((semantics.get("cim_model") or {}).get("coverage") or {}).get("classes") or []
+    ids, labels, parents, colours, hovers = [], [], [], [], []
+    for status in STATUS_LABELS:
+        mine = [r for r in rows if r["status"] == status]
+        if not mine:
+            continue
+        ids.append(status), labels.append(STATUS_LABELS[status]), parents.append(""), colours.append(
+            STATUS_COLOURS[status])
+        hovers.append(f"<b>{STATUS_LABELS[status]}</b><br>{len(mine)} classes, "
+                      f"{sum(r['in_model'] for r in mine):,} objects")
+        for r in mine:
+            ids.append(f"{status}/{r['class']}"), labels.append(r["class"]), parents.append(status)
+            colours.append(_faded(STATUS_COLOURS[status], 0.55))
+            hovers.append(f"<b>{r['class']}</b><br>{r['in_model']:,} in the model · {r['in_computation']:,} in the "
+                          f"studies · {r['in_layer']:,} in the layer"
+                          + (f"<br>read into: {r['read_into']}" if r.get("read_into") else ""))
+    return {"ids": ids, "labels": labels, "parents": parents, "colours": colours, "hovers": hovers}
+
+
+def model_legend(semantics: dict) -> list[tuple[str, str]]:
+    rows = ((semantics.get("cim_model") or {}).get("coverage") or {}).get("classes") or []
+    present = {r["status"] for r in rows}
+    return [(STATUS_LABELS[s], c) for s, c in STATUS_COLOURS.items() if s in present]
+
+
+def model_table(semantics: dict) -> list[dict]:
+    """The loss report: each class of the CIM model, how many objects it has, reach the studies, and the layer."""
+    rows = ((semantics.get("cim_model") or {}).get("coverage") or {}).get("classes") or []
+    order = list(STATUS_LABELS)
+    return [{"Class": r["class"], "In the model": r["in_model"], "In the studies": r["in_computation"],
+             "In the layer": r["in_layer"], "Status": STATUS_LABELS.get(r["status"], r["status"]),
+             "Profiles": ", ".join(r.get("profiles") or [])}
+            for r in sorted(rows, key=lambda r: (order.index(r["status"]) if r["status"] in order else 9,
+                                                 r["class"]))]
+
+
+def other_table(semantics: dict) -> list[dict]:
+    """Equipment the layer has no kind of its own for, and the model's equipment the studies do not see."""
+    return [{"Name": o["name"], "CIM class": o["cim_class"], "What": o["what"], "Buses": ", ".join(o["buses"]),
+             "In the studies": "yes" if o["in_computation"] else "no — not converted"}
+            for o in semantics.get("other_equipment") or []]
 
 
 def headline(semantics: dict) -> list[tuple[str, str, str]]:
@@ -210,7 +315,7 @@ def hierarchy(semantics: dict, kind: str = "units") -> dict:
 
 def figure(semantics: dict, kind: str = "units"):
     import plotly.graph_objects as go
-    h = hierarchy(semantics, kind)
+    h = model_hierarchy(semantics) if kind == "model" else hierarchy(semantics, kind)
     fig = go.Figure(go.Sunburst(
         ids=h["ids"], labels=h["labels"], parents=h["parents"],
         marker={"colors": h["colours"], "line": {"color": "white", "width": 2}},
@@ -224,6 +329,8 @@ def figure(semantics: dict, kind: str = "units"):
 
 def legend(semantics: dict, kind: str = "units") -> list[tuple[str, str]]:
     """(value, colour) for the values present, in the colour map's order."""
+    if kind == "model":
+        return model_legend(semantics)
     spec = KINDS[kind]
     present = {e[spec["fact"]]["value"] for e in semantics.get(kind) or []}
     return [(label(v), c) for v, c in spec["colours"].items() if v in present]

@@ -19,9 +19,16 @@ Every start shows a launch screen in two columns.
   at the evening peaks, so the flexibility studies have real choices to show.
   Loads take their reactive power from the load power factor. The network's own
   operating point (the *nominal point*) is included.
-- **Demo: IEEE 30 · with reactive measurements** — the same network and week,
-  with measured reactive demand and generation. A few values are left out on
-  purpose, so the data-quality report has gaps to show.
+- **Demo: ENTSO-E SmallGrid · a CIM model** — ENTSO-E's CGMES test model
+  SmallGrid (© ENTSO-E, CC BY-SA 4.0), loaded as CIM and kept whole: 118 nodes
+  at 220, 132 and 33 kV, 18 machines holding the model's own voltage set-points,
+  and the boundary equivalents. *System → CIM layer* shows the model itself:
+  its substations and names, what the studies use and ignore, and whether
+  CONDUCTOR's power flow matches the model's own solution. In its synthetic
+  week the units follow the demand and the 220 kV corridor Olive–X9–Breed
+  congests at the evening peaks. The demand and generation come with measured
+  reactive power; a few values are left out on purpose, so the data-quality
+  report has gaps to show.
 - **Demo: CIGRE MV · distribution with DER** — the CIGRE medium-voltage
   benchmark: a 110/20 kV substation and two radial feeders with PV, wind, CHP,
   fuel cells and batteries, each typed by the network (so *System → CIM layer*

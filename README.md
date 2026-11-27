@@ -29,7 +29,12 @@ curtail wind and solar but never raise them beyond what the resource gives; an
 outage study checks each tie that could restore supply with a power flow; an
 N-1 screen can be limited to one feeder, substation or voltage level; and the
 synthetic data follow each unit's source and each load's category. CGMES models
-load directly, and the layer can be exported as CIM.
+load directly and are kept whole: the layer reads their names, voltage levels,
+busbars, limits and controls, says what the studies do not use, and checks
+CONDUCTOR's power flow against the model's own solution; CGMES 3.0 models load
+too, inverters included. Any other network is written as CGMES 3.0 from its data,
+and reads back the same power flow. A proposal can be kept as the change it makes
+to the CIM model (an IEC 61970-552 difference). The layer can be exported as CIM.
 
 Corrective actions come as **options to choose from**, not one answer: the
 least disturbance, the cheapest, the fewest units, the most headroom,

@@ -41,6 +41,7 @@ across restarts.
 | **New line between existing buses** — meshing, a second circuit | *Add a line between Bus 0 and Bus 3, 10 km, like line 0.* |
 | **New transformer between existing buses** | *Add a 60 MVA transformer between Bus 3 and Bus 6.* |
 | **Switch an element in or out** — lines, transformers, loads, units, shunts, storage | *Open the Bus_2 – Bus_3 line.* · *Switch off Gen_bus1.* |
+| **Operate a switch** — a breaker, a disconnector, a busbar coupler, a normally open tie; by its name or mRID | *Close the tie S2.* · *Open the breaker at the feeder head of Line 1-2.* |
 | **Change any setting** of an existing element | *Set the external grid voltage to 1.05 p.u.* · *Set transformer T1 to tap +2.* · *Lower the line limit of line 3 to 80 %.* · *Hold the load at Bus 3 at 50 MW.* |
 | **Move an element** — a load, unit, shunt, storage, the external grid, or one end of a line | *Move the load at Bus 2 to Bus 4.* · *Reconnect the far end of line 5 to Bus 2.* |
 | **Scale existing loads or units** — keeping their measured profile | *Grow every load by 20 %.* · *Halve the loads at Bus 5.* |

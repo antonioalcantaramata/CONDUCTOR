@@ -200,6 +200,31 @@ def _proposed_mask(df: pd.DataFrame) -> pd.Series:
     return df["proposed"].map(lambda v: bool(v) if pd.notna(v) else False).astype(bool)
 
 
+def label_loads(net, measurement_prod_cons, substations, rows=None) -> None:
+    """Each load's bus name (`bus_name`: the name as loaded — a bus the operator renamed keeps its measurements;
+    Bus_{idx} for an empty one) and the measurement it matches (`substation_name`), in place; `rows`: only those."""
+    rows = net.load.index if rows is None else rows
+    # Step 3: map bus index to bus name.
+    bus_name_map = {int(idx): measurement_name(net, idx) for idx in net.bus.index}
+    if 'bus_name' not in net.load.columns:
+        net.load['bus_name'] = None
+    net.load.loc[rows, 'bus_name'] = net.load.loc[rows, 'bus'].map(bus_name_map)
+    # Step 4: prefer matching against measurement substation names (the canonical short names like 'Bravo') so the
+    # lookup works for measured substation-style networks where bus names have kV suffixes ('Bravo 10 kV'); else
+    # the network-derived substations list (IEEE / MATPOWER networks).
+    meas_sub_names = (
+        measurement_prod_cons['substation_name'].dropna().tolist()
+        if 'substation_name' in measurement_prod_cons.columns
+        else []
+    )
+    match_pool = meas_sub_names if meas_sub_names else substations
+    if 'substation_name' not in net.load.columns:
+        net.load['substation_name'] = None
+    net.load.loc[rows, 'substation_name'] = net.load.loc[rows, 'bus_name'].apply(
+        lambda name: match_substation(name, match_pool)
+    )
+
+
 def assign_load_values_from_measurements(net, measurement_prod_cons, substations,
                                          power_factor=DEFAULT_LOAD_POWER_FACTOR):
     """
@@ -244,25 +269,8 @@ def assign_load_values_from_measurements(net, measurement_prod_cons, substations
     if any(name in net.load['name'].values for name in names_to_drop):
         net.load = net.load[~net.load['name'].isin(names_to_drop)].copy()
 
-    # -------- Step 3: Map bus index to bus name (Bus_{idx} fallback for empty/missing names) --------
-    # The name as loaded: a bus the operator renamed keeps its measurements.
-    bus_name_map = {int(idx): measurement_name(net, idx) for idx in net.bus.index}
-    net.load['bus_name'] = net.load['bus'].map(bus_name_map)
-
-    # -------- Step 4: Assign substation names using helper function --------
-    # Prefer matching against measurement substation names (the canonical short
-    # names like 'Bravo') so the lookup in Step 5 works for measured substation-style networks
-    # where bus names have kV suffixes ('Bravo 10 kV'). Falls back to the
-    # network-derived substations list for IEEE / MATPOWER networks.
-    meas_sub_names = (
-        measurement_prod_cons['substation_name'].dropna().tolist()
-        if 'substation_name' in measurement_prod_cons.columns
-        else []
-    )
-    match_pool = meas_sub_names if meas_sub_names else substations
-    net.load['substation_name'] = net.load['bus_name'].apply(
-        lambda name: match_substation(name, match_pool)
-    )
+    # -------- Steps 3–4: each load's bus name and the measurement it matches --------
+    label_loads(net, measurement_prod_cons, substations)
 
     # -------- Step 5: Assign active power (p_mw) using external measurement data --------
     # Preserve the original index

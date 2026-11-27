@@ -63,7 +63,7 @@ class Match(NamedTuple):
     etype: str        # bus | line | trafo | gen | sgen
     idx: int
     label: str        # the name every result shows
-    how: str          # how it was found: name, index, tag, ends, bus, partial, slip
+    how: str          # how it was found: name, index, tag, ends, bus, partial, slip, mrid
 
 
 class ResolveError(ValueError):
@@ -264,6 +264,24 @@ def _one(net, hits: list[tuple[str, int]], how: str, wanted: str) -> Match | Non
 # The lookups
 # ---------------------------------------------------------------------------
 
+# The loaded network's identity, for the mRIDs the layer derives (set by the backend when a network loads).
+NETWORK_ID: str | None = None
+_MRID = re.compile(r"_?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _by_mrid(net, tables: tuple[str, ...], text: str) -> Match | None:
+    """The element whose mRID is `text` — a CIM model's own, or the one the layer derives."""
+    if not _MRID.fullmatch(text):
+        return None
+    import semantics as sm
+    wanted = text.lstrip("_").lower()
+    for table in tables:
+        for i, m in sm.row_mrids(net, table, NETWORK_ID or "local").items():
+            if m.lower() == wanted:
+                return Match(table, int(i), display(net, table, int(i)), "mrid")
+    return None
+
+
 def find(net, wanted, kinds: tuple[str, ...] = KINDS) -> Match:
     """The bus, line or transformer (of `kinds`) named `wanted`; raises
     ResolveError when none, or more than one, matches."""
@@ -276,6 +294,9 @@ def find(net, wanted, kinds: tuple[str, ...] = KINDS) -> Match:
         raise ResolveError("A name is required.", "not_found")
     if isinstance(wanted, (int, np.integer)) and not isinstance(wanted, bool):
         raise ResolveError(f"There is no {'/'.join(_WORD[k] for k in kinds)} with index {wanted}.", "not_found")
+    by_mrid = _by_mrid(net, tables, text)
+    if by_mrid:
+        return by_mrid
     said = _external(net, text)
     if said:
         raise ResolveError(said, "not_an_element")
@@ -325,6 +346,9 @@ def find_unit(net, wanted, tables: tuple[str, ...] = UNIT_TABLES) -> Match:
     text = str(wanted if wanted is not None else "").strip().strip("'\"`")
     if not text:
         raise ResolveError("A unit name is required.", "not_found")
+    by_mrid = _by_mrid(net, present, text)
+    if by_mrid:
+        return by_mrid
     for attempt, how in ((text, "name"), (foreign_tail(text), "slip")):
         if not attempt:
             continue

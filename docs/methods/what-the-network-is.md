@@ -107,9 +107,12 @@ piece of equipment, the equipment above with its units, controls and switches
 each fact's basis and origin, a unit's energy source, a load's category, where
 each value comes from — goes beside it in a namespace of CONDUCTOR's own
 (`cdr:`), so a reader that knows only CIM still reads a valid model. Units
-follow CGMES (kV, MW, km, ohm). The model is bus-branch: a switch is placed
-at the end of the branch it opens. The tests read the export back with rdflib
-and query it with SPARQL.
+follow CGMES (kV, MW, km, ohm). Nodes are topological nodes, or, for a
+node-breaker CIM model, its connectivity nodes; a bus coupler (and every switch
+of a node-breaker model) is joined to the nodes on both sides, and any other
+switch is placed at the end of the branch it opens. Voltage levels keep the
+model's names. The tests read the export back with rdflib and query it with
+SPARQL.
 
 A CGMES model can also be **uploaded** (a `.zip`; see
 [Network, data and the operating point](network-and-data.md)): its
@@ -118,6 +121,217 @@ the model, not inferred. A model that leaves lines without a node at one end
 (its boundary set missing) is refused with what to add; one the layer cannot
 fully connect lists the branches it could not place (`unresolved_branches`)
 instead of failing.
+
+## A CIM model kept whole
+
+pandapower's converter turns a CGMES model into the tables a power flow needs
+and keeps only what fits them. CONDUCTOR also keeps the **whole model**
+(`backend/cim_model.py`): every object of every profile (EQ, SSH, TP, SV, DL,
+GL and the boundary set), whatever its class, by its mRID, with its attributes
+and its references, tied to the network it came with. The layer reads its facts
+there first, then from pandapower, then infers:
+
+| From the model | In the layer |
+|---|---|
+| ConnectivityNode / TopologicalNode | each bus's class |
+| VoltageLevel, Bay, Substation, regions | voltage levels with their names, bays and busbars; substations with their names and mRIDs |
+| BusbarSection, BusNameMarker | the busbar at a node; the bus name the source tool shows |
+| OperationalLimitSet, CurrentLimit | every limit on a branch, permanent or temporary (held for a stated time) |
+| RegulatingControl, TapChangerControl | each machine's, shunt's and tap changer's control: mode, target, whether enabled |
+| PowerTransformerEnd, tap changers | rated voltage and power per end; tap steps, position and control |
+| GeneratingUnit, LoadResponseCharacteristic | each unit's generating unit and limits; how each load follows the voltage |
+| equipment pandapower has no table for | listed as *other equipment*, not in the computation |
+
+A **loss report** says, class by class, how many objects the model holds, how
+many reach the computation (pandapower's tables) and how many the layer
+describes, with a status: *described*, *partly*, *read into* other entries
+(limit sets into each branch's limits), *solved state* (the source tool's
+power-flow solution) or *model only*. Nothing is out of reach:
+`describe_network(about="around", element=<mRID>)` returns any object as the
+model states it, a limit set or a control area as much as a line, and a busbar,
+a bus name or a voltage level can be named as the model names it.
+
+**What the studies ignore.** The studies run on pandapower's copy, so some of
+what the model states they do not use: they check the permanent limit only;
+they hold shunts and taps at fixed positions, not following their controls;
+pandapower's converter makes every load constant power, whatever its load
+response says. `describe_network(about="model")` and the data issues say so for
+the network loaded, so the agent can say what a study did not take into account.
+
+**The model's own solution.** When the model carries the source tool's power-flow
+solution (its SV profile), CONDUCTOR's power flow on the network as loaded is
+compared with it: every node's voltage and angle and every injection's power.
+On ENTSO-E's SmallGrid (1,225 nodes, node-breaker and bus-branch) they agree
+within 0.0002 pu and 0.01°: the conversion keeps the model electrically intact.
+A difference beyond the tolerance (0.005 pu, 0.5°, 1 MW) is a data issue that
+names the largest differences.
+
+**On the map.** A node-breaker model has a node for every busbar section and every
+bay; drawn bus by bus, most look unconnected (their switches are not branches).
+The map draws the nodes joined by closed switches as one electrical node, named
+after its busbar or bus name in the model, as the power flow sees them; results
+reported for any of its buses land on it. When the model brings its own diagram
+(the DL profile), the map is drawn as that diagram: ENTSO-E's SmallGrid, 1,225
+nodes, becomes the 118 electrical nodes laid out as its source tool lays them out.
+
+**In the System tab.** The *CIM layer* pane shows the model too: its objects in the
+headline, a picture of what the layer does with each class (described, read into
+other entries, the source tool's solution, kept in the model only), and a *CIM
+model* tab with the solved-state check, what the studies do not use and the loss
+report; an *Other equipment* tab lists what the layer has no kind of its own for.
+Buses show their voltage level, busbar and name in the model; lines their limits
+by duration; transformers their tap position.
+
+**Exported losslessly.** Beside the layer's own export, a network loaded as CIM
+can be downloaded as *your model + CONDUCTOR's additions*
+(`GET /api/network/cim/package`): the uploaded zip, byte for byte, and one more
+profile with what the layer adds about the model's objects (energy sources,
+categories, feeders, switch roles, each with how it is known), referring to them
+by the model's own identifiers, with the feeders it infers. Read with the
+model's profiles, the additions sit on the model's objects; nothing of the model
+is regenerated.
+
+**Every network has a CIM model.** A network that did not come as CIM — a
+MATPOWER case, a pandapower file, the bundled demos — is written as CGMES 3.0
+(EQ, SSH, TP and, for transformers' vector groups, SC; 2.4.15 on request) from
+its data when it loads (`backend/cgmes_writer.py`): PV units, wind turbines and
+batteries as power-electronics connections with their units, each
+element under the CIM layer's mRID. What CGMES has no place for but the
+computation needs (generation costs, OPF limits, how loads follow the voltage,
+scaling, storage, the frequency) is kept beside it by mRID; what neither can
+carry is listed as a loss. The written model is *derived*: the layer never takes
+it for a model's own statement, so the facts keep their basis (stated by the
+network, named, inferred). It is what the network is exported as (**Export as
+CIM → The network as CGMES**) and what other tools can read.
+
+**The computation is a copy of the model.** An adapter (`backend/cim_adapter.py`)
+makes a tool's copy of a CGMES model with an explicit map from each element to
+the model's mRID, puts back what the profiles cannot carry, and returns the
+tool's results keyed by mRID, so they read the same whatever tool computed them.
+For pandapower, the copy is read by pandapower's own CIM converter. The round
+trip, pandapower → CGMES → pandapower, gives the same power flow element by
+element — within 10⁻⁷ MW and 10⁻¹⁰ pu on IEEE 30, CIGRE MV, MV Oberrhein, IEEE
+118, PEGASE 1354 and 9241, and pandapower's multi-voltage example (three-winding
+transformer, equivalents) — and the tests check it on every bundled network. The
+CGMES profiles alone, as another tool reads them, carry the bundled networks
+exactly too, and so do PEGASE's phase shifters (a shift that is not a multiple of
+30° is written as the clock's multiple plus a linear phase tap changer; beside a
+ratio tap, that phase tap changer goes on the other end, and the importer undoes
+pandapower's converter copying each tap's step to the other). DC lines are
+written as two voltage-source converters and a DC line segment between their DC
+nodes, which pandapower's converter reads back as the same DC line. What it
+reads back differently is listed, and CONDUCTOR's copy gets it from the extras:
+the sign of a negative resistance or reactance (read as a magnitude), a motor's
+consumption (read with the generator's sign), a static var compensator (read as
+a fixed shunt) and a DC line's loss percentage (read as a fixed loss). Motors
+are written as asynchronous machines, SVCs as static var compensators.
+`describe_network(about="model")` reports the round trip for the network loaded.
+
+**CGMES 3.0 through pandapower.** pandapower 3.5's reader cannot read a CGMES
+3.0 model with lines at all (its 3.0 parser keeps no line in-service state, which
+its converter then reads), and drops every power-electronics connection — PV,
+wind, batteries — which it converts for the LTDS profile only. CONDUCTOR's
+importer puts both back (ENTSO-E's 3.0 MicroGrid loads and solves), gives a
+boundary node with no nominal voltage its neighbour's and a static var
+compensator with no set point its bus's, and says each in the import notes. A
+3.0 model sent without its ShortCircuit profile has no vector groups: said too.
+
+**The network's state is its model and differences.** What CONDUCTOR studies
+is the CIM model and the changes made to it, each kept as a difference against
+the model (`backend/cim_changes.py`: objects added and removed, statements set
+and unset, keyed by mRID; IEC 61970-552 when exported):
+
+- *the operator's standing changes* — a unit's generator model (its control,
+  set-points and limits) and the names given — against the model as loaded
+  (`GET /api/network/cim/operator`);
+- *each proposal* against the base (`GET /api/network/cim/proposal`).
+
+The pandapower network a study runs on is projected from them
+(`project_onto`): the network as loaded, with each difference applied element by
+element by mRID — an element changed takes the values the adapter reads from
+the part of the model the difference touches, one added is placed at its row,
+one moved between tables (a voltage-controlled unit set to a fixed power factor)
+keeps its mRID and takes its cost along, every other row is untouched. An
+element the base has takes only the values the difference changes: the touched
+part of the model is read without the difference and with it, and only what
+differs between the two readings reaches the row. For a network loaded as CIM,
+the differences name the model's own objects — its terminals, transformer ends,
+tap changers, regulating controls, generating units and limits — so they apply
+to its own files. Only the
+touched part of the model is read, so a change costs what it touches: on PEGASE
+9241, about half a second, against a few milliseconds to build it from the edits.
+If a difference cannot be made or projected, the network is built as before, by
+the edits or the generator models, and the log says so.
+
+The edits and the operator's settings stay the language they are given in. Each
+is translated into a difference: a line reinforced, a transformer upgraded, a
+load set or scaled, a switch opened or closed (`set_switch`: its `Switch.open`),
+a move within a voltage level change the model's
+statements directly; any other edit — equipment added, a move to another
+voltage level, a parameter such as a line's length — and the operator's changes
+are applied to a scratch copy, and the elements they changed are written again
+by the writer (`reemit`), which stays the one definition of how a pandapower row
+is written as CIM. Each proposal records how its edits were translated.
+
+**Every moment as the model's operating point.** At each tick the measurements
+are allocated to the loads and units (as before). The result is a moment: every
+measured element's active and reactive power, keyed by mRID
+(`backend/operating_point.py`). It is computed once for the networks that share
+their measured elements and what the allocation reads of them — the base and
+the proposals that leave its measured elements alone — and applied to each by
+mRID; a network whose measured elements differ (a unit's capacity changed) is
+allocated on its own. `GET /api/network/cim/moment?timestamp=…` gives a moment
+as a CGMES SSH profile against the network's model (or each element's values by
+mRID with `format=json`).
+
+**Solved states as the model's SV.** `GET /api/network/cim/solved?timestamp=…`
+(or `source=nominal`) solves the network at a moment and writes the result as a
+CGMES state-variables profile against its model: each node's voltage and angle,
+the power at every terminal (branches at both ends), the tap positions — under
+the model's own identifiers for a network loaded as CIM — so another tool can
+read CONDUCTOR's solution or compare it with its own. On ENTSO-E's SmallGrid at
+its own operating point, every node of the model is there and the voltages are
+within 0.03 kV of the model's own SV.
+
+**Elements named by their mRID.** Every study that takes an element (a line to
+take out, a unit to hold) accepts its mRID as well as its name: the model's own
+for a network loaded as CIM, the layer's for any other. A unit a CIM model
+names keeps its name and its mRID when CONDUCTOR converts it to a static unit
+(the second of two alike is numbered), and its source is what the model's
+generating unit says (a `ThermalGeneratingUnit` is thermal, stated).
+
+**Saved and exported as files.** The differences are saved with the proposals
+and the operator's settings, with what they were made against: the network as
+loaded, the operator's changes, the writer's version. After a restart, a
+difference made against the same model is used as saved; otherwise it is made
+again from its edits or settings. The CIM package (**Export as CIM**) carries
+the model, the operator's changes, each proposal (`proposals/<id>.xml`) and a
+manifest of what each file is. A difference file carries, in CONDUCTOR's own
+namespace (which other tools ignore), the profile of each statement and what
+CGMES has no place for, so it reads back as the same difference
+(`cim_changes.from_xml`).
+
+**Checked end to end.** `python -m evaluation.cim_central run` builds every
+network these four ways and the way CONDUCTOR built it before, and compares them
+element by element through the mRIDs — every column of every table, the costs,
+the row indices and the power flow:
+
+- proposals: every kind of edit;
+- operator changes: generator models and names;
+- moments: the tick allocated on each network, or the base's moment applied;
+- saved state: differences read back from their files.
+
+It runs on IEEE 14 and 30, CIGRE MV, pandapower's multi-voltage example (also
+loaded from CGMES, where every object a difference changes must be one of the
+model's own) and MV Oberrhein (add `--large` for PEGASE 1354 and 9241, with
+timings), and writes a manifest. Every check gives the same network.
+
+**Switches the converter does not read.** pandapower's converter reads breakers,
+disconnectors, load-break switches and generic switches; a fuse, jumper,
+recloser, sectionaliser or ground disconnector it leaves out, and a fuse in series
+then leaves everything beyond it cut off. Each is added at import as a switch
+between its two nodes, open or closed as the model has it, with its class, so
+the topology is the model's.
 
 ## Around an element
 
@@ -164,7 +378,7 @@ The studies read the layer, not the names, for any network loaded:
 | Probabilistic and robust studies, the look-ahead | the same units: only their output is uncertain |
 | Optimisations (OPF, flexibility options, N-1 corrective and preventive plans) | wind and solar units are curtailable at 40 €/MWh, produce at 0 €/MWh, and are capped at what their resource gives at the moment studied |
 | Outage studies | the normally open ties that could restore what an outage cuts off, each checked with a power flow |
-| N-1 screen | a scope: the outages of one feeder, substation or voltage level |
+| N-1 screen | a scope: the outages of one feeder, substation or voltage level; for a network loaded as CIM, the model's temporary limits (TATL): each overload after an outage says how long it may be held, and the result the time left to act |
 | Synthetic data | each unit follows its source, each load its category (residential, commercial, industrial, a data centre…) |
 | The reading check | a study that depends on which units are wind or solar is re-run with the unknown units counted as wind or solar, and the name-only ones not counted (`assume_unit_sources`, nothing kept) |
 | Where values come from | which values are measured, allocated, derived, solved or set |
@@ -250,13 +464,14 @@ normal state, loads partly categorised, names used twice.
 
 ## A proposal as a difference
 
-Elements keep their mRIDs between the base and a proposal (they are derived from
-the network as loaded), so `cim_export.difference` compares the two layers
-element by element: added, removed, or the statements that changed. It is written
-as a CIM difference model (`GET /api/network/cim/difference?network=<proposal>`;
-IEC 61970-552: forward and reverse differences) — applied to the base's export, it
-gives the proposal's — and summarised for the agent
-(`describe_network(network=<proposal>, about="changes")`).
+A proposal *is* a difference to the CIM model (above). For the agent,
+`describe_network(network=<proposal>, about="changes")` reads it element by
+element: each element its difference touches, by mRID, added, removed or
+changed, with the statements that change (a line's r and x, its limit). Elements
+keep their mRIDs between the base and a proposal, so the layer's facts are
+compared element by element too (`cim_export.difference`: a feeder's members, a
+unit's source, a bus's level), written as a difference model of the layer
+(`GET /api/network/cim/difference?network=<proposal>`).
 
 ## Checked in every answer
 

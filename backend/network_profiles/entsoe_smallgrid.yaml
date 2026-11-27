@@ -1,0 +1,44 @@
+name: "ENTSO-E SmallGrid (CGMES 2.4.15)"
+# ENTSO-E's CGMES conformity test configuration SmallGrid v3.0.0, bus-branch base case with its boundary set
+# (network_data/entsoe_smallgrid/, CC BY-SA 4.0 — see the NOTICE there): a 118-node transmission model at 220, 132
+# and 33 kV with 18 synchronous machines, 103 loads, 14 shunts and three boundary equivalents. Loaded as a CIM model,
+# kept whole: its names, substations, limits and the model's own solution are read from it.
+source: cgmes
+cgmes_path: "backend/network_data/entsoe_smallgrid/SmallGrid_BusBranch_v3.0.0.zip"
+measurement_source: synthetic
+synthetic_n_days: 7
+synthetic_resolution_min: 15
+synthetic_load_profile: "residential"
+synthetic_generation_profile: "dispatched"
+synthetic_peak_load_factor: 1.0
+synthetic_forecast_overlap_days: 2
+precomputed_ybus_path: null
+slack_max_mw: 9999.0
+vm_lower: 0.9
+vm_upper: 1.1
+max_loading_pct: 100.0
+voltage_level_kv: 220
+grid_type: "transmission"
+slack_name: "Sporn SM (reference)"
+description: "Synthetic 7-day profile on ENTSO-E's CGMES SmallGrid test model (CC BY-SA 4.0, ENTSO-E), loaded as CIM."
+# The machines hold the voltages the model sets them (its RegulatingControl targets), as loaded; at power
+# factor 1.0 the 132 kV ring cannot hold its voltages.
+unit_model:
+  "TwinBrch SM": {control: voltage, vm_pu: 0.99}
+  "Breed SM": {control: voltage, vm_pu: 1.05}
+  "DeerCrk SM": {control: voltage, vm_pu: 0.967}
+  "Pinevlle SM": {control: voltage, vm_pu: 1.015}
+  "DanRiver SM": {control: voltage, vm_pu: 0.98}
+  "Glen Lyn SM": {control: voltage, vm_pu: 1.017}
+  "Muskngum SM": {control: voltage, vm_pu: 1.005}
+  "Philo SM": {control: voltage, vm_pu: 1.025}
+  "Muskngum SM 2": {control: voltage, vm_pu: 1.05}
+  "TannrsCk SM": {control: voltage, vm_pu: 1.05}
+  "Claytor SM": {control: voltage, vm_pu: 1.01}
+  "W.Lancst SM": {control: voltage, vm_pu: 1.005}
+  "CabinCrk SM": {control: voltage, vm_pu: 1.04}
+  "ClinchRv SM": {control: voltage, vm_pu: 1.005}
+  "TannrsCk SM 2": {control: voltage, vm_pu: 1.015}
+  "Tidd SM": {control: voltage, vm_pu: 0.985}
+  "W.Kammer SM": {control: voltage, vm_pu: 0.995}
+  "Torrey SM": {control: voltage, vm_pu: 0.955}

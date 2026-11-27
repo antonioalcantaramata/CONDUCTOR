@@ -283,6 +283,26 @@ def _move_cost(net, table: str, idx, new_table: str, new_idx) -> None:
     pc.loc[rows, "element"] = new_idx
 
 
+def _carry_identity(net, row: dict, old_table: str, old_idx, new_table: str, new_idx) -> None:
+    """A unit moved to the other table keeps the identity it had as loaded: the table and index it was loaded in
+    (`loaded_table`, `loaded_index`, from which its derived mRID is made) and a CIM model's own mRID and class."""
+    def keep(column: str, value) -> None:
+        if column not in net[new_table].columns:
+            net[new_table][column] = None
+            net[new_table][column] = net[new_table][column].astype(object)
+        net[new_table].at[new_idx, column] = value
+    loaded_table = row.get("loaded_table")
+    if isinstance(loaded_table, str) and loaded_table:
+        keep("loaded_table", loaded_table)
+        keep("loaded_index", int(row["loaded_index"]))
+    else:
+        keep("loaded_table", old_table)
+        keep("loaded_index", int(old_idx))
+    for column in ("origin_id", "origin_class"):
+        if isinstance(row.get(column), str) and row[column]:
+            keep(column, row[column])
+
+
 def apply(loaded_net, model: dict):
     """A copy of the network as loaded with `model` applied: units moved to the
     table their control needs, set-points and limits set. Raises ModelError."""
@@ -308,15 +328,18 @@ def apply(loaded_net, model: dict):
                 net.sgen.drop(index=idx, inplace=True)
                 new = pp.create_gen(net, vm_pu=want["vm_pu"] or 1.0, name=name, **common)
                 _move_cost(net, "sgen", idx, "gen", new)
+                _carry_identity(net, row, "sgen", idx, "gen", new)
                 table, idx = "gen", new
             net.gen.at[idx, "vm_pu"] = float(want["vm_pu"] or 1.0)
-            net.gen.at[idx, "min_q_mvar"] = float(want["q_min_mvar"])
-            net.gen.at[idx, "max_q_mvar"] = float(want["q_max_mvar"])
+            # A unit with no reactive limits keeps none (an empty limit is no limit).
+            net.gen.at[idx, "min_q_mvar"] = float("nan") if want["q_min_mvar"] is None else float(want["q_min_mvar"])
+            net.gen.at[idx, "max_q_mvar"] = float("nan") if want["q_max_mvar"] is None else float(want["q_max_mvar"])
         else:
             if table == "gen":
                 net.gen.drop(index=idx, inplace=True)
                 new = pp.create_sgen(net, q_mvar=0.0, name=name, **common)
                 _move_cost(net, "gen", idx, "sgen", new)
+                _carry_identity(net, row, "gen", idx, "sgen", new)
                 idx = new
                 if "substation_name" in net.sgen.columns:
                     net.sgen.at[idx, "substation_name"] = name
